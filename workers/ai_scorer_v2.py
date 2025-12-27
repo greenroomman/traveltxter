@@ -125,7 +125,13 @@ Notes: {row.get('notes')}
 
 
 def main():
-    client = OpenAI(api_key=get_env("OPENAI_API_KEY"))
+from openai import OpenAI
+import httpx
+
+client = OpenAI(
+    api_key=get_env("OPENAI_API_KEY"),
+    http_client=httpx.Client(proxies=None),
+)
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
     sheet_id = get_env("SHEET_ID")

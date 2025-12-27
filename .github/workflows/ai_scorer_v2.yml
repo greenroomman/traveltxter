@@ -36,6 +36,7 @@ jobs:
 
       - name: Run AI scorer
         env:
+          PYTHONPATH: ${{ github.workspace }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}

@@ -44,5 +44,5 @@ jobs:\
         env:\
           OPENAI_API_KEY: $\{\{ secrets.OPENAI_API_KEY \}\}\
         run: |\
-          python workers/ai_scorer_v2.py\
+          python workers/ai_scorer.py\
 }

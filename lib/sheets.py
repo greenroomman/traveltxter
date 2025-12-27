@@ -12,24 +12,24 @@ SCOPES = [
 ]
 
 
-def now_iso():
+def now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat()
 
 
-def get_env(name, optional=False):
+def get_env(name: str, optional: bool = False) -> str:
     v = os.getenv(name, "").strip()
     if not v and not optional:
         raise ValueError(f"Missing required env var: {name}")
     return v
 
 
-def get_gspread_client():
+def get_gspread_client() -> gspread.Client:
     info = json.loads(get_env("GCP_SA_JSON"))
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
-def ensure_headers(ws, required_headers):
+def ensure_headers(ws, required_headers: List[str]) -> Dict[str, int]:
     actual = ws.row_values(1)
     missing = sorted(set(required_headers) - set(actual))
     if missing:
@@ -37,29 +37,27 @@ def ensure_headers(ws, required_headers):
     return {h: actual.index(h) + 1 for h in actual}
 
 
-def validate_sheet_schema(ws, required_headers):
+def validate_sheet_schema(ws, required_headers: List[str]) -> None:
     actual = ws.row_values(1)
     missing = sorted(set(required_headers) - set(actual))
     if missing:
         raise ValueError(f"Sheet missing columns: {missing}")
 
 
-def row_to_dict(headers, values, row_num):
-    d = {}
-    for i, h in enumerate(headers):
-        d[h] = values[i] if i < len(values) else ""
+def row_to_dict(headers: List[str], values: List[str], row_num: int) -> Dict[str, Any]:
+    d = {h: (values[i] if i < len(values) else "") for i, h in enumerate(headers)}
     d["_row_number"] = row_num
     return d
 
 
-def _parse_lock(lock_value):
+def _parse_lock(lock_value: str) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(lock_value)
     except Exception:
         return None
 
 
-def lock_is_stale(lock_value, max_age):
+def lock_is_stale(lock_value: str, max_age: timedelta) -> bool:
     if not lock_value:
         return False
     t = _parse_lock(lock_value)
@@ -68,24 +66,25 @@ def lock_is_stale(lock_value, max_age):
     return (datetime.utcnow() - t) > max_age
 
 
-def update_row_by_headers(ws, header_map, row_num, updates):
+def update_row_by_headers(ws, header_map: Dict[str, int], row_num: int, updates: Dict[str, Any]) -> None:
     cells = []
     for k, v in updates.items():
-        if k in header_map:
-            cells.append(gspread.Cell(row_num, header_map[k], str(v)))
+        if k not in header_map:
+            continue
+        cells.append(gspread.Cell(row_num, header_map[k], str(v)))
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
 
 
 def claim_first_available(
     ws,
-    required_headers,
-    status_col,
-    wanted_status,
-    set_status,
-    worker_id,
-    max_lock_age,
-):
+    required_headers: List[str],
+    status_col: str,
+    wanted_status: str,
+    set_status: str,
+    worker_id: str,
+    max_lock_age: timedelta,
+) -> Optional[Dict[str, Any]]:
     headers = ws.row_values(1)
     hm = ensure_headers(ws, required_headers)
 
@@ -103,7 +102,7 @@ def claim_first_available(
         if status_val != wanted_status:
             continue
 
-        lock_val = row[lock_idx] if lock_idx is not None and lock_idx < len(row) else ""
+        lock_val = row[lock_idx] if (lock_idx is not None and lock_idx < len(row)) else ""
         if lock_val and not lock_is_stale(lock_val, max_lock_age):
             continue
 

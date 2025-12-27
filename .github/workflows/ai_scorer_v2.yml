@@ -11,37 +11,27 @@ jobs:
     timeout-minutes: 8
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: DEBUG – show commit + scorer lines
+      - name: DEBUG – show commit + sheets.py lines
         run: |
           echo "==== COMMIT CHECKED OUT ===="
           git rev-parse HEAD
           echo ""
-          echo "==== workers/ai_scorer_v2.py lines 120–140 ===="
-          nl -ba workers/ai_scorer_v2.py | sed -n '120,140p'
+          echo "==== lib/sheets.py (lines 30–55) ===="
+          nl -ba lib/sheets.py | sed -n '30,55p'
           echo ""
-          echo "==== END DEBUG ===="
 
-      - name: DEBUG – show sheets.py
-        run: |
-          echo "==== COMMIT ===="
-          git rev-parse HEAD
-          echo "==== lib/sheets.py (lines 1–80) ===="
-          nl -ba lib/sheets.py | sed -n '1,80p'
-
-      - name: Run AI scorer
+      - name: Run scorer
         env:
           PYTHONPATH: ${{ github.workspace }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -53,4 +43,3 @@ jobs:
           WORKER_ID: ai_scorer_v2
         run: |
           python workers/ai_scorer_v2.py
-

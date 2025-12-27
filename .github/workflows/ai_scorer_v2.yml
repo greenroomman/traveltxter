@@ -43,3 +43,11 @@ jobs:
           WORKER_ID: ai_scorer_v2
         run: |
           python workers/ai_scorer_v2.py
+      - name: Safety check – no nested project
+        run: |
+          if [ -d traveltxter ]; then
+            echo "ERROR: nested traveltxter directory exists"
+            find traveltxter
+            exit 1
+          fi
+

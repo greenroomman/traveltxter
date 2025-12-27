@@ -37,7 +37,7 @@ jobs:\
 \
       - name: Compile files (sanity check)\
         run: |\
-          python -m py_compile workers/ai_scorer_v2.py\
+          python -m py_compile workers/ai_scorer.py\
           python -m py_compile lib/sheets.py\
 \
       - name: Run scorer\

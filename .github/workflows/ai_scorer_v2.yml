@@ -34,6 +34,13 @@ jobs:
           echo ""
           echo "==== END DEBUG ===="
 
+      - name: DEBUG – show sheets.py
+        run: |
+          echo "==== COMMIT ===="
+          git rev-parse HEAD
+          echo "==== lib/sheets.py (lines 1–80) ===="
+          nl -ba lib/sheets.py | sed -n '1,80p'
+
       - name: Run AI scorer
         env:
           PYTHONPATH: ${{ github.workspace }}

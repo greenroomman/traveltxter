@@ -125,7 +125,7 @@ def build_prompt(row: Dict[str, Any]) -> str:
     return (
         "Score this flight deal for UK backpackers.\n\n"
         "Return JSON with EXACT keys:\n"
-        "price_score, date_score, friction_score, backpacker_score,\n"
+        "price_score, date_score, friction_score, backpacker_score, "
         "confidence, theme, reasons, ai_caption\n\n"
         "Rules:\n"
         "- All scores/confidence must be integers 0-100\n"

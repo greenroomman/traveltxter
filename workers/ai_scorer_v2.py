@@ -1,112 +1,119 @@
 #!/usr/bin/env python3
 """
-V3.2(A) AI Scorer Worker
-Clean, minimal, CI-safe version
+AI Scorer v2 – CI-safe, minimal, deterministic
 """
 
 import os
 import json
-import time
-from typing import Dict, Any
+from typing import Dict
 
-import httpx
 from openai import OpenAI
 
 from lib.sheets import (
     get_worksheet,
     ensure_headers,
-    fetch_next_row_for_processing,
+    find_and_lock_row,
     update_row_by_headers,
 )
 
-REQUIRED_HEADERS = [
-    "deal_id",
-    "origin_city",
-    "destination_city",
-    "price_gbp",
-    "outbound_date",
-    "return_date",
-    "ai_score",
-    "ai_verdict",
-    "ai_notes",
-    "status",
-]
+# -----------------------------
+# Helpers
+# -----------------------------
 
-
-def get_env(name: str, default: str | None = None) -> str:
-    val = os.getenv(name, default)
-    if val is None or val == "":
+def get_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
         raise RuntimeError(f"Missing required env var: {name}")
     return val
 
 
-def score_with_ai(client: OpenAI, row: Dict[str, Any]) -> Dict[str, Any]:
-    prompt = f"""
-You are scoring a flight deal.
+def score_deal(deal: Dict) -> Dict:
+    """
+    Minimal deterministic scoring stub.
+    Replace later with full LLM logic.
+    """
+    price = float(deal.get("price_gbp", 9999) or 9999)
 
-Return STRICT JSON with keys:
-- ai_score (0-100 integer)
-- ai_verdict ("GOOD", "AVERAGE", or "POOR")
-- ai_notes (short sentence)
+    if price < 50:
+        verdict = "GOOD"
+        score = 90
+    elif price < 150:
+        verdict = "AVERAGE"
+        score = 60
+    else:
+        verdict = "POOR"
+        score = 30
 
-Deal:
-Origin: {row.get('origin_city')}
-Destination: {row.get('destination_city')}
-Price GBP: {row.get('price_gbp')}
-Outbound: {row.get('outbound_date')}
-Return: {row.get('return_date')}
-"""
+    return {
+        "ai_score": score,
+        "ai_verdict": verdict,
+        "ai_notes": f"Auto-scored at £{price}",
+        "status": "READY_TO_POST",
+    }
 
-    resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
 
-    text = resp.choices[0].message.content.strip()
-    return json.loads(text)
-
+# -----------------------------
+# Main worker
+# -----------------------------
 
 def main() -> None:
+    # --- Env ---
     sheet_id = get_env("SHEET_ID")
-    raw_tab = get_env("RAW_DEALS_TAB")
-    worker_id = os.getenv("WORKER_ID", "ai_scorer_v2")
+    tab_name = get_env("RAW_DEALS_TAB")
+    worker_id = get_env("WORKER_ID")
 
-    ws = get_worksheet(sheet_id, raw_tab)
-    ensure_headers(ws, REQUIRED_HEADERS)
+    # OPENAI_API_KEY is validated here even if not used yet
+    _ = get_env("OPENAI_API_KEY")
 
-    client = OpenAI(
-        api_key=get_env("OPENAI_API_KEY"),
-        http_client=httpx.Client(proxies=None),
-    )
+    # --- Sheets ---
+    ws = get_worksheet(sheet_id, tab_name)
 
-    row = fetch_next_row_for_processing(
-        ws,
+    required_headers = [
+        "deal_id",
+        "price_gbp",
+        "status",
+        "processing_lock",
+        "locked_by",
+        "ai_score",
+        "ai_verdict",
+        "ai_notes",
+    ]
+
+    header_map = ensure_headers(ws, required_headers)
+
+    # --- Lock one row ---
+    locked = find_and_lock_row(
+        ws=ws,
+        header_map=header_map,
         status_col="status",
+        pick_status="NEW",
         set_status="SCORING",
         worker_id=worker_id,
     )
 
-    if not row:
-        print("No rows to score")
+    if not locked:
+        print("No NEW rows to score.")
         return
 
-    result = score_with_ai(client, row)
+    row_num, row_dict = locked
 
+    # --- Score ---
+    result = score_deal(row_dict)
+
+    # --- Write back ---
     update_row_by_headers(
         ws,
-        row["_row"],
-        {
-            "ai_score": result["ai_score"],
-            "ai_verdict": result["ai_verdict"],
-            "ai_notes": result["ai_notes"],
-            "status": "SCORED",
-        },
+        header_map,
+        row_num,
+        result,
     )
 
-    print(f"Scored deal {row.get('deal_id')}")
+    print(f"Scored row {row_num}: {result['ai_verdict']} ({result['ai_score']})")
 
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
 
 if __name__ == "__main__":
     main()
-

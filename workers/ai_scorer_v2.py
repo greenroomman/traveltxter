@@ -8,15 +8,12 @@ from openai import OpenAI
 from lib.sheets import (
     get_env,
     get_gspread_client,
-    ensure_headers,
     validate_sheet_schema,
+    ensure_headers,
     claim_first_available,
     update_row_by_headers,
 )
 
-# =========================
-# REQUIRED RAW_DEALS SCHEMA
-# =========================
 RAW_REQ = [
     "deal_id",
     "origin_city",
@@ -51,23 +48,13 @@ RAW_REQ = [
 ]
 
 SYSTEM_PROMPT = (
-    "You are Traveltxter_GPT scoring flight deals for UK backpackers. "
-    "Respond ONLY with valid JSON. No markdown. No commentary."
+    "You score flight deals for UK backpackers. "
+    "Return ONLY valid JSON. No markdown. No extra text."
 )
 
-THEMES = {
-    "CITY_BREAK",
-    "BEACH",
-    "ADVENTURE",
-    "CULTURE",
-    "PARTY",
-    "NATURE",
-    "SKI",
-}
+THEMES = {"CITY_BREAK", "BEACH", "ADVENTURE", "CULTURE", "PARTY", "NATURE", "SKI"}
 
-# =========================
-# Helpers
-# =========================
+
 def clamp_int(x: Any) -> int:
     try:
         v = int(float(str(x).strip()))
@@ -79,12 +66,7 @@ def clamp_int(x: Any) -> int:
 def parse_weights() -> Dict[str, float]:
     raw = os.getenv("SCORE_WEIGHTS", "").strip()
     if not raw:
-        return {
-            "price": 0.35,
-            "date": 0.20,
-            "friction": 0.20,
-            "backpacker": 0.25,
-        }
+        return {"price": 0.35, "date": 0.20, "friction": 0.20, "backpacker": 0.25}
     try:
         w = json.loads(raw)
         return {
@@ -94,12 +76,7 @@ def parse_weights() -> Dict[str, float]:
             "backpacker": float(w.get("backpacker", 0.25)),
         }
     except Exception:
-        return {
-            "price": 0.35,
-            "date": 0.20,
-            "friction": 0.20,
-            "backpacker": 0.25,
-        }
+        return {"price": 0.35, "date": 0.20, "friction": 0.20, "backpacker": 0.25}
 
 
 def compute_final(scores: Dict[str, int], w: Dict[str, float]) -> int:
@@ -122,36 +99,31 @@ def verdict(final_score: int, confidence: int) -> str:
 
 
 def build_prompt(row: Dict[str, Any]) -> str:
-    return (
-        "Score this flight deal for UK backpackers.\n\n"
-        "Return JSON with EXACT keys:\n"
-        "price_score, date_score, friction_score, backpacker_score, "
-        "confidence, theme, reasons, ai_caption\n\n"
-        "Rules:\n"
-        "- All scores/confidence must be integers 0-100\n"
-        "- theme must be one of: CITY_BREAK, BEACH, ADVENTURE, CULTURE, 
-PARTY, NATURE, SKI\n"
-        "- reasons must be ONE string with 3 short bullets separated by ' 
-; '\n"
-        "- ai_caption must be a short Instagram caption including route + 
-price + dates\n\n"
-        f"Origin: {row.get('origin_city')}\n"
-        f"Destination: {row.get('destination_city')}, 
-{row.get('destination_country')}\n"
-        f"Price GBP: {row.get('price_gbp')}\n"
-        f"Outbound: {row.get('outbound_date')}\n"
-        f"Return: {row.get('return_date')}\n"
-        f"Trip length (days): {row.get('trip_length_days')}\n"
-        f"Stops: {row.get('stops')}\n"
-        f"Baggage included: {row.get('baggage_included')}\n"
-        f"Airline: {row.get('airline')}\n"
-        f"Notes: {row.get('notes')}\n"
-    )
+    # Triple-quoted string = no risk of unterminated line breaks
+    return f"""Score this flight deal for UK backpackers.
+
+Return JSON with EXACT keys:
+price_score, date_score, friction_score, backpacker_score, confidence, theme, reasons, ai_caption
+
+Rules:
+- All scores/confidence must be integers 0-100
+- theme must be one of: CITY_BREAK, BEACH, ADVENTURE, CULTURE, PARTY, NATURE, SKI
+- reasons must be ONE string with 3 short bullets separated by ' ; '
+- ai_caption must be a short Instagram caption including route + price + dates
+
+Origin: {row.get('origin_city')}
+Destination: {row.get('destination_city')}, {row.get('destination_country')}
+Price GBP: {row.get('price_gbp')}
+Outbound: {row.get('outbound_date')}
+Return: {row.get('return_date')}
+Trip length (days): {row.get('trip_length_days')}
+Stops: {row.get('stops')}
+Baggage included: {row.get('baggage_included')}
+Airline: {row.get('airline')}
+Notes: {row.get('notes')}
+"""
 
 
-# =========================
-# Main worker
-# =========================
 def main():
     client = OpenAI(api_key=get_env("OPENAI_API_KEY"))
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
@@ -159,7 +131,6 @@ def main():
     sheet_id = get_env("SHEET_ID")
     tab = os.getenv("RAW_DEALS_TAB", "RAW_DEALS").strip()
     worker_id = os.getenv("WORKER_ID", "ai_scorer_v2").strip()
-
     weights = parse_weights()
 
     sh = get_gspread_client().open_by_key(sheet_id)
@@ -186,7 +157,7 @@ def main():
     deal_id = row.get("deal_id", "")
 
     try:
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=model,
             temperature=0.1,
             response_format={"type": "json_object"},
@@ -196,9 +167,9 @@ def main():
             ],
         )
 
-        data = json.loads(response.choices[0].message.content)
+        data = json.loads(resp.choices[0].message.content)
 
-        required_keys = {
+        required = {
             "price_score",
             "date_score",
             "friction_score",
@@ -208,11 +179,9 @@ def main():
             "reasons",
             "ai_caption",
         }
-
-        missing = required_keys - set(data.keys())
+        missing = required - set(data.keys())
         if missing:
-            raise ValueError(f"Missing keys in AI response: 
-{sorted(missing)}")
+            raise ValueError(f"Missing keys in AI response: {sorted(missing)}")
 
         scores = {
             "price_score": clamp_int(data["price_score"]),
@@ -269,4 +238,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

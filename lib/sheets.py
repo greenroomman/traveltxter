@@ -44,11 +44,7 @@ def validate_sheet_schema(ws, required_headers: List[str]) -> None:
         raise ValueError(f"Sheet missing columns: {missing}")
 
 
-def row_to_dict(
-    headers: List[str],
-    values: List[str],
-    row_num: int,
-) -> Dict[str, Any]:
+def row_to_dict(headers: List[str], values: List[str], row_num: int) -> Dict[str, Any]:
     d = {h: (values[i] if i < len(values) else "") for i, h in enumerate(headers)}
     d["_row_number"] = row_num
     return d
@@ -70,12 +66,7 @@ def lock_is_stale(lock_value: str, max_age: timedelta) -> bool:
     return (datetime.utcnow() - t) > max_age
 
 
-def update_row_by_headers(
-    ws,
-    header_map: Dict[str, int],
-    row_num: int,
-    updates: Dict[str, Any],
-) -> None:
+def update_row_by_headers(ws, header_map: Dict[str, int], row_num: int, updates: Dict[str, Any]) -> None:
     cells = []
     for k, v in updates.items():
         if k not in header_map:

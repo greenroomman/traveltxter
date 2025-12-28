@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-# --- Ensure repo root is on PYTHONPATH (fixes GitHub Actions import issues) ---
+# Ensure repo root is on the import path (works in GitHub Actions + locally)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -22,13 +22,15 @@ DUFFEL_VERSION = "v2"
 RAW_STATUS_NEW = "NEW"
 FEEDER_SOURCE = os.getenv("FEEDER_SOURCE", "DUFFEL_GHA_FEEDER").strip()
 
-# Defaults (override via env)
 DEFAULT_MAX_SEARCHES = 8
 DEFAULT_MAX_INSERTS = 20
 DEFAULT_SLEEP_SECONDS = 0.6
 DEFAULT_MAX_OFFERS_PER_SEARCH = 20
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_FLUSH_BATCH_SIZE = 10
+
+# If true, the GitHub Action fails when searches>0 but inserts==0 (alerts you)
+DEFAULT_FAIL_ON_ZERO_INSERTS = "FALSE"
 
 
 def safe_int(x: Any, default: int) -> int:
@@ -45,8 +47,11 @@ def safe_float(x: Any, default: float) -> float:
         return default
 
 
+def truthy(x: Any) -> bool:
+    return str(x).strip().upper() in ("TRUE", "1", "YES", "Y")
+
+
 def require_env() -> None:
-    # Hard fail early
     _ = get_env("DUFFEL_API_KEY")
     _ = get_env("SHEET_ID")
 
@@ -72,11 +77,14 @@ def duffel_headers() -> Dict[str, str]:
 
 
 def _log_duffel_error(prefix: str, r: requests.Response) -> None:
-    body = ""
+    body = "<no body>"
     try:
-        body = r.text[:600]
+        body = str(r.json())[:800]
     except Exception:
-        body = "<no body>"
+        try:
+            body = (r.text or "")[:800]
+        except Exception:
+            body = "<unreadable body>"
     print(f"[Duffel] {prefix} status={r.status_code} body={body}")
 
 
@@ -88,7 +96,7 @@ def _post_offer_request(payload: Dict[str, Any], max_retries: int) -> Optional[D
         try:
             r = requests.post(url, headers=duffel_headers(), json=payload, timeout=30)
         except Exception as e:
-            print(f"[Duffel] request exception attempt={attempt}: {e}")
+            print(f"[Duffel] offer_request exception attempt={attempt}: {e}")
             time.sleep(backoff)
             backoff *= 2
             continue
@@ -97,24 +105,32 @@ def _post_offer_request(payload: Dict[str, Any], max_retries: int) -> Optional[D
             try:
                 return r.json()
             except Exception:
-                print("[Duffel] JSON parse failed on successful response.")
+                print("[Duffel] offer_request ok but JSON parse failed")
                 return None
 
         if r.status_code in (429, 500, 502, 503, 504):
-            _log_duffel_error(f"retryable attempt={attempt}", r)
+            _log_duffel_error(f"offer_request retryable attempt={attempt}", r)
             time.sleep(backoff)
             backoff *= 2
             continue
 
-        _log_duffel_error("non-retryable", r)
+        _log_duffel_error("offer_request non-retryable", r)
         return None
 
-    print("[Duffel] max retries exceeded creating offer_request")
+    print("[Duffel] offer_request max retries exceeded")
+    return None
+
+
+def _extract_offer_request_id(data: Dict[str, Any]) -> Optional[str]:
+    # Try the most common shapes safely
+    offer_req = data.get("offer_request") or {}
+    cand = offer_req.get("id") or data.get("id")
+    if cand:
+        return str(cand)
     return None
 
 
 def _get_offers_for_offer_request(offer_request_id: str, max_retries: int) -> List[Dict[str, Any]]:
-    # Duffel supports: GET /air/offer_requests/{id}/offers
     url = f"{DUFFEL_BASE_URL}/offer_requests/{offer_request_id}/offers"
     backoff = 1.0
 
@@ -122,7 +138,7 @@ def _get_offers_for_offer_request(offer_request_id: str, max_retries: int) -> Li
         try:
             r = requests.get(url, headers=duffel_headers(), timeout=30)
         except Exception as e:
-            print(f"[Duffel] offers request exception attempt={attempt}: {e}")
+            print(f"[Duffel] offers exception attempt={attempt}: {e}")
             time.sleep(backoff)
             backoff *= 2
             continue
@@ -132,7 +148,7 @@ def _get_offers_for_offer_request(offer_request_id: str, max_retries: int) -> Li
                 data = r.json().get("data") or []
                 return data if isinstance(data, list) else []
             except Exception:
-                print("[Duffel] JSON parse failed fetching offers.")
+                print("[Duffel] offers ok but JSON parse failed")
                 return []
 
         if r.status_code in (429, 500, 502, 503, 504):
@@ -144,7 +160,7 @@ def _get_offers_for_offer_request(offer_request_id: str, max_retries: int) -> Li
         _log_duffel_error("offers non-retryable", r)
         return []
 
-    print("[Duffel] max retries exceeded fetching offers")
+    print("[Duffel] offers max retries exceeded")
     return []
 
 
@@ -175,23 +191,18 @@ def search_roundtrip(
 
     data = resp.get("data") or {}
 
-    # Some responses include offers directly
+    # If offers are included directly
     offers = data.get("offers")
     if isinstance(offers, list) and offers:
         return offers
 
     # Otherwise fetch offers via offer_request id
-    offer_req = data.get("offer_request") or data
-    offer_request_id = offer_req.get("id")
+    offer_request_id = _extract_offer_request_id(data)
     if not offer_request_id:
-        # Sometimes offer_request may be nested under "data": {"id": "..."} for offer_request itself
-        offer_request_id = data.get("id")
-
-    if not offer_request_id:
-        print(f"[Duffel] No offer_request id found in response keys={list(data.keys())}")
+        print(f"[Duffel] Could not find offer_request id. data keys={list(data.keys())}")
         return []
 
-    return _get_offers_for_offer_request(str(offer_request_id), max_retries=max_retries)
+    return _get_offers_for_offer_request(offer_request_id, max_retries=max_retries)
 
 
 def parse_offer(offer: Dict[str, Any], route: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -223,10 +234,10 @@ def parse_offer(offer: Dict[str, Any], route: Dict[str, Any]) -> Optional[Dict[s
 
     airline = str((offer.get("owner") or {}).get("name", "")).strip()
 
-    # Better stop detection: segments count (connections)
-    # stops = segments - 1 (for outbound only; still ok as a simple friction proxy)
-    stops_num = max(0, len(seg0) - 1)
-    stops = str(stops_num)
+    outbound_stops = max(0, len(seg0) - 1)
+    return_stops = max(0, len(seg1) - 1)
+    total_stops = outbound_stops + return_stops
+    stops = str(total_stops)
 
     fp = deal_fingerprint(
         origin_city=route["origin_city"],
@@ -260,7 +271,6 @@ def parse_offer(offer: Dict[str, Any], route: Dict[str, Any]) -> Optional[Dict[s
 def load_existing_fingerprints(raw_ws, raw_headers: List[str]) -> set:
     if "deal_fingerprint" not in raw_headers:
         return set()
-
     fp_col = raw_headers.index("deal_fingerprint") + 1
     vals = raw_ws.col_values(fp_col)
     return set(v.strip() for v in vals[1:] if v and v.strip())
@@ -283,6 +293,7 @@ def main() -> None:
     max_offers = safe_int(os.getenv("FEEDER_MAX_OFFERS_PER_SEARCH", DEFAULT_MAX_OFFERS_PER_SEARCH), DEFAULT_MAX_OFFERS_PER_SEARCH)
     max_retries = safe_int(os.getenv("FEEDER_MAX_RETRIES", DEFAULT_MAX_RETRIES), DEFAULT_MAX_RETRIES)
     flush_batch = safe_int(os.getenv("FEEDER_FLUSH_BATCH_SIZE", DEFAULT_FLUSH_BATCH_SIZE), DEFAULT_FLUSH_BATCH_SIZE)
+    fail_on_zero_inserts = truthy(os.getenv("FEEDER_FAIL_ON_ZERO_INSERTS", DEFAULT_FAIL_ON_ZERO_INSERTS))
 
     sh = get_gspread_client().open_by_key(get_env("SHEET_ID"))
     raw_ws = sh.worksheet(os.getenv("RAW_DEALS_TAB", "RAW_DEALS"))
@@ -319,12 +330,22 @@ def main() -> None:
         if str(r[cfg_idx["enabled"]]).strip().upper() != "TRUE":
             continue
 
+        origin_iata = str(r[cfg_idx["origin_iata"]]).strip()
+        origin_city = str(r[cfg_idx["origin_city"]]).strip()
+        dest_iata = str(r[cfg_idx["destination_iata"]]).strip()
+        dest_city = str(r[cfg_idx["destination_city"]]).strip()
+        dest_country = str(r[cfg_idx["destination_country"]]).strip()
+
+        if not all([origin_iata, origin_city, dest_iata, dest_city, dest_country]):
+            print(f"[Config] Skipping route with empty fields: {origin_iata}->{dest_iata}")
+            continue
+
         routes.append({
-            "origin_iata": str(r[cfg_idx["origin_iata"]]).strip(),
-            "origin_city": str(r[cfg_idx["origin_city"]]).strip(),
-            "destination_iata": str(r[cfg_idx["destination_iata"]]).strip(),
-            "destination_city": str(r[cfg_idx["destination_city"]]).strip(),
-            "destination_country": str(r[cfg_idx["destination_country"]]).strip(),
+            "origin_iata": origin_iata,
+            "origin_city": origin_city,
+            "destination_iata": dest_iata,
+            "destination_city": dest_city,
+            "destination_country": dest_country,
             "trip_length_days": safe_int(r[cfg_idx["trip_length_days"]], 4),
             "max_connections": safe_int(r[cfg_idx["max_connections"]], 1),
             "cabin_class": (str(r[cfg_idx["cabin_class"]]).strip().lower() or "economy"),
@@ -332,10 +353,11 @@ def main() -> None:
             "step_days": safe_int(r[cfg_idx["step_days"]], 7),
             "window_days": safe_int(r[cfg_idx["window_days"]], 28),
             "days_ahead": safe_int(r[cfg_idx["days_ahead"]], 7),
-            "notes": f'{str(r[cfg_idx["origin_iata"]]).strip()}->{str(r[cfg_idx["destination_iata"]]).strip()}',
+            "notes": f"{origin_iata}->{dest_iata}",
         })
 
     searches = 0
+    failed_searches = 0
     inserts = 0
     batch: List[List[str]] = []
 
@@ -364,7 +386,9 @@ def main() -> None:
             )
 
             if not offers:
+                failed_searches += 1
                 print(f"[Duffel] No offers for {route['origin_iata']}->{route['destination_iata']} out={d.isoformat()}")
+
             for offer in offers[:max_offers]:
                 parsed = parse_offer(offer, route)
                 if not parsed:
@@ -393,7 +417,11 @@ def main() -> None:
         raw_ws.append_rows(batch, value_input_option="USER_ENTERED")
         print(f"[Sheets] appended {len(batch)} rows (final flush)")
 
-    print(f"Duffel feeder done: searches={searches}, inserts={inserts}")
+    print(f"Duffel feeder done: searches={searches}, inserts={inserts}, failed_searches={failed_searches}")
+
+    if fail_on_zero_inserts and searches > 0 and inserts == 0:
+        print("[WARNING] searches>0 but inserts==0. Failing workflow to alert.")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

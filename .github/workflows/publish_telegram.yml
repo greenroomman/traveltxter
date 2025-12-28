@@ -1,36 +1,37 @@
 name: Publish Telegram Deal
-
-on:
-  schedule:
-    - cron: "30 7 * * *"
-    - cron: "30 16 * * *"
-  workflow_dispatch:
-
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-      
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: 'pip'
-      
-      - name: Install Dependencies
-        run: pip install -r requirements.txt
-      
-      - name: Publish Deal to Telegram
-        env:
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          DEALS_SHEET_NAME: RAW_DEALS
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          TELEGRAM_ALLOW_VERDICTS: "GOOD"
-          TELEGRAM_MIN_AI_SCORE: "70"
-        run: python workers/telegram_publisher.py
+2
+3on:
+4  schedule:
+5    - cron: "30 7 * * *"
+6    - cron: "30 16 * * *"
+7  workflow_dispatch:
+8
+9jobs:
+10  publish:
+11    runs-on: ubuntu-latest
+12    timeout-minutes: 10
+13    
+14    steps:
+15      - name: Checkout Repository
+16        uses: actions/checkout@v4
+17      
+18      - name: Setup Python
+19        uses: actions/setup-python@v5
+20        with:
+21          python-version: "3.11"
+22          cache: 'pip'
+23      
+24      - name: Install Dependencies
+25        run: pip install -r requirements.txt
+26      
+27      - name: Publish Deal to Telegram
+28        env:
+29          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+30          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+31          DEALS_SHEET_NAME: RAW_DEALS
+32          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+33          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+34          TELEGRAM_ALLOW_VERDICTS: "GOOD"
+35          TELEGRAM_MIN_AI_SCORE: "70"
+36        run: python workers/telegram_publisher.py
+37

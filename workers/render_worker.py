@@ -1,36 +1,31 @@
 #!/usr/bin/env python3
 """
-V3.2 — Render Worker (Stage B)
+V3.2 — Render Worker (Stage B) — Debug/Robust Edition
 
 Trigger condition (first match):
 - raw_status / RAW_STATUS == "SCORED"
 - ai_verdict / AI_VERDICT == "GOOD"
-- status is "" OR "RENDER_AGAIN" OR "NEEDS_IMAGE"
+- status in {"", "RENDER_AGAIN", "NEEDS_IMAGE"}
 
 Actions:
 1) Lock row by setting status = NEEDS_IMAGE (guarded)
-2) POST payload to RENDER_URL (default PythonAnywhere /render)
-3) On success:
-   - write graphic_url, rendered_timestamp
-   - set status = READY_TO_POST
-4) On failure:
-   - write render_error, rendered_timestamp
-   - set status = RENDER_AGAIN
+2) POST payload to RENDER_URL
+3) On success: write graphic_url, rendered_timestamp; set status=READY_TO_POST
+4) On failure: write render_error + status codes; set status=RENDER_AGAIN
 
-Safety:
+Important:
 - NEVER edits header row (works with protected headers)
-- Uses header-name mapping (never column letters)
-- Guards against races by re-checking status before locking
+- Uses header mapping (never column letters)
 """
 
 import os
 import sys
 import json
+import ssl
 import datetime as dt
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
-
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -61,6 +56,13 @@ def get_env(name: str, required: bool = True, default: str = "") -> str:
             die(f"ERROR: Missing environment variable: {name}")
         return default
     return v
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 # ============================================================
@@ -119,6 +121,8 @@ REQUIRED_COLS = [
     "graphic_url",
     "rendered_timestamp",
     "render_error",
+    "render_http_status",
+    "render_response_snippet",
 ]
 
 
@@ -126,7 +130,7 @@ def require_columns(hmap: Dict[str, int], cols: List[str]) -> None:
     missing = [c for c in cols if c not in hmap]
     if missing:
         die(
-            "ERROR: Your sheet is missing required columns: "
+            "ERROR: Sheet missing required columns: "
             + ", ".join(missing)
             + ". Add these headers to row 1 in RAW_DEALS (far right), then rerun."
         )
@@ -140,10 +144,15 @@ def find_col_name(hmap: Dict[str, int], candidates: List[str]) -> Optional[str]:
 
 
 # ============================================================
-# HTTP Render call (stdlib)
+# HTTP Render call
 # ============================================================
 
-def call_render(render_url: str, payload: Dict[str, Any], timeout_seconds: int = 30) -> Dict[str, Any]:
+def _ssl_context() -> ssl.SSLContext:
+    # After running Install Certificates.command this should work fine.
+    return ssl.create_default_context()
+
+
+def call_render(render_url: str, payload: Dict[str, Any], timeout_seconds: int) -> Dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     req = Request(
         render_url,
@@ -152,20 +161,14 @@ def call_render(render_url: str, payload: Dict[str, Any], timeout_seconds: int =
         method="POST",
     )
 
-    try:
-        with urlopen(req, timeout=timeout_seconds) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            try:
-                return json.loads(raw)
-            except Exception:
-                raise RuntimeError(f"Render response was not JSON. Raw: {raw[:300]}")
-    except HTTPError as e:
-        msg = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-        raise RuntimeError(f"HTTPError {e.code}: {msg[:300]}")
-    except URLError as e:
-        raise RuntimeError(f"URLError: {e}")
-    except Exception as e:
-        raise RuntimeError(str(e))
+    ctx = _ssl_context()
+
+    with urlopen(req, timeout=timeout_seconds, context=ctx) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw)
+        except Exception:
+            raise RuntimeError("Render response was not JSON. First 300 chars: " + raw[:300])
 
 
 # ============================================================
@@ -180,7 +183,6 @@ def get_all(ws) -> Tuple[List[str], List[List[str]]]:
 
 
 def record_from_row(headers: List[str], row: List[str]) -> Dict[str, str]:
-    # pad row to header length
     if len(row) < len(headers):
         row = row + [""] * (len(headers) - len(row))
     return {headers[i]: row[i] for i in range(len(headers))}
@@ -210,7 +212,7 @@ def find_first_render_candidate(ws) -> Optional[Dict[str, Any]]:
 
     allowed_statuses = {"", "RENDER_AGAIN", "NEEDS_IMAGE"}
 
-    for i, row in enumerate(rows, start=2):  # sheet row number
+    for i, row in enumerate(rows, start=2):
         if len(row) < len(headers):
             row = row + [""] * (len(headers) - len(row))
 
@@ -223,8 +225,6 @@ def find_first_render_candidate(ws) -> Optional[Dict[str, Any]]:
             return {
                 "row_number": i,
                 "record": rec,
-                "raw_status_col": raw_status_col,
-                "ai_verdict_col": ai_verdict_col,
                 "status_col": status_col,
                 "headers": headers,
             }
@@ -245,6 +245,13 @@ def get_cell(ws, row: int, col_1_based: int) -> str:
     return normalize(ws.cell(row, col_1_based).value)
 
 
+def pick(rec: Dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        if k in rec and normalize(rec.get(k)):
+            return normalize(rec.get(k))
+    return ""
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -252,13 +259,13 @@ def get_cell(ws, row: int, col_1_based: int) -> str:
 def main():
     log("RENDER WORKER STARTING")
 
-    # Required env (same as scorer)
     get_env("SHEET_ID")
     get_env("GCP_SA_JSON")
     log("Environment OK")
 
     render_url = get_env("RENDER_URL", required=False, default="https://greenroomman.pythonanywhere.com/render")
-    timeout_s = int(get_env("RENDER_TIMEOUT", required=False, default="30"))
+    timeout_s = int(get_env("RENDER_TIMEOUT", required=False, default="90"))
+    debug = env_bool("RENDER_DEBUG", default=False)
 
     ws = get_worksheet()
     log(f"Connected to worksheet: {ws.title}")
@@ -271,53 +278,63 @@ def main():
     row = hit["row_number"]
     rec = hit["record"]
     headers = hit["headers"]
-
     hmap = build_header_map(headers)
 
-    # Require output columns (NO editing headers)
     require_columns(hmap, REQUIRED_COLS)
 
     status_col_name = hit["status_col"]
     status_col_index = hmap[status_col_name]
 
-    deal_id = normalize(rec.get("deal_id") or rec.get("DEAL_ID"))
-    origin = normalize(rec.get("origin_city") or rec.get("ORIGIN_CITY"))
-    dest = normalize(rec.get("destination_city") or rec.get("DESTINATION_CITY"))
-    price = normalize(rec.get("price_gbp") or rec.get("PRICE_GBP"))
-    out_date = normalize(rec.get("outbound_date") or rec.get("OUTBOUND_DATE"))
+    deal_id = pick(rec, "deal_id", "DEAL_ID")
+    origin = pick(rec, "origin_city", "ORIGIN_CITY")
+    dest = pick(rec, "destination_city", "DESTINATION_CITY")
+    price = pick(rec, "price_gbp", "PRICE_GBP")
+    out_date = pick(rec, "outbound_date", "OUTBOUND_DATE")
 
     log(f"Found render candidate row #{row} | deal_id={deal_id} | {origin}->{dest} | £{price} | outbound={out_date}")
 
-    # -------- Lock row (guard) --------
+    # Lock row
     current_status = get_cell(ws, row, status_col_index)
     if current_status not in ("", "RENDER_AGAIN", "NEEDS_IMAGE"):
         log(f"Guard skip row {row} (status changed to {current_status})")
         return
 
-    batch_update_row(ws, row, hmap, {"status": "NEEDS_IMAGE", "render_error": ""})
+    batch_update_row(
+        ws,
+        row,
+        hmap,
+        {
+            "status": "NEEDS_IMAGE",
+            "render_error": "",
+            "render_http_status": "",
+            "render_response_snippet": "",
+        },
+    )
     log(f"Row #{row} locked: status=NEEDS_IMAGE")
 
-    # -------- Build payload to /render --------
-    # Keep payload simple + explicit. PythonAnywhere can ignore fields it doesn't need.
+    # Payload - keep small & predictable
     payload = {
         "deal_id": deal_id,
         "origin_city": origin,
         "destination_city": dest,
-        "destination_country": normalize(rec.get("destination_country") or rec.get("DESTINATION_COUNTRY")),
+        "destination_country": pick(rec, "destination_country", "DESTINATION_COUNTRY"),
         "price_gbp": price,
         "outbound_date": out_date,
-        "return_date": normalize(rec.get("return_date") or rec.get("RETURN_DATE")),
-        "trip_length_days": normalize(rec.get("trip_length_days") or rec.get("TRIP_LENGTH_DAYS")),
-        "stops": normalize(rec.get("stops") or rec.get("STOPS")),
-        "baggage_included": normalize(rec.get("baggage_included") or rec.get("BAGGAGE_INCLUDED")),
-        "airline": normalize(rec.get("airline") or rec.get("AIRLINE")),
-        "ai_score": normalize(rec.get("ai_score") or rec.get("AI_SCORE")),
-        "ai_grading": normalize(rec.get("ai_grading") or rec.get("AI_GRADING")),
-        "ai_verdict": normalize(rec.get("ai_verdict") or rec.get("AI_VERDICT")),
-        "ai_caption": normalize(rec.get("ai_caption") or rec.get("AI_CAPTION")),
+        "return_date": pick(rec, "return_date", "RETURN_DATE"),
+        "trip_length_days": pick(rec, "trip_length_days", "TRIP_LENGTH_DAYS"),
+        "stops": pick(rec, "stops", "STOPS"),
+        "baggage_included": pick(rec, "baggage_included", "BAGGAGE_INCLUDED"),
+        "airline": pick(rec, "airline", "AIRLINE"),
+        "ai_score": pick(rec, "ai_score", "AI_SCORE"),
+        "ai_grading": pick(rec, "ai_grading", "AI_GRADING"),
+        "ai_verdict": pick(rec, "ai_verdict", "AI_VERDICT"),
+        "ai_caption": pick(rec, "ai_caption", "AI_CAPTION"),
     }
 
-    # -------- Call render --------
+    if debug:
+        log("RENDER_DEBUG=1 enabled")
+        log("Payload keys: " + ", ".join(sorted(payload.keys())))
+
     try:
         result = call_render(render_url, payload, timeout_seconds=timeout_s)
 
@@ -325,24 +342,75 @@ def main():
         if not graphic_url:
             raise RuntimeError("Render succeeded but returned no graphic_url/image_url.")
 
-        updates = {
-            "graphic_url": graphic_url,
-            "rendered_timestamp": utc_now(),
-            "render_error": "",
-            "status": "READY_TO_POST",
-        }
-        batch_update_row(ws, row, hmap, updates)
+        batch_update_row(
+            ws,
+            row,
+            hmap,
+            {
+                "graphic_url": graphic_url,
+                "rendered_timestamp": utc_now(),
+                "render_error": "",
+                "render_http_status": "200",
+                "render_response_snippet": "",
+                "status": "READY_TO_POST",
+            },
+        )
         log(f"Render OK: row #{row} status=READY_TO_POST | graphic_url set")
+        return
+
+    except HTTPError as e:
+        # Read server-provided HTML error body
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        snippet = (body or "")[:240]
+        status = str(getattr(e, "code", "HTTPError"))
+        batch_update_row(
+            ws,
+            row,
+            hmap,
+            {
+                "rendered_timestamp": utc_now(),
+                "render_error": "HTTPError " + status,
+                "render_http_status": status,
+                "render_response_snippet": snippet,
+                "status": "RENDER_AGAIN",
+            },
+        )
+        die(f"Render FAILED for row #{row}: HTTPError {status}: {snippet}", code=2)
+
+    except URLError as e:
+        msg = str(e)
+        batch_update_row(
+            ws,
+            row,
+            hmap,
+            {
+                "rendered_timestamp": utc_now(),
+                "render_error": "URLError: " + msg[:200],
+                "render_http_status": "",
+                "render_response_snippet": "",
+                "status": "RENDER_AGAIN",
+            },
+        )
+        die(f"Render FAILED for row #{row}: URLError: {msg}", code=2)
 
     except Exception as e:
-        err = str(e)[:240]
-        updates = {
-            "rendered_timestamp": utc_now(),
-            "render_error": err,
-            "status": "RENDER_AGAIN",
-        }
-        batch_update_row(ws, row, hmap, updates)
-        die(f"Render FAILED for row #{row}: {err}", code=2)
+        msg = str(e)
+        batch_update_row(
+            ws,
+            row,
+            hmap,
+            {
+                "rendered_timestamp": utc_now(),
+                "render_error": "ERROR: " + msg[:200],
+                "render_http_status": "",
+                "render_response_snippet": "",
+                "status": "RENDER_AGAIN",
+            },
+        )
+        die(f"Render FAILED for row #{row}: {msg}", code=2)
 
 
 if __name__ == "__main__":

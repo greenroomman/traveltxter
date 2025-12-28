@@ -2,7 +2,6 @@ name: Publish to Instagram
 
 on:
   schedule:
-    # Runs every day at 08:10 UTC (08:10 UK time in winter)
     - cron: "10 8 * * *"
   workflow_dispatch: {}
 
@@ -10,19 +9,24 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout repo (force main)
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 1
+
       - name: Debug checkout contents
         run: |
           echo "PWD:"; pwd
-          echo "TOP:"; ls -la
-          echo "WORKERS:"; ls -la workers || true
-          echo "FIND publish_worker:"; find . -maxdepth 5 -name 
+          echo "TOP LEVEL:"; ls -la
+          echo "WORKERS DIR:"; ls -la workers || true
+          echo "FIND publish_worker.py:"; find . -maxdepth 6 -name 
 "publish_worker.py" -print
-          echo "HEAD:"; git --no-pager log -n 3 --oneline
+          echo "HEAD COMMITS:"; git --no-pager log -n 5 --oneline
+
+      - name: Fail if publish worker missing
+        run: |
+          test -f workers/publish_worker.py
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,8 +45,9 @@ jobs:
           raw = os.environ["GCP_SA_JSON_ONE_LINE"].strip()
           data = json.loads(raw)
           with open("service_account.json", "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-          print("service_account.json written for:", data.get("client_email"))
+              json.dump(data, f, indent=2)
+          print("service_account.json written for:", 
+data.get("client_email"))
           PY
         env:
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
@@ -60,3 +65,4 @@ jobs:
 
           GRAPH_VERSION: v19.0
           READY_STATUSES: SCORED,READY
+

@@ -1,25 +1,28 @@
 import os
+import sys
 import time
 import uuid
+from pathlib import Path
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
 
-from lib.sheets import get_env, get_gspread_client, now_iso
-from lib.fingerprints import deal_fingerprint
+# --- Ensure repo root is on PYTHONPATH (fixes GitHub Actions import issues) ---
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lib.sheets import get_env, get_gspread_client, now_iso  # noqa: E402
+from lib.fingerprints import deal_fingerprint  # noqa: E402
 
 
 DUFFEL_BASE_URL = "https://api.duffel.com/air"
 DUFFEL_VERSION = "v2"
 RAW_STATUS_NEW = "NEW"
-
 FEEDER_SOURCE = os.getenv("FEEDER_SOURCE", "DUFFEL_GHA_FEEDER").strip()
 
-
-# ----------------------------
-# Defaults (can be overridden)
-# ----------------------------
+# Defaults (override via env)
 DEFAULT_MAX_SEARCHES = 8
 DEFAULT_MAX_INSERTS = 20
 DEFAULT_SLEEP_SECONDS = 0.6
@@ -43,7 +46,7 @@ def safe_float(x: Any, default: float) -> float:
 
 
 def require_env() -> None:
-    # Hard fail early: if these are missing, we should stop immediately.
+    # Hard fail early
     _ = get_env("DUFFEL_API_KEY")
     _ = get_env("SHEET_ID")
 
@@ -68,6 +71,83 @@ def duffel_headers() -> Dict[str, str]:
     }
 
 
+def _log_duffel_error(prefix: str, r: requests.Response) -> None:
+    body = ""
+    try:
+        body = r.text[:600]
+    except Exception:
+        body = "<no body>"
+    print(f"[Duffel] {prefix} status={r.status_code} body={body}")
+
+
+def _post_offer_request(payload: Dict[str, Any], max_retries: int) -> Optional[Dict[str, Any]]:
+    url = f"{DUFFEL_BASE_URL}/offer_requests"
+    backoff = 1.0
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(url, headers=duffel_headers(), json=payload, timeout=30)
+        except Exception as e:
+            print(f"[Duffel] request exception attempt={attempt}: {e}")
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+
+        if r.ok:
+            try:
+                return r.json()
+            except Exception:
+                print("[Duffel] JSON parse failed on successful response.")
+                return None
+
+        if r.status_code in (429, 500, 502, 503, 504):
+            _log_duffel_error(f"retryable attempt={attempt}", r)
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+
+        _log_duffel_error("non-retryable", r)
+        return None
+
+    print("[Duffel] max retries exceeded creating offer_request")
+    return None
+
+
+def _get_offers_for_offer_request(offer_request_id: str, max_retries: int) -> List[Dict[str, Any]]:
+    # Duffel supports: GET /air/offer_requests/{id}/offers
+    url = f"{DUFFEL_BASE_URL}/offer_requests/{offer_request_id}/offers"
+    backoff = 1.0
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, headers=duffel_headers(), timeout=30)
+        except Exception as e:
+            print(f"[Duffel] offers request exception attempt={attempt}: {e}")
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+
+        if r.ok:
+            try:
+                data = r.json().get("data") or []
+                return data if isinstance(data, list) else []
+            except Exception:
+                print("[Duffel] JSON parse failed fetching offers.")
+                return []
+
+        if r.status_code in (429, 500, 502, 503, 504):
+            _log_duffel_error(f"offers retryable attempt={attempt}", r)
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+
+        _log_duffel_error("offers non-retryable", r)
+        return []
+
+    print("[Duffel] max retries exceeded fetching offers")
+    return []
+
+
 def search_roundtrip(
     origin: str,
     destination: str,
@@ -76,9 +156,7 @@ def search_roundtrip(
     cabin_class: str,
     max_connections: int,
     max_retries: int,
-) -> List[Dict]:
-
-    url = f"{DUFFEL_BASE_URL}/offer_requests"
+) -> List[Dict[str, Any]]:
     payload = {
         "data": {
             "slices": [
@@ -91,34 +169,32 @@ def search_roundtrip(
         }
     }
 
-    backoff = 1.0
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = requests.post(url, headers=duffel_headers(), json=payload, timeout=30)
-        except Exception as e:
-            print(f"[Duffel] request exception attempt={attempt}: {e}")
-            time.sleep(backoff)
-            backoff *= 2
-            continue
-
-        if r.ok:
-            data = (r.json().get("data") or {})
-            return data.get("offers") or []
-
-        if r.status_code in (429, 500, 502, 503, 504):
-            print(f"[Duffel] retryable status={r.status_code} attempt={attempt} body={r.text[:300]}")
-            time.sleep(backoff)
-            backoff *= 2
-            continue
-
-        print(f"[Duffel] non-retryable status={r.status_code} body={r.text[:300]}")
+    resp = _post_offer_request(payload, max_retries=max_retries)
+    if not resp:
         return []
 
-    print("[Duffel] max retries exceeded")
-    return []
+    data = resp.get("data") or {}
+
+    # Some responses include offers directly
+    offers = data.get("offers")
+    if isinstance(offers, list) and offers:
+        return offers
+
+    # Otherwise fetch offers via offer_request id
+    offer_req = data.get("offer_request") or data
+    offer_request_id = offer_req.get("id")
+    if not offer_request_id:
+        # Sometimes offer_request may be nested under "data": {"id": "..."} for offer_request itself
+        offer_request_id = data.get("id")
+
+    if not offer_request_id:
+        print(f"[Duffel] No offer_request id found in response keys={list(data.keys())}")
+        return []
+
+    return _get_offers_for_offer_request(str(offer_request_id), max_retries=max_retries)
 
 
-def parse_offer(offer: Dict, route: Dict) -> Optional[Dict]:
+def parse_offer(offer: Dict[str, Any], route: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     slices = offer.get("slices") or []
     if len(slices) < 2:
         return None
@@ -146,8 +222,11 @@ def parse_offer(offer: Dict, route: Dict) -> Optional[Dict]:
         return None
 
     airline = str((offer.get("owner") or {}).get("name", "")).strip()
-    max_conn = safe_int(route.get("max_connections", 1), 1)
-    stops = "0" if max_conn == 0 else "1"
+
+    # Better stop detection: segments count (connections)
+    # stops = segments - 1 (for outbound only; still ok as a simple friction proxy)
+    stops_num = max(0, len(seg0) - 1)
+    stops = str(stops_num)
 
     fp = deal_fingerprint(
         origin_city=route["origin_city"],
@@ -284,6 +363,8 @@ def main() -> None:
                 max_retries=max_retries,
             )
 
+            if not offers:
+                print(f"[Duffel] No offers for {route['origin_iata']}->{route['destination_iata']} out={d.isoformat()}")
             for offer in offers[:max_offers]:
                 parsed = parse_offer(offer, route)
                 if not parsed:
@@ -302,6 +383,7 @@ def main() -> None:
 
             if batch and (len(batch) >= flush_batch or inserts >= max_inserts):
                 raw_ws.append_rows(batch, value_input_option="USER_ENTERED")
+                print(f"[Sheets] appended {len(batch)} rows (total inserts={inserts})")
                 batch = []
 
             d += timedelta(days=route["step_days"])
@@ -309,6 +391,7 @@ def main() -> None:
 
     if batch:
         raw_ws.append_rows(batch, value_input_option="USER_ENTERED")
+        print(f"[Sheets] appended {len(batch)} rows (final flush)")
 
     print(f"Duffel feeder done: searches={searches}, inserts={inserts}")
 

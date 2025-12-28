@@ -1,10 +1,23 @@
-name: V3.2(A) Publish Worker
+name: V3.2(A) Publish Worker - Production Ready
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no actual posting to social media)'
+        required: false
+        default: false
+        type: boolean
+      force_run:
+        description: 'Force run even if already executed today'
+        required: false
+        default: false
+        type: boolean
+  
   schedule:
-    # UK time in winter = UTC
+    # 7:30 AM UTC (8:30 AM BST in summer, 7:30 AM GMT in winter)
     - cron: "30 7 * * *"
+    # 4:30 PM UTC (5:30 PM BST in summer, 4:30 PM GMT in winter)
     - cron: "30 16 * * *"
 
 concurrency:
@@ -12,33 +25,265 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run:
+  publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 15
+    
+    outputs:
+      status: ${{ job.status }}
+      posts_count: ${{ steps.publish.outputs.posts_count }}
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
+          cache: 'pip'
+      
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Run Publish Worker
+      
+      - name: Validate Environment Variables
+        run: |
+          echo "🔍 Validating required secrets and environment..."
+          
+          # Check all required secrets are present
+          MISSING_SECRETS=()
+          
+          if [ -z "${{ secrets.SHEET_ID }}" ]; then
+            MISSING_SECRETS+=("SHEET_ID")
+          fi
+          
+          if [ -z "${{ secrets.GCP_SA_JSON }}" ]; then
+            MISSING_SECRETS+=("GCP_SA_JSON")
+          fi
+          
+          if [ -z "${{ secrets.FB_ACCESS_TOKEN }}" ]; then
+            MISSING_SECRETS+=("FB_ACCESS_TOKEN")
+          fi
+          
+          if [ -z "${{ secrets.IG_USER_ID }}" ]; then
+            MISSING_SECRETS+=("IG_USER_ID")
+          fi
+          
+          if [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
+            echo "❌ Missing required secrets:"
+            printf '%s\n' "${MISSING_SECRETS[@]}"
+            exit 1
+          fi
+          
+          echo "✅ All required secrets are present"
+          
+          # Log run information (non-sensitive)
+          echo "📋 Run Information:"
+          echo "  - Run ID: ${{ github.run_id }}"
+          echo "  - Run Number: ${{ github.run_number }}"
+          echo "  - Attempt: ${{ github.run_attempt }}"
+          echo "  - Triggered by: ${{ github.event_name }}"
+          echo "  - Dry Run: ${{ github.event.inputs.dry_run || 'false' }}"
+          echo "  - Force Run: ${{ github.event.inputs.force_run || 'false' }}"
+      
+      - name: Create Logs Directory
+        run: mkdir -p logs
+      
+      - name: Run Publish Worker with Retry
+        id: publish
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 300  # 5 minutes between retries
+          retry_on: error
+          command: |
+            python workers/publish_worker.py 2>&1 | tee logs/publish_worker.log
         env:
           PYTHONPATH: ${{ github.workspace }}
-
-          # Sheets access
+          # Google Sheets Configuration
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-
-          # Publishing secrets (use whatever your publish_worker.py expects)
+          # Social Media API Credentials
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
-
+          # Worker Configuration
           WORKER_ID: publish_worker
-        run: python workers/publish_worker.py
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+          # GitHub Context (for logging/debugging)
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+      
+      - name: Save Execution Logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: publish-logs-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}
+          path: |
+            logs/*.log
+            *.log
+          retention-days: 30
+          if-no-files-found: warn
+      
+      - name: Generate Job Summary
+        if: always()
+        run: |
+          echo "## 📊 TravelTxter Publish Worker - Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 🆔 Run ID: \`${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔢 Run Number: #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔄 Attempt: ${{ github.run_attempt }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ⏰ Timestamp: \`$(date -u '+%Y-%m-%d %H:%M:%S UTC')\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 🎯 Triggered by: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏷️ Status: **${{ job.status }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 🧪 Dry Run: \`${{ github.event.inputs.dry_run || 'false' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 💪 Force Run: \`${{ github.event.inputs.force_run || 'false' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Try to include stats from the worker if available
+          if [ -f "logs/publish_stats.json" ]; then
+            echo "**Publishing Statistics:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+            cat logs/publish_stats.json >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Include last 20 lines of log if available
+          if [ -f "logs/publish_worker.log" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Last Log Entries:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            tail -n 20 logs/publish_worker.log >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Notify Success (Slack)
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              "attachments": [{
+                "color": "good",
+                "title": "✅ TravelTxter Publish Worker - Success",
+                "fields": [
+                  {
+                    "title": "Run",
+                    "value": "#${{ github.run_number }} (Attempt ${{ github.run_attempt }})",
+                    "short": true
+                  },
+                  {
+                    "title": "Mode",
+                    "value": "${{ github.event.inputs.dry_run == 'true' && '🧪 Dry Run' || '🚀 Live' }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Timestamp",
+                    "value": "$(date -u '+%Y-%m-%d %H:%M:%S UTC')",
+                    "short": false
+                  }
+                ],
+                "actions": [{
+                  "type": "button",
+                  "text": "View Logs",
+                  "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                }]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      - name: Notify Failure (Slack)
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              "attachments": [{
+                "color": "danger",
+                "title": "❌ TravelTxter Publish Worker - Failed",
+                "text": "The publish worker encountered an error and failed after ${{ github.run_attempt }} attempt(s).",
+                "fields": [
+                  {
+                    "title": "Run",
+                    "value": "#${{ github.run_number }} (Attempt ${{ github.run_attempt }})",
+                    "short": true
+                  },
+                  {
+                    "title": "Mode",
+                    "value": "${{ github.event.inputs.dry_run == 'true' && '🧪 Dry Run' || '🚀 Live' }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Triggered By",
+                    "value": "${{ github.event_name }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Timestamp",
+                    "value": "$(date -u '+%Y-%m-%d %H:%M:%S UTC')",
+                    "short": false
+                  }
+                ],
+                "actions": [{
+                  "type": "button",
+                  "text": "View Logs & Debug",
+                  "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                }]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      - name: Create Issue on Repeated Failures
+        if: failure() && github.run_attempt >= 3
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `⚠️ Publish Worker Failing - Run #${{ github.run_number }}`,
+              body: `## Publish Worker Failed After Multiple Attempts
+              
+              **Details:**
+              - Run ID: ${{ github.run_id }}
+              - Run Number: #${{ github.run_number }}
+              - Attempts: ${{ github.run_attempt }}
+              - Timestamp: ${new Date().toISOString()}
+              - Triggered by: ${{ github.event_name }}
+              
+              **Mode:**
+              - Dry Run: ${{ github.event.inputs.dry_run || 'false' }}
+              - Force Run: ${{ github.event.inputs.force_run || 'false' }}
+              
+              **Action Required:**
+              1. Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              2. Review error messages
+              3. Verify API credentials and quotas
+              4. Check Google Sheets access
+              5. Verify Facebook/Instagram API status
+              
+              **Quick Checks:**
+              - [ ] Google Sheets accessible?
+              - [ ] Facebook API working?
+              - [ ] Instagram API working?
+              - [ ] Rate limits hit?
+              - [ ] Secrets still valid?
+              
+              This issue was automatically created by GitHub Actions.`,
+              labels: ['bug', 'automation', 'publish-worker', 'high-priority']
+            });
+            
+            console.log(`Created issue #${issue.data.number}`);

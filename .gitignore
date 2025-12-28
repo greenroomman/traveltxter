@@ -2,3 +2,5 @@
 
 __pycache__/
 *.pyc
+service_account.json
+gcp_sa_one_line.txt

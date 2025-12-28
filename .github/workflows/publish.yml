@@ -12,6 +12,17 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Debug checkout contents
+        run: |
+          echo "PWD:"; pwd
+          echo "TOP:"; ls -la
+          echo "WORKERS:"; ls -la workers || true
+          echo "FIND publish_worker:"; find . -maxdepth 5 -name 
+"publish_worker.py" -print
+          echo "HEAD:"; git --no-pager log -n 3 --oneline
 
       - name: Set up Python
         uses: actions/setup-python@v5

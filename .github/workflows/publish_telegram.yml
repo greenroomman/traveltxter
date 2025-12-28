@@ -1,0 +1,34 @@
+name: Publish Telegram Deal
+
+on:
+  schedule:
+    - cron: "30 7 * * *"
+    - cron: "30 16 * * *"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Publish deal to Telegram
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          DEALS_SHEET_NAME: ${{ secrets.DEALS_SHEET_NAME }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          # Optional safety knobs:
+          # TELEGRAM_ALLOW_VERDICTS: "GOOD"
+          # TELEGRAM_MIN_AI_SCORE: "70"
+        run: python workers/telegram_publisher.py
+

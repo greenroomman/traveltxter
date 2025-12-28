@@ -1,9 +1,12 @@
 name: Publish V3.2 (DEBUG)
 
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: "10 8 * * *"
+    # 07:30 UK (UTC in winter)
+    - cron: "30 7 * * *"
+    # 16:30 UK (UTC in winter)
+    - cron: "30 16 * * *"
+  workflow_dispatch: {}
 
 jobs:
   publish:

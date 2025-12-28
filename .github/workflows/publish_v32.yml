@@ -15,18 +15,6 @@ jobs:
           ref: main
           fetch-depth: 1
 
-      - name: Debug list files
-        run: |
-          echo "PWD:"; pwd
-          echo "TOP:"; ls -la
-          echo "WORKERS:"; ls -la workers || true
-          echo "FIND publish_worker.py:"; find . -maxdepth 6 -name "publish_worker.py" -print
-          echo "HEAD:"; git --no-pager log -n 5 --oneline
-
-      - name: HARD FAIL if worker missing
-        run: |
-          test -f workers/publish_worker.py
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

@@ -1,34 +1,25 @@
 #!/usr/bin/env python3
 """
-V3.2_Stage2 — workers/ai_scorer.py
-Stage 1: Environment + Google Sheets connection
-Stage 2: Find first row where RAW_STATUS/raw_status == "NEW" (safe, 
-deterministic)
-Stage 3: Score (heuristic for now) + write-back + promote status to 
-"SCORED"
-
-Design rules:
-- NEVER write by column letters hardcoded. Always map by header row.
-- Guard before write: only update if status is still NEW.
-- Single batch_update per row for consistent write-back.
+V3.2 — AI Scorer
+Stage 1: Env + Sheets connect
+Stage 2: Find first NEW row
+Stage 3: Heuristic score + write-back + promote to SCORED
 """
 
-from __future__ import annotations
-
-import json
 import os
 import sys
+import json
 import time
 import datetime as dt
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# ----------------------------
+# ============================================================
 # Logging
-# ----------------------------
+# ============================================================
 
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -40,428 +31,272 @@ def die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
-# ----------------------------
-# Env helpers
-# ----------------------------
+# ============================================================
+# Environment helpers
+# ============================================================
 
 def get_env(name: str, required: bool = True, default: str = "") -> str:
-    v = os.getenv(name)
-    if v is None or v == "":
+    value = os.getenv(name)
+    if not value:
         if required:
             die(f"ERROR: Missing environment variable: {name}")
         return default
-    return v
+    return value
 
 
-# ----------------------------
+# ============================================================
 # Google Sheets helpers
-# ----------------------------
+# ============================================================
 
-SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 def get_worksheet():
     sheet_id = get_env("SHEET_ID", required=True)
     worksheet_name = get_env("WORKSHEET_NAME", required=False, 
-default="RAW_DEALS") or "RAW_DEALS"
+default="RAW_DEALS")
     sa_json = get_env("GCP_SA_JSON", required=True)
 
     try:
         sa_info = json.loads(sa_json)
-    except json.JSONDecodeError:
-        die("ERROR: GCP_SA_JSON is not valid JSON. It must be the full 
-service account JSON (as one line).")
+    except Exception:
+        die("ERROR: GCP_SA_JSON must be valid JSON on a single line.")
 
-    creds = Credentials.from_service_account_info(sa_info, 
-scopes=SHEETS_SCOPES)
+    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
     client = gspread.authorize(creds)
     sheet = client.open_by_key(sheet_id)
-    ws = sheet.worksheet(worksheet_name)
-    return ws
+    return sheet.worksheet(worksheet_name)
 
 
-def utc_now_iso() -> str:
+def utc_now() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def col_to_a1(col_index_1_based: int) -> str:
-    # 1 -> A, 2 -> B, ... 27 -> AA
+def col_to_a1(n: int) -> str:
     result = ""
-    n = col_index_1_based
     while n > 0:
-        n, rem = divmod(n - 1, 26)
-        result = chr(65 + rem) + result
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
     return result
 
 
-def a1_cell(row_1_based: int, col_1_based: int) -> str:
-    return f"{col_to_a1(col_1_based)}{row_1_based}"
+def a1(row: int, col: int) -> str:
+    return f"{col_to_a1(col)}{row}"
 
 
 def build_header_map(headers: List[str]) -> Dict[str, int]:
-    # header -> col index (1-based)
-    m: Dict[str, int] = {}
-    for i, h in enumerate(headers, start=1):
-        key = (h or "").strip()
-        if key:
-            m[key] = i
-    return m
+    return {h.strip(): i + 1 for i, h in enumerate(headers) if h.strip()}
 
 
-def first_existing_col(hmap: Dict[str, int], candidates: List[str]) -> 
-Optional[str]:
-    for c in candidates:
-        if c in hmap:
-            return c
-    return None
+# ============================================================
+# Stage 2 — find NEW row
+# ============================================================
+
+def normalize(v: Any) -> str:
+    return "" if v is None else str(v).strip()
 
 
-# ----------------------------
-# Stage 2: find NEW row
-# ----------------------------
-
-def get_all_rows(ws) -> Tuple[List[str], List[List[str]]]:
-    """
-    Returns (headers, rows) where rows are raw values for each row 
-(excluding header row).
-    """
+def find_first_new(ws) -> Optional[Dict[str, Any]]:
     values = ws.get_all_values()
-    if not values or len(values) < 2:
-        return [], []
-    headers = values[0]
-    rows = values[1:]
-    return headers, rows
-
-
-def normalize(s: Any) -> str:
-    return ("" if s is None else str(s)).strip()
-
-
-def find_first_new_row(ws) -> Optional[Dict[str, Any]]:
-    """
-    Finds the first row where raw_status/RAW_STATUS == "NEW".
-    Returns:
-      {
-        "row_number": <1-based row number in sheet>,
-        "record": {header: value, ...},
-        "status_col_name": "raw_status" or "RAW_STATUS"
-      }
-    """
-    headers, rows = get_all_rows(ws)
-    if not headers:
-        log("No headers found (sheet looks empty).")
+    if len(values) < 2:
         return None
 
+    headers = values[0]
+    rows = values[1:]
     hmap = build_header_map(headers)
 
-    status_col_name = first_existing_col(hmap, ["raw_status", 
-"RAW_STATUS"])
-    if not status_col_name:
-        die("ERROR: Sheet must contain a status column named 'raw_status' 
-or 'RAW_STATUS'.")
+    status_col = None
+    for k in ("raw_status", "RAW_STATUS"):
+        if k in hmap:
+            status_col = k
+            break
 
-    status_col_idx = hmap[status_col_name] - 1  # 0-based for row lists
+    if not status_col:
+        die("ERROR: Missing raw_status or RAW_STATUS column.")
 
-    for i, row in enumerate(rows, start=2):  # sheet row number starts at 
-2 (row 1 is headers)
-        # pad row to header length
+    status_idx = hmap[status_col] - 1
+
+    for i, row in enumerate(rows, start=2):
         if len(row) < len(headers):
-            row = row + [""] * (len(headers) - len(row))
-
-        status_val = normalize(row[status_col_idx])
-        if status_val == "NEW":
-            record = {headers[j].strip(): row[j] for j in 
-range(len(headers)) if headers[j].strip()}
-            return {"row_number": i, "record": record, "status_col_name": 
-status_col_name}
+            row += [""] * (len(headers) - len(row))
+        if normalize(row[status_idx]) == "NEW":
+            record = {headers[j]: row[j] for j in range(len(headers))}
+            return {"row_number": i, "record": record, "status_col": 
+status_col}
 
     return None
 
 
-# ----------------------------
-# Stage 3: scoring (heuristic v1)
-# ----------------------------
+# ============================================================
+# Stage 3 — heuristic scorer
+# ============================================================
 
 def safe_float(x: Any, default: float = 0.0) -> float:
     try:
         s = normalize(x).replace("£", "").replace(",", "")
-        if s == "":
-            return default
-        return float(s)
+        return float(s) if s else default
     except Exception:
         return default
 
 
 def safe_int(x: Any, default: int = 0) -> int:
     try:
-        s = normalize(x).replace(",", "")
-        if s == "":
-            return default
-        return int(float(s))
+        s = normalize(x)
+        return int(float(s)) if s else default
     except Exception:
         return default
 
 
 def pick(rec: Dict[str, Any], *keys: str) -> str:
     for k in keys:
-        if k in rec and normalize(rec.get(k)) != "":
-            return normalize(rec.get(k))
+        if k in rec and normalize(rec[k]):
+            return normalize(rec[k])
     return ""
 
 
-def heuristic_score(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Produces:
-      ai_score: 0-100
-      ai_grading: A/B/C/D
-      ai_verdict: GOOD/AVERAGE/POOR
-      ai_notes: short rationale
-    """
-    price = safe_float(pick(rec, "price_gbp", "PRICE_GBP"), 
-default=9999.0)
-    stops_raw = pick(rec, "stops", "STOPS")
-    stops = safe_int(stops_raw, default=0)
+def score_deal(rec: Dict[str, Any]) -> Dict[str, Any]:
+    price = safe_float(pick(rec, "price_gbp", "PRICE_GBP"), 9999)
+    stops = safe_int(pick(rec, "stops", "STOPS"), 0)
     baggage = pick(rec, "baggage_included", "BAGGAGE_INCLUDED").lower()
-    trip_len = safe_int(pick(rec, "trip_length_days", "TRIP_LENGTH_DAYS"), 
-default=0)
+    days = safe_int(pick(rec, "trip_length_days", "TRIP_LENGTH_DAYS"), 0)
 
-    # Base score from price bands (tune later)
-    score = 50.0
-    notes: List[str] = []
+    score = 50
+    notes = []
 
-    if price <= 35:
-        score += 35
-        notes.append("ultra-low fare")
-    elif price <= 80:
-        score += 25
-        notes.append("very cheap")
-    elif price <= 150:
+    if price <= 50:
+        score += 30
+        notes.append("cheap")
+    elif price <= 120:
         score += 15
-        notes.append("good price")
-    elif price <= 250:
-        score += 5
-        notes.append("fair price")
-    else:
+        notes.append("good value")
+    elif price > 300:
         score -= 10
-        notes.append("pricey")
+        notes.append("expensive")
 
-    # Stops
     if stops == 0:
         score += 10
         notes.append("direct")
-    elif stops == 1:
-        score += 3
-        notes.append("1 stop")
-    else:
-        score -= 8
-        notes.append(f"{stops} stops")
+    elif stops > 1:
+        score -= 5
+        notes.append("multiple stops")
 
-    # Baggage
-    if baggage in ("yes", "true", "1", "included", "y"):
+    if baggage in ("yes", "true", "included"):
         score += 5
         notes.append("baggage included")
-    elif baggage in ("no", "false", "0", "n"):
-        score -= 2
-        notes.append("no baggage")
 
-    # Trip length (soft preference for 3–10 days)
-    if 3 <= trip_len <= 10:
+    if 3 <= days <= 10:
         score += 5
-        notes.append("good trip length")
-    elif trip_len >= 14:
-        score -= 2
-        notes.append("long trip")
+        notes.append("good length")
 
-    # Clamp
-    score = max(0.0, min(100.0, score))
-    ai_score = round(score, 1)
+    score = max(0, min(100, score))
 
-    # Grade + verdict
-    if ai_score >= 85:
-        grading, verdict = "A", "GOOD"
-    elif ai_score >= 70:
-        grading, verdict = "B", "GOOD"
-    elif ai_score >= 55:
-        grading, verdict = "C", "AVERAGE"
+    if score >= 80:
+        grade, verdict = "A", "GOOD"
+    elif score >= 65:
+        grade, verdict = "B", "GOOD"
+    elif score >= 50:
+        grade, verdict = "C", "AVERAGE"
     else:
-        grading, verdict = "D", "POOR"
+        grade, verdict = "D", "POOR"
 
-    ai_notes = "; ".join(notes) if notes else "scored by heuristic"
     return {
-        "ai_score": ai_score,
-        "ai_grading": grading,
+        "ai_score": score,
+        "ai_grading": grade,
         "ai_verdict": verdict,
-        "ai_notes": ai_notes,
+        "ai_notes": "; ".join(notes),
     }
 
 
-# ----------------------------
-# Stage 3: write-back
-# ----------------------------
+# ============================================================
+# Stage 3 — write-back
+# ============================================================
 
-REQUIRED_OUTPUT_COLS = ["ai_score", "ai_grading", "ai_verdict", 
-"ai_notes", "scored_timestamp"]
+OUTPUT_COLS = ["ai_score", "ai_grading", "ai_verdict", "ai_notes", 
+"scored_timestamp"]
 
 
-def ensure_output_columns(ws, hmap: Dict[str, int], headers: List[str]) -> 
-Tuple[Dict[str, int], List[str]]:
-    """
-    Ensures required output columns exist. If missing, appends them to 
-header row.
-    Returns updated (hmap, headers).
-    """
-    missing = [c for c in REQUIRED_OUTPUT_COLS if c not in hmap]
+def ensure_columns(ws, headers, hmap):
+    missing = [c for c in OUTPUT_COLS if c not in hmap]
     if not missing:
-        return hmap, headers
+        return headers, hmap
 
-    log(f"Stage 3: Missing output columns {missing}. Adding to header 
-row...")
-    new_headers = headers[:] + missing
-    ws.update("1:1", [new_headers])  # replace header row
-    # Small delay to let Sheets settle
-    time.sleep(0.6)
+    ws.update("1:1", [headers + missing])
+    time.sleep(0.5)
 
-    # Re-read headers to be safe
-    updated_headers = ws.row_values(1)
-    updated_hmap = build_header_map(updated_headers)
-    still_missing = [c for c in REQUIRED_OUTPUT_COLS if c not in 
-updated_hmap]
-    if still_missing:
-        die(f"ERROR: Failed to create required output columns: 
-{still_missing}")
-
-    return updated_hmap, updated_headers
+    new_headers = ws.row_values(1)
+    return new_headers, build_header_map(new_headers)
 
 
-def stage3_writeback_row(ws, row_number: int, hmap: Dict[str, int], 
-status_col_name: str, updates: Dict[str, Any]) -> bool:
-    """
-    Writes updates to a single row.
-    Guard: only writes if raw_status/RAW_STATUS is still NEW.
-    Returns True if updated, False if skipped due to guard.
-    """
-    status_col = hmap[status_col_name]
-    current_status = normalize(ws.cell(row_number, status_col).value)
-    if current_status != "NEW":
-        log(f"Stage 3: Guard skip — row #{row_number} status is 
-'{current_status}' (expected NEW).")
-        return False
+def write_row(ws, row, hmap, status_col, updates):
+    current = normalize(ws.cell(row, hmap[status_col]).value)
+    if current != "NEW":
+        log(f"Guard skip row {row} (status={current})")
+        return
 
     data = []
-    for field, value in updates.items():
-        if field not in hmap:
-            continue
-        col = hmap[field]
-        data.append({"range": a1_cell(row_number, col), "values": 
-[[value]]})
-
-    if not data:
-        log(f"Stage 3: Nothing to write for row #{row_number}.")
-        return False
+    for k, v in updates.items():
+        if k in hmap:
+            data.append({"range": a1(row, hmap[k]), "values": [[v]]})
 
     ws.batch_update(data)
-    return True
 
 
-# ----------------------------
+# ============================================================
 # Main
-# ----------------------------
+# ============================================================
 
-def main() -> None:
+def main():
     log("AI SCORER STARTING")
 
-    # Stage 1: env check
-    get_env("SHEET_ID", required=True)
-    get_env("GCP_SA_JSON", required=True)
-    # OPENAI_API_KEY kept for future stage; not required for heuristic 
-scoring
+    get_env("SHEET_ID")
+    get_env("GCP_SA_JSON")
     log("Environment OK")
 
-    # Stage 1: connect
     ws = get_worksheet()
     log(f"Connected to worksheet: {ws.title}")
     log("AI SCORER STAGE 1 COMPLETE")
 
-    # Stage 2: find first NEW row
-    hit = find_first_new_row(ws)
+    hit = find_first_new(ws)
     if not hit:
-        log("Stage 2: No NEW rows found. Nothing to do.")
-        log("AI SCORER STAGE 2 COMPLETE")
+        log("Stage 2: No NEW rows found")
         return
 
-    row_number = hit["row_number"]
+    row = hit["row_number"]
     rec = hit["record"]
-    status_col_name = hit["status_col_name"]
+    status_col = hit["status_col"]
 
-    def p(*keys: str) -> str:
-        return pick(rec, *keys)
+    log(f"Stage 2: Found NEW row #{row}")
 
-    deal_id = p("deal_id", "DEAL_ID")
-    origin = p("origin_city", "ORIGIN_CITY")
-    dest = p("destination_city", "DESTINATION_CITY")
-    price = p("price_gbp", "PRICE_GBP")
-    out_date = p("outbound_date", "OUTBOUND_DATE")
+    headers = ws.row_values(1)
+    hmap = build_header_map(headers)
+    headers, hmap = ensure_columns(ws, headers, hmap)
 
-    log(f"Stage 2: Found NEW row at sheet row #{row_number}")
-    log(f"deal_id={deal_id} | {origin} -> {dest} | £{price} | 
-outbound={out_date}")
-    log("AI SCORER STAGE 2 COMPLETE")
-
-    # Stage 3: write-back + promote
     try:
-        headers = ws.row_values(1)
-        hmap = build_header_map(headers)
-
-        # Ensure status column exists (already validated in Stage 2)
-        if status_col_name not in hmap:
-            die(f"ERROR: Status column '{status_col_name}' disappeared 
-from header row.")
-
-        # Ensure outputs exist
-        hmap, headers = ensure_output_columns(ws, hmap, headers)
-
-        # Score
-        result = heuristic_score(rec)
-
+        result = score_deal(rec)
         updates = {
             "ai_score": result["ai_score"],
             "ai_grading": result["ai_grading"],
             "ai_verdict": result["ai_verdict"],
             "ai_notes": result["ai_notes"],
-            "scored_timestamp": utc_now_iso(),
-            status_col_name: "SCORED",  # promote in same column that 
-triggered it
+            "scored_timestamp": utc_now(),
+            status_col: "SCORED",
         }
-
-        wrote = stage3_writeback_row(ws, row_number, hmap, 
-status_col_name, updates)
-        if wrote:
-            log(f"Stage 3: Wrote score + promoted row #{row_number} to 
-SCORED.")
-            log(f"ai_score={result['ai_score']} | 
-ai_grading={result['ai_grading']} | ai_verdict={result['ai_verdict']}")
-        log("AI SCORER STAGE 3 COMPLETE")
+        write_row(ws, row, hmap, status_col, updates)
+        log(f"Stage 3: Row #{row} scored and promoted to SCORED")
 
     except Exception as e:
-        # Attempt to mark error (best-effort)
-        try:
-            headers = ws.row_values(1)
-            hmap = build_header_map(headers)
-            # ensure output cols so we can write notes/timestamp
-            hmap, headers = ensure_output_columns(ws, hmap, headers)
-
-            err_msg = (str(e) or "Unknown error")[:240]
-            updates = {
-                "ai_notes": f"ERROR_SCORING: {err_msg}",
-                "scored_timestamp": utc_now_iso(),
-                status_col_name: "ERROR_SCORING",
-            }
-            _ = stage3_writeback_row(ws, row_number, hmap, 
-status_col_name, updates)
-        except Exception:
-            pass
-
-        die(f"Stage 3: ERROR while scoring row #{row_number}: {e}")
+        write_row(
+            ws,
+            row,
+            hmap,
+            status_col,
+            {
+                "ai_notes": f"ERROR_SCORING: {str(e)[:200]}",
+                "scored_timestamp": utc_now(),
+                status_col: "ERROR_SCORING",
+            },
+        )
+        die(f"Stage 3 failed: {e}")
 
 
 if __name__ == "__main__":

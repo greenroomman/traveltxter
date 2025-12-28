@@ -14,7 +14,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from lib.sheets import get_env, get_gspread_client, now_iso  # noqa: E402
-from lib.fingerprints import deal_fingerprint  # noqa: E402
+# Define fingerprint function directly
+import hashlib
+
+def deal_fingerprint(origin_city, destination_city, outbound_date, return_date, airline, stops):
+    raw = f"{origin_city}|{destination_city}|{outbound_date}|{return_date}|{airline}|{stops}".lower()
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
 DUFFEL_BASE_URL = "https://api.duffel.com/air"

@@ -6,9 +6,9 @@ from lib.sheets import get_ready_deal, mark_posted, mark_error
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHANNEL = os.getenv("TELEGRAM_CHANNEL", "").strip()
 
-# Optional safety knobs (can be set as env vars later)
 MIN_AI_SCORE = os.getenv("TELEGRAM_MIN_AI_SCORE", "").strip()  # e.g. "70"
-ALLOW_VERDICTS = os.getenv("TELEGRAM_ALLOW_VERDICTS", "GOOD").strip()  # "GOOD" or "GOOD,AVERAGE"
+ALLOW_VERDICTS = os.getenv("TELEGRAM_ALLOW_VERDICTS", "GOOD").strip()  # 
+"GOOD" or "GOOD,AVERAGE"
 
 
 def _send_telegram_message(text: str) -> dict:
@@ -59,18 +59,15 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("Missing env var: TELEGRAM_BOT_TOKEN")
     if not CHANNEL:
-        raise RuntimeError("Missing env var: TELEGRAM_CHANNEL (example: @traveltxter)")
+        raise RuntimeError("Missing env var: TELEGRAM_CHANNEL (example: 
+@traveltxter)")
 
-    # Safety config
-    allow_verdicts = tuple([v.strip().upper() for v in ALLOW_VERDICTS.split(",") if v.strip()])
+    allow_verdicts = tuple([v.strip().upper() for v in 
+ALLOW_VERDICTS.split(",") if v.strip()])
     min_ai_score = None
     if MIN_AI_SCORE:
-        try:
-            min_ai_score = float(MIN_AI_SCORE)
-        except Exception:
-            raise RuntimeError("TELEGRAM_MIN_AI_SCORE must be a number, e.g. 70")
+        min_ai_score = float(MIN_AI_SCORE)
 
-    # Claim one deal (this sets status=POSTING + lock fields)
     deal = get_ready_deal(
         worker_id="telegram_publisher",
         allow_verdicts=allow_verdicts,
@@ -89,7 +86,6 @@ def main():
         _send_telegram_message(msg)
         mark_posted(deal_id)
         print(f"Posted to Telegram: {deal_id}")
-
     except Exception as e:
         mark_error(deal_id, str(e))
         print(f"ERROR posting {deal_id}: {e}")
@@ -98,3 +94,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

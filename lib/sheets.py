@@ -317,3 +317,154 @@ def mark_error(deal_id: str, error_msg: str):
         existing = ws.cell(row_num, hm[target]).value or ""
         appended = (existing + "\n" if existing else "") + f"[TELEGRAM_ERROR {now_iso()}] {error_msg}"
         update_row_by_headers(ws, hm, row_num, {target: appended[:45000]})
+# 
+=============================================================================
+# Telegram publishing helpers
+# 
+=============================================================================
+
+STATUS_READY = "READY_TO_POST"
+STATUS_POSTING = "POSTING"
+STATUS_POSTED = "POSTED"
+STATUS_ERROR = "ERROR"
+
+
+def get_ws():
+    """
+    Open worksheet using env vars:
+      - SPREADSHEET_ID (preferred) OR SPREADSHEET_NAME
+      - DEALS_SHEET_NAME (default RAW_DEALS)
+    """
+    gc = get_gspread_client()
+    sheet_name = os.getenv("DEALS_SHEET_NAME", "RAW_DEALS").strip() or 
+"RAW_DEALS"
+
+    sid = os.getenv("SPREADSHEET_ID", "").strip()
+    sname = os.getenv("SPREADSHEET_NAME", "").strip()
+
+    if sid:
+        sh = gc.open_by_key(sid)
+    elif sname:
+        sh = gc.open(sname)
+    else:
+        raise ValueError("Missing SPREADSHEET_ID (preferred) or 
+SPREADSHEET_NAME")
+
+    return sh.worksheet(sheet_name)
+
+
+def _safe_float(x):
+    try:
+        return float(str(x).strip())
+    except Exception:
+        return None
+
+
+def release_back_to_ready(ws, hm, row_num: int):
+    update_row_by_headers(
+        ws, hm, row_num,
+        {"status": STATUS_READY, "processing_lock": "", "locked_by": ""}
+    )
+
+
+def get_ready_deal(worker_id: str, allow_verdicts=("GOOD",), 
+min_ai_score=None, max_lock_age_minutes=30):
+    """
+    Claims + returns one deal ready for posting.
+    Uses existing claim_first_available lock mechanism and sets status -> 
+POSTING.
+    Also prevents reposts by requiring published_timestamp empty.
+    """
+    ws = get_ws()
+
+    # Require these columns for safe posting
+    required = ["deal_id", "status", "published_timestamp", 
+"processing_lock", "locked_by"]
+    # These are optional filters if present
+    optional = ["ai_verdict", "ai_score", "ai_caption"]
+
+    headers = ws.row_values(1)
+    for col in required:
+        if col not in headers:
+            raise ValueError(f"Sheet missing required column: {col}")
+
+    hm = {h: headers.index(h) + 1 for h in headers}
+
+    deal = claim_first_available(
+        ws=ws,
+        required_headers=list(set(required + [c for c in optional if c in 
+headers])),
+        status_col="status",
+        wanted_status=STATUS_READY,
+        set_status=STATUS_POSTING,
+        worker_id=worker_id,
+        max_lock_age=timedelta(minutes=max_lock_age_minutes),
+    )
+    if not deal:
+        return None
+
+    # Anti-repost
+    if str(deal.get("published_timestamp", "")).strip():
+        # Already posted, finalise state and clear lock
+        mark_posted(deal["deal_id"], keep_existing_timestamp=True)
+        return None
+
+    # Verdict filter (if column exists and has a value)
+    verdict = str(deal.get("ai_verdict", "")).strip()
+    if allow_verdicts and verdict and verdict not in allow_verdicts:
+        release_back_to_ready(ws, hm, deal["_row_number"])
+        return None
+
+    # Score filter
+    if min_ai_score is not None:
+        score = _safe_float(deal.get("ai_score", ""))
+        if score is None or score < float(min_ai_score):
+            release_back_to_ready(ws, hm, deal["_row_number"])
+            return None
+
+    return deal
+
+
+def mark_posted(deal_id: str, keep_existing_timestamp: bool = False):
+    ws = get_ws()
+    hm = ensure_headers(ws, ["deal_id", "status", "processing_lock", 
+"locked_by", "published_timestamp"])
+
+    cell = ws.find(deal_id)
+    if not cell:
+        raise RuntimeError(f"Could not find deal_id in sheet: {deal_id}")
+
+    updates = {
+        "status": STATUS_POSTED,
+        "processing_lock": "",
+        "locked_by": "",
+    }
+    if not keep_existing_timestamp:
+        updates["published_timestamp"] = now_iso()
+
+    update_row_by_headers(ws, hm, cell.row, updates)
+
+
+def mark_error(deal_id: str, error_msg: str):
+    ws = get_ws()
+    headers = ws.row_values(1)
+    hm = {h: headers.index(h) + 1 for h in headers}
+
+    cell = ws.find(deal_id)
+    if not cell:
+        raise RuntimeError(f"Could not find deal_id in sheet: {deal_id}")
+
+    row_num = cell.row
+    update_row_by_headers(
+        ws, hm, row_num,
+        {"status": STATUS_ERROR, "processing_lock": "", "locked_by": ""}
+    )
+
+    target = "ai_notes" if "ai_notes" in hm else ("notes" if "notes" in hm 
+else None)
+    if target:
+        existing = ws.cell(row_num, hm[target]).value or ""
+        appended = (existing + "\n" if existing else "") + 
+f"[TELEGRAM_ERROR {now_iso()}] {error_msg}"
+        update_row_by_headers(ws, hm, row_num, {target: appended[:45000]})
+

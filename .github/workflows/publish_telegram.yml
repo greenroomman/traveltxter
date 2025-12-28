@@ -27,7 +27,7 @@ jobs:
           DEALS_SHEET_NAME: ${{ secrets.DEALS_SHEET_NAME }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          # Optional safety knobs:
+          # Optional:
           # TELEGRAM_ALLOW_VERDICTS: "GOOD"
           # TELEGRAM_MIN_AI_SCORE: "70"
         run: python workers/telegram_publisher.py

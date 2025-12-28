@@ -2,123 +2,21 @@ import os
 import time
 import uuid
 import hashlib
-from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import requests
 
 from lib.sheets import get_env, get_gspread_client, now_iso
 
 
-# =============================
-# V3.2(A) FEEDER WRITE CONTRACT
-# =============================
-
-SAFE_INSERT_FIELDS = [
-    "deal_id",
-    "origin_city",
-    "destination_city",
-    "destination_country",
-    "price_gbp",
-    "outbound_date",
-    "return_date",
-    "trip_length_days",
-    "stops",
-    "baggage_included",
-    "airline",
-    "deal_source",
-    "notes",
-    "date_added",
-    "raw_status",
-    "deal_fingerprint",
-]
-
-RAW_STATUS_NEW = "NEW"
-
 DUFFEL_BASE_URL = "https://api.duffel.com/air"
 DUFFEL_VERSION = "v2"
 
-
-@dataclass
-class RouteConfig:
-    enabled: bool
-    priority: int
-    origin_iata: str
-    origin_city: str
-    destination_iata: str
-    destination_city: str
-    destination_country: str
-    trip_length_days: int
-    max_connections: int
-    cabin_class: str
-    max_price_gbp: float
-    step_days: int
-    window_days: int
-    days_ahead: int
+RAW_STATUS_NEW = "NEW"
 
 
-# -----------------------------
-# Utility helpers
-# -----------------------------
-
-def _bool(v: Any) -> bool:
-    return str(v).strip().upper() in ("TRUE", "1", "YES", "Y")
-
-
-def _int(v: Any, default: int) -> int:
-    try:
-        return int(float(str(v).strip()))
-    except Exception:
-        return default
-
-
-def _float(v: Any, default: float) -> float:
-    try:
-        return float(str(v).strip())
-    except Exception:
-        return default
-
-
-def _dupe_headers(headers: List[str]) -> List[str]:
-    seen = set()
-    dupes = []
-    for h in headers:
-        if h in seen:
-            dupes.append(h)
-        seen.add(h)
-    return dupes
-
-
-def _hm(headers: List[str]) -> Dict[str, int]:
-    return {h: i + 1 for i, h in enumerate(headers)}
-
-
-def _fingerprint(
-    origin_city: str,
-    dest_city: str,
-    out_date: str,
-    ret_date: str,
-    airline: str,
-    stops: str,
-) -> str:
-    raw = 
-f"{origin_city}|{dest_city}|{out_date}|{ret_date}|{airline}|{stops}".lower().strip()
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
-
-def _deal_id(fp: str, price_gbp: float) -> str:
-    bucket = int(round(price_gbp))
-    seed = f"{fp}|{bucket}"
-    h = hashlib.md5(seed.encode("utf-8")).hexdigest()[:10]
-    return f"{h}{uuid.uuid4().hex[:6]}"
-
-
-# -----------------------------
-# Duffel helpers
-# -----------------------------
-
-def _duffel_headers() -> Dict[str, str]:
+def duffel_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {get_env('DUFFEL_API_KEY')}",
         "Duffel-Version": DUFFEL_VERSION,
@@ -127,15 +25,21 @@ def _duffel_headers() -> Dict[str, str]:
     }
 
 
-def _search_roundtrip(
+def fingerprint(origin: str, dest: str, out_date: str, ret_date: str, 
+airline: str) -> str:
+    raw = f"{origin}|{dest}|{out_date}|{ret_date}|{airline}".lower()
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def search_roundtrip(
     origin: str,
     destination: str,
     departure_date: str,
     return_date: str,
     cabin_class: str,
     max_connections: int,
-) -> List[Dict[str, Any]]:
-    url = f"{DUFFEL_BASE_URL}/offer_requests"
+) -> List[Dict]:
+
     payload = {
         "data": {
             "slices": [
@@ -149,226 +53,147 @@ def _search_roundtrip(
             "max_connections": max_connections,
         }
     }
-    r = requests.post(url, headers=_duffel_headers(), json=payload, 
-timeout=30)
-    if r.status_code not in (200, 201):
+
+    r = requests.post(
+        f"{DUFFEL_BASE_URL}/offer_requests",
+        headers=duffel_headers(),
+        json=payload,
+        timeout=30,
+    )
+
+    if not r.ok:
         return []
-    j = r.json()
-    return (j.get("data", {}) or {}).get("offers", []) or []
+
+    return (r.json().get("data") or {}).get("offers") or []
 
 
-# -----------------------------
-# Offer → RAW_DEALS row mapping
-# -----------------------------
-
-def _parse_offer_to_row(offer: Dict[str, Any], route: RouteConfig) -> 
-Optional[Dict[str, Any]]:
-    try:
-        slices = offer.get("slices", [])
-        if len(slices) < 2:
-            return None
-
-        out_seg = (slices[0].get("segments") or [])[0]
-        ret_seg = (slices[1].get("segments") or [])[0]
-
-        outbound_date = str(out_seg.get("departing_at", ""))[:10]
-        return_date = str(ret_seg.get("departing_at", ""))[:10]
-
-        total_amount = float(offer.get("total_amount", 0))
-        currency = str(offer.get("total_currency", "")).upper().strip()
-
-        # If your Duffel account returns non-GBP, skip to keep pipeline 
-simple.
-        if currency and currency != "GBP":
-            return None
-
-        # Stops: 0 if direct, else 1 (we request max_connections=1, so 
-keep it simple).
-        stops = "0" if route.max_connections == 0 else "1"
-
-        airline = (offer.get("owner") or {}).get("name", "") or ""
-
-        # Baggage requires deeper parsing; keep conservative default.
-        baggage_included = ""
-
-        if total_amount > route.max_price_gbp:
-            return None
-
-        fp = _fingerprint(
-            origin_city=route.origin_city,
-            dest_city=route.destination_city,
-            out_date=outbound_date,
-            ret_date=return_date,
-            airline=airline,
-            stops=stops,
-        )
-
-        return {
-            "deal_fingerprint": fp,
-            "deal_id": _deal_id(fp, total_amount),
-            "origin_city": route.origin_city,
-            "destination_city": route.destination_city,
-            "destination_country": route.destination_country,
-            "price_gbp": f"{total_amount:.2f}",
-            "outbound_date": outbound_date,
-            "return_date": return_date,
-            "trip_length_days": str(route.trip_length_days),
-            "stops": stops,
-            "baggage_included": baggage_included,
-            "airline": airline,
-            "deal_source": "DUFFEL",
-            "notes": f"{route.origin_iata}->{route.destination_iata}",
-            "date_added": now_iso(),
-            "raw_status": RAW_STATUS_NEW,
-        }
-
-    except Exception:
+def parse_offer(offer: Dict, route: Dict) -> Optional[Dict]:
+    slices = offer.get("slices") or []
+    if len(slices) < 2:
         return None
 
+    out_seg = slices[0]["segments"][0]
+    ret_seg = slices[1]["segments"][0]
 
-# -----------------------------
-# CONFIG loading
-# -----------------------------
+    out_date = out_seg["departing_at"][:10]
+    ret_date = ret_seg["departing_at"][:10]
 
-def _load_routes(sh, tab_name: str) -> List[RouteConfig]:
-    ws = sh.worksheet(tab_name)
-    values = ws.get_all_values()
-    if len(values) < 2:
-        return []
+    price = float(offer.get("total_amount", 0))
+    currency = offer.get("total_currency")
 
-    headers = values[0]
-    dupes = _dupe_headers(headers)
-    if dupes:
-        raise ValueError(f"CONFIG has duplicate headers: 
-{sorted(set(dupes))}")
+    if currency != "GBP":
+        return None
 
-    idx = {h: i for i, h in enumerate(headers)}
+    if price > float(route["max_price_gbp"]):
+        return None
 
-    def g(row: List[str], key: str, default: str = "") -> str:
-        i = idx.get(key)
-        return row[i].strip() if i is not None and i < len(row) else 
-default
+    airline = offer.get("owner", {}).get("name", "")
 
-    routes: List[RouteConfig] = []
-    for r in values[1:]:
-        if not r or not any(c.strip() for c in r):
-            continue
-        if not _bool(g(r, "enabled", "FALSE")):
-            continue
+    fp = fingerprint(
+        route["origin_city"],
+        route["destination_city"],
+        out_date,
+        ret_date,
+        airline,
+    )
 
-        routes.append(
-            RouteConfig(
-                enabled=True,
-                priority=_int(g(r, "priority", "0"), 0),
-                origin_iata=g(r, "origin_iata"),
-                origin_city=g(r, "origin_city") or g(r, "origin_iata"),
-                destination_iata=g(r, "destination_iata"),
-                destination_city=g(r, "destination_city") or g(r, 
-"destination_iata"),
-                destination_country=g(r, "destination_country"),
-                trip_length_days=_int(g(r, "trip_length_days", "4"), 4),
-                max_connections=_int(g(r, "max_connections", "1"), 1),
-                cabin_class=(g(r, "cabin_class", "economy") or 
-"economy").lower(),
-                max_price_gbp=_float(g(r, "max_price_gbp", "9999"), 
-9999.0),
-                step_days=_int(g(r, "step_days", "7"), 7),
-                window_days=_int(g(r, "window_days", "28"), 28),
-                days_ahead=_int(g(r, "days_ahead", "7"), 7),
-            )
-        )
-
-    routes.sort(key=lambda x: -x.priority)
-    return routes
+    return {
+        "deal_id": f"{uuid.uuid4().hex[:12]}",
+        "origin_city": route["origin_city"],
+        "destination_city": route["destination_city"],
+        "destination_country": route["destination_country"],
+        "price_gbp": f"{price:.2f}",
+        "outbound_date": out_date,
+        "return_date": ret_date,
+        "trip_length_days": route["trip_length_days"],
+        "stops": "1",
+        "baggage_included": "",
+        "airline": airline,
+        "deal_source": "DUFFEL",
+        "notes": f'{route["origin_iata"]}->{route["destination_iata"]}',
+        "date_added": now_iso(),
+        "raw_status": RAW_STATUS_NEW,
+        "deal_fingerprint": fp,
+    }
 
 
-# -----------------------------
-# MAIN
-# -----------------------------
+def main() -> None:
+    sh = get_gspread_client().open_by_key(get_env("SHEET_ID"))
 
-def main():
-    sheet_id = get_env("SHEET_ID")
-    raw_tab = os.getenv("RAW_DEALS_TAB", "RAW_DEALS").strip()
-    config_tab = os.getenv("FEEDER_CONFIG_TAB", "CONFIG").strip()
-
-    max_searches = _int(os.getenv("FEEDER_MAX_SEARCHES", "8"), 8)
-    max_inserts = _int(os.getenv("FEEDER_MAX_INSERTS", "20"), 20)
-    sleep_seconds = _float(os.getenv("FEEDER_SLEEP_SECONDS", "0.4"), 0.4)
-
-    sh = get_gspread_client().open_by_key(sheet_id)
-    raw_ws = sh.worksheet(raw_tab)
+    raw_ws = sh.worksheet(os.getenv("RAW_DEALS_TAB", "RAW_DEALS"))
+    cfg_ws = sh.worksheet(os.getenv("FEEDER_CONFIG_TAB", "CONFIG"))
 
     raw_headers = raw_ws.row_values(1)
-    dupes = _dupe_headers(raw_headers)
-    if dupes:
-        raise ValueError(f"RAW_DEALS has duplicate headers: 
-{sorted(set(dupes))}")
+    raw_idx = {h: i for i, h in enumerate(raw_headers)}
 
-    raw_hm = _hm(raw_headers)
-
-    routes = _load_routes(sh, config_tab)
-    if not routes:
-        print("No enabled routes in CONFIG.")
-        return
-
-    existing_fps = set()
-    if "deal_fingerprint" in raw_headers:
-        fp_idx = raw_headers.index("deal_fingerprint")
+    existing_fp = set()
+    if "deal_fingerprint" in raw_idx:
+        idx = raw_idx["deal_fingerprint"]
         for r in raw_ws.get_all_values()[1:]:
-            if fp_idx < len(r) and r[fp_idx]:
-                existing_fps.add(r[fp_idx])
+            if idx < len(r) and r[idx]:
+                existing_fp.add(r[idx])
 
-    searches = 0
+    cfg_rows = cfg_ws.get_all_values()
+    headers = cfg_rows[0]
+    idx = {h: i for i, h in enumerate(headers)}
+
+    routes = []
+    for r in cfg_rows[1:]:
+        if not r or r[idx["enabled"]] != "TRUE":
+            continue
+        routes.append({
+            "origin_iata": r[idx["origin_iata"]],
+            "origin_city": r[idx["origin_city"]],
+            "destination_iata": r[idx["destination_iata"]],
+            "destination_city": r[idx["destination_city"]],
+            "destination_country": r[idx["destination_country"]],
+            "trip_length_days": int(r[idx["trip_length_days"]]),
+            "max_connections": int(r[idx["max_connections"]]),
+            "cabin_class": r[idx["cabin_class"]],
+            "max_price_gbp": r[idx["max_price_gbp"]],
+            "step_days": int(r[idx["step_days"]]),
+            "window_days": int(r[idx["window_days"]]),
+            "days_ahead": int(r[idx["days_ahead"]]),
+        })
+
     inserts = 0
 
     for route in routes:
-        if searches >= max_searches or inserts >= max_inserts:
-            break
-
-        start = date.today() + timedelta(days=route.days_ahead)
-        end = start + timedelta(days=route.window_days)
+        start = date.today() + timedelta(days=route["days_ahead"])
+        end = start + timedelta(days=route["window_days"])
         d = start
 
         while d <= end:
-            if searches >= max_searches or inserts >= max_inserts:
-                break
-
-            searches += 1
-            offers = _search_roundtrip(
-                route.origin_iata,
-                route.destination_iata,
+            offers = search_roundtrip(
+                route["origin_iata"],
+                route["destination_iata"],
                 d.isoformat(),
-                (d + timedelta(days=route.trip_length_days)).isoformat(),
-                route.cabin_class,
-                route.max_connections,
+                (d + 
+timedelta(days=route["trip_length_days"])).isoformat(),
+                route["cabin_class"],
+                route["max_connections"],
             )
 
-            for offer in offers[:50]:
-                row = _parse_offer_to_row(offer, route)
+            for offer in offers[:20]:
+                row = parse_offer(offer, route)
                 if not row:
                     continue
-
-                fp = row.get("deal_fingerprint")
-                if fp in existing_fps:
+                if row["deal_fingerprint"] in existing_fp:
                     continue
 
                 out = [""] * len(raw_headers)
-                for k in SAFE_INSERT_FIELDS:
-                    if k in raw_hm:
-                        out[raw_hm[k] - 1] = str(row.get(k, ""))
+                for k, v in row.items():
+                    if k in raw_idx:
+                        out[raw_idx[k]] = str(v)
 
                 raw_ws.append_row(out, value_input_option="USER_ENTERED")
-                existing_fps.add(fp)
+                existing_fp.add(row["deal_fingerprint"])
                 inserts += 1
 
-                if inserts >= max_inserts:
-                    break
+            d += timedelta(days=route["step_days"])
+            time.sleep(0.4)
 
-            time.sleep(sleep_seconds)
-            d += timedelta(days=route.step_days)
-
-    print(f"Duffel feeder complete: searches={searches}, 
-inserts={inserts}")
+    print(f"Duffel feeder complete: {inserts} rows inserted")
 
 
 if __name__ == "__main__":

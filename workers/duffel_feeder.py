@@ -134,8 +134,8 @@ Optional[Dict[str, Any]]:
 pipeline simple.
             return None
 
-        # stops: 0 if direct, else 1 (we request max_connections 1, so 
-keep it simple)
+# stops: 0 if direct, else 1 (we request max_connections 1, so keep it 
+simple)
         stops = "0" if route.max_connections == 0 else "1"
 
         airline = (offer.get("owner") or {}).get("name", "") or ""

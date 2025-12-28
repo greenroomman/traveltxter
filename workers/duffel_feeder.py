@@ -12,7 +12,6 @@ from lib.sheets import get_env, get_gspread_client, now_iso
 
 DUFFEL_BASE_URL = "https://api.duffel.com/air"
 DUFFEL_VERSION = "v2"
-
 RAW_STATUS_NEW = "NEW"
 
 
@@ -25,8 +24,7 @@ def duffel_headers() -> Dict[str, str]:
     }
 
 
-def fingerprint(origin: str, dest: str, out_date: str, ret_date: str, 
-airline: str) -> str:
+def fingerprint(origin: str, dest: str, out_date: str, ret_date: str, airline: str) -> str:
     raw = f"{origin}|{dest}|{out_date}|{ret_date}|{airline}".lower()
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
@@ -43,10 +41,8 @@ def search_roundtrip(
     payload = {
         "data": {
             "slices": [
-                {"origin": origin, "destination": destination, 
-"departure_date": departure_date},
-                {"origin": destination, "destination": origin, 
-"departure_date": return_date},
+                {"origin": origin, "destination": destination, "departure_date": departure_date},
+                {"origin": destination, "destination": origin, "departure_date": return_date},
             ],
             "passengers": [{"type": "adult"}],
             "cabin_class": cabin_class,
@@ -97,16 +93,18 @@ def parse_offer(offer: Dict, route: Dict) -> Optional[Dict]:
         airline,
     )
 
+    stops = "0" if int(route["max_connections"]) == 0 else "1"
+
     return {
-        "deal_id": f"{uuid.uuid4().hex[:12]}",
+        "deal_id": uuid.uuid4().hex[:12],
         "origin_city": route["origin_city"],
         "destination_city": route["destination_city"],
         "destination_country": route["destination_country"],
         "price_gbp": f"{price:.2f}",
         "outbound_date": out_date,
         "return_date": ret_date,
-        "trip_length_days": route["trip_length_days"],
-        "stops": "1",
+        "trip_length_days": int(route["trip_length_days"]),
+        "stops": stops,
         "baggage_included": "",
         "airline": airline,
         "deal_source": "DUFFEL",
@@ -128,19 +126,26 @@ def main() -> None:
 
     existing_fp = set()
     if "deal_fingerprint" in raw_idx:
-        idx = raw_idx["deal_fingerprint"]
+        fp_i = raw_idx["deal_fingerprint"]
         for r in raw_ws.get_all_values()[1:]:
-            if idx < len(r) and r[idx]:
-                existing_fp.add(r[idx])
+            if fp_i < len(r) and r[fp_i]:
+                existing_fp.add(r[fp_i])
 
     cfg_rows = cfg_ws.get_all_values()
+    if len(cfg_rows) < 2:
+        print("No CONFIG routes.")
+        return
+
     headers = cfg_rows[0]
     idx = {h: i for i, h in enumerate(headers)}
 
     routes = []
     for r in cfg_rows[1:]:
-        if not r or r[idx["enabled"]] != "TRUE":
+        if not r:
             continue
+        if r[idx["enabled"]] != "TRUE":
+            continue
+
         routes.append({
             "origin_iata": r[idx["origin_iata"]],
             "origin_city": r[idx["origin_city"]],
@@ -168,10 +173,9 @@ def main() -> None:
                 route["origin_iata"],
                 route["destination_iata"],
                 d.isoformat(),
-                (d + 
-timedelta(days=route["trip_length_days"])).isoformat(),
+                (d + timedelta(days=route["trip_length_days"])).isoformat(),
                 route["cabin_class"],
-                route["max_connections"],
+                int(route["max_connections"]),
             )
 
             for offer in offers[:20]:
@@ -198,4 +202,3 @@ timedelta(days=route["trip_length_days"])).isoformat(),
 
 if __name__ == "__main__":
     main()
-

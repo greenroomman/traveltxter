@@ -1,73 +1,337 @@
-name: V3_beta_b AI Scorer
+#!/usr/bin/env python3
+"""
+V3_beta_b AI Scorer with Debug Logging
 
-on:
-  workflow_dispatch:
-    inputs:
-      max_rows:
-        description: 'Max rows to process'
-        required: false
-        default: '10'
-  schedule:
-    - cron: "0 7 * * *"    # 07:00 UTC
-    - cron: "0 16 * * *"   # 16:00 UTC
+Stage 1: Connect to sheet
+Stage 2: Find first NEW row
+Stage 3: Heuristic score + write-back + promote to SCORED
+"""
 
-concurrency:
-  group: v3-ai-scorer
-  cancel-in-progress: false
+import os
+import sys
+import json
+import time
+import datetime as dt
+from typing import Dict, Any, Optional
 
-jobs:
-  score:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+import gspread
+from google.oauth2.service_account import Credentials
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+def log(msg: str) -> None:
+    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    print(f"{ts} | {msg}", flush=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    log(msg)
+    sys.exit(code)
+
+
+# ============================================================
+# Environment helpers
+# ============================================================
+
+def get_env(name: str, required: bool = True, default: str = "") -> str:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        if required:
+            die(f"ERROR: Missing environment variable: {name}")
+        return default
+    return str(v).strip()
+
+
+# ============================================================
+# Google Sheets
+# ============================================================
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+
+def get_worksheet():
+    sheet_id = get_env("SHEET_ID", required=True)
+    worksheet_name = get_env("WORKSHEET_NAME", required=False, default="RAW_DEALS")
+    sa_json = get_env("GCP_SA_JSON", required=True)
+
+    try:
+        sa_info = json.loads(sa_json)
+    except Exception:
+        die("ERROR: GCP_SA_JSON must be valid JSON")
+
+    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(sheet_id)
     
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-      
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: 'pip'
-      
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      
-      - name: Run AI Scorer
-        env:
-          # Required
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          
-          # Configuration
-          WORKSHEET_NAME: RAW_DEALS
-          MAX_ROWS_PER_RUN: ${{ github.event.inputs.max_rows || '1' }}
-          
-          # V3_beta_b: Uses raw_status column
-          PYTHONUNBUFFERED: "1"
-        run: python workers/ai_scorer.py
-      
-      - name: Save Scorer Logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scorer-logs-${{ github.run_number }}
-          path: logs/*.log
-          retention-days: 7
-          if-no-files-found: warn
-      
-      - name: Generate Summary
-        if: always()
-        run: |
-          echo "## 🤖 AI Scorer Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Run Details:**" >> $GITHUB_STEP_SUMMARY
-          echo "- 🆔 Run: #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- ⏰ Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**V3_beta_b Pipeline:**" >> $GITHUB_STEP_SUMMARY
-          echo "- Reads: raw_status = NEW" >> $GITHUB_STEP_SUMMARY
-          echo "- Promotes: raw_status = SCORED" >> $GITHUB_STEP_SUMMARY
-          echo "- Next: Render Worker" >> $GITHUB_STEP_SUMMARY
+    try:
+        ws = sheet.worksheet(worksheet_name)
+        return ws
+    except Exception as e:
+        die(f"ERROR: Could not open worksheet '{worksheet_name}': {e}")
+
+
+def build_header_map(headers):
+    hmap = {}
+    for i, h in enumerate(headers, start=1):
+        if h and str(h).strip():
+            hmap[str(h).strip()] = i
+    return hmap
+
+
+# ============================================================
+# Stage 2 — find NEW row
+# ============================================================
+
+def normalize(v: Any) -> str:
+    return "" if v is None else str(v).strip()
+
+
+def find_first_new(ws) -> Optional[Dict[str, Any]]:
+    """Find first row with raw_status = NEW"""
+    
+    log("Stage 2: Fetching all sheet data...")
+    values = ws.get_all_values()
+    
+    log(f"DEBUG: Got {len(values)} total rows from sheet")
+    
+    if len(values) < 2:
+        log("DEBUG: Sheet has less than 2 rows (no data)")
+        return None
+
+    headers = values[0]
+    rows = values[1:]
+    
+    log(f"DEBUG: Headers (first 15): {headers[:15]}")
+    log(f"DEBUG: First data row (first 15): {rows[0][:15] if rows else 'No rows'}")
+    log(f"DEBUG: Total data rows: {len(rows)}")
+    
+    hmap = build_header_map(headers)
+    
+    log(f"DEBUG: Header map has {len(hmap)} columns")
+    log(f"DEBUG: Looking for 'raw_status' or 'RAW_STATUS' column...")
+
+    status_col = None
+    for k in ("raw_status", "RAW_STATUS"):
+        if k in hmap:
+            status_col = k
+            log(f"DEBUG: Found status column: '{k}' at position {hmap[k]}")
+            break
+
+    if not status_col:
+        log("ERROR: Missing raw_status or RAW_STATUS column.")
+        log(f"DEBUG: Available columns: {list(hmap.keys())[:20]}")
+        die("ERROR: Missing raw_status or RAW_STATUS column.")
+
+    status_idx = hmap[status_col] - 1  # Convert to 0-based
+    log(f"DEBUG: Status column index (0-based): {status_idx}")
+    log(f"DEBUG: Will check {len(rows)} rows for status='NEW'")
+
+    # Check first 5 rows for debugging
+    for i, row in enumerate(rows[:5], start=2):
+        if len(row) < len(headers):
+            row += [""] * (len(headers) - len(row))
+        
+        if status_idx < len(row):
+            status_value = normalize(row[status_idx])
+            log(f"DEBUG Row {i}: raw_status = '{status_value}' (length={len(status_value)})")
+        else:
+            log(f"DEBUG Row {i}: raw_status column not present (row has {len(row)} cells)")
+
+    # Now search all rows
+    for i, row in enumerate(rows, start=2):
+        if len(row) < len(headers):
+            row += [""] * (len(headers) - len(row))
+        
+        if status_idx >= len(row):
+            continue
+            
+        status_value = normalize(row[status_idx])
+        
+        if status_value == "NEW":
+            log(f"DEBUG: FOUND NEW at row {i}!")
+            record = {headers[j]: row[j] for j in range(len(headers))}
+            return {"row_number": i, "record": record, "status_col": status_col}
+
+    log("DEBUG: Checked all rows, no 'NEW' status found")
+    return None
+
+
+# ============================================================
+# Stage 3 — scoring logic
+# ============================================================
+
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        s = normalize(x).replace("£", "").replace(",", "")
+        return float(s) if s else default
+    except Exception:
+        return default
+
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        s = normalize(x)
+        return int(float(s)) if s else default
+    except Exception:
+        return default
+
+
+def score_deal(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Simple heuristic scoring"""
+    
+    price = safe_float(rec.get("price_gbp", ""), 9999)
+    stops = safe_int(rec.get("stops", ""), 0)
+    days = safe_int(rec.get("trip_length_days", ""), 0)
+    baggage = normalize(rec.get("baggage_included", "")).lower()
+
+    score = 50
+    notes = []
+
+    # Price scoring
+    if price <= 50:
+        score += 30
+        notes.append("cheap")
+    elif price <= 120:
+        score += 15
+        notes.append("good value")
+    elif price > 300:
+        score -= 10
+        notes.append("expensive")
+
+    # Stops
+    if stops == 0:
+        score += 10
+        notes.append("direct")
+    elif stops > 1:
+        score -= 5
+
+    # Baggage
+    if baggage in ("yes", "true", "included"):
+        score += 5
+        notes.append("bag included")
+
+    # Trip length
+    if 3 <= days <= 10:
+        score += 5
+
+    score = max(0, min(100, score))
+
+    # Grade
+    if score >= 80:
+        grade, verdict = "A", "GOOD"
+    elif score >= 65:
+        grade, verdict = "B", "GOOD"
+    elif score >= 50:
+        grade, verdict = "C", "AVERAGE"
+    else:
+        grade, verdict = "D", "POOR"
+
+    return {
+        "ai_score": score,
+        "ai_grading": grade,
+        "ai_verdict": verdict,
+        "ai_notes": "; ".join(notes) if notes else "standard",
+    }
+
+
+# ============================================================
+# Write-back
+# ============================================================
+
+def col_to_a1(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def write_score(ws, row_num: int, hmap: Dict[str, int], status_col: str, result: Dict[str, Any]):
+    """Write scoring results and promote to SCORED"""
+    
+    updates = {}
+    
+    # Score fields
+    if "ai_score" in hmap:
+        updates[col_to_a1(hmap["ai_score"]) + str(row_num)] = result["ai_score"]
+    if "ai_grading" in hmap:
+        updates[col_to_a1(hmap["ai_grading"]) + str(row_num)] = result["ai_grading"]
+    if "ai_verdict" in hmap:
+        updates[col_to_a1(hmap["ai_verdict"]) + str(row_num)] = result["ai_verdict"]
+    if "ai_notes" in hmap:
+        updates[col_to_a1(hmap["ai_notes"]) + str(row_num)] = result["ai_notes"]
+    
+    # Timestamp
+    timestamp = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    if "scored_timestamp" in hmap:
+        updates[col_to_a1(hmap["scored_timestamp"]) + str(row_num)] = timestamp
+    
+    # Status promotion: NEW → SCORED
+    if status_col in hmap:
+        updates[col_to_a1(hmap[status_col]) + str(row_num)] = "SCORED"
+    
+    log(f"DEBUG: Writing {len(updates)} updates to row {row_num}")
+    
+    # Batch update
+    data = [{"range": k, "values": [[v]]} for k, v in updates.items()]
+    if data:
+        ws.batch_update(data)
+        log(f"Stage 3: Row #{row_num} scored and promoted to SCORED")
+    else:
+        log("WARNING: No updates to write (missing columns?)")
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+    log("AI SCORER STARTING (V3_beta_b DEBUG)")
+    
+    # Connect
+    ws = get_worksheet()
+    log(f"Connected to worksheet: {ws.title}")
+    
+    log("AI SCORER STAGE 1 COMPLETE")
+    
+    # Find NEW row
+    result = find_first_new(ws)
+    
+    if not result:
+        log("Stage 2: No NEW rows found")
+        log("💡 Check:")
+        log("   - Does raw_status column exist?")
+        log("   - Are there rows with raw_status = 'NEW' (exact, caps)?")
+        log("   - No extra spaces in the value?")
+        return
+
+    row_num = result["row_number"]
+    rec = result["record"]
+    status_col = result["status_col"]
+    
+    deal_id = normalize(rec.get("deal_id", ""))
+    log(f"Stage 2: Found NEW row #{row_num} (deal_id={deal_id})")
+    
+    # Score it
+    log(f"Stage 3: Scoring deal...")
+    score_result = score_deal(rec)
+    
+    log(f"DEBUG: Score={score_result['ai_score']}, Verdict={score_result['ai_verdict']}")
+    
+    # Get header map
+    headers = ws.row_values(1)
+    hmap = build_header_map(headers)
+    
+    # Write back
+    write_score(ws, row_num, hmap, status_col, score_result)
+    
+    log("AI SCORER COMPLETE")
+    log(f"✅ Processed 1 row: {deal_id}")
+    log("🔄 Run again to process more NEW rows")
+
+
+if __name__ == "__main__":
+    main()

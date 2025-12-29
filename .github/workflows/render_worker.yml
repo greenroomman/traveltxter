@@ -3,9 +3,15 @@ name: Render Worker
 on:
   workflow_dispatch:
 
+concurrency:
+  group: render-worker
+  cancel-in-progress: false
+
 jobs:
   render:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -14,6 +20,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -26,11 +33,22 @@ jobs:
 
       - name: Run Render Worker
         env:
+          # --- Sheet identifiers (support both naming conventions) ---
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
+
+          # --- Worksheet name (support both naming conventions) ---
           WORKSHEET_NAME: RAW_DEALS
+          DEALS_SHEET_NAME: RAW_DEALS
+
+          # --- Google Service Account JSON (single-line) ---
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+
+          # --- Render endpoint + timeouts ---
           RENDER_URL: ${{ secrets.RENDER_URL }}
           RENDER_TIMEOUT: "30"
+
+          # --- Runtime flags ---
+          PYTHONUNBUFFERED: "1"
         run: |
           python workers/render_worker.py
-

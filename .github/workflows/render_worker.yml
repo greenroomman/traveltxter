@@ -1,348 +1,105 @@
-#!/usr/bin/env python3
-"""
-V3_beta_b — Render Worker
-Generates graphics for Instagram-bound deals
+name: Render Worker (V3_beta_b)
 
-Strategy:
-- Reads from INSTAGRAM_FEED (not RAW_DEALS)
-- Only renders deals that need graphics
-- Updates instagram_status after rendering
-- Keeps Instagram and Telegram separate
-"""
+on:
+  workflow_dispatch:
+    inputs:
+      target_tab:
+        description: 'Which tab to render for'
+        required: false
+        default: 'RAW_DEALS'
+        type: choice
+        options:
+          - RAW_DEALS
+          - INSTAGRAM_FEED
+      max_renders:
+        description: 'Max renders per run'
+        required: false
+        default: '5'
+  schedule:
+    - cron: "0 14 * * *"  # 14:00 UTC (after scorer, before publishers)
 
-import os
-import sys
-import json
-import time
-import requests
-from pathlib import Path
-from typing import Optional, Dict, Any
+concurrency:
+  group: render-worker
+  cancel-in-progress: false
 
-import gspread
-from google.oauth2.service_account import Credentials
-
-# ============================================================
-# Configuration
-# ============================================================
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# V3_beta_b: Target Instagram deals specifically
-RENDER_TAB = os.getenv("RENDER_TAB", "INSTAGRAM_FEED").strip()
-
-# Status for Instagram
-STATUS_COL = "instagram_status"
-STATUS_NEEDS_IMAGE = "NEEDS_IMAGE"
-STATUS_READY = "READY"
-STATUS_ERROR = "ERROR_RENDER"
-
-# Render endpoint
-RENDER_URL = os.getenv("RENDER_URL", "").strip()
-RENDER_TIMEOUT = int(os.getenv("RENDER_TIMEOUT", "30"))
-
-# How many to process per run
-MAX_RENDERS_PER_RUN = int(os.getenv("MAX_RENDERS_PER_RUN", "5"))
-
-
-# ============================================================
-# Logging
-# ============================================================
-
-def log(msg: str) -> None:
-    import datetime as dt
-    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    print(f"{ts} | {msg}", flush=True)
-
-
-def die(msg: str, code: int = 1) -> None:
-    log(msg)
-    sys.exit(code)
-
-
-# ============================================================
-# Google Sheets
-# ============================================================
-
-def get_worksheet():
-    """Connect to Google Sheet"""
-    # Support both naming conventions
-    sheet_id = os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID")
-    if not sheet_id:
-        die("ERROR: Missing SPREADSHEET_ID or SHEET_ID")
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     
-    # Support both worksheet name conventions
-    worksheet_name = os.getenv("DEALS_SHEET_NAME") or os.getenv("WORKSHEET_NAME") or RENDER_TAB
-    
-    sa_json = os.getenv("GCP_SA_JSON")
-    if not sa_json:
-        die("ERROR: Missing GCP_SA_JSON")
-    
-    try:
-        sa_info = json.loads(sa_json)
-    except Exception:
-        die("ERROR: GCP_SA_JSON must be valid JSON")
-    
-    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(sheet_id)
-    
-    log(f"Connected to sheet: {sheet.title}")
-    
-    try:
-        ws = sheet.worksheet(worksheet_name)
-        log(f"Using worksheet: {ws.title}")
-        return ws
-    except gspread.exceptions.WorksheetNotFound:
-        available = [s.title for s in sheet.worksheets()]
-        die(f"ERROR: Worksheet '{worksheet_name}' not found. Available: {available}")
-
-
-def normalize(v: Any) -> str:
-    return "" if v is None else str(v).strip()
-
-
-def build_header_map(headers):
-    """Map header name -> 1-based column index"""
-    return {normalize(h): i for i, h in enumerate(headers, start=1) if normalize(h)}
-
-
-def find_rows_needing_render(ws, hmap: Dict[str, int], max_rows: int):
-    """
-    Find rows that need graphics rendered.
-    
-    V3_beta_b Logic:
-    - Has deal data
-    - graphic_url is empty
-    - instagram_status is empty or NEEDS_IMAGE
-    """
-    if "graphic_url" not in hmap:
-        log("WARNING: No 'graphic_url' column found")
-        return []
-    
-    if "deal_id" not in hmap:
-        log("WARNING: No 'deal_id' column found")
-        return []
-    
-    # Get all data
-    all_data = ws.get_all_values()
-    if len(all_data) < 2:
-        return []
-    
-    headers = all_data[0]
-    rows = all_data[1:]
-    
-    graphic_idx = hmap["graphic_url"] - 1  # Convert to 0-based
-    deal_id_idx = hmap["deal_id"] - 1
-    
-    status_idx = None
-    if STATUS_COL in hmap:
-        status_idx = hmap[STATUS_COL] - 1
-    
-    needs_render = []
-    
-    for row_num, row in enumerate(rows, start=2):  # Row 2+ (1 is headers)
-        if len(row) <= max(graphic_idx, deal_id_idx):
-            continue
-        
-        # Check if graphic_url is empty
-        graphic_url = normalize(row[graphic_idx]) if graphic_idx < len(row) else ""
-        if graphic_url:
-            continue  # Already has graphic
-        
-        # Check deal_id exists
-        deal_id = normalize(row[deal_id_idx]) if deal_id_idx < len(row) else ""
-        if not deal_id:
-            continue
-        
-        # Check status if column exists
-        if status_idx is not None and status_idx < len(row):
-            status = normalize(row[status_idx]).upper()
-            # Skip if already processed successfully
-            if status in ("READY", "POSTED"):
-                continue
-        
-        # Build row dict
-        row_dict = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
-        row_dict["_row_number"] = row_num
-        
-        needs_render.append(row_dict)
-        
-        if len(needs_render) >= max_rows:
-            break
-    
-    return needs_render
-
-
-# ============================================================
-# Rendering
-# ============================================================
-
-def render_graphic(deal: Dict[str, Any]) -> Optional[str]:
-    """
-    Call render endpoint to generate graphic.
-    
-    Returns:
-        graphic_url if successful, None if failed
-    """
-    if not RENDER_URL:
-        log("ERROR: RENDER_URL not set, skipping render")
-        return None
-    
-    deal_id = deal.get("deal_id", "")
-    origin = deal.get("origin_city", "")
-    dest = deal.get("destination_city", "")
-    price = deal.get("price_gbp", "")
-    
-    log(f"Rendering graphic for {deal_id}: {origin} → {dest} (£{price})")
-    
-    try:
-        # Prepare payload
-        payload = {
-            "deal_id": deal_id,
-            "origin_city": origin,
-            "destination_city": dest,
-            "destination_country": deal.get("destination_country", ""),
-            "price_gbp": price,
-            "outbound_date": deal.get("outbound_date", ""),
-            "return_date": deal.get("return_date", ""),
-            "ai_score": deal.get("ai_score", ""),
-            "ai_verdict": deal.get("ai_verdict", ""),
-        }
-        
-        # Call render endpoint
-        response = requests.post(
-            RENDER_URL,
-            json=payload,
-            timeout=RENDER_TIMEOUT
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            graphic_url = result.get("graphic_url") or result.get("url") or result.get("image_url")
-            
-            if graphic_url:
-                log(f"✅ Rendered: {graphic_url}")
-                return graphic_url
-            else:
-                log(f"WARNING: Render succeeded but no URL in response: {result}")
-                return None
-        else:
-            log(f"ERROR: Render failed with status {response.status_code}: {response.text[:200]}")
-            return None
-            
-    except requests.exceptions.Timeout:
-        log(f"ERROR: Render timeout after {RENDER_TIMEOUT}s")
-        return None
-    except Exception as e:
-        log(f"ERROR: Render exception: {e}")
-        return None
-
-
-def update_row(ws, hmap: Dict[str, int], row_num: int, updates: Dict[str, Any]):
-    """Update specific cells in a row"""
-    for col_name, value in updates.items():
-        if col_name in hmap:
-            col_idx = hmap[col_name]
-            ws.update_cell(row_num, col_idx, str(value))
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main():
-    log("🎨 RENDER WORKER STARTING (V3_beta_b)")
-    log(f"📋 Target tab: {RENDER_TAB}")
-    log(f"🖼️  Max renders per run: {MAX_RENDERS_PER_RUN}")
-    
-    # Connect to sheet
-    ws = get_worksheet()
-    
-    # Get headers
-    headers = ws.row_values(1)
-    if not headers:
-        die("ERROR: Empty header row")
-    
-    hmap = build_header_map(headers)
-    log(f"Found {len(hmap)} columns")
-    
-    # Check required columns
-    required = ["deal_id", "graphic_url"]
-    missing = [c for c in required if c not in hmap]
-    if missing:
-        die(f"ERROR: Missing required columns: {missing}")
-    
-    # Find rows needing render
-    rows = find_rows_needing_render(ws, hmap, MAX_RENDERS_PER_RUN)
-    
-    if not rows:
-        log("ℹ️  No rows need rendering")
-        log("💡 Looking for rows with:")
-        log("   - graphic_url = empty")
-        log("   - deal_id = present")
-        if STATUS_COL in hmap:
-            log(f"   - {STATUS_COL} = empty or NEEDS_IMAGE")
-        return
-    
-    log(f"Found {len(rows)} row(s) needing render")
-    
-    # Process each row
-    rendered = 0
-    failed = 0
-    
-    for row in rows:
-        row_num = row["_row_number"]
-        deal_id = row.get("deal_id", "")
-        
-        try:
-            # Set status to processing (if column exists)
-            if STATUS_COL in hmap:
-                update_row(ws, hmap, row_num, {STATUS_COL: STATUS_NEEDS_IMAGE})
-            
-            # Render graphic
-            graphic_url = render_graphic(row)
-            
-            if graphic_url:
-                # Success: update graphic_url and status
-                updates = {"graphic_url": graphic_url}
-                if STATUS_COL in hmap:
-                    updates[STATUS_COL] = STATUS_READY
-                
-                update_row(ws, hmap, row_num, updates)
-                rendered += 1
-                log(f"✅ Row {row_num} rendered successfully")
-            else:
-                # Failed: mark error
-                if STATUS_COL in hmap:
-                    update_row(ws, hmap, row_num, {STATUS_COL: STATUS_ERROR})
-                failed += 1
-                log(f"❌ Row {row_num} render failed")
-            
-            # Rate limit
-            time.sleep(1)
-            
-        except Exception as e:
-            log(f"ERROR processing row {row_num}: {e}")
-            if STATUS_COL in hmap:
-                try:
-                    update_row(ws, hmap, row_num, {STATUS_COL: STATUS_ERROR})
-                except:
-                    pass
-            failed += 1
-    
-    # Summary
-    log("="*60)
-    log("📊 RENDER WORKER SUMMARY")
-    log(f"✅ Rendered: {rendered}")
-    log(f"❌ Failed: {failed}")
-    log("="*60)
-    
-    if failed > 0 and rendered == 0:
-        log("⚠️  All renders failed - check RENDER_URL and endpoint")
-        sys.exit(1)
-    
-    log("✅ Render worker complete")
-
-
-if __name__ == "__main__":
-    main()
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Verify Worker Exists
+        run: |
+          if [ ! -f "workers/render_worker.py" ]; then
+            echo "❌ ERROR: workers/render_worker.py not found"
+            exit 1
+          fi
+          echo "✅ Found workers/render_worker.py"
+      
+      - name: Run Render Worker
+        env:
+          # Sheet identifiers
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
+          
+          # Target tab
+          RENDER_TAB: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}
+          DEALS_SHEET_NAME: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}
+          WORKSHEET_NAME: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}
+          
+          # Google credentials
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          
+          # Render endpoint
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          RENDER_TIMEOUT: "30"
+          
+          # Control
+          MAX_RENDERS_PER_RUN: ${{ github.event.inputs.max_renders || '5' }}
+          
+          # V3_beta_b: Status promotion
+          RENDER_INPUT_STATUS: SCORED
+          RENDER_OUTPUT_STATUS: READY_TO_POST
+          RENDER_STATUS_COLUMN: raw_status
+          
+          # Runtime
+          PYTHONUNBUFFERED: "1"
+        run: python workers/render_worker.py
+      
+      - name: Save Render Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
+      
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "## 🎨 Render Worker Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🆔 Run: #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ⏰ Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- 📋 Target: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**V3_beta_b Pipeline:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Reads: raw_status = SCORED" >> $GITHUB_STEP_SUMMARY
+          echo "- Renders: graphic_url" >> $GITHUB_STEP_SUMMARY
+          echo "- Promotes: raw_status = READY_TO_POST" >> $GITHUB_STEP_SUMMARY
+          echo "- Next: Telegram & Instagram publishers" >> $GITHUB_STEP_SUMMARY

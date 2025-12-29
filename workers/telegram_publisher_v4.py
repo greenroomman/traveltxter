@@ -152,9 +152,12 @@ def format_message_v4_vip(row: Dict[str, str]) -> str:
 
     ai_grade = safe(row.get("ai_grading", row.get("ai_grade", 
 ""))).upper()
-    reason = clean_whitespace(row.get("ai_notes", row.get("ai_reason", 
-row.get("notes", ""))) or "")
-    affiliate = (row.get("affiliate_url") or row.get("deal_url") or 
+reason = clean_whitespace(
+    row.get("ai_notes") or row.get("ai_reason") or row.get("notes") or ""
+)
+    
+affiliate = (row.get("affiliate_url") or 
+row.get("deal_url") or 
 row.get("booking_url") or "").strip()
 
     header = "✈️ <b>A-GRADE DEAL</b>" if ai_grade == "A" else "✈️ 

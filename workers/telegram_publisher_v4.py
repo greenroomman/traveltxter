@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TravelTxter — Telegram Publisher (V4 CLEAN)
-Rugged, authentic messaging for real adventurers.
+Clean, structured messaging with appropriate emojis.
 """
 
 import os
@@ -58,7 +58,7 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> Tuple[bool, str]:
         return False, str(e)
 
 def legacy_message(row: Dict[str, str]) -> str:
-    bits = ["✈ <b>Flight Deal</b>"]
+    bits = ["✈️ <b>Flight Deal</b>"]
     origin = safe(row.get('origin_city', ''))
     dest = safe(row.get('destination_city', ''))
     price = safe(row.get('price_gbp', ''))
@@ -68,7 +68,7 @@ def legacy_message(row: Dict[str, str]) -> str:
         bits.append(f"£{price}")
     link = row.get("affiliate_url", "").strip()
     if link:
-        bits.append(f"\n▸ <b>Book:</b> {safe(link)}")
+        bits.append(f"\n🔗 Book: {safe(link)}")
     return "\n".join(bits).strip()
 
 def vip_message(row: Dict[str, str]) -> str:
@@ -81,48 +81,47 @@ def vip_message(row: Dict[str, str]) -> str:
     out_date = safe(row.get('outbound_date', ''))
     ret_date = safe(row.get('return_date', ''))
     
-    # Rugged header - no diamonds, just A-GRADE marker
-    if ai_grade == "A":
-        header = "▲ <b>A-GRADE DEAL</b>"
+    lines = []
+    
+    # Price headline
+    if price and dest:
+        dest_display = f"{dest}, {country}" if country else dest
+        lines.append(f"<b>£{price} to {dest_display}</b>")
     else:
-        header = "✈ <b>DEAL ALERT</b>"
+        lines.append("<b>DEAL ALERT</b>")
     
-    lines = [header, ""]
+    lines.append("")
     
-    # Route - simple arrow
-    if origin and dest:
-        if country:
-            lines.append(f"→ {origin} to {dest}, {country}")
-        else:
-            lines.append(f"→ {origin} to {dest}")
+    # Structured info
+    if dest:
+        lines.append(f"TO: {dest.upper()}")
+    if origin:
+        lines.append(f"FROM: {origin}")
     
-    # Dates - calendar icon
-    if out_date and ret_date:
-        lines.append(f"▸ {out_date} → {ret_date}")
-    elif out_date or ret_date:
-        lines.append(f"▸ {out_date or ret_date}")
+    lines.append("")
     
-    # Price - bold, no fancy symbols
-    if price:
-        lines.append(f"▸ <b>£{price}</b>")
+    if out_date:
+        lines.append(f"OUT:  {out_date}")
+    if ret_date:
+        lines.append(f"BACK: {ret_date}")
     
-    # Why it's good - plain bullets
+    # Why it's good
     if reason:
         lines.append("")
-        lines.append("<b>Worth booking:</b>")
+        lines.append("<b>Why book this:</b>")
         parts = [p.strip() for p in re.split(r"[.;]", reason) if p.strip()]
         for p in parts[:3]:
             lines.append(f"• {safe(p)}")
     
     lines.append("")
-    lines.append("<i>Availability limited. Book soon.</i>")
+    lines.append("⏱ Availability limited")
     
     # Booking link
     link = row.get("affiliate_url", "").strip()
     if link:
-        lines.append(f"\n▸ <b>Book this deal:</b> {safe(link)}")
-    else:
-        lines.append("\n⚠ <i>Booking link unavailable</i>")
+        lines.append("")
+        lines.append("<b>Book now:</b>")
+        lines.append(safe(link))
     
     return "\n".join(lines).strip()
 
@@ -136,46 +135,57 @@ def free_message(row: Dict[str, str], stripe: str) -> str:
     
     lines = []
     
-    # Strong headline - no fire emoji, just bold price
+    # Price headline
     if price and dest:
         dest_display = f"{dest}, {country}" if country else dest
-        lines.append(f"<b>£{price} → {dest_display}</b>")
+        lines.append(f"<b>£{price} to {dest_display}</b>")
     else:
         lines.append("<b>DEAL SPOTTED</b>")
     
     lines.append("")
     
-    # Basic info - simple markers
+    # Structured info
+    if dest:
+        lines.append(f"TO: {dest.upper()}")
     if origin:
-        lines.append(f"▸ From {origin}")
-    if out_date and ret_date:
-        lines.append(f"▸ {out_date} → {ret_date}")
-    elif out_date or ret_date:
-        lines.append(f"▸ {out_date or ret_date}")
-    
-    lines.append("")
-    lines.append("─────────────────")
-    lines.append("")
-    
-    # Reality check - plain language
-    lines.append("<b>The reality:</b>")
-    lines.append("• Free members see deals 24hrs late")
-    lines.append("• By then, best prices are gone")
-    lines.append("• VIP members already booked this")
+        lines.append(f"FROM: {origin}")
     
     lines.append("")
     
-    # Value prop - straightforward
-    lines.append("<b>TravelTxter Nomad — £7.99/month</b>")
-    lines.append("▸ Deals 24 hours early")
-    lines.append("▸ Direct booking links")
-    lines.append("▸ Mistake fares when they drop")
-    lines.append("▸ Cancel anytime")
+    if out_date:
+        lines.append(f"OUT:  {out_date}")
+    if ret_date:
+        lines.append(f"BACK: {ret_date}")
+    
+    lines.append("")
+    
+    # Reality check
+    lines.append("<b>Heads up:</b>")
+    lines.append("• VIP members saw this 24 hours ago")
+    lines.append("• Availability is running low")
+    lines.append("• Best deals go to VIPs first")
+    
+    lines.append("")
+    
+    # CTA
+    lines.append("<b>Want instant access?</b>")
+    lines.append("Join TravelTxter Nomad")
+    lines.append("for £7.99 / month:")
+    
+    lines.append("")
+    
+    lines.append("* Deals 24 hours early")
+    lines.append("* Direct booking links")
+    lines.append("* Exclusive mistake fares")
+    lines.append("* Cancel anytime")
+    
+    lines.append("")
     
     if stripe:
-        lines.append(f"\n▸ <b>Upgrade:</b> {safe(stripe)}")
+        lines.append("<b>Upgrade now:</b>")
+        lines.append(safe(stripe))
     else:
-        lines.append("\n▸ traveltxter.com/vip")
+        lines.append("<b>Upgrade:</b> traveltxter.com/vip")
     
     return "\n".join(lines).strip()
 

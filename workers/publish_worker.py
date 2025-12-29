@@ -5,7 +5,7 @@ Posts approved deals to Facebook and Instagram on schedule.
 
 This worker:
 1. Connects to Google Sheets to fetch approved deals
-2. Filters deals ready for publishing
+2. Filters deals ready for publishing (workflow=READY_TO_POST)
 3. Posts to Facebook and Instagram
 4. Updates sheet with publish status
 5. Logs all activities for monitoring
@@ -141,8 +141,8 @@ def get_worksheet():
                 f"Make sure the service account has access to the sheet"
             )
         
-        # Get worksheet
-        tab_name = os.getenv('RAW_DEALS_TAB', 'Raw Deals')
+        # Get worksheet - Use RAW_DEALS by default
+        tab_name = os.getenv('RAW_DEALS_TAB', 'RAW_DEALS')
         try:
             ws = sh.worksheet(tab_name)
             logger.info(f"✅ Using worksheet: '{ws.title}' ({ws.row_count} rows)")
@@ -166,7 +166,7 @@ def get_worksheet():
 
 def get_column_index(headers: List[str], column_name: str) -> Optional[int]:
     """
-    Get the index of a column by name.
+    Get the index of a column by name (case-insensitive).
     
     Args:
         headers: List of column headers
@@ -176,8 +176,14 @@ def get_column_index(headers: List[str], column_name: str) -> Optional[int]:
         int: Column index (0-based), or None if not found
     """
     try:
+        # Try exact match first
         return headers.index(column_name)
     except ValueError:
+        # Try case-insensitive match
+        column_name_lower = column_name.lower()
+        for i, h in enumerate(headers):
+            if h.lower() == column_name_lower:
+                return i
         logger.warning(f"Column '{column_name}' not found in headers")
         return None
 
@@ -185,6 +191,7 @@ def get_column_index(headers: List[str], column_name: str) -> Optional[int]:
 def fetch_deals_to_publish(ws) -> List[Dict]:
     """
     Fetch deals from sheet that are ready to publish.
+    Looks for: workflow=READY_TO_POST
     
     Args:
         ws: gspread.Worksheet object
@@ -206,79 +213,83 @@ def fetch_deals_to_publish(ws) -> List[Dict]:
         rows = all_data[1:]
         
         logger.info(f"📊 Found {len(rows)} total rows in sheet")
-        logger.debug(f"Headers: {headers}")
+        logger.debug(f"Headers: {headers[:10]}...")  # Show first 10 headers
         
-        # Get column indices
-        idx_status = get_column_index(headers, 'publish_status')
-        idx_scheduled = get_column_index(headers, 'scheduled_date')
-        idx_approved = get_column_index(headers, 'approved')
+        # Get column indices (using your actual column names)
+        idx_workflow = get_column_index(headers, 'workflow')
+        idx_raw_status = get_column_index(headers, 'raw_status')
+        idx_ig_status = get_column_index(headers, 'ig_status')
         
-        # Required columns
+        # Required columns from your sheet
         required_cols = {
-            'origin': get_column_index(headers, 'origin'),
-            'destination': get_column_index(headers, 'destination'),
-            'price': get_column_index(headers, 'price'),
+            'deal_id': get_column_index(headers, 'deal_id'),
+            'origin_city': get_column_index(headers, 'origin_city'),
+            'destination_city': get_column_index(headers, 'destination_city'),
+            'price_gbp': get_column_index(headers, 'price_gbp'),
             'outbound_date': get_column_index(headers, 'outbound_date'),
-            'deal_url': get_column_index(headers, 'deal_url')
+            'graphic_url': get_column_index(headers, 'graphic_url'),
         }
         
         # Check if we have minimum required columns
         missing = [k for k, v in required_cols.items() if v is None]
         if missing:
-            logger.warning(f"⚠️ Missing required columns: {missing}")
+            logger.error(f"❌ Missing required columns: {missing}")
+            raise ValueError(f"Missing columns: {missing}")
+        
+        if idx_workflow is None:
+            logger.error("❌ Missing 'workflow' column - cannot determine which deals to publish")
+            raise ValueError("Missing 'workflow' column")
+        
+        logger.info(f"✅ Found all required columns")
         
         # Filter deals ready to publish
         deals_to_publish = []
-        today = datetime.now().date()
         
         for row_idx, row in enumerate(rows, start=2):  # start=2 because row 1 is headers
-            # Skip if not enough columns
-            if len(row) <= max(filter(None, [idx_status, idx_scheduled, idx_approved])):
+            # Pad row to match header length
+            if len(row) < len(headers):
+                row = row + [''] * (len(headers) - len(row))
+            
+            # Check workflow status
+            workflow = row[idx_workflow].strip().upper() if idx_workflow < len(row) else ''
+            
+            # Check if already posted to Instagram
+            ig_status = row[idx_ig_status].strip().upper() if idx_ig_status is not None and idx_ig_status < len(row) else ''
+            
+            # Skip if not READY_TO_POST or already posted
+            if workflow != 'READY_TO_POST':
                 continue
             
-            # Check approval status
-            if idx_approved is not None:
-                approved = row[idx_approved].lower().strip()
-                if approved not in ['yes', 'true', '1', 'approved']:
-                    continue
+            if ig_status in ['POSTED', 'PUBLISHED', 'DONE']:
+                logger.debug(f"Row {row_idx}: Already posted to Instagram, skipping")
+                continue
             
-            # Check publish status
-            if idx_status is not None:
-                status = row[idx_status].lower().strip()
-                if status in ['published', 'posted', 'done']:
-                    continue  # Already published
-            
-            # Check scheduled date
-            if idx_scheduled is not None and row[idx_scheduled]:
-                try:
-                    scheduled_date = datetime.strptime(
-                        row[idx_scheduled].strip(), 
-                        '%Y-%m-%d'
-                    ).date()
-                    
-                    if scheduled_date > today and not FORCE_RUN:
-                        continue  # Not scheduled yet
-                        
-                except (ValueError, IndexError):
-                    logger.warning(f"⚠️ Invalid date format in row {row_idx}: {row[idx_scheduled]}")
+            # Check if we have a graphic_url
+            graphic_url = row[required_cols['graphic_url']] if required_cols['graphic_url'] < len(row) else ''
+            if not graphic_url or not graphic_url.strip():
+                logger.warning(f"Row {row_idx}: Missing graphic_url, skipping")
+                continue
             
             # Build deal object
             deal = {
                 'row_number': row_idx,
-                'origin': row[required_cols['origin']] if required_cols['origin'] is not None else '',
-                'destination': row[required_cols['destination']] if required_cols['destination'] is not None else '',
-                'price': row[required_cols['price']] if required_cols['price'] is not None else '',
-                'outbound_date': row[required_cols['outbound_date']] if required_cols['outbound_date'] is not None else '',
-                'deal_url': row[required_cols['deal_url']] if required_cols['deal_url'] is not None else '',
+                'deal_id': row[required_cols['deal_id']],
+                'origin_city': row[required_cols['origin_city']],
+                'destination_city': row[required_cols['destination_city']],
+                'price_gbp': row[required_cols['price_gbp']],
+                'outbound_date': row[required_cols['outbound_date']],
+                'graphic_url': graphic_url.strip(),
             }
             
-            # Add optional fields
-            for col_name in headers:
-                idx = get_column_index(headers, col_name)
-                if idx is not None and idx < len(row) and col_name not in deal:
-                    deal[col_name] = row[idx]
+            # Add optional fields that might be useful
+            optional_fields = ['return_date', 'trip_length_days', 'stops', 'airline', 'ai_caption']
+            for field in optional_fields:
+                idx = get_column_index(headers, field)
+                if idx is not None and idx < len(row):
+                    deal[field] = row[idx]
             
             deals_to_publish.append(deal)
+            logger.info(f"✅ Row {row_idx}: {deal['origin_city']} → {deal['destination_city']} (£{deal['price_gbp']})")
         
         logger.info(f"✅ Found {len(deals_to_publish)} deals ready to publish")
         return deals_to_publish
@@ -293,99 +304,48 @@ def fetch_deals_to_publish(ws) -> List[Dict]:
 # SOCIAL MEDIA POSTING
 # ============================================================================
 
-def format_deal_message(deal: Dict) -> str:
+def format_instagram_caption(deal: Dict) -> str:
     """
-    Format a deal into a social media post message.
+    Format a deal into an Instagram caption.
     
     Args:
         deal: Deal dictionary
         
     Returns:
-        Formatted message string
+        Formatted caption string
     """
-    origin = deal.get('origin', 'UK')
-    destination = deal.get('destination', 'Unknown')
-    price = deal.get('price', '???')
+    origin = deal.get('origin_city', 'UK')
+    destination = deal.get('destination_city', 'Unknown')
+    price = deal.get('price_gbp', '???')
     date = deal.get('outbound_date', '')
     
     # Clean up price (ensure it starts with £)
     if not price.startswith('£'):
         price = f"£{price}"
     
-    # Format message
-    message = f"""✈️ {origin} → {destination}
+    # Use AI caption if available
+    ai_caption = deal.get('ai_caption', '')
+    if ai_caption and ai_caption.strip():
+        caption = ai_caption.strip()
+    else:
+        # Default caption
+        caption = f"""✈️ {origin} → {destination}
 
 💰 From just {price}
 📅 {date if date else 'Flexible dates'}
 
 🔥 Limited availability - book fast!
 
-#TravelTxter #CheapFlights #Backpacking #TravelDeals
-"""
-    
-    return message.strip()
+Want ALL the best deals? Join our Telegram! Link in bio 👆
 
-
-def post_to_facebook(deal: Dict) -> Tuple[bool, str]:
-    """
-    Post a deal to Facebook.
+#TravelTxter #CheapFlights #Backpacking #TravelDeals #BudgetTravel"""
     
-    Args:
-        deal: Deal dictionary
-        
-    Returns:
-        Tuple of (success: bool, post_id or error message: str)
-    """
-    if DRY_RUN:
-        logger.info("🧪 [DRY RUN] Would post to Facebook")
-        return True, "dry_run_fb_123"
-    
-    try:
-        access_token = os.getenv('FB_ACCESS_TOKEN')
-        if not access_token:
-            raise ValueError("FB_ACCESS_TOKEN not set")
-        
-        # Format message
-        message = format_deal_message(deal)
-        deal_url = deal.get('deal_url', '')
-        
-        # Facebook Graph API endpoint
-        # Note: You'll need your Page ID - get it from Facebook Business Settings
-        page_id = os.getenv('FB_PAGE_ID', 'me')  # 'me' for user, or specific page ID
-        endpoint = f"https://graph.facebook.com/v18.0/{page_id}/feed"
-        
-        # Post data
-        post_data = {
-            'message': message,
-            'access_token': access_token
-        }
-        
-        # Add link if available
-        if deal_url:
-            post_data['link'] = deal_url
-        
-        # Make request
-        logger.info(f"📘 Posting to Facebook: {deal['destination']}")
-        response = requests.post(endpoint, data=post_data, timeout=30)
-        
-        if response.status_code == 200:
-            result = response.json()
-            post_id = result.get('id', 'unknown')
-            logger.info(f"✅ Posted to Facebook: {post_id}")
-            return True, post_id
-        else:
-            error_msg = response.json().get('error', {}).get('message', 'Unknown error')
-            logger.error(f"❌ Facebook API error: {error_msg}")
-            return False, f"FB Error: {error_msg}"
-            
-    except Exception as e:
-        logger.error(f"❌ Failed to post to Facebook: {e}")
-        return False, str(e)
+    return caption.strip()
 
 
 def post_to_instagram(deal: Dict) -> Tuple[bool, str]:
     """
-    Post a deal to Instagram.
+    Post a deal to Instagram using the Graph API.
     
     Args:
         deal: Deal dictionary
@@ -395,92 +355,134 @@ def post_to_instagram(deal: Dict) -> Tuple[bool, str]:
     """
     if DRY_RUN:
         logger.info("🧪 [DRY RUN] Would post to Instagram")
-        return True, "dry_run_ig_456"
+        return True, "dry_run_ig_123"
     
     try:
-        access_token = os.getenv('FB_ACCESS_TOKEN')  # Same token for IG
+        access_token = os.getenv('FB_ACCESS_TOKEN')
         ig_user_id = os.getenv('IG_USER_ID')
         
         if not access_token or not ig_user_id:
             raise ValueError("FB_ACCESS_TOKEN and IG_USER_ID required")
         
-        # Format message (Instagram has different character limits)
-        message = format_deal_message(deal)
+        # Get image URL
+        image_url = deal.get('graphic_url', '')
+        if not image_url:
+            raise ValueError("No graphic_url found for deal")
         
-        # For Instagram, you typically need to:
-        # 1. Upload image to Instagram
-        # 2. Create container
-        # 3. Publish container
+        # Format caption
+        caption = format_instagram_caption(deal)
         
-        # Note: Instagram API requires images. This is a simplified version.
-        # You'll need to generate/provide deal images
+        logger.info(f"📸 Posting to Instagram: {deal['destination_city']}")
+        logger.info(f"   Image URL: {image_url}")
         
-        logger.info(f"📸 Would post to Instagram: {deal['destination']}")
-        logger.warning("⚠️ Instagram posting requires image - implement image generation")
+        # Step 1: Create container
+        graph_version = os.getenv('GRAPH_VERSION', 'v19.0')
+        container_endpoint = f"https://graph.facebook.com/{graph_version}/{ig_user_id}/media"
         
-        # Placeholder - implement actual Instagram posting
-        # See: https://developers.facebook.com/docs/instagram-api/guides/content-publishing
+        container_data = {
+            'image_url': image_url,
+            'caption': caption,
+            'access_token': access_token
+        }
         
-        return True, "ig_placeholder"
+        logger.info("   Creating Instagram media container...")
+        container_response = requests.post(container_endpoint, data=container_data, timeout=30)
         
+        if container_response.status_code != 200:
+            error_data = container_response.json()
+            error_msg = error_data.get('error', {}).get('message', 'Unknown error')
+            logger.error(f"❌ Container creation failed: {error_msg}")
+            return False, f"Container Error: {error_msg}"
+        
+        container_id = container_response.json().get('id')
+        logger.info(f"   ✅ Container created: {container_id}")
+        
+        # Step 2: Publish container
+        publish_endpoint = f"https://graph.facebook.com/{graph_version}/{ig_user_id}/media_publish"
+        
+        publish_data = {
+            'creation_id': container_id,
+            'access_token': access_token
+        }
+        
+        logger.info("   Publishing container...")
+        publish_response = requests.post(publish_endpoint, data=publish_data, timeout=30)
+        
+        if publish_response.status_code == 200:
+            result = publish_response.json()
+            post_id = result.get('id', 'unknown')
+            logger.info(f"✅ Posted to Instagram: {post_id}")
+            return True, post_id
+        else:
+            error_data = publish_response.json()
+            error_msg = error_data.get('error', {}).get('message', 'Unknown error')
+            logger.error(f"❌ Publishing failed: {error_msg}")
+            return False, f"Publish Error: {error_msg}"
+            
     except Exception as e:
         logger.error(f"❌ Failed to post to Instagram: {e}")
+        logger.debug(traceback.format_exc())
         return False, str(e)
 
 
-def update_publish_status(ws, row_number: int, status: str, post_ids: Dict[str, str] = None):
+def update_publish_status(ws, row_number: int, status: str, media_id: str = None):
     """
     Update the publish status in the sheet.
     
     Args:
         ws: Worksheet object
         row_number: Row number to update (1-based)
-        status: New status ('published', 'failed', etc.)
-        post_ids: Dictionary of platform -> post_id
+        status: New status ('POSTED', 'FAILED', etc.)
+        media_id: Instagram media ID
     """
     if DRY_RUN:
-        logger.info(f"🧪 [DRY RUN] Would update row {row_number} status to: {status}")
+        logger.info(f"🧪 [DRY RUN] Would update row {row_number} ig_status to: {status}")
         return
     
     try:
-        # Get headers to find status column
+        # Get headers to find columns
         headers = ws.row_values(1)
         
-        # Find or create publish_status column
-        if 'publish_status' in headers:
-            status_col = headers.index('publish_status') + 1  # 1-based
-        else:
-            # Add column if it doesn't exist
-            logger.info("Adding 'publish_status' column to sheet")
-            ws.update_cell(1, len(headers) + 1, 'publish_status')
-            status_col = len(headers) + 1
+        # Find ig_status column
+        ig_status_col = None
+        for i, h in enumerate(headers, start=1):
+            if h.lower() == 'ig_status':
+                ig_status_col = i
+                break
+        
+        if not ig_status_col:
+            logger.warning("ig_status column not found, cannot update status")
+            return
         
         # Update status
-        ws.update_cell(row_number, status_col, status)
+        ws.update_cell(row_number, ig_status_col, status)
+        logger.info(f"   Updated ig_status to: {status}")
+        
+        # Update media ID if provided
+        if media_id:
+            ig_media_col = None
+            for i, h in enumerate(headers, start=1):
+                if h.lower() == 'ig_media_id':
+                    ig_media_col = i
+                    break
+            
+            if ig_media_col:
+                ws.update_cell(row_number, ig_media_col, media_id)
+                logger.info(f"   Updated ig_media_id: {media_id}")
         
         # Update timestamp
-        if 'published_at' in headers:
-            ts_col = headers.index('published_at') + 1
-        else:
-            ws.update_cell(1, len(headers) + 2, 'published_at')
-            ts_col = len(headers) + 2
+        ig_timestamp_col = None
+        for i, h in enumerate(headers, start=1):
+            if h.lower() == 'ig_published_timestamp':
+                ig_timestamp_col = i
+                break
         
-        ws.update_cell(row_number, ts_col, datetime.now().isoformat())
-        
-        # Add post IDs if provided
-        if post_ids:
-            if 'post_ids' in headers:
-                ids_col = headers.index('post_ids') + 1
-            else:
-                ws.update_cell(1, len(headers) + 3, 'post_ids')
-                ids_col = len(headers) + 3
-            
-            ws.update_cell(row_number, ids_col, json.dumps(post_ids))
-        
-        logger.info(f"✅ Updated row {row_number}: {status}")
+        if ig_timestamp_col:
+            ws.update_cell(row_number, ig_timestamp_col, datetime.now().isoformat())
         
     except Exception as e:
         logger.error(f"❌ Failed to update status for row {row_number}: {e}")
+        logger.debug(traceback.format_exc())
 
 
 # ============================================================================
@@ -489,7 +491,7 @@ def update_publish_status(ws, row_number: int, status: str, post_ids: Dict[str, 
 
 def publish_deals(deals: List[Dict], ws) -> Dict[str, int]:
     """
-    Publish deals to social media and update sheet.
+    Publish deals to Instagram and update sheet.
     
     Args:
         deals: List of deals to publish
@@ -508,45 +510,30 @@ def publish_deals(deals: List[Dict], ws) -> Dict[str, int]:
     for deal in deals:
         try:
             logger.info(f"\n{'='*60}")
-            logger.info(f"Publishing: {deal['origin']} → {deal['destination']} (£{deal['price']})")
+            logger.info(f"Publishing: {deal['origin_city']} → {deal['destination_city']} (£{deal['price_gbp']})")
             logger.info(f"Row: {deal['row_number']}")
-            
-            post_ids = {}
-            all_success = True
-            
-            # Post to Facebook
-            fb_success, fb_result = post_to_facebook(deal)
-            if fb_success:
-                post_ids['facebook'] = fb_result
-                logger.info(f"✅ Facebook: {fb_result}")
-            else:
-                all_success = False
-                logger.error(f"❌ Facebook failed: {fb_result}")
+            logger.info(f"Deal ID: {deal['deal_id']}")
             
             # Post to Instagram
             ig_success, ig_result = post_to_instagram(deal)
-            if ig_success:
-                post_ids['instagram'] = ig_result
-                logger.info(f"✅ Instagram: {ig_result}")
-            else:
-                # Instagram failure is non-critical for now
-                logger.warning(f"⚠️ Instagram skipped: {ig_result}")
             
-            # Update sheet status
-            if all_success:
-                update_publish_status(ws, deal['row_number'], 'published', post_ids)
+            if ig_success:
+                logger.info(f"✅ Instagram: {ig_result}")
+                update_publish_status(ws, deal['row_number'], 'POSTED', ig_result)
                 stats['published'] += 1
                 stats['post_ids'].append({
-                    'deal': f"{deal['origin']}-{deal['destination']}",
-                    'ids': post_ids
+                    'deal_id': deal['deal_id'],
+                    'destination': deal['destination_city'],
+                    'instagram_id': ig_result
                 })
             else:
-                update_publish_status(ws, deal['row_number'], 'failed')
+                logger.error(f"❌ Instagram failed: {ig_result}")
+                update_publish_status(ws, deal['row_number'], 'FAILED')
                 stats['failed'] += 1
             
-            # Rate limiting - be nice to APIs
+            # Rate limiting - be nice to Instagram API
             import time
-            time.sleep(2)  # 2 second delay between posts
+            time.sleep(3)  # 3 second delay between posts
             
         except Exception as e:
             logger.error(f"❌ Error publishing deal: {e}")
@@ -554,7 +541,7 @@ def publish_deals(deals: List[Dict], ws) -> Dict[str, int]:
             stats['failed'] += 1
             
             try:
-                update_publish_status(ws, deal['row_number'], 'error')
+                update_publish_status(ws, deal['row_number'], 'ERROR')
             except:
                 pass
     
@@ -585,7 +572,7 @@ def save_stats(stats: Dict):
 def main():
     """Main worker execution."""
     logger.info("\n" + "="*60)
-    logger.info("🚀 TravelTxter V3.2(A) Publish Worker Starting")
+    logger.info("🚀 TravelTxter Instagram Publisher Starting")
     logger.info("="*60)
     logger.info(f"⏰ Timestamp: {datetime.now().isoformat()}")
     logger.info(f"🆔 Worker ID: {WORKER_ID}")
@@ -603,7 +590,7 @@ def main():
     try:
         # Validate environment
         logger.info("🔍 Validating environment...")
-        required_vars = ['SHEET_ID', 'GCP_SA_JSON', 'FB_ACCESS_TOKEN']
+        required_vars = ['SHEET_ID', 'GCP_SA_JSON', 'FB_ACCESS_TOKEN', 'IG_USER_ID']
         missing = [v for v in required_vars if not os.getenv(v)]
         
         if missing:
@@ -625,7 +612,7 @@ def main():
             stats['skipped'] = 0
         else:
             # Publish deals
-            logger.info(f"\n📤 Publishing {len(deals)} deal(s)...")
+            logger.info(f"\n📤 Publishing {len(deals)} deal(s) to Instagram...")
             stats = publish_deals(deals, ws)
         
         # Log summary

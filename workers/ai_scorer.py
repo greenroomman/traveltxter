@@ -45,7 +45,8 @@ def score_deal(rec: Dict[str, Any]) -> Dict[str, Any]:
     """Heuristic scoring engine"""
     def safe_val(key, default=0):
         try:
-            val = str(rec.get(key, "")).replace("£", "").replace(",", "").strip()
+            val = str(rec.get(key, "")).replace("£", "").replace(",", 
+"").strip()
             return float(val) if val else default
         except:
             return default
@@ -98,9 +99,11 @@ def main():
     
     # 1. Setup Connection
     sheet_id = get_env("SHEET_ID")
-    ws_name = get_env("WORKSHEET_NAME", required=False, default="RAW_DEALS")
+    ws_name = get_env("WORKSHEET_NAME", required=False, 
+default="RAW_DEALS")
     sa_json = json.loads(get_env("GCP_SA_JSON"))
-    max_rows = int(get_env("MAX_ROWS_PER_RUN", required=False, default="10"))
+    max_rows = int(get_env("MAX_ROWS_PER_RUN", required=False, 
+default="10"))
 
     creds = Credentials.from_service_account_info(
         sa_json, 

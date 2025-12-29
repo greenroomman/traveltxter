@@ -68,8 +68,14 @@ RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", os.getenv("DEALS_SHEET_NAME",
 vars from workflows
 RAW_STATUS_COLUMN = os.getenv("RAW_STATUS_COLUMN", 
 os.getenv("TELEGRAM_STATUS_COLUMN", "raw_status")).strip()
+
 TG_STATUS_COLUMN = os.getenv("TG_STATUS_COLUMN", 
 os.getenv("TELEGRAM_STATUS_WRITEBACK_COLUMN", "tg_status")).strip()
+TG_TEMPLATE_VERSION = os.getenv("TG_TEMPLATE_VERSION", 
+os.getenv("TELEGRAM_TEMPLATE_VERSION", "legacy")).strip().lower()
+TG_MODE = os.getenv("TG_MODE", os.getenv("TELEGRAM_MODE", 
+"free")).strip().lower()
+STRIPE_LINK = os.getenv("STRIPE_LINK", "").strip()
 
 TG_REQUIRED_STATUS = os.getenv("TG_REQUIRED_STATUS", 
 os.getenv("TELEGRAM_REQUIRED_STATUS", "POSTED_INSTAGRAM")).strip().upper()

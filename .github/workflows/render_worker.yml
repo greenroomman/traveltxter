@@ -4,19 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       target_tab:
-        description: 'Which tab to render for'
+        description: "Which tab to render for"
         required: false
-        default: 'RAW_DEALS'
+        default: "RAW_DEALS"
         type: choice
         options:
           - RAW_DEALS
           - INSTAGRAM_FEED
       max_renders:
-        description: 'Max renders per run'
+        description: "Max renders per run"
         required: false
-        default: '5'
+        default: "5"
+
   schedule:
-    - cron: "0 14 * * *"  # 14:00 UTC (after scorer, before publishers)
+    # Runs after AI Scheduler and before Telegram publishing
+    - cron: "15 07 * * *"   # 07:15 UTC
+    - cron: "15 16 * * *"   # 16:15 UTC
 
 concurrency:
   group: render-worker
@@ -26,61 +29,60 @@ jobs:
   render:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-      
+
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
-      - name: Verify Worker Exists
+
+      - name: Verify Render Worker Exists
         run: |
           if [ ! -f "workers/render_worker.py" ]; then
             echo "❌ ERROR: workers/render_worker.py not found"
             exit 1
           fi
           echo "✅ Found workers/render_worker.py"
-      
+
       - name: Run Render Worker
         env:
-          # Sheet identifiers
+          # Spreadsheet
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
-          
-          # Target tab
-          RENDER_TAB: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}
-          DEALS_SHEET_NAME: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}
           WORKSHEET_NAME: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}
-          
+          DEALS_SHEET_NAME: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}
+          RENDER_TAB: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}
+
           # Google credentials
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          
-          # Render endpoint
+
+          # Render service
           RENDER_URL: ${{ secrets.RENDER_URL }}
           RENDER_TIMEOUT: "30"
-          
+
           # Control
           MAX_RENDERS_PER_RUN: ${{ github.event.inputs.max_renders || '5' }}
-          
-          # V3_beta_b: Status promotion
+
+          # V3_beta_b lifecycle (LOCKED)
+          RENDER_STATUS_COLUMN: raw_status
           RENDER_INPUT_STATUS: SCORED
           RENDER_OUTPUT_STATUS: READY_TO_POST
-          RENDER_STATUS_COLUMN: raw_status
-          
+
           # Runtime
           PYTHONUNBUFFERED: "1"
+
         run: python workers/render_worker.py
-      
-      - name: Save Render Logs
+
+      - name: Upload Render Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -88,18 +90,19 @@ jobs:
           path: logs/
           retention-days: 7
           if-no-files-found: warn
-      
-      - name: Generate Summary
+
+      - name: Render Summary
         if: always()
         run: |
           echo "## 🎨 Render Worker Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- 🆔 Run: #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
           echo "- ⏰ Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "- 📋 Target: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 📋 Target tab: ${{ github.event.inputs.target_tab || 'RAW_DEALS' }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**V3_beta_b Pipeline:**" >> $GITHUB_STEP_SUMMARY
           echo "- Reads: raw_status = SCORED" >> $GITHUB_STEP_SUMMARY
-          echo "- Renders: graphic_url" >> $GITHUB_STEP_SUMMARY
+          echo "- Action: Render HTML → PNG" >> $GITHUB_STEP_SUMMARY
+          echo "- Writes: graphic_url" >> $GITHUB_STEP_SUMMARY
           echo "- Promotes: raw_status = READY_TO_POST" >> $GITHUB_STEP_SUMMARY
-          echo "- Next: Telegram & Instagram publishers" >> $GITHUB_STEP_SUMMARY
+          echo "- Next: Telegram / Instagram publishers" >> $GITHUB_STEP_SUMMARY

@@ -317,6 +317,7 @@ def main():
 
     # Lock row
     current_workflow = get_cell(ws, row, workflow_col_index)
+    log(f"DEBUG: Row {row} workflow cell raw value: '{current_workflow}' | normalized: '{normalize(current_workflow)}' | len={len(current_workflow)}")
     if current_workflow not in ("", "RENDER_AGAIN", "NEEDS_IMAGE"):
         log(f"Guard skip row {row} (workflow changed to {current_workflow})")
         return

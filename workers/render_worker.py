@@ -5,17 +5,18 @@ V3.2 — Render Worker (Stage B) — Debug/Robust Edition
 Trigger condition (first match):
 - raw_status / RAW_STATUS == "SCORED"
 - ai_verdict / AI_VERDICT == "GOOD"
-- status in {"", "RENDER_AGAIN", "NEEDS_IMAGE"}
+- workflow in {"", "RENDER_AGAIN", "NEEDS_IMAGE"}
 
 Actions:
-1) Lock row by setting status = NEEDS_IMAGE (guarded)
+1) Lock row by setting workflow = NEEDS_IMAGE (guarded)
 2) POST payload to RENDER_URL
-3) On success: write graphic_url, rendered_timestamp; set status=READY_TO_POST
-4) On failure: write render_error + status codes; set status=RENDER_AGAIN
+3) On success: write graphic_url, rendered_timestamp; set workflow=READY_TO_POST
+4) On failure: write render_error + status codes; set workflow=RENDER_AGAIN
 
 Important:
 - NEVER edits header row (works with protected headers)
 - Uses header mapping (never column letters)
+- Uses 'workflow' column instead of 'status' to avoid confusion with raw_status
 """
 
 import os
@@ -124,7 +125,7 @@ def a1(row: int, col: int) -> str:
 # ============================================================
 
 REQUIRED_COLS = [
-    "status",
+    "workflow",
     "graphic_url",
     "rendered_timestamp",
     "render_error",
@@ -202,10 +203,10 @@ def find_first_render_candidate(ws) -> Optional[Dict[str, Any]]:
 
     hmap = build_header_map(headers)
 
-    # FIXED: Check for raw_status column (case-insensitive)
+    # Check for required columns (case-insensitive)
     raw_status_col = None
     ai_verdict_col = None
-    status_col = None
+    workflow_col = None
     
     for header, idx in hmap.items():
         header_upper = header.upper()
@@ -213,24 +214,25 @@ def find_first_render_candidate(ws) -> Optional[Dict[str, Any]]:
             raw_status_col = header
         elif header_upper == "AI_VERDICT":
             ai_verdict_col = header
-        elif header_upper == "STATUS":
-            status_col = header
+        elif header_upper == "WORKFLOW":
+            workflow_col = header
 
     if not raw_status_col:
         log(f"Available headers: {list(hmap.keys())}")
         die("ERROR: Missing 'raw_status' column in sheet.")
     if not ai_verdict_col:
         die("ERROR: Missing 'ai_verdict' column in sheet.")
-    if not status_col:
-        die("ERROR: Missing 'status' column in sheet.")
+    if not workflow_col:
+        log(f"Available headers: {list(hmap.keys())}")
+        die("ERROR: Missing 'workflow' column in sheet. Please add a 'workflow' column to your sheet headers.")
 
-    log(f"Using columns: raw_status='{raw_status_col}', ai_verdict='{ai_verdict_col}', status='{status_col}'")
+    log(f"Using columns: raw_status='{raw_status_col}', ai_verdict='{ai_verdict_col}', workflow='{workflow_col}'")
 
     raw_status_idx = hmap[raw_status_col] - 1
     ai_verdict_idx = hmap[ai_verdict_col] - 1
-    status_idx = hmap[status_col] - 1
+    workflow_idx = hmap[workflow_col] - 1
 
-    allowed_statuses = {"", "RENDER_AGAIN", "NEEDS_IMAGE"}
+    allowed_workflows = {"", "RENDER_AGAIN", "NEEDS_IMAGE"}
 
     for i, row in enumerate(rows, start=2):
         if len(row) < len(headers):
@@ -238,14 +240,14 @@ def find_first_render_candidate(ws) -> Optional[Dict[str, Any]]:
 
         raw_status = normalize(row[raw_status_idx])
         ai_verdict = normalize(row[ai_verdict_idx])
-        status = normalize(row[status_idx])
+        workflow = normalize(row[workflow_idx])
 
-        if raw_status == "SCORED" and ai_verdict == "GOOD" and status in allowed_statuses:
+        if raw_status == "SCORED" and ai_verdict == "GOOD" and workflow in allowed_workflows:
             rec = record_from_row(headers, row)
             return {
                 "row_number": i,
                 "record": rec,
-                "status_col": status_col,
+                "workflow_col": workflow_col,
                 "headers": headers,
             }
 
@@ -302,8 +304,8 @@ def main():
 
     require_columns(hmap, REQUIRED_COLS)
 
-    status_col_name = hit["status_col"]
-    status_col_index = hmap[status_col_name]
+    workflow_col_name = hit["workflow_col"]
+    workflow_col_index = hmap[workflow_col_name]
 
     deal_id = pick(rec, "deal_id", "DEAL_ID")
     origin = pick(rec, "origin_city", "ORIGIN_CITY")
@@ -314,9 +316,9 @@ def main():
     log(f"Found render candidate row #{row} | deal_id={deal_id} | {origin}->{dest} | £{price} | outbound={out_date}")
 
     # Lock row
-    current_status = get_cell(ws, row, status_col_index)
-    if current_status not in ("", "RENDER_AGAIN", "NEEDS_IMAGE"):
-        log(f"Guard skip row {row} (status changed to {current_status})")
+    current_workflow = get_cell(ws, row, workflow_col_index)
+    if current_workflow not in ("", "RENDER_AGAIN", "NEEDS_IMAGE"):
+        log(f"Guard skip row {row} (workflow changed to {current_workflow})")
         return
 
     batch_update_row(
@@ -324,13 +326,13 @@ def main():
         row,
         hmap,
         {
-            "status": "NEEDS_IMAGE",
+            "workflow": "NEEDS_IMAGE",
             "render_error": "",
             "render_http_status": "",
             "render_response_snippet": "",
         },
     )
-    log(f"Row #{row} locked: status=NEEDS_IMAGE")
+    log(f"Row #{row} locked: workflow=NEEDS_IMAGE")
 
     # Payload - keep small & predictable
     payload = {
@@ -372,10 +374,10 @@ def main():
                 "render_error": "",
                 "render_http_status": "200",
                 "render_response_snippet": "",
-                "status": "READY_TO_POST",
+                "workflow": "READY_TO_POST",
             },
         )
-        log(f"Render OK: row #{row} status=READY_TO_POST | graphic_url set")
+        log(f"Render OK: row #{row} workflow=READY_TO_POST | graphic_url set")
         return
 
     except HTTPError as e:
@@ -395,7 +397,7 @@ def main():
                 "render_error": "HTTPError " + status,
                 "render_http_status": status,
                 "render_response_snippet": snippet,
-                "status": "RENDER_AGAIN",
+                "workflow": "RENDER_AGAIN",
             },
         )
         die(f"Render FAILED for row #{row}: HTTPError {status}: {snippet}", code=2)
@@ -411,7 +413,7 @@ def main():
                 "render_error": "URLError: " + msg[:200],
                 "render_http_status": "",
                 "render_response_snippet": "",
-                "status": "RENDER_AGAIN",
+                "workflow": "RENDER_AGAIN",
             },
         )
         die(f"Render FAILED for row #{row}: URLError: {msg}", code=2)
@@ -427,7 +429,7 @@ def main():
                 "render_error": "ERROR: " + msg[:200],
                 "render_http_status": "",
                 "render_response_snippet": "",
-                "status": "RENDER_AGAIN",
+                "workflow": "RENDER_AGAIN",
             },
         )
         die(f"Render FAILED for row #{row}: {msg}", code=2)

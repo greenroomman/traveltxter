@@ -1,37 +1,153 @@
-name: Publish Telegram Deal
+#!/usr/bin/env python3
+"""
+V3_beta_b — Telegram Publisher
+Reads from TELEGRAM_FEED tab (not RAW_DEALS)
 
-on:
-  schedule:
-    - cron: "30 7 * * *"
-    - cron: "30 16 * * *"
-  workflow_dispatch:
+This ensures:
+- Telegram gets ALL good deals (product)
+- Separation from Instagram (marketing)
+- Clean status management per platform
+"""
 
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+import os
+import sys
+import requests
+
+# Add project root to path
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lib.sheets import get_ready_deal, mark_posted, mark_error
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHANNEL = os.getenv("TELEGRAM_CHANNEL", "").strip()
+
+# V3_beta_b: Control which deals to post
+MIN_AI_SCORE = os.getenv("TELEGRAM_MIN_AI_SCORE", "").strip()  # e.g. "70"
+ALLOW_VERDICTS = os.getenv("TELEGRAM_ALLOW_VERDICTS", "GOOD").strip()  # "GOOD" or "GOOD,AVERAGE"
+
+# V3_beta_b: Specify tab name
+TELEGRAM_TAB = os.getenv("TELEGRAM_FEED_TAB", "TELEGRAM_FEED").strip()
+
+
+def _send_telegram_message(text: str) -> dict:
+    """Send message to Telegram channel via Bot API"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHANNEL,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    r = requests.post(url, json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def _format_message(deal: dict) -> str:
+    """
+    Format deal for Telegram.
+    V3_beta_b: FULL details (not a teaser like Instagram)
+    """
+    origin = (deal.get("origin_city") or "").strip()
+    dest = (deal.get("destination_city") or "").strip()
+    country = (deal.get("destination_country") or "").strip()
+    price = (deal.get("price_gbp") or "").strip()
+    out_d = (deal.get("outbound_date") or "").strip()
+    ret_d = (deal.get("return_date") or "").strip()
+    days = (deal.get("trip_length_days") or "").strip()
+    bag = (deal.get("baggage_included") or "").strip()
+    stops = (deal.get("stops") or "").strip()
+    airline = (deal.get("airline") or "").strip()
+    verdict = (deal.get("ai_verdict") or "").strip()
     
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-      
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: 'pip'
-      
-      - name: Install Dependencies
-        run: pip install -r requirements.txt
-      
-      - name: Publish Deal to Telegram
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
-          DEALS_SHEET_NAME: RAW_DEALS
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          TELEGRAM_ALLOW_VERDICTS: "GOOD"
-          TELEGRAM_MIN_AI_SCORE: "70"
-        run: python workers/telegram_publisher.py
+    # V3_beta_b: Use full_caption if available (from TELEGRAM_FEED)
+    caption = (deal.get("full_caption") or "").strip()
+    
+    # V3_beta_b: Include booking link if available
+    booking_link = (deal.get("booking_link") or "").strip()
+
+    lines = [
+        f"✈️ <b>{origin} → {dest}</b> ({country})",
+        f"💷 <b>From £{price}</b>",
+        f"📅 {out_d} → {ret_d} ({days} days)",
+        f"🧳 Bag: {bag} | Stops: {stops}",
+        f"🏷 Airline: {airline}",
+        "",
+        f"🔥 <b>{verdict or 'Deal'}</b>",
+    ]
+
+    # Add custom caption if provided
+    if caption:
+        lines += ["", caption]
+    
+    # Add booking link if provided
+    if booking_link:
+        lines += ["", f"🔗 <a href='{booking_link}'>Book now</a>"]
+
+    lines += ["", "#traveltxter #cheapflights"]
+    return "\n".join(lines)
+
+
+def main():
+    """Main execution"""
+    print("🚀 TravelTxter Telegram Publisher (V3_beta_b)")
+    print(f"📋 Reading from: {TELEGRAM_TAB}")
+    
+    # Validate environment
+    if not BOT_TOKEN:
+        raise RuntimeError("Missing env var: TELEGRAM_BOT_TOKEN")
+    if not CHANNEL:
+        raise RuntimeError("Missing env var: TELEGRAM_CHANNEL (example: @traveltxter)")
+
+    # Parse filter settings
+    allow_verdicts = tuple([v.strip().upper() for v in ALLOW_VERDICTS.split(",") if v.strip()])
+    min_ai_score = None
+    if MIN_AI_SCORE:
+        min_ai_score = float(MIN_AI_SCORE)
+
+    print(f"🎯 Filters: verdicts={allow_verdicts}, min_score={min_ai_score or 'none'}")
+
+    # Get next deal ready to post
+    # V3_beta_b: This will read from TELEGRAM_FEED if DEALS_SHEET_NAME is set
+    deal = get_ready_deal(
+        worker_id="telegram_publisher",
+        allow_verdicts=allow_verdicts,
+        min_ai_score=min_ai_score,
+        max_lock_age_minutes=30,
+    )
+
+    if not deal:
+        print("ℹ️ No deals ready to post")
+        print("💡 Check TELEGRAM_FEED tab for rows with telegram_status = (empty)")
+        return
+
+    deal_id = (deal.get("deal_id") or "").strip()
+    destination = (deal.get("destination_city") or "").strip()
+    
+    print(f"📤 Found deal: {deal_id} ({destination})")
+
+    try:
+        # Format and send
+        msg = _format_message(deal)
+        print(f"📝 Message length: {len(msg)} chars")
+        
+        result = _send_telegram_message(msg)
+        
+        # Mark as posted
+        mark_posted(deal_id)
+        
+        print(f"✅ Posted to Telegram: {deal_id}")
+        print(f"📊 Telegram response: {result.get('ok', False)}")
+        
+    except Exception as e:
+        # Mark error
+        mark_error(deal_id, str(e))
+        print(f"❌ ERROR posting {deal_id}: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()

@@ -110,7 +110,7 @@ def clean_whitespace(s: str) -> str:
 
 def format_message_legacy(row: Dict[str, str]) -> str:
     # A simple safe legacy message (keeps system functional even if no V4 
-fields exist
+# fields exist
     origin = safe(row.get("origin_city", row.get("origin", "")))
     dest = safe(row.get("destination_city", row.get("destination", "")))
     price = safe(row.get("price_gbp", row.get("price", "")))

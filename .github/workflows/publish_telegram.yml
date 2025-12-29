@@ -2,8 +2,8 @@ name: Publish Telegram Deal (V3_beta_b)
 
 on:
   schedule:
-    - cron: "30 7 * * *"   # 07:30 UTC
-    - cron: "30 16 * * *"  # 16:30 UTC
+    - cron: "30 7 * * *"
+    - cron: "30 16 * * *"
   workflow_dispatch:
 
 jobs:
@@ -28,36 +28,17 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
           
-          # Google Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
           DEALS_SHEET_NAME: RAW_DEALS
           
-          # Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           
-          # V3_beta_b: Status column and filters
           TELEGRAM_STATUS_COLUMN: raw_status
           TELEGRAM_REQUIRED_STATUS: READY_TO_POST
           TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM
           
-          # Optional filters
-          TELEGRAM_ALLOW_VERDICTS: "GOOD"
-          TELEGRAM_MIN_AI_SCORE: "70"
+          TELEGRAM_ALLOW_VERDICTS: "GOOD,AVERAGE"
+          TELEGRAM_MIN_AI_SCORE: "0"
         run: python workers/telegram_publisher.py
-      
-      - name: Generate Summary
-        if: always()
-        run: |
-          echo "## 📱 Telegram Publisher Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- 🆔 Run: #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- ⏰ Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**V3_beta_b Pipeline (Product):**" >> $GITHUB_STEP_SUMMARY
-          echo "- Reads: raw_status = READY_TO_POST" >> $GITHUB_STEP_SUMMARY
-          echo "- Posts: Telegram (ALL good deals)" >> $GITHUB_STEP_SUMMARY
-          echo "- Marks: raw_status = POSTED_TELEGRAM" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Future:** Will read from TELEGRAM_FEED for paid tiers" >> $GITHUB_STEP_SUMMARY

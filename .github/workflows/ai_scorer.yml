@@ -6,7 +6,7 @@ on:
       max_rows:
         description: 'Max rows to process'
         required: false
-        default: '1'
+        default: '10'
   schedule:
     - cron: "0 7 * * *"    # 07:00 UTC
     - cron: "0 16 * * *"   # 16:00 UTC

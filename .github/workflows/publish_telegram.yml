@@ -29,6 +29,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
           
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
           SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
           DEALS_SHEET_NAME: RAW_DEALS
           

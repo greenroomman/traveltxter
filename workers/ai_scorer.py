@@ -52,16 +52,15 @@ def normalize_status(s: str) -> str:
     s = str(s)
     # common invisible troublemakers
     s = s.replace("\u00A0", " ")   # NBSP
-    s = s.replace("\u200B", "")   # zero-width space
-    s = s.replace("\uFEFF", "")   # BOM / zero-width no-break
+    s = s.replace("\u200B", "")    # zero-width space
+    s = s.replace("\uFEFF", "")    # BOM / zero-width no-break
     return s.strip().upper()
 
 
 def score_deal(rec: Dict[str, Any]) -> Dict[str, Any]:
     def safe_val(key, default=0):
         try:
-            val = str(rec.get(key, "")).replace("£", "").replace(",", 
-"").strip()
+            val = str(rec.get(key, "")).replace("£", "").replace(",", "").strip()
             return float(val) if val else default
         except:
             return default
@@ -110,11 +109,9 @@ def main():
     log("🚀 AI SCORER STARTING (V3_beta_b_final FIXED)")
 
     sheet_id = get_env("SHEET_ID")
-    ws_name = get_env("WORKSHEET_NAME", required=False, 
-default="RAW_DEALS")
+    ws_name = get_env("WORKSHEET_NAME", required=False, default="RAW_DEALS")
     sa_json = json.loads(get_env("GCP_SA_JSON"))
-    max_rows = int(get_env("MAX_ROWS_PER_RUN", required=False, 
-default="10"))
+    max_rows = int(get_env("MAX_ROWS_PER_RUN", required=False, default="10"))
 
     creds = Credentials.from_service_account_info(
         sa_json,
@@ -162,10 +159,9 @@ default="10"))
         status_raw = padded[status_col_idx0]
         status_val = normalize_status(status_raw)
 
-        # light debug (don’t spam everything unless needed)
+        # light debug (don't spam everything unless needed)
         deal_id = padded[hmap["deal_id"] - 1] if "deal_id" in hmap else ""
-        log(f"Row {row_num} deal_id={deal_id} status='{status_raw}' -> 
-'{status_val}'")
+        log(f"Row {row_num} deal_id={deal_id} status='{status_raw}' -> '{status_val}'")
 
         if status_val == "NEW":
             rec = dict(zip(headers, padded))
@@ -186,30 +182,29 @@ default="10"))
 
     for row_num, rec in rows_to_process:
         res = score_deal(rec)
-        log(f"Scoring row {row_num}: score={res['ai_score']} 
-verdict={res['ai_verdict']}")
+        log(f"Scoring row {row_num}: score={res['ai_score']} verdict={res['ai_verdict']}")
 
         def add(col: str, val: Any):
             if col in hmap:
                 col_idx = hmap[col]
-                updates.append({"range": f"{col_to_a1(col_idx)}{row_num}", 
-"values": [[val]]})
+                updates.append({
+                    "range": f"{col_to_a1(col_idx)}{row_num}", 
+                    "values": [[val]]
+                })
 
         add("ai_score", res["ai_score"])
         add("ai_verdict", res["ai_verdict"])
         add("ai_notes", res["ai_notes"])
         add("scored_timestamp", now)
 
-        # Baseline lifecycle
+        # Promote directly to READY_TO_POST (skipping SCORED step)
         add(status_col_name, "READY_TO_POST")
 
     if updates:
         log(f"Writing {len(updates)} cell updates...")
         ws.batch_update(updates)
-        log(f"✅ Done: processed {len(rows_to_process)} rows. NEW → 
-READY_TO_POST")
+        log(f"✅ Done: processed {len(rows_to_process)} rows. NEW → READY_TO_POST")
 
 
 if __name__ == "__main__":
     main()
-

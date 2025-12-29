@@ -152,7 +152,7 @@ default="10"))
     status_col_idx0 = hmap[status_col_name] - 1
     status_col_letter = col_to_a1(hmap[status_col_name])
 
-    log(f"Using status column: '{status_col_name}' at 
+    log(f"Using status column: '{status_col_name}' at position {hmap[status_col_name]}") 
 {status_col_letter}")
 
     rows_to_process: List[Tuple[int, Dict[str, Any]]] = []

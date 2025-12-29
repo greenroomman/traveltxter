@@ -109,16 +109,16 @@ def clean_whitespace(s: str) -> str:
 # =========================
 
 def format_message_legacy(row: Dict[str, str]) -> str:
-    # A simple safe legacy message (keeps system functional even if no V4 
-# fields exist
+    """
+    A simple safe legacy message (keeps system functional even if no V4 fields exist)
+    """
     origin = safe(row.get("origin_city", row.get("origin", "")))
     dest = safe(row.get("destination_city", row.get("destination", "")))
     price = safe(row.get("price_gbp", row.get("price", "")))
     out_date = safe(row.get("outbound_date", ""))
     ret_date = safe(row.get("return_date", ""))
     airline = safe(row.get("airline", ""))
-    link = row.get("affiliate_url", row.get("deal_url", 
-row.get("booking_url", ""))).strip()
+    link = row.get("affiliate_url", row.get("deal_url", row.get("booking_url", ""))).strip()
 
     bits = []
     bits.append("✈️ <b>Flight deal</b>")
@@ -141,111 +141,136 @@ row.get("booking_url", ""))).strip()
 
 
 def format_message_v4_vip(row: Dict[str, str]) -> str:
+    """
+    VIP/Premium Telegram message - Full details with booking link
+    """
     origin = safe(row.get("origin_city", row.get("origin", "")))
     dest = safe(row.get("destination_city", row.get("destination", "")))
+    country = safe(row.get("destination_country", ""))
     price = safe(row.get("price_gbp", row.get("price", "")))
     out_date = safe(row.get("outbound_date", ""))
     ret_date = safe(row.get("return_date", ""))
     cabin = safe(row.get("cabin_class", "")).lower()
-    cabin_show = "Business" if cabin == "business" else ("First" if cabin 
-== "first" else ("Economy" if cabin else ""))
+    cabin_show = "Business" if cabin == "business" else ("First" if cabin == "first" else ("Economy" if cabin else ""))
 
-    ai_grade = safe(row.get("ai_grading", row.get("ai_grade", 
-""))).upper()
-reason = clean_whitespace(
-    row.get("ai_notes") or row.get("ai_reason") or row.get("notes") or ""
-)
+    ai_grade = safe(row.get("ai_grading", row.get("ai_grade", ""))).upper()
+    reason = clean_whitespace(row.get("ai_notes") or row.get("ai_reason") or row.get("notes") or "")
     
-affiliate = (row.get("affiliate_url") or 
-row.get("deal_url") or 
-row.get("booking_url") or "").strip()
+    affiliate = (row.get("affiliate_url") or row.get("deal_url") or row.get("booking_url") or "").strip()
 
-    header = "✈️ <b>A-GRADE DEAL</b>" if ai_grade == "A" else 
-"✈️ <b>DEAL</b>"
-<b>DEAL</b>"
+    # Header based on grade
+    header = "✈️ <b>A-GRADE DEAL</b>" if ai_grade == "A" else "✈️ <b>PREMIUM DEAL</b>"
 
     lines = [header, ""]
+    
+    # Route with country
     if origin and dest:
-        lines.append(f"🇬🇧 {origin} → {dest}")
-    if cabin_show:
-        lines.append(f"💼 {safe(cabin_show)}")
+        if country:
+            lines.append(f"🌍 {origin} → {dest}, {country}")
+        else:
+            lines.append(f"🌍 {origin} → {dest}")
+    
+    # Dates
     if out_date or ret_date:
         if out_date and ret_date:
             lines.append(f"📅 {out_date} → {ret_date}")
         else:
             lines.append(f"📅 {out_date or ret_date}")
+    
+    # Price
     if price:
-        lines.append(f"💰 £{price}")
+        lines.append(f"💰 <b>£{price}</b>")
+    
+    # Cabin class
+    if cabin_show:
+        lines.append(f"💼 {safe(cabin_show)}")
 
+    # AI reasoning
     if reason:
         lines.append("")
         lines.append("<b>Why this is special:</b>")
-        # keep it short; first ~3 bullet-worthy clauses
-        # split on ; or . then take up to 3
-        parts = [p.strip() for p in re.split(r"[.;]\s+", reason) if 
-p.strip()]
+        # Keep it short; first ~3 bullet-worthy clauses
+        parts = [p.strip() for p in re.split(r"[.;]\s+", reason) if p.strip()]
         for p in parts[:3]:
             lines.append(f"• {safe(p)}")
 
     lines.append("")
-    lines.append("⏳ Likely to disappear fast.")
+    lines.append("⏳ <i>Likely to disappear fast. Book now.</i>")
 
+    # Affiliate link (critical for revenue!)
     if affiliate:
-        lines.append(f"\n👉 <b>Book now:</b> {safe(affiliate)}")
+        lines.append(f"\n👉 <b>Book this deal:</b> {safe(affiliate)}")
     else:
-        lines.append("\n⚠️ <i>Missing affiliate_url</i>")
+        lines.append("\n⚠️ <i>Booking link unavailable</i>")
 
     return "\n".join(lines).strip()
 
 
 def format_message_v4_free(row: Dict[str, str], stripe_link: str) -> str:
+    """
+    Free tier Telegram message - Teaser to drive VIP subscriptions
+    Creates FOMO and urgency to convert
+    """
     dest = safe(row.get("destination_city", row.get("destination", "")))
     origin = safe(row.get("origin_city", row.get("origin", "")))
+    country = safe(row.get("destination_country", ""))
     price = safe(row.get("price_gbp", row.get("price", "")))
     out_date = safe(row.get("outbound_date", ""))
     ret_date = safe(row.get("return_date", ""))
     cabin = safe(row.get("cabin_class", "")).lower()
-    cabin_show = "Business" if cabin == "business" else ("First" if cabin 
-== "first" else "Economy")
+    cabin_show = "Business" if cabin == "business" else ("First" if cabin == "first" else "Economy")
 
     lines = []
+    
+    # Eye-catching headline
     if price and dest:
-        lines.append(f"🔥 <b>£{price} flights to {dest}</b>")
+        dest_display = f"{dest}, {country}" if country else dest
+        lines.append(f"🔥 <b>£{price} to {dest_display}</b>")
     else:
-        lines.append("🔥 <b>Deal spotted</b>")
+        lines.append("🔥 <b>Deal Alert</b>")
 
     lines.append("")
-    lines.append("Details:")
+    
+    # Basic details (just enough to create interest)
     if origin and dest:
-        lines.append(f"• 🇬🇧 From {origin}")
+        lines.append(f"📍 From {origin}")
     if out_date or ret_date:
         if out_date and ret_date:
-            lines.append(f"• 📅 {out_date} → {ret_date}")
+            lines.append(f"📅 {out_date} → {ret_date}")
         else:
-            lines.append(f"• 📅 {out_date or ret_date}")
-    lines.append(f"• 💼 {safe(cabin_show)}")
+            lines.append(f"📅 {out_date or ret_date}")
+    lines.append(f"💼 {safe(cabin_show)}")
 
     lines.append("")
-    lines.append("⚠️ Heads up:")
-    lines.append("This deal was sent to our VIP channel first.")
+    
+    # FOMO messaging
+    lines.append("⚠️ <b>Heads up:</b>")
+    lines.append("• VIP members saw this 24 hours ago")
+    lines.append("• Availability is running low")
+    lines.append("• Best deals go to VIPs first")
+
+    lines.append("")
+    
+    # Call to action
+    lines.append("💎 <b>Want instant access to deals like this?</b>")
+    lines.append("Join TravelTxter VIP for just £7/month:")
+    lines.append("✓ Deals 24 hours early")
+    lines.append("✓ Direct booking links")
+    lines.append("✓ Exclusive mistake fares")
+    lines.append("✓ Cancel anytime")
 
     if stripe_link:
-        lines.append("")
-        lines.append("👉 Want deals like this <b>as soon as we find 
-them</b>?")
-        lines.append(f"Join Traveltxter VIP 👇")
-        lines.append(safe(stripe_link))
+        lines.append(f"\n👉 <b>Upgrade now:</b> {safe(stripe_link)}")
     else:
-        lines.append("")
-        lines.append("👉 Want deals like this <b>as soon as we find 
-them</b>?")
-        lines.append("<i>(VIP link not configured)</i>")
+        lines.append("\n👉 Upgrade at traveltxter.com")
 
     return "\n".join(lines).strip()
 
 
-def build_message(row: Dict[str, str], template_version: str, mode: str, 
-stripe_link: str) -> str:
+def build_message(row: Dict[str, str], template_version: str, mode: str, stripe_link: str) -> str:
+    """
+    Build the appropriate message based on template version and mode
+    """
     tv = (template_version or "legacy").strip().lower()
     md = (mode or "free").strip().lower()
 
@@ -254,19 +279,18 @@ stripe_link: str) -> str:
             return format_message_v4_vip(row)
         return format_message_v4_free(row, stripe_link)
 
-    # legacy / fallback
+    # Legacy / fallback
     return format_message_legacy(row)
 
 
 # =========================
-# Google Sheets helpers
+# Google Sheets
 # =========================
 
 def get_gspread_client() -> gspread.Client:
-    sa_json = env_first(["GCP_SA_JSON"], "")
+    sa_json = env_first(["GCP_SA_JSON"], "").strip()
     if not sa_json:
-        raise RuntimeError("Missing GCP_SA_JSON env var (service account 
-json).")
+        raise RuntimeError("Missing GCP_SA_JSON env var (service account json).")
 
     try:
         info = json.loads(sa_json)
@@ -281,8 +305,7 @@ json).")
     return gspread.authorize(creds)
 
 
-def open_worksheet(gc: gspread.Client, spreadsheet_id: str, tab: str) -> 
-gspread.Worksheet:
+def open_worksheet(gc: gspread.Client, spreadsheet_id: str, tab: str) -> gspread.Worksheet:
     sh = gc.open_by_key(spreadsheet_id)
     return sh.worksheet(tab)
 
@@ -303,8 +326,7 @@ def get_cell(row: List[str], idx_map: Dict[str, int], key: str) -> str:
     return str(row[i]).strip()
 
 
-def set_cell(ws: gspread.Worksheet, row_num: int, col_num: int, value: 
-str) -> None:
+def set_cell(ws: gspread.Worksheet, row_num: int, col_num: int, value: str) -> None:
     ws.update_cell(row_num, col_num, value)
 
 
@@ -324,51 +346,36 @@ def main() -> int:
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID/SHEET_ID env var.")
 
-    tab = env_first(["RAW_DEALS_TAB", "DEALS_SHEET_NAME"], 
-"RAW_DEALS").strip()
+    tab = env_first(["RAW_DEALS_TAB", "DEALS_SHEET_NAME"], "RAW_DEALS").strip()
 
-    status_col = env_first(["TG_STATUS_COLUMN", "TELEGRAM_STATUS_COLUMN", 
-"RAW_STATUS_COLUMN"], "raw_status").strip()
-    required_status = env_first(["TG_REQUIRED_STATUS", 
-"TELEGRAM_REQUIRED_STATUS"], "POSTED_INSTAGRAM").strip().upper()
-    posted_status = env_first(["TG_POSTED_STATUS", 
-"TELEGRAM_POSTED_STATUS"], "POSTED_TELEGRAM").strip().upper()
+    status_col = env_first(["TG_STATUS_COLUMN", "TELEGRAM_STATUS_COLUMN", "RAW_STATUS_COLUMN"], "raw_status").strip()
+    required_status = env_first(["TG_REQUIRED_STATUS", "TELEGRAM_REQUIRED_STATUS"], "POSTED_INSTAGRAM").strip().upper()
+    posted_status = env_first(["TG_POSTED_STATUS", "TELEGRAM_POSTED_STATUS"], "POSTED_TELEGRAM").strip().upper()
 
-    allow_verdicts_raw = env_first(["TELEGRAM_ALLOW_VERDICTS", 
-"TG_ALLOW_VERDICTS"], "").strip()
-    allow_verdicts = [v.strip().upper() for v in 
-allow_verdicts_raw.split(",") if v.strip()] if allow_verdicts_raw else []
-    min_ai_score = to_float(env_first(["TELEGRAM_MIN_AI_SCORE", 
-"TG_MIN_AI_SCORE"], "0"), 0.0)
+    allow_verdicts_raw = env_first(["TELEGRAM_ALLOW_VERDICTS", "TG_ALLOW_VERDICTS"], "").strip()
+    allow_verdicts = [v.strip().upper() for v in allow_verdicts_raw.split(",") if v.strip()] if allow_verdicts_raw else []
+    min_ai_score = to_float(env_first(["TELEGRAM_MIN_AI_SCORE", "TG_MIN_AI_SCORE"], "0"), 0.0)
 
-    max_posts = int(env_first(["MAX_POSTS_PER_RUN", 
-"TELEGRAM_MAX_POSTS_PER_RUN"], "1").strip() or "1")
+    max_posts = int(env_first(["MAX_POSTS_PER_RUN", "TELEGRAM_MAX_POSTS_PER_RUN"], "1").strip() or "1")
 
     # ---- telegram config
     bot_token = env_first(["TELEGRAM_BOT_TOKEN"], "").strip()
     chat_id = env_first(["TELEGRAM_CHANNEL"], "").strip()
     if not bot_token or not chat_id:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL 
-env var.")
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL env var.")
 
     # ---- v4 template controls
-    tg_template_version = env_first(["TG_TEMPLATE_VERSION", 
-"TELEGRAM_TEMPLATE_VERSION"], "legacy").strip().lower()
-    tg_mode = env_first(["TG_MODE", "TELEGRAM_MODE"], 
-"free").strip().lower()
+    tg_template_version = env_first(["TG_TEMPLATE_VERSION", "TELEGRAM_TEMPLATE_VERSION"], "legacy").strip().lower()
+    tg_mode = env_first(["TG_MODE", "TELEGRAM_MODE"], "free").strip().lower()
     stripe_link = env_first(["STRIPE_LINK"], "").strip()
-    premium_filter = env_first(["DEAL_PREMIUM_FILTER"], 
-"all").strip().lower()
+    premium_filter = env_first(["DEAL_PREMIUM_FILTER"], "all").strip().lower()
 
-    posted_ts_col = env_first(["TELEGRAM_POSTED_TIMESTAMP_COLUMN"], 
-"telegram_published_timestamp").strip()
+    posted_ts_col = env_first(["TELEGRAM_POSTED_TIMESTAMP_COLUMN"], "telegram_published_timestamp").strip()
 
     # ---- log header
-    
-log.info("\n============================================================")
+    log.info("\n============================================================")
     log.info("🚀 TravelTxter Telegram Publisher Starting")
-    
-log.info("============================================================")
+    log.info("============================================================")
     log.info(f"⏰ Timestamp: {utc_now_iso()}")
     log.info(f"🆔 Worker ID: {worker_id}")
     log.info(f"📋 Run: #{attempt} (ID: {run_id})")
@@ -377,8 +384,8 @@ log.info("============================================================")
     log.info(f"🔎 Filter: {status_col} == {required_status}")
     log.info(f"✅ Promote on success: {status_col} -> {posted_status}")
     log.info(f"📊 Max posts per run: {max_posts}")
-    
-log.info("============================================================\n")
+    log.info(f"📱 Template: {tg_template_version} (mode: {tg_mode})")
+    log.info("============================================================\n")
 
     # ---- open sheet
     gc = get_gspread_client()
@@ -440,21 +447,18 @@ log.info("============================================================\n")
             row_dict[key] = get_cell(row, idx, key)
 
         # message
-        msg = build_message(row_dict, tg_template_version, tg_mode, 
-stripe_link)
+        msg = build_message(row_dict, tg_template_version, tg_mode, stripe_link)
 
         if dry_run:
-            log.info(f"🧪 Dry-run: would post row {row_num} 
-(deal_id={row_dict.get('deal_id','')})")
+            log.info(f"🧪 Dry-run: would post row {row_num} (deal_id={row_dict.get('deal_id','')})")
+            log.info(f"📝 Message preview:\n{msg}\n")
             published += 1
             continue
 
-        ok, info = telegram_send_message(bot_token, chat_id, msg, 
-disable_preview=True)
+        ok, info = telegram_send_message(bot_token, chat_id, msg, disable_preview=True)
         if not ok:
             failed += 1
-            log.error(f"❌ Telegram post failed for row {row_num}: 
-{info}")
+            log.error(f"❌ Telegram post failed for row {row_num}: {info}")
             continue
 
         # promote status + timestamp
@@ -470,25 +474,20 @@ disable_preview=True)
                 set_cell(ws, row_num, col_num, utc_now_iso())
 
             published += 1
-            log.info(f"✅ Posted row {row_num} and promoted status to 
-{posted_status}")
+            log.info(f"✅ Posted row {row_num} and promoted status to {posted_status}")
             time.sleep(0.6)  # small throttle
         except Exception as e:
             failed += 1
-            log.error(f"❌ Posted but failed to update sheet for row 
-{row_num}: {e}")
+            log.error(f"❌ Posted but failed to update sheet for row {row_num}: {e}")
 
     # summary
-    
-log.info("\n============================================================")
+    log.info("\n============================================================")
     log.info("📊 PUBLISH SUMMARY")
-    
-log.info("============================================================")
+    log.info("============================================================")
     log.info(f"🔎 Considered: {considered}")
     log.info(f"✅ Published:  {published}")
     log.info(f"❌ Failed:     {failed}")
-    
-log.info("============================================================\n")
+    log.info("============================================================\n")
 
     # optional stats write
     try:
@@ -521,4 +520,3 @@ if __name__ == "__main__":
     except Exception as e:
         log.error(f"❌ Worker failed with error: {e}")
         raise
-

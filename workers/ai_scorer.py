@@ -116,14 +116,19 @@ def find_first_new(ws) -> Optional[Dict[str, Any]]:
 
     status_idx = hmap[status_col] - 1
 
-    for i, row in enumerate(rows, start=2):
-        if len(row) < len(headers):
-            row += [""] * (len(headers) - len(row))
-        if normalize(row[status_idx]) == "NEW":
-            record = {headers[j]: row[j] for j in range(len(headers))}
-            return {"row_number": i, "record": record, "status_col": 
+for i, row in enumerate(rows, start=2):
+    if len(row) < len(headers):
+        row += [""] * (len(headers) - len(row))
+    
+    status_value = normalize(row[status_idx])
+    if i <= 5:  # Log first 5 rows
+        print(f"DEBUG Row {i}: raw_status='{status_value}' (looking for 
+'NEW')")
+    
+    if status_value == "NEW":
+        record = {headers[j]: row[j] for j in range(len(headers))}
+        return {"row_number": i, "record": record, "status_col": 
 status_col}
-
     return None
 
 

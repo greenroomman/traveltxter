@@ -1,395 +1,73 @@
-#!/usr/bin/env python3
-"""
-V3_beta_b — AI Scorer (CORRECTED)
-
-Reads:    RAW_DEALS where status == NEW
-Writes:   ai_score, ai_grading, ai_verdict, ai_notes, scored_timestamp
-Promotes: status -> READY_TO_POST (Telegram will consume next)
-
-Design goals:
-- Uses 'status' column (matches Telegram publisher)
-- Promotes to 'READY_TO_POST' (not 'SCORED')
-- Header-map only (no column-number writes)
-- Guarded updates (idempotent)
-- Efficient: reads only header + status column + specific row(s)
-- Processes up to MAX_ROWS_PER_RUN (default 1)
-"""
-
-import os
-import sys
-import json
-import time
-import datetime as dt
-from typing import Dict, Any, List, Tuple
-
-import gspread
-from google.oauth2.service_account import Credentials
-
-
-# ============================================================
-# Logging
-# ============================================================
-
-def log(msg: str) -> None:
-    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    print(f"{ts} | {msg}", flush=True)
-
-
-def die(msg: str, code: int = 1) -> None:
-    log(msg)
-    sys.exit(code)
-
-
-# ============================================================
-# Environment helpers
-# ============================================================
-
-def get_env(name: str, required: bool = True, default: str = "") -> str:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        if required:
-            die(f"ERROR: Missing environment variable: {name}")
-        return default
-    return str(v).strip()
-
-
-def get_env_int(name: str, required: bool = False, default: int = 1) -> int:
-    v = get_env(name, required=required, default=str(default))
-    try:
-        return int(v)
-    except Exception:
-        die(f"ERROR: {name} must be an integer (got {v!r})")
-
-
-def utc_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-# ============================================================
-# Google Sheets helpers
-# ============================================================
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# CORRECTED: Use 'status' column (matches Telegram publisher)
-STATUS_COL = "status"  # FIXED: Was "raw_status"
-STATUS_NEW = "NEW"
-STATUS_AFTER_SCORING = "READY_TO_POST"  # FIXED: Was "SCORED"
-STATUS_ERROR = "ERROR_SCORING"
-
-OUTPUT_COLS = ["ai_score", "ai_grading", "ai_verdict", "ai_notes", "scored_timestamp"]
-
-
-def normalize(v: Any) -> str:
-    return "" if v is None else str(v).strip()
-
-
-def col_to_a1(n: int) -> str:
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-def a1(row: int, col: int) -> str:
-    return f"{col_to_a1(col)}{row}"
-
-
-def build_header_map(headers: List[str]) -> Dict[str, int]:
-    # exact header -> 1-based index
-    hmap: Dict[str, int] = {}
-    for i, h in enumerate(headers, start=1):
-        key = normalize(h)
-        if key:
-            hmap[key] = i
-    return hmap
-
-
-def get_worksheet() -> gspread.Worksheet:
-    sheet_id = get_env("SHEET_ID", required=True)
-    worksheet_name = get_env("WORKSHEET_NAME", required=False, default="RAW_DEALS")
-    sa_json = get_env("GCP_SA_JSON", required=True)
-
-    try:
-        sa_info = json.loads(sa_json)
-    except Exception:
-        die("ERROR: GCP_SA_JSON must be valid JSON on a single line.")
-
-    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(sheet_id)
-    return sheet.worksheet(worksheet_name)
-
-
-def ensure_columns(ws: gspread.Worksheet, headers: List[str], hmap: Dict[str, int]) -> Tuple[List[str], Dict[str, int]]:
-    missing = [c for c in OUTPUT_COLS if c not in hmap]
-    if not missing:
-        return headers, hmap
-
-    log(f"Adding missing columns to header row: {missing}")
-    new_headers = headers + missing
-
-    end_col = col_to_a1(len(new_headers))
-    ws.update(f"A1:{end_col}1", [new_headers])
-    time.sleep(0.3)
-
-    headers2 = ws.row_values(1)
-    hmap2 = build_header_map(headers2)
-
-    still_missing = [c for c in OUTPUT_COLS if c not in hmap2]
-    if still_missing:
-        die(f"ERROR: Failed to add required columns: {still_missing}")
-
-    return headers2, hmap2
-
-
-# ============================================================
-# Stage 2 — find NEW rows efficiently
-# ============================================================
-
-def find_new_row_numbers(ws: gspread.Worksheet, hmap: Dict[str, int], max_rows: int) -> List[int]:
-    if STATUS_COL not in hmap:
-        die(f"ERROR: Missing required column: {STATUS_COL}")
-
-    col_idx = hmap[STATUS_COL]
-    col_vals = ws.col_values(col_idx)  # includes header at row 1
-    if len(col_vals) < 2:
-        return []
-
-    hits: List[int] = []
-    for row_number, val in enumerate(col_vals, start=1):
-        if row_number == 1:
-            continue
-        if normalize(val).upper() == STATUS_NEW:
-            hits.append(row_number)
-            if len(hits) >= max_rows:
-                break
-    return hits
-
-
-def read_row_as_record(ws: gspread.Worksheet, row_number: int, headers: List[str]) -> Dict[str, Any]:
-    row = ws.row_values(row_number)
-    if len(row) < len(headers):
-        row += [""] * (len(headers) - len(row))
-    return {headers[i]: row[i] for i in range(len(headers))}
-
-
-# ============================================================
-# Stage 3 — heuristic scorer
-# ============================================================
-
-def safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        s = normalize(x).replace("£", "").replace(",", "")
-        return float(s) if s else default
-    except Exception:
-        return default
-
-
-def safe_int(x: Any, default: int = 0) -> int:
-    try:
-        s = normalize(x)
-        return int(float(s)) if s else default
-    except Exception:
-        return default
-
-
-def pick(rec: Dict[str, Any], *keys: str) -> str:
-    for k in keys:
-        if k in rec and normalize(rec[k]):
-            return normalize(rec[k])
-    return ""
-
-
-def score_deal(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Heuristic scoring logic for deal quality.
-    Returns: dict with ai_score, ai_grading, ai_verdict, ai_notes
-    """
-    price = safe_float(pick(rec, "price_gbp"), 9999)
-    stops = safe_int(pick(rec, "stops"), 0)
-    baggage = pick(rec, "baggage_included").lower()
-    days = safe_int(pick(rec, "trip_length_days"), 0)
-
-    score = 50
-    notes: List[str] = []
-
-    # Price scoring
-    if price <= 50:
-        score += 30
-        notes.append("cheap")
-    elif price <= 120:
-        score += 15
-        notes.append("good value")
-    elif price > 300:
-        score -= 10
-        notes.append("expensive")
-
-    # Stops scoring
-    if stops == 0:
-        score += 10
-        notes.append("direct")
-    elif stops > 1:
-        score -= 5
-        notes.append("multiple stops")
-
-    # Baggage scoring
-    if baggage in ("yes", "true", "included"):
-        score += 5
-        notes.append("baggage included")
-
-    # Trip length scoring
-    if 3 <= days <= 10:
-        score += 5
-        notes.append("good length")
-
-    # Clamp score to 0-100
-    score = max(0, min(100, score))
-
-    # Grade and verdict
-    if score >= 80:
-        grade, verdict = "A", "GOOD"
-    elif score >= 65:
-        grade, verdict = "B", "GOOD"
-    elif score >= 50:
-        grade, verdict = "C", "AVERAGE"
-    else:
-        grade, verdict = "D", "POOR"
-
-    return {
-        "ai_score": score,
-        "ai_grading": grade,
-        "ai_verdict": verdict,
-        "ai_notes": "; ".join(notes),
-    }
-
-
-# ============================================================
-# Write-back (guarded)
-# ============================================================
-
-def is_row_new(ws: gspread.Worksheet, row_number: int, hmap: Dict[str, int]) -> bool:
-    """Check if row still has status=NEW"""
-    current = normalize(ws.cell(row_number, hmap[STATUS_COL]).value).upper()
-    return current == STATUS_NEW
-
-
-def write_updates_guarded(
-    ws: gspread.Worksheet,
-    row_number: int,
-    hmap: Dict[str, int],
-    updates: Dict[str, Any],
-) -> bool:
-    """
-    Write updates to row, but only if status is still NEW.
-    Returns True if written, False if skipped.
-    """
-    # Guard: status must still be NEW at write time
-    if not is_row_new(ws, row_number, hmap):
-        current = normalize(ws.cell(row_number, hmap[STATUS_COL]).value).upper()
-        log(f"Guard skip row {row_number} ({STATUS_COL}={current})")
-        return False
-
-    # Build batch update data
-    data = []
-    for k, v in updates.items():
-        if k not in hmap:
-            continue
-        data.append({"range": a1(row_number, hmap[k]), "values": [[v]]})
-
-    if not data:
-        die(f"ERROR: No valid update ranges built for row {row_number}. Check headers vs updates keys.")
-
-    ws.batch_update(data)
-    return True
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main() -> None:
-    log("AI SCORER STARTING (V3_beta_b - CORRECTED)")
-
-    # Required env
-    get_env("SHEET_ID")
-    get_env("GCP_SA_JSON")
-
-    worksheet_name = get_env("WORKSHEET_NAME", required=False, default="RAW_DEALS")
-    max_rows = get_env_int("MAX_ROWS_PER_RUN", required=False, default=1)
-
-    ws = get_worksheet()
-    log(f"Connected to worksheet: {ws.title}")
-
-    if ws.title != worksheet_name:
-        log(f"NOTE: WORKSHEET_NAME={worksheet_name} but connected to {ws.title} (check env if unexpected).")
-
-    # Get headers
-    headers = ws.row_values(1)
-    if not headers:
-        die("ERROR: Header row (row 1) is empty.")
-
-    hmap = build_header_map(headers)
-
-    # Hard requirement
-    if STATUS_COL not in hmap:
-        die(f"ERROR: Missing required column: {STATUS_COL}")
-
-    # Ensure output columns exist
-    headers, hmap = ensure_columns(ws, headers, hmap)
-
-    # Find NEW rows
-    new_rows = find_new_row_numbers(ws, hmap, max_rows=max_rows)
-    if not new_rows:
-        log("Stage 2: No NEW rows found")
-        log(f"✅ Pipeline: Looking for 'status = NEW' in column '{STATUS_COL}'")
-        log(f"✅ Will promote to: 'status = {STATUS_AFTER_SCORING}'")
-        return
-
-    log(f"Stage 2: Found {len(new_rows)} NEW row(s): {new_rows}")
-
-    processed = 0
-    for row_number in new_rows:
-        rec = read_row_as_record(ws, row_number, headers)
-        deal_id = normalize(rec.get("deal_id", ""))
-
-        try:
-            log(f"Scoring row {row_number} deal_id={deal_id or '(missing)'}")
-            result = score_deal(rec)
-
-            updates = {
-                "ai_score": result["ai_score"],
-                "ai_grading": result["ai_grading"],
-                "ai_verdict": result["ai_verdict"],
-                "ai_notes": result["ai_notes"],
-                "scored_timestamp": utc_now(),
-                STATUS_COL: STATUS_AFTER_SCORING,  # READY_TO_POST
-            }
-
-            if write_updates_guarded(ws, row_number, hmap, updates):
-                processed += 1
-                log(f"Stage 3: Row {row_number} scored (score={result['ai_score']}, verdict={result['ai_verdict']}) and promoted to {STATUS_AFTER_SCORING}")
-
-        except Exception as e:
-            err_msg = str(e)[:200]
-            log(f"ERROR scoring row {row_number}: {err_msg}")
-
-            # Try to write error state (still guarded)
-            try:
-                updates_err = {
-                    "ai_notes": f"{STATUS_ERROR}: {err_msg}",
-                    "scored_timestamp": utc_now(),
-                    STATUS_COL: STATUS_ERROR,
-                }
-                write_updates_guarded(ws, row_number, hmap, updates_err)
-            except Exception as e2:
-                log(f"ERROR writing error state for row {row_number}: {str(e2)[:200]}")
-
-    log(f"AI SCORER COMPLETE. processed={processed} / found={len(new_rows)}")
-    log(f"✅ Pipeline: Rows promoted from 'NEW' → '{STATUS_AFTER_SCORING}'")
-    log(f"✅ Next: Telegram publisher will consume '{STATUS_AFTER_SCORING}' rows")
-
-
-if __name__ == "__main__":
-    main()
+name: V3_beta_b AI Scorer
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_rows:
+        description: 'Max rows to process'
+        required: false
+        default: '1'
+  schedule:
+    - cron: "0 7 * * *"    # 07:00 UTC
+    - cron: "0 16 * * *"   # 16:00 UTC
+
+concurrency:
+  group: v3-ai-scorer
+  cancel-in-progress: false
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+      
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run AI Scorer
+        env:
+          # Required
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          
+          # Configuration
+          WORKSHEET_NAME: RAW_DEALS
+          MAX_ROWS_PER_RUN: ${{ github.event.inputs.max_rows || '1' }}
+          
+          # V3_beta_b: Uses raw_status column
+          PYTHONUNBUFFERED: "1"
+        run: python workers/ai_scorer.py
+      
+      - name: Save Scorer Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorer-logs-${{ github.run_number }}
+          path: logs/*.log
+          retention-days: 7
+          if-no-files-found: warn
+      
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "## 🤖 AI Scorer Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 🆔 Run: #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ⏰ Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**V3_beta_b Pipeline:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Reads: raw_status = NEW" >> $GITHUB_STEP_SUMMARY
+          echo "- Promotes: raw_status = SCORED" >> $GITHUB_STEP_SUMMARY
+          echo "- Next: Render Worker" >> $GITHUB_STEP_SUMMARY

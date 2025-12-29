@@ -160,7 +160,8 @@ affiliate = (row.get("affiliate_url") or
 row.get("deal_url") or 
 row.get("booking_url") or "").strip()
 
-    header = "✈️ <b>A-GRADE DEAL</b>" if ai_grade == "A" else "✈️ 
+    header = "✈️ <b>A-GRADE DEAL</b>" if ai_grade == "A" else 
+"✈️ <b>DEAL</b>"
 <b>DEAL</b>"
 
     lines = [header, ""]

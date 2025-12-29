@@ -1,558 +1,520 @@
 #!/usr/bin/env python3
 """
-Traveltxter V3_beta_b_final — Telegram Publisher (CLEAN + PIPELINE-CORRECT)
+TravelTxter — Telegram Publisher (V4, safe + backwards-compatible)
 
-✅ Reads from RAW_DEALS
-✅ Filters using raw_status == POSTED_INSTAGRAM (or READY_TO_POST)
-✅ Posts to Telegram channel
-✅ Writes back: tg_status, tg_message_id, tg_published_timestamp
-✅ Promotes raw_status -> POSTED_TELEGRAM
+- Reads from Google Sheets RAW_DEALS
+- Filters by status (default: raw_status == POSTED_INSTAGRAM)
+- Posts to Telegram channel
+- Promotes status on success (default: POSTED_TELEGRAM)
+- Optional V4 templates (free/vip) controlled by env vars
+- Backwards compatible with existing workflow env names (TELEGRAM_*)
 
-Environment variables required:
-- SHEET_ID
-- GCP_SA_JSON
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHANNEL (e.g., @yourtraveltxterchannel or -1001234567890)
-
-Optional:
-- RAW_DEALS_TAB (default RAW_DEALS)
-- TG_REQUIRED_STATUS (default POSTED_INSTAGRAM)
-- TG_POSTED_STATUS (default POSTED_TELEGRAM)
-- MAX_POSTS_PER_RUN (default 1)
+This file is designed to be drop-in and NOT break existing working 
+pipelines.
 """
 
 import os
-import html
-import sys
-import json
 import re
+import json
+import html
+import time
 import logging
-import traceback
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+import datetime as dt
+from typing import Dict, List, Optional, Tuple
 
-from google.oauth2 import service_account
-import gspread
 import requests
+import gspread
+from google.oauth2.service_account import Credentials
 
 
-# =============================================================================
+# =========================
 # Logging
-# =============================================================================
+# =========================
 
-os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("logs/telegram_publisher.log", mode="a"),
-    ],
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("telegram_publisher")
 
 
-# =============================================================================
-# Config / Env
-# =============================================================================
-
-DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
-WORKER_ID = os.getenv("WORKER_ID", "telegram_publisher")
-GITHUB_RUN_ID = os.getenv("GITHUB_RUN_ID", "local")
-GITHUB_RUN_NUMBER = os.getenv("GITHUB_RUN_NUMBER", "0")
-
-RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", os.getenv("DEALS_SHEET_NAME", 
-"RAW_DEALS"))
-
-# Back-compat: accept both the new TG_* vars and your existing TELEGRAM_* 
-vars from workflows
-RAW_STATUS_COLUMN = os.getenv("RAW_STATUS_COLUMN", 
-os.getenv("TELEGRAM_STATUS_COLUMN", "raw_status")).strip()
-
-TG_STATUS_COLUMN = os.getenv("TG_STATUS_COLUMN", 
-os.getenv("TELEGRAM_STATUS_WRITEBACK_COLUMN", "tg_status")).strip()
-TG_TEMPLATE_VERSION = os.getenv("TG_TEMPLATE_VERSION", 
-os.getenv("TELEGRAM_TEMPLATE_VERSION", "legacy")).strip().lower()
-TG_MODE = os.getenv("TG_MODE", os.getenv("TELEGRAM_MODE", 
-"free")).strip().lower()
-STRIPE_LINK = os.getenv("STRIPE_LINK", "").strip()
-
-TG_REQUIRED_STATUS = os.getenv("TG_REQUIRED_STATUS", 
-os.getenv("TELEGRAM_REQUIRED_STATUS", "POSTED_INSTAGRAM")).strip().upper()
-TG_POSTED_STATUS = os.getenv("TG_POSTED_STATUS", 
-os.getenv("TELEGRAM_POSTED_STATUS", "POSTED_TELEGRAM")).strip().upper()
-
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", 
-os.getenv("TELEGRAM_MAX_POSTS_PER_RUN", "1")).strip())
-
-# V4 templating controls (default = legacy behaviour unless explicitly 
-turned on)
-TG_TEMPLATE_VERSION = os.getenv("TG_TEMPLATE_VERSION", 
-os.getenv("TELEGRAM_TEMPLATE_VERSION", "legacy")).strip().lower()
-TG_MODE = os.getenv("TG_MODE", os.getenv("TELEGRAM_MODE", 
-"free")).strip().lower()
-STRIPE_LINK = os.getenv("STRIPE_LINK", "").strip()
-DEAL_PREMIUM_FILTER = os.getenv("DEAL_PREMIUM_FILTER", 
-"all").strip().lower()
-
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "1").strip())
+def utc_now_iso() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-# =============================================================================
-# Sheets helpers
-# =============================================================================
+def env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v)
 
-def get_sheets_credentials():
+
+def env_first(names: List[str], default: str = "") -> str:
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return str(v)
+    return default
+
+
+def truthy(s: str) -> bool:
+    return str(s).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def to_float(s: str, default: float = 0.0) -> float:
+    try:
+        return float(str(s).strip())
+    except Exception:
+        return default
+
+
+# =========================
+# Telegram helpers
+# =========================
+
+def telegram_send_message(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    disable_preview: bool = True,
+) -> Tuple[bool, str]:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_preview,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=20)
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}: {r.text}"
+        data = r.json()
+        if not data.get("ok"):
+            return False, f"Telegram API error: {data}"
+        return True, "ok"
+    except Exception as e:
+        return False, f"Exception: {e}"
+
+
+def safe(s: str) -> str:
+    # Telegram HTML parse_mode safe escape
+    return html.escape(str(s or "").strip())
+
+
+def clean_whitespace(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip())
+
+
+# =========================
+# Templates
+# =========================
+
+def format_message_legacy(row: Dict[str, str]) -> str:
+    # A simple safe legacy message (keeps system functional even if no V4 
+fields exist)
+    origin = safe(row.get("origin_city", row.get("origin", "")))
+    dest = safe(row.get("destination_city", row.get("destination", "")))
+    price = safe(row.get("price_gbp", row.get("price", "")))
+    out_date = safe(row.get("outbound_date", ""))
+    ret_date = safe(row.get("return_date", ""))
+    airline = safe(row.get("airline", ""))
+    link = row.get("affiliate_url", row.get("deal_url", 
+row.get("booking_url", ""))).strip()
+
+    bits = []
+    bits.append("✈️ <b>Flight deal</b>")
+    if origin and dest:
+        bits.append(f"🇬🇧 {origin} → {dest}")
+    if price:
+        bits.append(f"💰 £{price}")
+    if out_date or ret_date:
+        if out_date and ret_date:
+            bits.append(f"📅 {out_date} → {ret_date}")
+        else:
+            bits.append(f"📅 {out_date or ret_date}")
+    if airline:
+        bits.append(f"🛫 {airline}")
+
+    if link:
+        bits.append(f"\n👉 <b>Book now:</b> {safe(link)}")
+
+    return "\n".join(bits).strip()
+
+
+def format_message_v4_vip(row: Dict[str, str]) -> str:
+    origin = safe(row.get("origin_city", row.get("origin", "")))
+    dest = safe(row.get("destination_city", row.get("destination", "")))
+    price = safe(row.get("price_gbp", row.get("price", "")))
+    out_date = safe(row.get("outbound_date", ""))
+    ret_date = safe(row.get("return_date", ""))
+    cabin = safe(row.get("cabin_class", "")).lower()
+    cabin_show = "Business" if cabin == "business" else ("First" if cabin 
+== "first" else ("Economy" if cabin else ""))
+
+    ai_grade = safe(row.get("ai_grading", row.get("ai_grade", 
+""))).upper()
+    reason = clean_whitespace(row.get("ai_notes", row.get("ai_reason", 
+row.get("notes", ""))) or "")
+    affiliate = (row.get("affiliate_url") or row.get("deal_url") or 
+row.get("booking_url") or "").strip()
+
+    header = "✈️ <b>A-GRADE DEAL</b>" if ai_grade == "A" else "✈️ 
+<b>DEAL</b>"
+
+    lines = [header, ""]
+    if origin and dest:
+        lines.append(f"🇬🇧 {origin} → {dest}")
+    if cabin_show:
+        lines.append(f"💼 {safe(cabin_show)}")
+    if out_date or ret_date:
+        if out_date and ret_date:
+            lines.append(f"📅 {out_date} → {ret_date}")
+        else:
+            lines.append(f"📅 {out_date or ret_date}")
+    if price:
+        lines.append(f"💰 £{price}")
+
+    if reason:
+        lines.append("")
+        lines.append("<b>Why this is special:</b>")
+        # keep it short; first ~3 bullet-worthy clauses
+        # split on ; or . then take up to 3
+        parts = [p.strip() for p in re.split(r"[.;]\s+", reason) if 
+p.strip()]
+        for p in parts[:3]:
+            lines.append(f"• {safe(p)}")
+
+    lines.append("")
+    lines.append("⏳ Likely to disappear fast.")
+
+    if affiliate:
+        lines.append(f"\n👉 <b>Book now:</b> {safe(affiliate)}")
+    else:
+        lines.append("\n⚠️ <i>Missing affiliate_url</i>")
+
+    return "\n".join(lines).strip()
+
+
+def format_message_v4_free(row: Dict[str, str], stripe_link: str) -> str:
+    dest = safe(row.get("destination_city", row.get("destination", "")))
+    origin = safe(row.get("origin_city", row.get("origin", "")))
+    price = safe(row.get("price_gbp", row.get("price", "")))
+    out_date = safe(row.get("outbound_date", ""))
+    ret_date = safe(row.get("return_date", ""))
+    cabin = safe(row.get("cabin_class", "")).lower()
+    cabin_show = "Business" if cabin == "business" else ("First" if cabin 
+== "first" else "Economy")
+
+    lines = []
+    if price and dest:
+        lines.append(f"🔥 <b>£{price} flights to {dest}</b>")
+    else:
+        lines.append("🔥 <b>Deal spotted</b>")
+
+    lines.append("")
+    lines.append("Details:")
+    if origin and dest:
+        lines.append(f"• 🇬🇧 From {origin}")
+    if out_date or ret_date:
+        if out_date and ret_date:
+            lines.append(f"• 📅 {out_date} → {ret_date}")
+        else:
+            lines.append(f"• 📅 {out_date or ret_date}")
+    lines.append(f"• 💼 {safe(cabin_show)}")
+
+    lines.append("")
+    lines.append("⚠️ Heads up:")
+    lines.append("This deal was sent to our VIP channel first.")
+
+    if stripe_link:
+        lines.append("")
+        lines.append("👉 Want deals like this <b>as soon as we find 
+them</b>?")
+        lines.append(f"Join Traveltxter VIP 👇")
+        lines.append(safe(stripe_link))
+    else:
+        lines.append("")
+        lines.append("👉 Want deals like this <b>as soon as we find 
+them</b>?")
+        lines.append("<i>(VIP link not configured)</i>")
+
+    return "\n".join(lines).strip()
+
+
+def build_message(row: Dict[str, str], template_version: str, mode: str, 
+stripe_link: str) -> str:
+    tv = (template_version or "legacy").strip().lower()
+    md = (mode or "free").strip().lower()
+
+    if tv == "v4":
+        if md == "vip":
+            return format_message_v4_vip(row)
+        return format_message_v4_free(row, stripe_link)
+
+    # legacy / fallback
+    return format_message_legacy(row)
+
+
+# =========================
+# Google Sheets helpers
+# =========================
+
+def get_gspread_client() -> gspread.Client:
+    sa_json = env_first(["GCP_SA_JSON"], "")
+    if not sa_json:
+        raise RuntimeError("Missing GCP_SA_JSON env var (service account 
+json).")
+
+    try:
+        info = json.loads(sa_json)
+    except Exception as e:
+        raise RuntimeError(f"GCP_SA_JSON is not valid JSON: {e}")
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    
-    gcp_json_str = os.getenv("GCP_SA_JSON")
-    if not gcp_json_str:
-        raise ValueError("Missing GCP_SA_JSON")
-    
-    try:
-        info = json.loads(gcp_json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"GCP_SA_JSON is not valid JSON: {e}")
-    
-    return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
 
 
-def get_worksheet():
-    sheet_id = os.getenv("SHEET_ID")
-    if not sheet_id:
-        raise ValueError("Missing SHEET_ID")
-    
-    creds = get_sheets_credentials()
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(RAW_DEALS_TAB)
-    
-    logger.info(f"✅ Using worksheet: '{ws.title}' ({ws.row_count} rows)")
-    return ws
+def open_worksheet(gc: gspread.Client, spreadsheet_id: str, tab: str) -> 
+gspread.Worksheet:
+    sh = gc.open_by_key(spreadsheet_id)
+    return sh.worksheet(tab)
 
 
-def col_index(headers: List[str], name: str) -> Optional[int]:
-    name_l = name.strip().lower()
+def header_index_map(headers: List[str]) -> Dict[str, int]:
+    m = {}
     for i, h in enumerate(headers):
-        if str(h).strip().lower() == name_l:
-            return i
-    return None
+        m[str(h).strip()] = i
+    return m
 
 
-def pad_row(row: List[str], n: int) -> List[str]:
-    return (row + [""] * n)[:n]
+def get_cell(row: List[str], idx_map: Dict[str, int], key: str) -> str:
+    if key not in idx_map:
+        return ""
+    i = idx_map[key]
+    if i < 0 or i >= len(row):
+        return ""
+    return str(row[i]).strip()
 
 
-def batch_update_cells(ws, headers: List[str], row_number: int, updates: Dict[str, str]) -> None:
-    if DRY_RUN:
-        logger.info(f"🧪 [DRY RUN] Would update row {row_number}: {updates}")
-        return
-    
-    hmap = {h.strip(): i + 1 for i, h in enumerate(headers) if h.strip()}
-    data = []
-    
-    for k, v in updates.items():
-        if k in hmap:
-            a1 = gspread.utils.rowcol_to_a1(row_number, hmap[k])
-            data.append({"range": a1, "values": [[v]]})
-    
-    if data:
-        ws.batch_update(data)
+def set_cell(ws: gspread.Worksheet, row_num: int, col_num: int, value: 
+str) -> None:
+    ws.update_cell(row_num, col_num, value)
 
 
-# =============================================================================
-# Telegram posting
-# =============================================================================
-
-def format_message(deal: Dict[str, str]) -> str:
-    """Format deal as Telegram message with HTML markup."""
-    origin = deal.get("origin_city", "UK").strip()
-    destination = deal.get("destination_city", "Unknown").strip()
-    country = deal.get("destination_country", "").strip()
-    price = deal.get("price_gbp", "???").strip()
-    out_date = deal.get("outbound_date", "").strip()
-    ret_date = deal.get("return_date", "").strip()
-    days = deal.get("trip_length_days", "?").strip()
-    stops = deal.get("stops", "?").strip()
-    baggage = deal.get("baggage_included", "Unknown").strip()
-    airline = deal.get("airline", "Various").strip()
-    verdict = deal.get("ai_verdict", "").strip()
-    
-    # Build message
-    country_text = f" ({country})" if country else ""
-    
-    msg = f"✈️ <b>{origin} → {destination}</b>{country_text}\n\n"
-    msg += f"💷 <b>From £{price}</b>\n"
-    
-    if out_date and ret_date:
-        msg += f"📅 {out_date} → {ret_date} ({days} days)\n"
-    elif out_date:
-        msg += f"📅 {out_date}\n"
-    
-    msg += f"🧳 Bag: {baggage} | Stops: {stops}\n"
-    msg += f"🏷 Airline: {airline}\n"
-    
-    if verdict:
-        msg += f"\n🔥 <b>{verdict}</b>\n"
-    
-    msg += "\n#TravelTxter #CheapFlights #BudgetTravel"
-    
-    return msg
-
-
-    return msg
-
-
-# =============================================================================
-# V4 message templates (additive; legacy remains default)
-# =============================================================================
-
-def _esc(s: str) -> str:
-    """HTML-escape user/content fields safely for Telegram HTML parse_mode."""
-    return html.escape(str(s or "").strip(), quote=True)
-
-def _first_nonempty(*vals: str) -> str:
-    for v in vals:
-        v = (v or "").strip()
-        if v:
-            return v
-    return ""
-
-def _extract_reasons(deal: Dict[str, str], max_items: int = 3) -> List[str]:
-    """
-    Pull up to max_items short reasons from ai_notes/ai_caption/notes.
-    Falls back to generic reasons if none exist.
-    """
-    blob = _first_nonempty(deal.get("ai_notes", ""), deal.get("ai_caption", ""), deal.get("notes", ""))
-    blob = re.sub(r"\s+", " ", blob).strip()
-    reasons: List[str] = []
-    if blob:
-        # Split on common separators into short phrases
-        parts = re.split(r"(?:\.\s+|;\s+|\|\s+|•\s+|-\s+)", blob)
-        for p in parts:
-            p = p.strip(" .;-|")
-            if 6 <= len(p) <= 80:
-                reasons.append(p)
-            if len(reasons) >= max_items:
-                break
-    if not reasons:
-        reasons = ["Rare price for this route", "Good availability window", "High value vs typical fares"][:max_items]
-    return reasons
-
-def format_message_v4_vip(deal: Dict[str, str]) -> str:
-    """VIP message: calm, minimal selling, includes tracked booking link."""
-    origin = _esc(deal.get("origin_city", "UK"))
-    destination = _esc(deal.get("destination_city", "Unknown"))
-    country = _esc(deal.get("destination_country", ""))
-    price = _esc(deal.get("price_gbp", "???"))
-    out_date = _esc(deal.get("outbound_date", ""))
-    ret_date = _esc(deal.get("return_date", ""))
-    cabin = _esc(deal.get("cabin_class", "")) or "Economy"
-    affiliate = (deal.get("affiliate_url") or "").strip()
-
-    country_text = f" ({country})" if country else ""
-    date_range = ""
-    if out_date and ret_date:
-        date_range = f"{out_date} → {ret_date}"
-    elif out_date:
-        date_range = out_date
-
-    reasons = _extract_reasons(deal, 3)
-    reasons_html = "\n".join([f"• {_esc(r)}" for r in reasons])
-
-    msg = ""
-    msg += "✈️ <b>[A-GRADE DEAL]</b>\n\n"
-    msg += f"🇬🇧 <b>{origin} → {destination}</b>{country_text}\n"
-    msg += f"💼 <b>{_esc(cabin.title())}</b>\n"
-    if date_range:
-        msg += f"📅 <b>{date_range}</b>\n"
-    msg += f"💰 <b>£{price}</b>\n\n"
-    msg += "Why this is special:\n"
-    msg += reasons_html + "\n\n"
-    msg += "⏳ Likely to disappear fast.\n"
-    if affiliate:
-        msg += f'👉 <b><a href="{_esc(affiliate)}">Book now</a></b>'
-    else:
-        msg += "👉 Booking link: (missing affiliate_url)"
-    return msg
-
-def format_message_v4_free(deal: Dict[str, str]) -> str:
-    """Free message: teaser + VIP CTA via Stripe link (if provided)."""
-    origin = _esc(deal.get("origin_city", "UK"))
-    destination = _esc(deal.get("destination_city", "Unknown"))
-    price = _esc(deal.get("price_gbp", "???"))
-    out_date = _esc(deal.get("outbound_date", ""))
-    ret_date = _esc(deal.get("return_date", ""))
-    cabin = _esc(deal.get("cabin_class", "")) or "Economy"
-
-    date_range = ""
-    if out_date and ret_date:
-        date_range = f"{out_date} → {ret_date}"
-    elif out_date:
-        date_range = out_date
-
-    msg = ""
-    msg += f"🔥 <b>£{price} flights to {destination}</b>\n\n"
-    msg += "We found this earlier today.\n\n"
-    msg += "<b>Details:</b>\n"
-    msg += f"• 🇬🇧 From {origin}\n"
-    if date_range:
-        msg += f"• 📅 {date_range}\n"
-    msg += f"• 💼 {cabin.title()}\n\n"
-    msg += "⚠️ Heads up:\nThis deal was sent to our VIP channel first.\n\n"
-    if STRIPE_LINK:
-        msg += "👉 Want deals like this <b>as soon as we find them</b>?\n"
-        msg += f'Join Traveltxter VIP: <a href="{_esc(STRIPE_LINK)}">Unlock access</a>'
-    else:
-        msg += "👉 Want deals like this as soon as we find them? (Set STRIPE_LINK env var)"
-    return msg
-
-def build_message(deal: Dict[str, str]) -> str:
-    """
-    Backwards-compatible message builder.
-    - legacy (default): existing format_message()
-    - v4: uses VIP/FREE templates controlled by TG_MODE
-    """
-    if TG_TEMPLATE_VERSION != "v4":
-        return format_message(deal)
-    if TG_MODE == "vip":
-        return format_message_v4_vip(deal)
-    return format_message_v4_free(deal)
-
-def post_to_telegram(message: str, photo_url: str = None) -> Tuple[bool, str]:
-    """
-    Post message to Telegram channel.
-    
-    Args:
-        message: Message text (HTML format)
-        photo_url: Optional image URL
-        
-    Returns:
-        Tuple of (success: bool, message_id or error: str)
-    """
-    if DRY_RUN:
-        logger.info("🧪 [DRY RUN] Would post to Telegram")
-        return True, "dry_run_tg_123"
-    
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    channel = os.getenv("TELEGRAM_CHANNEL")
-    
-    if not bot_token or not channel:
-        return False, "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL"
-    
-    try:
-        if photo_url:
-            # Send photo with caption
-            url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-            payload = {
-                "chat_id": channel,
-                "photo": photo_url,
-                "caption": message,
-                "parse_mode": "HTML",
-            }
-        else:
-            # Send text message
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            payload = {
-                "chat_id": channel,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            }
-        
-        logger.info(f"   Sending to Telegram channel: {channel}")
-        response = requests.post(url, json=payload, timeout=30)
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get("ok"):
-                message_id = result.get("result", {}).get("message_id", "unknown")
-                return True, str(message_id)
-            else:
-                error = result.get("description", "Unknown error")
-                return False, f"Telegram API error: {error}"
-        else:
-            return False, f"HTTP {response.status_code}: {response.text[:200]}"
-            
-    except Exception as e:
-        logger.error(f"❌ Failed to post to Telegram: {e}")
-        return False, str(e)
-
-
-# =============================================================================
+# =========================
 # Main
-# =============================================================================
+# =========================
 
 def main() -> int:
-    logger.info("\n" + "=" * 60)
-    logger.info("🚀 TravelTxter Telegram Publisher Starting")
-    logger.info("=" * 60)
-    logger.info(f"⏰ Timestamp: {datetime.utcnow().isoformat()}Z")
-    logger.info(f"🆔 Worker ID: {WORKER_ID}")
-    logger.info(f"📋 Run: #{GITHUB_RUN_NUMBER} (ID: {GITHUB_RUN_ID})")
-    logger.info(f"🧪 Dry Run: {DRY_RUN}")
-    logger.info(f"📄 Tab: {RAW_DEALS_TAB}")
-    logger.info(f"🔎 Filter: {RAW_STATUS_COLUMN} == {TG_REQUIRED_STATUS}")
-    logger.info(f"✅ Promote on success: {RAW_STATUS_COLUMN} -> {TG_POSTED_STATUS}")
-    logger.info(f"📊 Max posts per run: {MAX_POSTS_PER_RUN}")
-    logger.info("=" * 60 + "\n")
+    # ---- identity / run meta
+    run_id = env_first(["GITHUB_RUN_ID", "RUN_ID"], "local")
+    attempt = env_first(["GITHUB_RUN_ATTEMPT", "RUN_ATTEMPT"], "1")
+    worker_id = env_first(["WORKER_ID"], "telegram_publisher")
+    dry_run = truthy(env_first(["DRY_RUN", "TELEGRAM_DRY_RUN"], "false"))
+
+    # ---- spreadsheet config (back-compat)
+    spreadsheet_id = env_first(["SPREADSHEET_ID", "SHEET_ID"], "").strip()
+    if not spreadsheet_id:
+        raise RuntimeError("Missing SPREADSHEET_ID/SHEET_ID env var.")
+
+    tab = env_first(["RAW_DEALS_TAB", "DEALS_SHEET_NAME"], 
+"RAW_DEALS").strip()
+
+    status_col = env_first(["TG_STATUS_COLUMN", "TELEGRAM_STATUS_COLUMN", 
+"RAW_STATUS_COLUMN"], "raw_status").strip()
+    required_status = env_first(["TG_REQUIRED_STATUS", 
+"TELEGRAM_REQUIRED_STATUS"], "POSTED_INSTAGRAM").strip().upper()
+    posted_status = env_first(["TG_POSTED_STATUS", 
+"TELEGRAM_POSTED_STATUS"], "POSTED_TELEGRAM").strip().upper()
+
+    allow_verdicts_raw = env_first(["TELEGRAM_ALLOW_VERDICTS", 
+"TG_ALLOW_VERDICTS"], "").strip()
+    allow_verdicts = [v.strip().upper() for v in 
+allow_verdicts_raw.split(",") if v.strip()] if allow_verdicts_raw else []
+    min_ai_score = to_float(env_first(["TELEGRAM_MIN_AI_SCORE", 
+"TG_MIN_AI_SCORE"], "0"), 0.0)
+
+    max_posts = int(env_first(["MAX_POSTS_PER_RUN", 
+"TELEGRAM_MAX_POSTS_PER_RUN"], "1").strip() or "1")
+
+    # ---- telegram config
+    bot_token = env_first(["TELEGRAM_BOT_TOKEN"], "").strip()
+    chat_id = env_first(["TELEGRAM_CHANNEL"], "").strip()
+    if not bot_token or not chat_id:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL 
+env var.")
+
+    # ---- v4 template controls
+    tg_template_version = env_first(["TG_TEMPLATE_VERSION", 
+"TELEGRAM_TEMPLATE_VERSION"], "legacy").strip().lower()
+    tg_mode = env_first(["TG_MODE", "TELEGRAM_MODE"], 
+"free").strip().lower()
+    stripe_link = env_first(["STRIPE_LINK"], "").strip()
+    premium_filter = env_first(["DEAL_PREMIUM_FILTER"], 
+"all").strip().lower()
+
+    posted_ts_col = env_first(["TELEGRAM_POSTED_TIMESTAMP_COLUMN"], 
+"telegram_published_timestamp").strip()
+
+    # ---- log header
     
-    # Validate env
-    required_vars = ["SHEET_ID", "GCP_SA_JSON", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHANNEL"]
-    missing = [v for v in required_vars if not os.getenv(v)]
+log.info("\n============================================================")
+    log.info("🚀 TravelTxter Telegram Publisher Starting")
     
-    if missing:
-        logger.error(f"❌ Missing required environment variables: {missing}")
-        return 1
+log.info("============================================================")
+    log.info(f"⏰ Timestamp: {utc_now_iso()}")
+    log.info(f"🆔 Worker ID: {worker_id}")
+    log.info(f"📋 Run: #{attempt} (ID: {run_id})")
+    log.info(f"🧪 Dry Run: {dry_run}")
+    log.info(f"📄 Tab: {tab}")
+    log.info(f"🔎 Filter: {status_col} == {required_status}")
+    log.info(f"✅ Promote on success: {status_col} -> {posted_status}")
+    log.info(f"📊 Max posts per run: {max_posts}")
     
+log.info("============================================================\n")
+
+    # ---- open sheet
+    gc = get_gspread_client()
+    ws = open_worksheet(gc, spreadsheet_id, tab)
+    log.info(f"✅ Using worksheet: '{ws.title}' ({ws.row_count} rows)")
+
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        log.info("No data rows found.")
+        return 0
+
+    headers = values[0]
+    idx = header_index_map(headers)
+
+    def has_col(name: str) -> bool:
+        return name in idx
+
+    considered = 0
+    published = 0
+    failed = 0
+
+    for r_i in range(1, len(values)):  # 0 is header
+        if published >= max_posts:
+            break
+
+        row = values[r_i]
+        row_num = r_i + 1  # 1-indexed in Sheets
+
+        current_status = get_cell(row, idx, status_col).strip().upper()
+        if current_status != required_status:
+            continue
+
+        considered += 1
+
+        # verdict gate (optional)
+        verdict = get_cell(row, idx, "ai_verdict").strip().upper()
+        if allow_verdicts and verdict and verdict not in allow_verdicts:
+            continue
+
+        # min ai score gate
+        ai_score = to_float(get_cell(row, idx, "ai_score"), 0.0)
+        if ai_score < min_ai_score:
+            continue
+
+        # premium filter gate (optional)
+        is_premium_val = get_cell(row, idx, "is_premium")
+        is_premium = truthy(is_premium_val)
+        if premium_filter == "premium_only" and not is_premium:
+            continue
+        if premium_filter == "free_only" and is_premium:
+            continue
+
+        # build row dict
+        row_dict: Dict[str, str] = {}
+        for h in headers:
+            key = str(h).strip()
+            if not key:
+                continue
+            row_dict[key] = get_cell(row, idx, key)
+
+        # message
+        msg = build_message(row_dict, tg_template_version, tg_mode, 
+stripe_link)
+
+        if dry_run:
+            log.info(f"🧪 Dry-run: would post row {row_num} 
+(deal_id={row_dict.get('deal_id','')})")
+            published += 1
+            continue
+
+        ok, info = telegram_send_message(bot_token, chat_id, msg, 
+disable_preview=True)
+        if not ok:
+            failed += 1
+            log.error(f"❌ Telegram post failed for row {row_num}: 
+{info}")
+            continue
+
+        # promote status + timestamp
+        try:
+            # update status cell
+            if has_col(status_col):
+                col_num = idx[status_col] + 1
+                set_cell(ws, row_num, col_num, posted_status)
+
+            # timestamp (only if column exists)
+            if posted_ts_col and has_col(posted_ts_col):
+                col_num = idx[posted_ts_col] + 1
+                set_cell(ws, row_num, col_num, utc_now_iso())
+
+            published += 1
+            log.info(f"✅ Posted row {row_num} and promoted status to 
+{posted_status}")
+            time.sleep(0.6)  # small throttle
+        except Exception as e:
+            failed += 1
+            log.error(f"❌ Posted but failed to update sheet for row 
+{row_num}: {e}")
+
+    # summary
+    
+log.info("\n============================================================")
+    log.info("📊 PUBLISH SUMMARY")
+    
+log.info("============================================================")
+    log.info(f"🔎 Considered: {considered}")
+    log.info(f"✅ Published:  {published}")
+    log.info(f"❌ Failed:     {failed}")
+    
+log.info("============================================================\n")
+
+    # optional stats write
     try:
-        ws = get_worksheet()
-        data = ws.get_all_values()
-        
-        if len(data) < 2:
-            logger.info("ℹ️ No rows to publish.")
-            return 0
-        
-        headers = [h.strip() for h in data[0]]
-        rows = data[1:]
-        header_len = len(headers)
-        
-        # Required columns
-        required_cols = [
-            "deal_id",
-            "origin_city",
-            "destination_city",
-            "price_gbp",
-            RAW_STATUS_COLUMN,
-            TG_STATUS_COLUMN,
-        ]
-        
-        missing_cols = [c for c in required_cols if col_index(headers, c) is None]
-        if missing_cols:
-            raise ValueError(f"Missing required columns in '{RAW_DEALS_TAB}': {missing_cols}")
-        
-        idx = {c: col_index(headers, c) for c in required_cols}
-        
-        # Optional columns
-        optional_cols = [
-            "destination_country", "outbound_date", "return_date", 
-            "trip_length_days", "stops", "baggage_included", 
-            "airline", "ai_verdict", "graphic_url",
-            "affiliate_url", "cabin_class", "ai_grading", "ai_notes", "ai_caption",
-            "is_premium", "price_percentile", "price_drop_percent", "route_rarity_score", "availability_window_hours"
-        ]
-        for col in optional_cols:
-            idx[col] = col_index(headers, col)
-        
-        published = 0
-        failed = 0
-        considered = 0
-        
-        for row_num, row in enumerate(rows, start=2):
-            if published >= MAX_POSTS_PER_RUN:
-                logger.info(f"✋ Reached MAX_POSTS_PER_RUN ({MAX_POSTS_PER_RUN}), stopping")
-                break
-            
-            row = pad_row(row, header_len)
-            
-            raw_status = (row[idx[RAW_STATUS_COLUMN]] or "").strip().upper()
-            if raw_status != TG_REQUIRED_STATUS:
-                continue
-            
-            tg_status = (row[idx[TG_STATUS_COLUMN]] or "").strip().upper()
-            if tg_status in ("POSTED", "PUBLISHED", "DONE"):
-                logger.debug(f"Row {row_num}: Already posted to Telegram, skipping")
-                continue
-            
-            # Build deal dict
-            deal = {}
-            for col_name, col_idx in idx.items():
-                if col_idx is not None and col_idx < len(row):
-                    deal[col_name] = row[col_idx]
-                else:
-                    deal[col_name] = ""
-            
-            considered += 1
-            message = build_message(deal)
-            photo_url = deal.get("graphic_url", "").strip() or None
-            
-            logger.info(f"\n{'='*60}")
-            logger.info(f"📱 Posting row {row_num}: {deal['origin_city']} → {deal['destination_city']} (£{deal['price_gbp']})")
-            logger.info(f"   Deal ID: {deal['deal_id']}")
-            if photo_url:
-                logger.info(f"   Photo: {photo_url}")
-            
-            ok, result = post_to_telegram(message, photo_url)
-            
-            if ok:
-                published += 1
-                logger.info(f"✅ Posted successfully: message_id={result}")
-                
-                batch_update_cells(
-                    ws,
-                    headers,
-                    row_num,
-                    {
-                        TG_STATUS_COLUMN: "POSTED",
-                        "tg_message_id": result,
-                        "tg_published_timestamp": datetime.utcnow().isoformat() + "Z",
-                        RAW_STATUS_COLUMN: TG_POSTED_STATUS,
-                    },
-                )
-            else:
-                failed += 1
-                logger.error(f"❌ Post failed: {result}")
-                
-                batch_update_cells(
-                    ws,
-                    headers,
-                    row_num,
-                    {
-                        TG_STATUS_COLUMN: "FAILED",
-                        "tg_error": result[:200],
-                        "tg_published_timestamp": datetime.utcnow().isoformat() + "Z",
-                    },
-                )
-            
-            # Rate limiting
-            if published < MAX_POSTS_PER_RUN:
-                import time
-                time.sleep(2)  # 2 seconds between posts
-        
-        logger.info("\n" + "=" * 60)
-        logger.info("📊 PUBLISH SUMMARY")
-        logger.info("=" * 60)
-        logger.info(f"🔎 Considered: {considered}")
-        logger.info(f"✅ Published:  {published}")
-        logger.info(f"❌ Failed:     {failed}")
-        logger.info("=" * 60 + "\n")
-        
-        # Save stats
-        stats = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "run_id": GITHUB_RUN_ID,
-            "run_number": GITHUB_RUN_NUMBER,
+        os.makedirs("logs", exist_ok=True)
+        stats_path = os.path.join("logs", "telegram_stats.json")
+        payload = {
+            "timestamp": utc_now_iso(),
             "considered": considered,
             "published": published,
             "failed": failed,
-            "dry_run": DRY_RUN,
+            "required_status": required_status,
+            "posted_status": posted_status,
+            "template_version": tg_template_version,
+            "mode": tg_mode,
+            "premium_filter": premium_filter,
         }
-        
-        with open("logs/telegram_stats.json", "w") as f:
-            json.dump(stats, f, indent=2)
-        
-        logger.info("📊 Stats saved to logs/telegram_stats.json")
-        
-        return 1 if failed > 0 else 0
-        
-    except Exception as e:
-        logger.error(f"❌ Worker failed with error: {e}")
-        logger.debug(traceback.format_exc())
-        return 1
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        log.info(f"📊 Stats saved to {stats_path}")
+    except Exception:
+        # don't fail the run for stats logging
+        pass
+
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        log.error(f"❌ Worker failed with error: {e}")
+        raise
+

@@ -93,7 +93,14 @@ def utc_now() -> str:
 
 
 def normalize(v: Any) -> str:
-    return "" if v is None else str(v).strip()
+    if v is None:
+        return ""
+    s = str(v)
+    # Remove invisible characters
+    s = s.replace("\u00A0", " ")   # NBSP
+    s = s.replace("\u200B", "")    # zero-width space
+    s = s.replace("\uFEFF", "")    # BOM
+    return s.strip().upper()
 
 
 def build_header_map(headers: List[str]) -> Dict[str, int]:
@@ -195,16 +202,29 @@ def find_first_render_candidate(ws) -> Optional[Dict[str, Any]]:
 
     hmap = build_header_map(headers)
 
-    raw_status_col = find_col_name(hmap, ["raw_status", "RAW_STATUS"])
-    ai_verdict_col = find_col_name(hmap, ["ai_verdict", "AI_VERDICT"])
-    status_col = find_col_name(hmap, ["status", "STATUS"])
+    # FIXED: Check for raw_status column (case-insensitive)
+    raw_status_col = None
+    ai_verdict_col = None
+    status_col = None
+    
+    for header, idx in hmap.items():
+        header_upper = header.upper()
+        if header_upper == "RAW_STATUS":
+            raw_status_col = header
+        elif header_upper == "AI_VERDICT":
+            ai_verdict_col = header
+        elif header_upper == "STATUS":
+            status_col = header
 
     if not raw_status_col:
-        die("ERROR: Missing raw_status or RAW_STATUS column.")
+        log(f"Available headers: {list(hmap.keys())}")
+        die("ERROR: Missing 'raw_status' column in sheet.")
     if not ai_verdict_col:
-        die("ERROR: Missing ai_verdict or AI_VERDICT column.")
+        die("ERROR: Missing 'ai_verdict' column in sheet.")
     if not status_col:
-        die("ERROR: Missing status column.")
+        die("ERROR: Missing 'status' column in sheet.")
+
+    log(f"Using columns: raw_status='{raw_status_col}', ai_verdict='{ai_verdict_col}', status='{status_col}'")
 
     raw_status_idx = hmap[raw_status_col] - 1
     ai_verdict_idx = hmap[ai_verdict_col] - 1
@@ -415,4 +435,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

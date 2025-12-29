@@ -166,7 +166,7 @@ def free_message(row: Dict[str, str], stripe: str) -> str:
     lines.append("")
     
     # Value prop - straightforward
-    lines.append("<b>TravelTxter VIP — £7/month</b>")
+    lines.append("<b>TravelTxter Nomad — £7.99/month</b>")
     lines.append("▸ Deals 24 hours early")
     lines.append("▸ Direct booking links")
     lines.append("▸ Mistake fares when they drop")

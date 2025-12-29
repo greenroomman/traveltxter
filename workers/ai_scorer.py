@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Traveltxter V3_beta_b - AI Scorer (Production Grade)
+Traveltxter V3_beta_b - AI Scorer (Production Grade with Debug)
 - Processes multiple rows in one run
-- Injects Affiliate Links
+- Enhanced debugging to show what's in each row
 - Standardizes raw_status lifecycle
 """
 
@@ -95,7 +95,7 @@ def score_deal(rec: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 def main():
-    log("🚀 AI SCORER STARTING (Batch Mode)")
+    log("🚀 AI SCORER STARTING (Batch Mode with Debug)")
     
     # 1. Setup Connection
     sheet_id = get_env("SHEET_ID")
@@ -124,13 +124,15 @@ default="10"))
     hmap = {h: i+1 for i, h in enumerate(headers) if h}
     
     log(f"Found {len(headers)} columns, {len(all_values)-1} data rows")
+    log(f"DEBUG: First 10 headers: {headers[:10]}")
     
     # Identify status column
     status_col = None
     for col_name in ["raw_status", "RAW_STATUS", "status"]:
         if col_name in hmap:
             status_col = col_name
-            log(f"Using status column: '{status_col}'")
+            log(f"Using status column: '{status_col}' at position 
+{hmap[status_col]}")
             break
     
     if not status_col:
@@ -142,28 +144,51 @@ default="10"))
     rows_to_process = []
     status_idx = hmap[status_col] - 1  # Convert to 0-based
     
+    log(f"Status column is at index {status_idx} (0-based), which is 
+column {col_to_a1(hmap[status_col])}")
     log(f"Searching for rows with status = NEW or READY...")
+    log(f"DEBUG: Will check rows 2 through {len(all_values)}")
     
+    # Debug: Show all rows
     for idx, row in enumerate(all_values[1:], start=2):
+        row_len = len(row)
+        
+        # Show basic info for every row
+        deal_id = row[0] if len(row) > 0 else "NO_ID"
+        log(f"DEBUG: Row {idx} - length={row_len}, deal_id={deal_id}")
+        
         # Handle short rows
-        if len(row) <= status_idx:
+        if row_len <= status_idx:
+            log(f"  -> Row {idx} is too short ({row_len} cells, need 
+>{status_idx})")
             continue
         
-        status_val = row[status_idx].strip().upper()
+        # Get status value
+        status_cell = row[status_idx] if status_idx < row_len else ""
+        status_val = status_cell.strip().upper()
+        
+        log(f"  -> Row {idx} raw_status (column 
+{col_to_a1(hmap[status_col])}): '{status_cell}' -> '{status_val}'")
         
         # V3_beta_b Fix: Look for 'NEW' and 'READY' to clear backlog
         if status_val in ["NEW", "READY"]:
             rows_to_process.append((idx, dict(zip(headers, row))))
-            log(f"  Row {idx}: {status_val} -> will process")
+            log(f"  ✅ Row {idx}: MATCHED (status={status_val}) -> will 
+process")
+        else:
+            log(f"  ⏭️  Row {idx}: SKIPPED (status='{status_val}' not in 
+[NEW, READY])")
         
         if len(rows_to_process) >= max_rows:
+            log(f"Reached max_rows limit ({max_rows}), stopping search")
             break
 
     if not rows_to_process:
-        log("No rows found with status = NEW or READY")
+        log("❌ No rows found with status = NEW or READY")
+        log("💡 Checked all rows above - none matched")
         return
     
-    log(f"Found {len(rows_to_process)} rows to process.")
+    log(f"✅ Found {len(rows_to_process)} rows to process.")
 
     # 4. Process Batch
     all_updates = []

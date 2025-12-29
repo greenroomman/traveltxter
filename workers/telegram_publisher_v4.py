@@ -110,7 +110,12 @@ def clean_whitespace(s: str) -> str:
 
 def format_message_legacy(row: Dict[str, str]) -> str:
     """
+<<<<<<< HEAD
     A simple safe legacy message (keeps system functional even if no V4 fields exist)
+=======
+    A simple safe legacy message (keeps system functional even if no V4 
+fields exist)
+>>>>>>> 62e6176 (Fix broken comment causing syntax error)
     """
     origin = safe(row.get("origin_city", row.get("origin", "")))
     dest = safe(row.get("destination_city", row.get("destination", "")))
@@ -153,6 +158,7 @@ def format_message_v4_vip(row: Dict[str, str]) -> str:
     cabin = safe(row.get("cabin_class", "")).lower()
     cabin_show = "Business" if cabin == "business" else ("First" if cabin == "first" else ("Economy" if cabin else ""))
 
+<<<<<<< HEAD
     ai_grade = safe(row.get("ai_grading", row.get("ai_grade", ""))).upper()
     reason = clean_whitespace(row.get("ai_notes") or row.get("ai_reason") or row.get("notes") or "")
     
@@ -160,6 +166,19 @@ def format_message_v4_vip(row: Dict[str, str]) -> str:
 
     # Header based on grade
     header = "✈️ <b>A-GRADE DEAL</b>" if ai_grade == "A" else "✈️ <b>PREMIUM DEAL</b>"
+=======
+    ai_grade = safe(row.get("ai_grading", row.get("ai_grade", 
+""))).upper()
+    reason = clean_whitespace(row.get("ai_notes") or row.get("ai_reason") 
+or row.get("notes") or "")
+    
+    affiliate = (row.get("affiliate_url") or row.get("deal_url") or 
+row.get("booking_url") or "").strip()
+
+    # Header based on grade
+    header = "✈️ <b>A-GRADE DEAL</b>" if ai_grade == "A" else "✈️ 
+<b>PREMIUM DEAL</b>"
+>>>>>>> 62e6176 (Fix broken comment causing syntax error)
 
     lines = [header, ""]
     
@@ -190,7 +209,12 @@ def format_message_v4_vip(row: Dict[str, str]) -> str:
         lines.append("")
         lines.append("<b>Why this is special:</b>")
         # Keep it short; first ~3 bullet-worthy clauses
+<<<<<<< HEAD
         parts = [p.strip() for p in re.split(r"[.;]\s+", reason) if p.strip()]
+=======
+        parts = [p.strip() for p in re.split(r"[.;]\s+", reason) if 
+p.strip()]
+>>>>>>> 62e6176 (Fix broken comment causing syntax error)
         for p in parts[:3]:
             lines.append(f"• {safe(p)}")
 
@@ -267,7 +291,12 @@ def format_message_v4_free(row: Dict[str, str], stripe_link: str) -> str:
     return "\n".join(lines).strip()
 
 
+<<<<<<< HEAD
 def build_message(row: Dict[str, str], template_version: str, mode: str, stripe_link: str) -> str:
+=======
+def build_message(row: Dict[str, str], template_version: str, mode: str, 
+stripe_link: str) -> str:
+>>>>>>> 62e6176 (Fix broken comment causing syntax error)
     """
     Build the appropriate message based on template version and mode
     """
@@ -385,7 +414,12 @@ def main() -> int:
     log.info(f"✅ Promote on success: {status_col} -> {posted_status}")
     log.info(f"📊 Max posts per run: {max_posts}")
     log.info(f"📱 Template: {tg_template_version} (mode: {tg_mode})")
+<<<<<<< HEAD
     log.info("============================================================\n")
+=======
+    
+log.info("============================================================\n")
+>>>>>>> 62e6176 (Fix broken comment causing syntax error)
 
     # ---- open sheet
     gc = get_gspread_client()
@@ -450,7 +484,12 @@ def main() -> int:
         msg = build_message(row_dict, tg_template_version, tg_mode, stripe_link)
 
         if dry_run:
+<<<<<<< HEAD
             log.info(f"🧪 Dry-run: would post row {row_num} (deal_id={row_dict.get('deal_id','')})")
+=======
+            log.info(f"🧪 Dry-run: would post row {row_num} 
+(deal_id={row_dict.get('deal_id','')})")
+>>>>>>> 62e6176 (Fix broken comment causing syntax error)
             log.info(f"📝 Message preview:\n{msg}\n")
             published += 1
             continue

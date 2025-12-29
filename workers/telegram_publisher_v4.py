@@ -25,6 +25,7 @@ import os
 import html
 import sys
 import json
+import re
 import logging
 import traceback
 from datetime import datetime
@@ -60,11 +61,33 @@ WORKER_ID = os.getenv("WORKER_ID", "telegram_publisher")
 GITHUB_RUN_ID = os.getenv("GITHUB_RUN_ID", "local")
 GITHUB_RUN_NUMBER = os.getenv("GITHUB_RUN_NUMBER", "0")
 
-RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
-RAW_STATUS_COLUMN = os.getenv("RAW_STATUS_COLUMN", "raw_status").strip()
-TG_STATUS_COLUMN = os.getenv("TG_STATUS_COLUMN", "tg_status").strip()
-TG_REQUIRED_STATUS = os.getenv("TG_REQUIRED_STATUS", "POSTED_INSTAGRAM").strip().upper()
-TG_POSTED_STATUS = os.getenv("TG_POSTED_STATUS", "POSTED_TELEGRAM").strip().upper()
+RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", os.getenv("DEALS_SHEET_NAME", 
+"RAW_DEALS"))
+
+# Back-compat: accept both the new TG_* vars and your existing TELEGRAM_* 
+vars from workflows
+RAW_STATUS_COLUMN = os.getenv("RAW_STATUS_COLUMN", 
+os.getenv("TELEGRAM_STATUS_COLUMN", "raw_status")).strip()
+TG_STATUS_COLUMN = os.getenv("TG_STATUS_COLUMN", 
+os.getenv("TELEGRAM_STATUS_WRITEBACK_COLUMN", "tg_status")).strip()
+
+TG_REQUIRED_STATUS = os.getenv("TG_REQUIRED_STATUS", 
+os.getenv("TELEGRAM_REQUIRED_STATUS", "POSTED_INSTAGRAM")).strip().upper()
+TG_POSTED_STATUS = os.getenv("TG_POSTED_STATUS", 
+os.getenv("TELEGRAM_POSTED_STATUS", "POSTED_TELEGRAM")).strip().upper()
+
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", 
+os.getenv("TELEGRAM_MAX_POSTS_PER_RUN", "1")).strip())
+
+# V4 templating controls (default = legacy behaviour unless explicitly 
+turned on)
+TG_TEMPLATE_VERSION = os.getenv("TG_TEMPLATE_VERSION", 
+os.getenv("TELEGRAM_TEMPLATE_VERSION", "legacy")).strip().lower()
+TG_MODE = os.getenv("TG_MODE", os.getenv("TELEGRAM_MODE", 
+"free")).strip().lower()
+STRIPE_LINK = os.getenv("STRIPE_LINK", "").strip()
+DEAL_PREMIUM_FILTER = os.getenv("DEAL_PREMIUM_FILTER", 
+"all").strip().lower()
 
 MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "1").strip())
 

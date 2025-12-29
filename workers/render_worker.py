@@ -241,6 +241,8 @@ def find_first_render_candidate(ws) -> Optional[Dict[str, Any]]:
         raw_status = normalize(row[raw_status_idx])
         ai_verdict = normalize(row[ai_verdict_idx])
         workflow = normalize(row[workflow_idx])
+        
+        log(f"DEBUG Row {i}: raw_status='{raw_status}' ai_verdict='{ai_verdict}' workflow='{workflow}'")
 
         if raw_status == "SCORED" and ai_verdict == "GOOD" and workflow in allowed_workflows:
             rec = record_from_row(headers, row)

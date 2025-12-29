@@ -28,7 +28,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
           DEALS_SHEET_NAME: RAW_DEALS
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}

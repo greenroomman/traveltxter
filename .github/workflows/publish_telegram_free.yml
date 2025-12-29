@@ -1,0 +1,53 @@
+name: Publish Telegram Deal (FREE – V4)
+
+on:
+  schedule:
+    - cron: "30 7 * * *"
+    - cron: "30 16 * * *"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Publish Deal to Telegram (FREE)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
+          DEALS_SHEET_NAME: RAW_DEALS
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+
+          TELEGRAM_STATUS_COLUMN: raw_status
+          TELEGRAM_REQUIRED_STATUS: READY_TO_POST
+          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM
+
+          TELEGRAM_ALLOW_VERDICTS: "GOOD,AVERAGE"
+          TELEGRAM_MIN_AI_SCORE: "0"
+
+          # 🔽 V4 monetisation flags (SAFE)
+          TG_TEMPLATE_VERSION: "v4"
+          TG_MODE: "free"
+          STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
+          DEAL_PREMIUM_FILTER: "free_only"
+
+        run: python workers/telegram_publisher_v4.py
+

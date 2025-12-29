@@ -31,11 +31,29 @@ def format_message(deal: dict) -> str:
 
 def main():
     if not BOT_TOKEN or not CHANNEL:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL")
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or 
+TELEGRAM_CHANNEL")
 
-    deal = get_ready_deal(worker_id="telegram")
+    # Get filter settings from environment
+    allow_verdicts_str = os.getenv("TELEGRAM_ALLOW_VERDICTS", "GOOD")
+    allow_verdicts = tuple(v.strip() for v in 
+allow_verdicts_str.split(","))
+    
+    min_score_str = os.getenv("TELEGRAM_MIN_AI_SCORE", "0")
+    min_score = float(min_score_str) if min_score_str else None
+
+    # Get deal with filters
+    deal = get_ready_deal(
+        worker_id="telegram",
+        allow_verdicts=allow_verdicts,
+        min_ai_score=min_score,
+        max_lock_age_minutes=30
+    )
+    
     if not deal:
         print("No deal ready")
+        print(f"Filters: verdicts={allow_verdicts}, 
+min_score={min_score}")
         return
 
     try:
@@ -45,6 +63,3 @@ def main():
     except Exception as e:
         mark_error(deal["deal_id"], str(e))
         raise
-
-if __name__ == "__main__":
-    main()

@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-V3.2 — AI Scorer
-Stage 1: Env + Sheets connect
-Stage 2: Find first NEW row
-Stage 3: Heuristic score + write-back + promote to SCORED
+V3_beta — AI Scorer (Option A: raw_status is the single source of truth)
+
+Reads:    RAW_DEALS where raw_status == NEW
+Writes:   ai_score, ai_grading, ai_verdict, ai_notes, scored_timestamp
+Promotes: raw_status -> SCORED   (renderer should consume SCORED next)
+
+Design goals:
+- No column-number writes (header-map only)
+- Guarded updates (idempotent: only updates rows still NEW at write time)
+- Efficient: reads only header + raw_status column + the specific row(s) processed
+- Processes up to MAX_ROWS_PER_RUN (default 1)
 """
 
 import os
@@ -11,7 +18,7 @@ import sys
 import json
 import time
 import datetime as dt
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -36,12 +43,24 @@ def die(msg: str, code: int = 1) -> None:
 # ============================================================
 
 def get_env(name: str, required: bool = True, default: str = "") -> str:
-    value = os.getenv(name)
-    if not value:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
         if required:
             die(f"ERROR: Missing environment variable: {name}")
         return default
-    return value
+    return str(v).strip()
+
+
+def get_env_int(name: str, required: bool = False, default: int = 1) -> int:
+    v = get_env(name, required=required, default=str(default))
+    try:
+        return int(v)
+    except Exception:
+        die(f"ERROR: {name} must be an integer (got {v!r})")
+
+
+def utc_now() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 # ============================================================
@@ -50,11 +69,43 @@ def get_env(name: str, required: bool = True, default: str = "") -> str:
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+STATUS_COL = "raw_status"
+STATUS_NEW = "NEW"
+STATUS_AFTER_SCORING = "SCORED"
+STATUS_ERROR = "ERROR_SCORING"
 
-def get_worksheet():
+OUTPUT_COLS = ["ai_score", "ai_grading", "ai_verdict", "ai_notes", "scored_timestamp"]
+
+
+def normalize(v: Any) -> str:
+    return "" if v is None else str(v).strip()
+
+
+def col_to_a1(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def a1(row: int, col: int) -> str:
+    return f"{col_to_a1(col)}{row}"
+
+
+def build_header_map(headers: List[str]) -> Dict[str, int]:
+    # exact header -> 1-based index
+    hmap: Dict[str, int] = {}
+    for i, h in enumerate(headers, start=1):
+        key = normalize(h)
+        if key:
+            hmap[key] = i
+    return hmap
+
+
+def get_worksheet() -> gspread.Worksheet:
     sheet_id = get_env("SHEET_ID", required=True)
-    worksheet_name = get_env("WORKSHEET_NAME", required=False, 
-default="RAW_DEALS")
+    worksheet_name = get_env("WORKSHEET_NAME", required=False, default="RAW_DEALS")
     sa_json = get_env("GCP_SA_JSON", required=True)
 
     try:
@@ -68,63 +119,57 @@ default="RAW_DEALS")
     return sheet.worksheet(worksheet_name)
 
 
-def utc_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+def ensure_columns(ws: gspread.Worksheet, headers: List[str], hmap: Dict[str, int]) -> Tuple[List[str], Dict[str, int]]:
+    missing = [c for c in OUTPUT_COLS if c not in hmap]
+    if not missing:
+        return headers, hmap
 
+    log(f"Adding missing columns to header row: {missing}")
+    new_headers = headers + missing
 
-def col_to_a1(n: int) -> str:
-    result = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        result = chr(65 + r) + result
-    return result
+    end_col = col_to_a1(len(new_headers))
+    ws.update(f"A1:{end_col}1", [new_headers])
+    time.sleep(0.3)
 
+    headers2 = ws.row_values(1)
+    hmap2 = build_header_map(headers2)
 
-def a1(row: int, col: int) -> str:
-    return f"{col_to_a1(col)}{row}"
+    still_missing = [c for c in OUTPUT_COLS if c not in hmap2]
+    if still_missing:
+        die(f"ERROR: Failed to add required columns: {still_missing}")
 
-
-def build_header_map(headers: List[str]) -> Dict[str, int]:
-    return {h.strip(): i + 1 for i, h in enumerate(headers) if h.strip()}
+    return headers2, hmap2
 
 
 # ============================================================
-# Stage 2 — find NEW row
+# Stage 2 — find NEW rows efficiently
 # ============================================================
 
-def normalize(v: Any) -> str:
-    return "" if v is None else str(v).strip()
+def find_new_row_numbers(ws: gspread.Worksheet, hmap: Dict[str, int], max_rows: int) -> List[int]:
+    if STATUS_COL not in hmap:
+        die(f"ERROR: Missing required column: {STATUS_COL}")
+
+    col_idx = hmap[STATUS_COL]
+    col_vals = ws.col_values(col_idx)  # includes header at row 1
+    if len(col_vals) < 2:
+        return []
+
+    hits: List[int] = []
+    for row_number, val in enumerate(col_vals, start=1):
+        if row_number == 1:
+            continue
+        if normalize(val).upper() == STATUS_NEW:
+            hits.append(row_number)
+            if len(hits) >= max_rows:
+                break
+    return hits
 
 
-def find_first_new(ws) -> Optional[Dict[str, Any]]:
-    values = ws.get_all_values()
-    if len(values) < 2:
-        return None
-
-    headers = values[0]
-    rows = values[1:]
-    hmap = build_header_map(headers)
-
-    status_col = None
-    for k in ("raw_status", "RAW_STATUS"):
-        if k in hmap:
-            status_col = k
-            break
-
-    if not status_col:
-        die("ERROR: Missing raw_status or RAW_STATUS column.")
-
-    status_idx = hmap[status_col] - 1
-
-    for i, row in enumerate(rows, start=2):
-        if len(row) < len(headers):
-            row += [""] * (len(headers) - len(row))
-        if normalize(row[status_idx]) == "NEW":
-            record = {headers[j]: row[j] for j in range(len(headers))}
-            return {"row_number": i, "record": record, "status_col": 
-status_col}
-
-    return None
+def read_row_as_record(ws: gspread.Worksheet, row_number: int, headers: List[str]) -> Dict[str, Any]:
+    row = ws.row_values(row_number)
+    if len(row) < len(headers):
+        row += [""] * (len(headers) - len(row))
+    return {headers[i]: row[i] for i in range(len(headers))}
 
 
 # ============================================================
@@ -155,13 +200,13 @@ def pick(rec: Dict[str, Any], *keys: str) -> str:
 
 
 def score_deal(rec: Dict[str, Any]) -> Dict[str, Any]:
-    price = safe_float(pick(rec, "price_gbp", "PRICE_GBP"), 9999)
-    stops = safe_int(pick(rec, "stops", "STOPS"), 0)
-    baggage = pick(rec, "baggage_included", "BAGGAGE_INCLUDED").lower()
-    days = safe_int(pick(rec, "trip_length_days", "TRIP_LENGTH_DAYS"), 0)
+    price = safe_float(pick(rec, "price_gbp"), 9999)
+    stops = safe_int(pick(rec, "stops"), 0)
+    baggage = pick(rec, "baggage_included").lower()
+    days = safe_int(pick(rec, "trip_length_days"), 0)
 
     score = 50
-    notes = []
+    notes: List[str] = []
 
     if price <= 50:
         score += 30
@@ -208,97 +253,117 @@ def score_deal(rec: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
-# Stage 3 — write-back
+# Write-back (guarded)
 # ============================================================
 
-OUTPUT_COLS = ["ai_score", "ai_grading", "ai_verdict", "ai_notes", 
-"scored_timestamp"]
+def is_row_new(ws: gspread.Worksheet, row_number: int, hmap: Dict[str, int]) -> bool:
+    current = normalize(ws.cell(row_number, hmap[STATUS_COL]).value).upper()
+    return current == STATUS_NEW
 
 
-def ensure_columns(ws, headers, hmap):
-    missing = [c for c in OUTPUT_COLS if c not in hmap]
-    if not missing:
-        return headers, hmap
-
-    ws.update("1:1", [headers + missing])
-    time.sleep(0.5)
-
-    new_headers = ws.row_values(1)
-    return new_headers, build_header_map(new_headers)
-
-
-def write_row(ws, row, hmap, status_col, updates):
-    current = normalize(ws.cell(row, hmap[status_col]).value)
-    if current != "NEW":
-        log(f"Guard skip row {row} (status={current})")
-        return
+def write_updates_guarded(
+    ws: gspread.Worksheet,
+    row_number: int,
+    hmap: Dict[str, int],
+    updates: Dict[str, Any],
+) -> bool:
+    # Guard: raw_status must still be NEW at write time
+    if not is_row_new(ws, row_number, hmap):
+        current = normalize(ws.cell(row_number, hmap[STATUS_COL]).value).upper()
+        log(f"Guard skip row {row_number} ({STATUS_COL}={current})")
+        return False
 
     data = []
     for k, v in updates.items():
-        if k in hmap:
-            data.append({"range": a1(row, hmap[k]), "values": [[v]]})
+        if k not in hmap:
+            continue
+        data.append({"range": a1(row_number, hmap[k]), "values": [[v]]})
+
+    if not data:
+        die(f"ERROR: No valid update ranges built for row {row_number}. Check headers vs updates keys.")
 
     ws.batch_update(data)
+    return True
 
 
 # ============================================================
 # Main
 # ============================================================
 
-def main():
-    log("AI SCORER STARTING")
+def main() -> None:
+    log("AI SCORER STARTING (Option A: raw_status)")
 
+    # required env
     get_env("SHEET_ID")
     get_env("GCP_SA_JSON")
-    log("Environment OK")
+
+    worksheet_name = get_env("WORKSHEET_NAME", required=False, default="RAW_DEALS")
+    max_rows = get_env_int("MAX_ROWS_PER_RUN", required=False, default=1)
 
     ws = get_worksheet()
     log(f"Connected to worksheet: {ws.title}")
-    log("AI SCORER STAGE 1 COMPLETE")
 
-    hit = find_first_new(ws)
-    if not hit:
+    if ws.title != worksheet_name:
+        log(f"NOTE: WORKSHEET_NAME={worksheet_name} but connected to {ws.title} (check env if unexpected).")
+
+    headers = ws.row_values(1)
+    if not headers:
+        die("ERROR: Header row (row 1) is empty.")
+
+    hmap = build_header_map(headers)
+
+    # hard requirement for Option A
+    if STATUS_COL not in hmap:
+        die(f"ERROR: Missing required column for Option A: {STATUS_COL}")
+
+    headers, hmap = ensure_columns(ws, headers, hmap)
+
+    new_rows = find_new_row_numbers(ws, hmap, max_rows=max_rows)
+    if not new_rows:
         log("Stage 2: No NEW rows found")
         return
 
-    row = hit["row_number"]
-    rec = hit["record"]
-    status_col = hit["status_col"]
+    log(f"Stage 2: Found {len(new_rows)} NEW row(s): {new_rows}")
 
-    log(f"Stage 2: Found NEW row #{row}")
+    processed = 0
+    for row_number in new_rows:
+        rec = read_row_as_record(ws, row_number, headers)
+        deal_id = normalize(rec.get("deal_id", ""))
 
-    headers = ws.row_values(1)
-    hmap = build_header_map(headers)
-    headers, hmap = ensure_columns(ws, headers, hmap)
+        try:
+            log(f"Scoring row {row_number} deal_id={deal_id or '(missing)'}")
+            result = score_deal(rec)
 
-    try:
-        result = score_deal(rec)
-        updates = {
-            "ai_score": result["ai_score"],
-            "ai_grading": result["ai_grading"],
-            "ai_verdict": result["ai_verdict"],
-            "ai_notes": result["ai_notes"],
-            "scored_timestamp": utc_now(),
-            status_col: "SCORED",
-        }
-        write_row(ws, row, hmap, status_col, updates)
-        log(f"Stage 3: Row #{row} scored and promoted to SCORED")
-
-    except Exception as e:
-        write_row(
-            ws,
-            row,
-            hmap,
-            status_col,
-            {
-                "ai_notes": f"ERROR_SCORING: {str(e)[:200]}",
+            updates = {
+                "ai_score": result["ai_score"],
+                "ai_grading": result["ai_grading"],
+                "ai_verdict": result["ai_verdict"],
+                "ai_notes": result["ai_notes"],
                 "scored_timestamp": utc_now(),
-                status_col: "ERROR_SCORING",
-            },
-        )
-        die(f"Stage 3 failed: {e}")
+                STATUS_COL: STATUS_AFTER_SCORING,
+            }
+
+            if write_updates_guarded(ws, row_number, hmap, updates):
+                processed += 1
+                log(f"Stage 3: Row {row_number} scored and promoted to {STATUS_AFTER_SCORING}")
+
+        except Exception as e:
+            err_msg = str(e)[:200]
+            log(f"ERROR scoring row {row_number}: {err_msg}")
+
+            # Try to write error state (still guarded—won't overwrite if status changed)
+            try:
+                updates_err = {
+                    "ai_notes": f"{STATUS_ERROR}: {err_msg}",
+                    "scored_timestamp": utc_now(),
+                    STATUS_COL: STATUS_ERROR,
+                }
+                write_updates_guarded(ws, row_number, hmap, updates_err)
+            except Exception as e2:
+                log(f"ERROR writing error state for row {row_number}: {str(e2)[:200]}")
+
+    log(f"AI SCORER COMPLETE. processed={processed} / found={len(new_rows)}")
 
 
 if __name__ == "__main__":
     main()
-

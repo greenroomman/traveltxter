@@ -208,14 +208,6 @@ def main() -> int:
     status_col = env_first(["TELEGRAM_STATUS_COLUMN", "RAW_STATUS_COLUMN"], "raw_status")
     required = env_first(["TELEGRAM_REQUIRED_STATUS"], "POSTED_INSTAGRAM").upper()
     posted = env_first(["TELEGRAM_POSTED_STATUS"], "POSTED_TELEGRAM").upper()
-<<<<<<< HEAD
-    bot = env("TELEGRAM_BOT_TOKEN").strip()
-    chat = env("TELEGRAM_CHANNEL").strip()
-    log.info(f"Bot token length: {len(bot)}")
-    log.info(f"Channel value: '{chat}'")
-    if not bot or not chat:
-    raise RuntimeError(f"Missing credentials - bot:{len(bot)} chars, channel:{len(chat)} chars")
-=======
     
     bot = env("TELEGRAM_BOT_TOKEN")
     chat = env("TELEGRAM_CHANNEL")
@@ -227,7 +219,6 @@ def main() -> int:
     if not bot or not chat:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL")
     
->>>>>>> b148469 (Fix telegram publisher with debug logging)
     mode = env_first(["TELEGRAM_MODE", "TG_MODE"], "free").lower()
     template = env_first(["TELEGRAM_TEMPLATE_VERSION", "TG_TEMPLATE_VERSION"], "legacy").lower()
     stripe = env("STRIPE_LINK")

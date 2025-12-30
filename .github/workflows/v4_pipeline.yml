@@ -1,4 +1,5 @@
-name: V4 Pipeline (SAFE: Feeder → Scorer → Telegram DUAL)
+name: V4 Production Pipeline (Feeder → Scorer → Render → Insta → Telegram)
+
 concurrency:
   group: v4_pipeline
   cancel-in-progress: true
@@ -12,6 +13,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -25,49 +27,86 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run feeder (affiliate-safe)
+      # --------------------------
+      # FEEDER
+      # --------------------------
+      - name: Feeder (NEW)
         env:
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          # Optional: add later when approved (won't error if missing)
-          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }}
+          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }} # optional; safe if blank
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: RAW_DEALS
-          ORIGIN_IATA: LON
-          DEST_IATA: BCN
-          DAYS_AHEAD: "60"
-          TRIP_LENGTH_DAYS: "5"
+          RAW_STATUS_NEW: NEW
           MAX_INSERTS: "3"
         run: |
           python workers/duffel_feeder_v4_affiliate_safe.py
 
-      - name: Run AI scorer
+      # --------------------------
+      # SCORER
+      # --------------------------
+      - name: AI Scorer (NEW → READY_TO_POST)
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          MAX_ROWS_PER_RUN: "1"
+          INPUT_STATUS: NEW
+          OUTPUT_STATUS: READY_TO_POST
         run: |
           python workers/ai_scorer.py
 
-      - name: Publish Telegram (FREE+VIP from one file)
+      # --------------------------
+      # RENDER
+      # --------------------------
+      - name: Render (READY_TO_POST → READY_TO_PUBLISH)
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          MAX_ROWS_PER_RUN: "1"
+          INPUT_STATUS: READY_TO_POST
+          OUTPUT_STATUS: READY_TO_PUBLISH
+          RENDER_BASE_URL: ${{ secrets.RENDER_BASE_URL }}
+        run: |
+          python workers/render_worker.py
+
+      # --------------------------
+      # INSTAGRAM
+      # --------------------------
+      - name: Instagram Publish (READY_TO_PUBLISH → POSTED_INSTAGRAM)
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          MAX_ROWS_PER_RUN: "1"
+          INPUT_STATUS: READY_TO_PUBLISH
+          OUTPUT_STATUS: POSTED_INSTAGRAM
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+        run: |
+          python workers/publish_worker.py
+
+      # --------------------------
+      # TELEGRAM (FREE + VIP)
+      # --------------------------
+      - name: Telegram Dual Publish (POSTED_INSTAGRAM → POSTED_ALL)
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: RAW_DEALS
 
           TELEGRAM_STATUS_COLUMN: status
-          TELEGRAM_REQUIRED_STATUS: READY_TO_POST
-          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM
+          TELEGRAM_REQUIRED_STATUS: POSTED_INSTAGRAM
+          TELEGRAM_POSTED_STATUS: POSTED_ALL
           TELEGRAM_MAX_POSTS_PER_RUN: "1"
 
           TELEGRAM_BOT_TOKEN_FREE: ${{ secrets.TELEGRAM_BOT_TOKEN_FREE }}
           TELEGRAM_CHAT_ID_FREE: ${{ secrets.TELEGRAM_CHAT_ID_FREE }}
-
           TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
           TELEGRAM_CHAT_ID_VIP: ${{ secrets.TELEGRAM_CHAT_ID_VIP }}
 
           STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
-
-          # Optional click tracking (works only if you deploy the PA redirect endpoint)
-          REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
+          REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }} # optional
         run: |
           python workers/telegram_publisher_V4.py

@@ -1,9 +1,6 @@
 name: V3.2(A) Route Planner (Weekly)
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "10 4 * * 0"
+on: []
 
 concurrency:
   group: v32a-route-planner

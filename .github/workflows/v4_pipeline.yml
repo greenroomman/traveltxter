@@ -1,8 +1,7 @@
-name: V4.1 PRODUCTION (Streamlined - Error-Proof)
+name: V4.1 UNIFIED PIPELINE
 
-# Prevents overlapping runs
 concurrency:
-  group: v4_1_production
+  group: v4_1_unified
   cancel-in-progress: true
 
 on:
@@ -26,29 +25,21 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
-          pip install gspread google-auth requests openai pillow
+          pip install gspread google-auth requests openai
 
       # ============================================================
-      # STEP 1: DUFFEL FEEDER (NEW)
+      # STAGE 1: DUFFEL FEEDER (Optional - inserts NEW deals)
       # ============================================================
       - name: "1️⃣ Duffel Feeder"
-        id: feeder
         continue-on-error: true
         env:
-          # Core secrets
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          
-          # Config
           RAW_DEALS_TAB: "RAW_DEALS"
           RAW_STATUS_NEW: "NEW"
           MAX_INSERTS: "3"
-          
-          # Optional affiliate
           SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }}
-          
-          # Route defaults
           ORIGIN_IATA: "LON"
           DEST_IATA: "BCN"
           DAYS_AHEAD: "60"
@@ -56,123 +47,64 @@ jobs:
         run: python workers/duffel_feeder_v4_affiliate_safe.py
 
       # ============================================================
-      # STEP 2: AI SCORER (NEW → READY_TO_POST)
+      # STAGE 2: AI SCORER (NEW → READY_TO_POST)
       # ============================================================
       - name: "2️⃣ AI Scorer"
-        id: scorer
-        continue-on-error: true
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
-          DEALS_SHEET_NAME: "RAW_DEALS"
-          
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          
-          INPUT_STATUS: "NEW"
-          OUTPUT_STATUS: "READY_TO_POST"
-          MAX_ROWS_PER_RUN: "1"
-        run: python workers/ai_scorer.py
+        run: python workers/unified_pipeline_worker.py
 
       # ============================================================
-      # STEP 3: RENDER (READY_TO_POST → READY_TO_PUBLISH)
+      # STAGE 3: RENDER (READY_TO_POST → READY_TO_PUBLISH)
       # ============================================================
       - name: "3️⃣ Render Graphics"
-        id: render
-        continue-on-error: true
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
-          DEALS_SHEET_NAME: "RAW_DEALS"
-          
           RENDER_URL: ${{ secrets.RENDER_URL }}
-          RENDER_BASE_URL: ${{ secrets.RENDER_URL }}
-          
-          INPUT_STATUS: "READY_TO_POST"
-          OUTPUT_STATUS: "READY_TO_PUBLISH"
-          MAX_ROWS_PER_RUN: "1"
-        run: python workers/render_worker.py
+        run: python workers/unified_pipeline_worker.py
 
       # ============================================================
-      # STEP 4: INSTAGRAM (READY_TO_PUBLISH → POSTED_INSTAGRAM)
+      # STAGE 4: INSTAGRAM (READY_TO_PUBLISH → POSTED_INSTAGRAM)
       # ============================================================
       - name: "4️⃣ Instagram Publish"
-        id: instagram
-        continue-on-error: true
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
-          DEALS_SHEET_NAME: "RAW_DEALS"
-          
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          META_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          
-          INPUT_STATUS: "READY_TO_PUBLISH"
-          OUTPUT_STATUS: "POSTED_INSTAGRAM"
-          MAX_ROWS_PER_RUN: "1"
-        run: python workers/publish_worker.py
+        run: python workers/unified_pipeline_worker.py
 
       # ============================================================
-      # STEP 5: TELEGRAM FREE (POSTED_INSTAGRAM → POSTED_TELEGRAM_FREE)
+      # STAGE 5: TELEGRAM FREE (POSTED_INSTAGRAM → POSTED_TELEGRAM_FREE)
       # ============================================================
       - name: "5️⃣ Telegram FREE"
-        id: telegram_free
-        continue-on-error: true
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
-          DEALS_SHEET_NAME: "RAW_DEALS"
-          
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: "-1003505750272"
-          
-          TELEGRAM_STATUS_COLUMN: "status"
-          RAW_STATUS_COLUMN: "status"
-          TELEGRAM_REQUIRED_STATUS: "POSTED_INSTAGRAM"
-          TELEGRAM_POSTED_STATUS: "POSTED_TELEGRAM_FREE"
-          TELEGRAM_MAX_POSTS_PER_RUN: "1"
-          
+          TELEGRAM_FREE_CHANNEL: "-1003505750272"
           STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
-          TG_MODE: "free"
-          TG_TEMPLATE_VERSION: "v4"
-        run: python workers/telegram_publisher_v4.py
+        run: python workers/unified_pipeline_worker.py
 
       # ============================================================
-      # STEP 6: TELEGRAM VIP (POSTED_TELEGRAM_FREE → POSTED_ALL)
+      # STAGE 6: TELEGRAM VIP (POSTED_TELEGRAM_FREE → POSTED_ALL)
       # ============================================================
       - name: "6️⃣ Telegram VIP"
-        id: telegram_vip
-        continue-on-error: true
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
-          DEALS_SHEET_NAME: "RAW_DEALS"
-          
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: "-1003517970522"
-          
-          TELEGRAM_STATUS_COLUMN: "status"
-          RAW_STATUS_COLUMN: "status"
-          TELEGRAM_REQUIRED_STATUS: "POSTED_TELEGRAM_FREE"
-          TELEGRAM_POSTED_STATUS: "POSTED_ALL"
-          TELEGRAM_MAX_POSTS_PER_RUN: "1"
-          
-          TG_MODE: "vip"
-          TG_TEMPLATE_VERSION: "v4"
-          TELEGRAM_ALLOW_VERDICTS: "GOOD"
-          TELEGRAM_MIN_AI_SCORE: "7.0"
-        run: python workers/telegram_publisher_v4.py
+          TELEGRAM_VIP_CHANNEL: "-1003517970522"
+        run: python workers/unified_pipeline_worker.py
 
       # ============================================================
       # SUMMARY
@@ -181,12 +113,8 @@ jobs:
         if: always()
         run: |
           echo "==================================="
-          echo "V4.1 PIPELINE SUMMARY"
+          echo "V4.1 UNIFIED PIPELINE SUMMARY"
           echo "==================================="
-          echo "Feeder:    ${{ steps.feeder.outcome }}"
-          echo "Scorer:    ${{ steps.scorer.outcome }}"
-          echo "Render:    ${{ steps.render.outcome }}"
-          echo "Instagram: ${{ steps.instagram.outcome }}"
-          echo "Tg FREE:   ${{ steps.telegram_free.outcome }}"
-          echo "Tg VIP:    ${{ steps.telegram_vip.outcome }}"
+          echo "All stages complete"
+          echo "Check logs for deal progression"
           echo "==================================="

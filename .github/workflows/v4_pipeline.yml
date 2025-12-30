@@ -1,4 +1,7 @@
 name: V4 Pipeline (SAFE: Feeder → Scorer → Telegram DUAL)
+concurrency:
+  group: v4_pipeline
+  cancel-in-progress: true
 
 on:
   schedule:

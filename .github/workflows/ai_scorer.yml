@@ -1,15 +1,6 @@
 name: V3_beta_b AI Scorer
 
-on:
-  workflow_dispatch:
-    inputs:
-      max_rows:
-        description: 'Max rows to process'
-        required: false
-        default: '10'
-  schedule:
-    - cron: "45 6 * * *"
-    - cron: "45 15 * * *"
+on: []
 
 concurrency:
   group: v3-ai-scorer

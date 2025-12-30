@@ -1,7 +1,7 @@
-name: V4 Production Pipeline (Feeder → Scorer → Render → Insta → Telegram)
+name: V4.1 Production Pipeline (Feeder → Scorer → Render → Insta → Telegram)
 
 concurrency:
-  group: v4_pipeline
+  group: v4_1_pipeline
   cancel-in-progress: true
 
 on:
@@ -27,105 +27,153 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --------------------------
-      # FEEDER
-      # --------------------------
-      - name: Feeder (NEW)
+      # ==========================================================
+      # 1) FEEDER (Duffel) — hard-capped for free tier
+      # ==========================================================
+      - name: Feeder (NEW) — Duffel Free Tier Safe
         id: feeder
         env:
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }} # optional
+
+          # Optional – safe if missing
+          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }}
+
+          # Sheets auth (support both formats you already store)
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+
+          # Sheet ID (support both names you already store)
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+
+          # Tab name (your secret exists)
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+
+          # Canonical state machine
           RAW_STATUS_NEW: NEW
+
+          # Duffel free-tier hard cap
           MAX_INSERTS: "3"
+          SLEEP_SECONDS: "0.8"
+
+          # Minimal route defaults (safe)
+          ORIGIN_IATA: "LON"
+          DEST_IATA: "BCN"
+          DAYS_AHEAD: "60"
+          TRIP_LENGTH_DAYS: "5"
+          MAX_CONNECTIONS: "1"
+          CABIN_CLASS: "economy"
         run: |
           python workers/duffel_feeder_v4_affiliate_safe.py
 
-      # --------------------------
-      # SCORER
-      # --------------------------
+      # ==========================================================
+      # 2) AI SCORER — NEW → READY_TO_POST
+      # ==========================================================
       - name: AI Scorer (NEW → READY_TO_POST)
         id: scorer
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          MAX_ROWS_PER_RUN: "1"
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+
+          # Standardised gates
           INPUT_STATUS: NEW
           OUTPUT_STATUS: READY_TO_POST
+          MAX_ROWS_PER_RUN: "1"
         run: |
           python workers/ai_scorer.py
 
-      # --------------------------
-      # RENDER
-      # --------------------------
+      # ==========================================================
+      # 3) RENDER — READY_TO_POST → READY_TO_PUBLISH
+      # ==========================================================
       - name: Render (READY_TO_POST → READY_TO_PUBLISH)
         id: render
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          MAX_ROWS_PER_RUN: "1"
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+
           INPUT_STATUS: READY_TO_POST
           OUTPUT_STATUS: READY_TO_PUBLISH
-          RENDER_BASE_URL: ${{ secrets.RENDER_BASE_URL }}
+          MAX_ROWS_PER_RUN: "1"
+
+          # Support both env names (common historic mismatch)
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          RENDER_BASE_URL: ${{ secrets.RENDER_URL }}
         run: |
           python workers/render_worker.py
 
-      # --------------------------
-      # INSTAGRAM
-      # --------------------------
+      # ==========================================================
+      # 4) INSTAGRAM — READY_TO_PUBLISH → POSTED_INSTAGRAM
+      # ==========================================================
       - name: Instagram Publish (READY_TO_PUBLISH → POSTED_INSTAGRAM)
         id: insta
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          MAX_ROWS_PER_RUN: "1"
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+
           INPUT_STATUS: READY_TO_PUBLISH
           OUTPUT_STATUS: POSTED_INSTAGRAM
+          MAX_ROWS_PER_RUN: "1"
+
+          # Support both token names (historic mismatch)
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
         run: |
           python workers/publish_worker.py
 
-      # --------------------------
-      # TELEGRAM
-      # --------------------------
+      # ==========================================================
+      # 5) TELEGRAM (FREE + VIP) — POSTED_INSTAGRAM → POSTED_ALL
+      # ==========================================================
       - name: Telegram Dual Publish (POSTED_INSTAGRAM → POSTED_ALL)
         id: telegram
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
 
           TELEGRAM_STATUS_COLUMN: status
           TELEGRAM_REQUIRED_STATUS: POSTED_INSTAGRAM
           TELEGRAM_POSTED_STATUS: POSTED_ALL
           TELEGRAM_MAX_POSTS_PER_RUN: "1"
 
-          TELEGRAM_BOT_TOKEN_FREE: ${{ secrets.TELEGRAM_BOT_TOKEN_FREE }}
-          TELEGRAM_CHAT_ID_FREE: ${{ secrets.TELEGRAM_CHAT_ID_FREE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_CHAT_ID_VIP: ${{ secrets.TELEGRAM_CHAT_ID_VIP }}
+          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
 
           STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
-          REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }} # optional
+
+          # Optional click tracking (safe if not set)
+          REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
         run: |
           python workers/telegram_publisher_V4.py
 
       # ==========================================================
-      # DEAD-LETTER GUARDS (run only if a stage fails)
+      # DEAD-LETTER GUARDS — only run if the stage fails
       # ==========================================================
-
-      - name: Deadletter Guard (if scorer fails) - INPUT_STATUS=NEW
+      - name: Deadletter Guard (if scorer fails) INPUT_STATUS=NEW
         if: failure() && steps.scorer.outcome == 'failure'
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           INPUT_STATUS: NEW
           MAX_FAILS: "3"
           DEADLETTER_STATUS: ERROR_HARD
@@ -134,12 +182,14 @@ jobs:
         run: |
           python workers/deadletter_guard.py
 
-      - name: Deadletter Guard (if render fails) - INPUT_STATUS=READY_TO_POST
+      - name: Deadletter Guard (if render fails) INPUT_STATUS=READY_TO_POST
         if: failure() && steps.render.outcome == 'failure'
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           INPUT_STATUS: READY_TO_POST
           MAX_FAILS: "3"
           DEADLETTER_STATUS: ERROR_HARD
@@ -148,12 +198,14 @@ jobs:
         run: |
           python workers/deadletter_guard.py
 
-      - name: Deadletter Guard (if insta fails) - INPUT_STATUS=READY_TO_PUBLISH
+      - name: Deadletter Guard (if insta fails) INPUT_STATUS=READY_TO_PUBLISH
         if: failure() && steps.insta.outcome == 'failure'
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           INPUT_STATUS: READY_TO_PUBLISH
           MAX_FAILS: "3"
           DEADLETTER_STATUS: ERROR_HARD
@@ -162,12 +214,14 @@ jobs:
         run: |
           python workers/deadletter_guard.py
 
-      - name: Deadletter Guard (if telegram fails) - INPUT_STATUS=POSTED_INSTAGRAM
+      - name: Deadletter Guard (if telegram fails) INPUT_STATUS=POSTED_INSTAGRAM
         if: failure() && steps.telegram.outcome == 'failure'
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           INPUT_STATUS: POSTED_INSTAGRAM
           MAX_FAILS: "3"
           DEADLETTER_STATUS: ERROR_HARD
@@ -177,17 +231,15 @@ jobs:
           python workers/deadletter_guard.py
 
       # ==========================================================
-      # OPS ALERT (run only if anything failed)
+      # OPS ALERT — optional; does nothing if OPS secrets not set
       # ==========================================================
-
-      - name: Ops Alert (Telegram)
+      - name: Ops Alert (optional)
         if: failure()
         env:
           OPS_TELEGRAM_BOT_TOKEN: ${{ secrets.OPS_TELEGRAM_BOT_TOKEN }}
           OPS_TELEGRAM_CHAT_ID: ${{ secrets.OPS_TELEGRAM_CHAT_ID }}
           OPS_STATUS: "FAILED"
-          OPS_MESSAGE: "V4 pipeline failed. Check the run logs."
+          OPS_MESSAGE: "V4.1 pipeline failed. Check the run logs."
           GITHUB_RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          OPS_JOB_NAME: "run"
         run: |
           python workers/ops_alert.py

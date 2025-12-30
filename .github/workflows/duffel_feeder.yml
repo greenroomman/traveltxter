@@ -1,19 +1,6 @@
 name: V3.2(A) Duffel Feeder
 
-on:
-  workflow_dispatch:
-    inputs:
-      max_searches:
-        description: 'Max searches to perform'
-        required: false
-        default: '8'
-      max_inserts:
-        description: 'Max deals to insert'
-        required: false
-        default: '20'
-  schedule:
-    - cron: "55 6 * * *"   # 06:55 UTC (before scorer)
-    - cron: "55 15 * * *"  # 15:55 UTC (before scorer)
+on: []
 
 concurrency:
   group: v32a-feeder

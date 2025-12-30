@@ -23,11 +23,11 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
       
-      - name: Debug Secrets (remove after testing)
+      - name: Debug Secrets
         run: |
           echo "Bot token exists: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}"
           echo "TELEGRAM_VIP_CHANNEL exists: ${{ secrets.TELEGRAM_VIP_CHANNEL != '' }}"
-          echo "VIP_CHANNEL exists: "-1003517970522"
+          echo "Using channel ID: -1003517970522"
 
       - name: Publish Deal to Telegram (VIP)
         env:
@@ -39,9 +39,9 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
           DEALS_SHEET_NAME: RAW_DEALS
 
-          # Telegram - Try multiple possible secret names
+          # Telegram - Use numeric ID for private channel
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_VIP_CHANNEL || secrets.VIP_CHANNEL || "-1003517970522" }}
+          TELEGRAM_CHANNEL: "-1003517970522"
 
           # Status tracking
           TELEGRAM_STATUS_COLUMN: raw_status
@@ -60,5 +60,5 @@ jobs:
           TELEGRAM_MAX_POSTS_PER_RUN: "3"
 
         run: |
-          echo "Running with TELEGRAM_CHANNEL: "-1003517970522"
+          echo "Running with TELEGRAM_CHANNEL: $TELEGRAM_CHANNEL"
           python workers/telegram_publisher_v4.py

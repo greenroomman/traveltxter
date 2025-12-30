@@ -1,10 +1,6 @@
 name: Publish Telegram Deal (FREE – V4)
 
-on:
-  schedule:
-    - cron: "30 7 * * *"
-    - cron: "30 16 * * *"
-  workflow_dispatch:
+on: []
 
 jobs:
   publish:

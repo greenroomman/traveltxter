@@ -27,7 +27,7 @@ jobs:
         run: |
           echo "Bot token exists: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}"
           echo "TELEGRAM_VIP_CHANNEL exists: ${{ secrets.TELEGRAM_VIP_CHANNEL != '' }}"
-          echo "VIP_CHANNEL exists: ${{ secrets.VIP_CHANNEL != '' }}"
+          echo "VIP_CHANNEL exists: "-1003517970522"
 
       - name: Publish Deal to Telegram (VIP)
         env:
@@ -41,7 +41,7 @@ jobs:
 
           # Telegram - Try multiple possible secret names
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_VIP_CHANNEL || secrets.VIP_CHANNEL || '@traveltxter_vip' }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_VIP_CHANNEL || secrets.VIP_CHANNEL || "-1003517970522" }}
 
           # Status tracking
           TELEGRAM_STATUS_COLUMN: raw_status
@@ -60,5 +60,5 @@ jobs:
           TELEGRAM_MAX_POSTS_PER_RUN: "3"
 
         run: |
-          echo "Running with TELEGRAM_CHANNEL: $TELEGRAM_CHANNEL"
+          echo "Running with TELEGRAM_CHANNEL: "-1003517970522"
           python workers/telegram_publisher_v4.py

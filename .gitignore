@@ -10,3 +10,6 @@ sa.json
 .env.example
 fix_status_backlog.py
 run_*.sh
+sa.json
+*.json # Block all JSON files with credentials
+.env

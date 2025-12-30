@@ -64,7 +64,9 @@ jobs:
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
+          DEALS_SHEET_NAME: "RAW_DEALS"
           
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
@@ -83,9 +85,12 @@ jobs:
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
+          DEALS_SHEET_NAME: "RAW_DEALS"
           
           RENDER_URL: ${{ secrets.RENDER_URL }}
+          RENDER_BASE_URL: ${{ secrets.RENDER_URL }}
           
           INPUT_STATUS: "READY_TO_POST"
           OUTPUT_STATUS: "READY_TO_PUBLISH"
@@ -101,10 +106,13 @@ jobs:
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
+          DEALS_SHEET_NAME: "RAW_DEALS"
           
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          META_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           
           INPUT_STATUS: "READY_TO_PUBLISH"
           OUTPUT_STATUS: "POSTED_INSTAGRAM"
@@ -120,18 +128,22 @@ jobs:
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
+          DEALS_SHEET_NAME: "RAW_DEALS"
           
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: "-1003505750272"
           
           TELEGRAM_STATUS_COLUMN: "status"
+          RAW_STATUS_COLUMN: "status"
           TELEGRAM_REQUIRED_STATUS: "POSTED_INSTAGRAM"
           TELEGRAM_POSTED_STATUS: "POSTED_TELEGRAM_FREE"
           TELEGRAM_MAX_POSTS_PER_RUN: "1"
           
           STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
           TG_MODE: "free"
+          TG_TEMPLATE_VERSION: "v4"
         run: python workers/telegram_publisher_v4.py
 
       # ============================================================
@@ -143,17 +155,23 @@ jobs:
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
+          DEALS_SHEET_NAME: "RAW_DEALS"
           
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: "-1003517970522"
           
           TELEGRAM_STATUS_COLUMN: "status"
+          RAW_STATUS_COLUMN: "status"
           TELEGRAM_REQUIRED_STATUS: "POSTED_TELEGRAM_FREE"
           TELEGRAM_POSTED_STATUS: "POSTED_ALL"
           TELEGRAM_MAX_POSTS_PER_RUN: "1"
           
           TG_MODE: "vip"
+          TG_TEMPLATE_VERSION: "v4"
+          TELEGRAM_ALLOW_VERDICTS: "GOOD"
+          TELEGRAM_MIN_AI_SCORE: "7.0"
         run: python workers/telegram_publisher_v4.py
 
       # ============================================================

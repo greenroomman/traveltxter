@@ -2,7 +2,7 @@ name: Publish Telegram Deal (VIP – V4)
 
 on:
   schedule:
-    - cron: "0 * * * *"  # Every hour (VIP gets deals immediately)
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -22,6 +22,12 @@ jobs:
 
       - name: Install Dependencies
         run: pip install -r requirements.txt
+      
+      - name: Debug Secrets (remove after testing)
+        run: |
+          echo "Bot token exists: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}"
+          echo "TELEGRAM_VIP_CHANNEL exists: ${{ secrets.TELEGRAM_VIP_CHANNEL != '' }}"
+          echo "VIP_CHANNEL exists: ${{ secrets.VIP_CHANNEL != '' }}"
 
       - name: Publish Deal to Telegram (VIP)
         env:
@@ -29,28 +35,30 @@ jobs:
 
           # Google Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}  # FIXED: Was missing!
-          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}  # Fallback compatibility
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
           DEALS_SHEET_NAME: RAW_DEALS
 
-          # Telegram
+          # Telegram - Try multiple possible secret names
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_VIP_CHANNEL }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_VIP_CHANNEL || secrets.VIP_CHANNEL || '@traveltxter_vip' }}
 
           # Status tracking
           TELEGRAM_STATUS_COLUMN: raw_status
           TELEGRAM_REQUIRED_STATUS: READY_TO_POST
-          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM_VIP  # Different from FREE!
+          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM_VIP
 
           # Filtering
-          TELEGRAM_ALLOW_VERDICTS: "GOOD"  # VIP only gets GOOD deals
-          TELEGRAM_MIN_AI_SCORE: "7.0"     # VIP only gets high-scoring deals
+          TELEGRAM_ALLOW_VERDICTS: "GOOD"
+          TELEGRAM_MIN_AI_SCORE: "7.0"
 
           # V4 Monetization
           TG_TEMPLATE_VERSION: "v4"
           TG_MODE: "vip"
-          DEAL_PREMIUM_FILTER: "all"  # VIP gets everything (or "premium_only" for business class only)
+          DEAL_PREMIUM_FILTER: "all"
           
-          TELEGRAM_MAX_POSTS_PER_RUN: "3"  # VIP can post more per run
+          TELEGRAM_MAX_POSTS_PER_RUN: "3"
 
-        run: python workers/telegram_publisher_v4.py  # V4 script!
+        run: |
+          echo "Running with TELEGRAM_CHANNEL: $TELEGRAM_CHANNEL"
+          python workers/telegram_publisher_v4.py

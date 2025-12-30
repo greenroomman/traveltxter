@@ -2,8 +2,8 @@ name: Publish Telegram Deal (FREE – V4)
 
 on:
   schedule:
-    - cron: "30 7 * * *"   # 7:30 AM UTC
-    - cron: "30 16 * * *"  # 4:30 PM UTC
+    - cron: "30 7 * * *"
+    - cron: "30 16 * * *"
   workflow_dispatch:
 
 jobs:
@@ -23,6 +23,12 @@ jobs:
 
       - name: Install Dependencies
         run: pip install -r requirements.txt
+      
+      - name: Debug Secrets (remove after testing)
+        run: |
+          echo "Bot token exists: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}"
+          echo "TELEGRAM_CHANNEL exists: ${{ secrets.TELEGRAM_CHANNEL != '' }}"
+          echo "VIP_CHANNEL exists: ${{ secrets.TELEGRAM_VIP_CHANNEL != '' }}"
 
       - name: Publish Deal to Telegram (FREE)
         env:
@@ -31,17 +37,17 @@ jobs:
           # Google Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}  # Fallback compatibility
+          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
           DEALS_SHEET_NAME: RAW_DEALS
 
-          # Telegram
+          # Telegram - Try multiple possible secret names
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}  # Use secret, not hardcoded
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL || '@traveltxter' }}
 
           # Status tracking
           TELEGRAM_STATUS_COLUMN: raw_status
           TELEGRAM_REQUIRED_STATUS: READY_TO_POST
-          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM_FREE  # Different from VIP!
+          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM_FREE
 
           # Filtering
           TELEGRAM_ALLOW_VERDICTS: "GOOD,AVERAGE"
@@ -51,8 +57,10 @@ jobs:
           TG_TEMPLATE_VERSION: "v4"
           TG_MODE: "free"
           STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
-          DEAL_PREMIUM_FILTER: "free_only"  # CRITICAL: Only free-tier deals!
+          DEAL_PREMIUM_FILTER: "free_only"
           
           TELEGRAM_MAX_POSTS_PER_RUN: "1"
 
-        run: python workers/telegram_publisher_v4.py  # V4 script!
+        run: |
+          echo "Running with TELEGRAM_CHANNEL: $TELEGRAM_CHANNEL"
+          python workers/telegram_publisher_v4.py

@@ -13,3 +13,5 @@ run_*.sh
 sa.json
 *.json # Block all JSON files with credentials
 .env
+sa.json
+sa_oneline.txt

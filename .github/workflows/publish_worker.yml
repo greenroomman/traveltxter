@@ -1,9 +1,6 @@
 name: Publish to Instagram (V3_beta_b Marketing)
 
-on:
-  schedule:
-    - cron: "10 18 * * *"  # 18:10 UTC (evening, after renders)
-  workflow_dispatch:
+on: []
 
 jobs:
   publish:

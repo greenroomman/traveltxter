@@ -1,10 +1,6 @@
 name: AI Scorer (V3_beta_b)
 
-on:
-  schedule:
-    - cron: "05 07 * * *"   # 07:05 UTC (after 06:55 feeder)
-    - cron: "05 16 * * *"   # 16:05 UTC (after 15:55 feeder)
-  workflow_dispatch:
+on: []
 
 concurrency:
   group: ai-scorer

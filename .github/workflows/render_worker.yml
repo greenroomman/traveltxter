@@ -1,25 +1,6 @@
 name: Render Worker (V3_beta_b)
 
-on:
-  workflow_dispatch:
-    inputs:
-      target_tab:
-        description: "Which tab to render for"
-        required: false
-        default: "RAW_DEALS"
-        type: choice
-        options:
-          - RAW_DEALS
-          - INSTAGRAM_FEED
-      max_renders:
-        description: "Max renders per run"
-        required: false
-        default: "5"
-
-  schedule:
-    # Runs after AI Scheduler and before Telegram publishing
-    - cron: "15 07 * * *"   # 07:15 UTC
-    - cron: "15 16 * * *"   # 16:15 UTC
+on: []
 
 concurrency:
   group: render-worker

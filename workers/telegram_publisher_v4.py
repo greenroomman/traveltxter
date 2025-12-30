@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-TravelTxter — Telegram Publisher (V4 CLEAN)
-Clean, structured messaging with appropriate emojis.
+TravelTxter — Telegram Publisher V4 (Dual Post, Affiliate-SAFE)
+
+- Posts BOTH FREE + VIP in a single run.
+- Uses booking_link_free / booking_link_vip if present, otherwise falls back to affiliate_url.
+- Does NOT require Skyscanner affiliate approval yet.
+- Optional click tracking via REDIRECT_BASE_URL (PythonAnywhere /r endpoint).
+- Resume-safe if posted_to_free / posted_to_vip columns exist.
+
+Env:
+- GCP_SA_JSON, SPREADSHEET_ID
+- TELEGRAM_BOT_TOKEN_FREE, TELEGRAM_CHAT_ID_FREE
+- TELEGRAM_BOT_TOKEN_VIP, TELEGRAM_CHAT_ID_VIP
+- STRIPE_LINK
+- REDIRECT_BASE_URL (optional)
 """
 
 import os
@@ -11,180 +23,141 @@ import html
 import time
 import logging
 import datetime as dt
+import urllib.parse
 from typing import Dict, List, Tuple
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("telegram_publisher")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("telegram_publisher_v4")
 
-def utc_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def env(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None else str(v)
-
-def env_first(names: List[str], default: str = "") -> str:
-    for n in names:
-        v = os.getenv(n)
-        if v:
-            return str(v)
-    return default
-
-def truthy(v: str) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+def env(key: str, default: str = "") -> str:
+    return os.getenv(key, default).strip()
 
 def safe(s: str) -> str:
-    return html.escape(str(s or "").strip())
+    return html.escape((s or "").strip())
 
 def clean(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s or "").strip())
+    s = (s or "").strip()
+    return re.sub(r"\s+", " ", s)
 
-def send_telegram(bot_token: str, chat_id: str, text: str) -> Tuple[bool, str]:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+def send_telegram(bot_token: str, chat_id: str, text: str) -> Tuple[bool, str, str]:
     try:
-        r = requests.post(url, json=payload, timeout=20)
-        if r.status_code != 200:
-            return False, f"HTTP {r.status_code}"
-        j = r.json()
-        if not j.get("ok"):
-            return False, str(j)
-        return True, "ok"
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        }
+        r = requests.post(url, json=payload, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            return False, str(data), ""
+        msg_id = str((data.get("result") or {}).get("message_id") or "")
+        return True, "", msg_id
     except Exception as e:
-        return False, str(e)
+        return False, str(e), ""
 
-def legacy_message(row: Dict[str, str]) -> str:
-    bits = ["✈️ <b>Flight Deal</b>"]
-    origin = safe(row.get('origin_city', ''))
-    dest = safe(row.get('destination_city', ''))
-    price = safe(row.get('price_gbp', ''))
-    if origin and dest:
-        bits.append(f"→ {origin} to {dest}")
-    if price:
-        bits.append(f"£{price}")
-    link = row.get("affiliate_url", "").strip()
-    if link:
-        bits.append(f"\n🔗 Book: {safe(link)}")
-    return "\n".join(bits).strip()
+def wrap_link(deal_id: str, tier: str, url: str, redirect_base: str) -> str:
+    if not url:
+        return ""
+    if not redirect_base:
+        return url
+    q = {"deal_id": deal_id, "tier": tier, "url": url}
+    return redirect_base + "?" + urllib.parse.urlencode(q)
 
-def vip_message(row: Dict[str, str]) -> str:
-    ai_grade = safe(row.get("ai_grading", "")).upper()
-    reason = clean(row.get("ai_notes") or row.get("notes") or "")
-    origin = safe(row.get('origin_city', ''))
-    dest = safe(row.get('destination_city', ''))
-    country = safe(row.get('destination_country', ''))
-    price = safe(row.get('price_gbp', ''))
-    out_date = safe(row.get('outbound_date', ''))
-    ret_date = safe(row.get('return_date', ''))
-    
+
+def free_message(row: Dict[str, str], stripe: str, free_link: str) -> str:
+    origin = safe(row.get("origin_city", ""))
+    dest = safe(row.get("destination_city", ""))
+    country = safe(row.get("destination_country", ""))
+    price = clean(row.get("price_gbp", ""))
+    out_date = safe(row.get("outbound_date", ""))
+    ret_date = safe(row.get("return_date", ""))
+
     lines = []
-    
     if price and dest:
-        dest_display = f"{dest}, {country}" if country else dest
-        lines.append(f"<b>£{price} to {dest_display}</b>")
+        lines.append(f"🔥 <b>£{price} to {dest}{(', ' + country) if country else ''}</b>")
     else:
-        lines.append("<b>DEAL ALERT</b>")
-    
-    lines.append("")
-    
-    if dest:
-        lines.append(f"TO: {dest.upper()}")
-    if origin:
-        lines.append(f"FROM: {origin}")
-    
-    lines.append("")
-    
-    if out_date:
-        lines.append(f"OUT:  {out_date}")
-    if ret_date:
-        lines.append(f"BACK: {ret_date}")
-    
-    if reason:
-        lines.append("")
-        lines.append("<b>Why book this:</b>")
-        parts = [p.strip() for p in re.split(r"[.;]", reason) if p.strip()]
-        for p in parts[:3]:
-            lines.append(f"• {safe(p)}")
-    
-    lines.append("")
-    lines.append("⏱ Availability limited")
-    
-    link = row.get("affiliate_url", "").strip()
-    if link:
-        lines.append("")
-        lines.append("<b>Book now:</b>")
-        lines.append(safe(link))
-    
-    return "\n".join(lines).strip()
+        lines.append("🔥 <b>DEAL SPOTTED</b>")
 
-def free_message(row: Dict[str, str], stripe: str) -> str:
-    dest = safe(row.get('destination_city', ''))
-    country = safe(row.get('destination_country', ''))
-    origin = safe(row.get('origin_city', ''))
-    price = safe(row.get('price_gbp', ''))
-    out_date = safe(row.get('outbound_date', ''))
-    ret_date = safe(row.get('return_date', ''))
-    
-    lines = []
-    
-    if price and dest:
-        dest_display = f"{dest}, {country}" if country else dest
-        lines.append(f"<b>£{price} to {dest_display}</b>")
-    else:
-        lines.append("<b>DEAL SPOTTED</b>")
-    
     lines.append("")
-    
-    if dest:
-        lines.append(f"TO: {dest.upper()}")
     if origin:
-        lines.append(f"FROM: {origin}")
-    
+        lines.append(f"📍 From {origin}")
+    if out_date and ret_date:
+        lines.append(f"📅 {out_date} → {ret_date}")
+
     lines.append("")
-    
-    if out_date:
-        lines.append(f"OUT:  {out_date}")
-    if ret_date:
-        lines.append(f"BACK: {ret_date}")
-    
-    lines.append("")
-    
-    lines.append("<b>Heads up:</b>")
+    lines.append("⚠️ Heads up:")
     lines.append("• VIP members saw this 24 hours ago")
     lines.append("• Availability is running low")
     lines.append("• Best deals go to VIPs first")
-    
     lines.append("")
-    
     lines.append("<b>Want instant access?</b>")
     lines.append("Join TravelTxter Nomad")
     lines.append("for £7.99 / month:")
-    
     lines.append("")
-    
     lines.append("* Deals 24 hours early")
     lines.append("* Direct booking links")
     lines.append("* Exclusive mistake fares")
     lines.append("* Cancel anytime")
-    
     lines.append("")
-    
+
+    # FREE link is optional; keep it for now (non-affiliate)
+    if free_link:
+        lines.append("<b>Book (FREE):</b>")
+        lines.append(safe(free_link))
+        lines.append("")
+
     if stripe:
         lines.append("<b>Upgrade now:</b>")
         lines.append(safe(stripe))
     else:
         lines.append("<b>Upgrade:</b> traveltxter.com/vip")
-    
+
     return "\n".join(lines).strip()
 
-def build_message(row: Dict[str, str], mode: str, template: str, stripe: str) -> str:
-    if template == "v4":
-        return vip_message(row) if mode == "vip" else free_message(row, stripe)
-    return legacy_message(row)
+
+def vip_message(row: Dict[str, str], vip_link: str) -> str:
+    ai_grade = safe(row.get("ai_grading", "")).upper()
+    origin = safe(row.get("origin_city", ""))
+    dest = safe(row.get("destination_city", ""))
+    country = safe(row.get("destination_country", ""))
+    price = clean(row.get("price_gbp", ""))
+    out_date = safe(row.get("outbound_date", ""))
+    ret_date = safe(row.get("return_date", ""))
+
+    lines = []
+    head = "💎 <b>VIP EARLY ACCESS</b>"
+    if ai_grade:
+        head += f" — {ai_grade}"
+    lines.append(head)
+
+    if price and dest:
+        lines.append(f"🔥 <b>£{price} to {dest}{(', ' + country) if country else ''}</b>")
+
+    lines.append("")
+    if origin:
+        lines.append(f"📍 From {origin}")
+    if out_date and ret_date:
+        lines.append(f"📅 {out_date} → {ret_date}")
+
+    lines.append("")
+    if vip_link:
+        lines.append("🔗 <b>Direct booking link:</b>")
+        lines.append(safe(vip_link))
+    else:
+        lines.append("🔗 Booking link unavailable (try again later).")
+
+    lines.append("")
+    lines.append("✅ You’re seeing this first because you’re VIP.")
+    return "\n".join(lines).strip()
+
 
 def gs_client() -> gspread.Client:
     sa_json = env("GCP_SA_JSON")
@@ -195,108 +168,128 @@ def gs_client() -> gspread.Client:
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
+
+def update_cells(ws, row_num: int, headers: List[str], updates: Dict[str, str]) -> None:
+    idx = {h: i + 1 for i, h in enumerate(headers)}
+    cells = []
+    for k, v in updates.items():
+        if k in idx:
+            cells.append(gspread.Cell(row_num, idx[k], v))
+    if cells:
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
+
+
 def main() -> int:
-    log.info("="*60)
-    log.info("🚀 TravelTxter Telegram Publisher")
-    log.info("="*60)
-    
-    sheet_id = env_first(["SPREADSHEET_ID", "SHEET_ID"])
+    log.info("=" * 60)
+    log.info("🚀 TravelTxter Telegram Publisher (V4 DUAL, SAFE)")
+    log.info("=" * 60)
+
+    sheet_id = env("SPREADSHEET_ID")
     if not sheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
-    
-    tab = env_first(["RAW_DEALS_TAB", "DEALS_SHEET_NAME"], "RAW_DEALS")
-    status_col = env_first(["TELEGRAM_STATUS_COLUMN", "RAW_STATUS_COLUMN"], "raw_status")
-    required = env_first(["TELEGRAM_REQUIRED_STATUS"], "POSTED_INSTAGRAM").upper()
-    posted = env_first(["TELEGRAM_POSTED_STATUS"], "POSTED_TELEGRAM").upper()
-    
-    bot = env("TELEGRAM_BOT_TOKEN")
-    chat = env("TELEGRAM_CHANNEL")
-    
-    # Debug logging
-    log.info(f"DEBUG: Bot token length = {len(bot)}")
-    log.info(f"DEBUG: Channel = '{chat}'")
-    
-    if not bot or not chat:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL")
-    
-    mode = env_first(["TELEGRAM_MODE", "TG_MODE"], "free").lower()
-    template = env_first(["TELEGRAM_TEMPLATE_VERSION", "TG_TEMPLATE_VERSION"], "legacy").lower()
+
+    tab = env("RAW_DEALS_TAB", "RAW_DEALS")
+    status_col = env("TELEGRAM_STATUS_COLUMN", "status")
+    required = env("TELEGRAM_REQUIRED_STATUS", "READY_TO_POST").upper()
+    posted = env("TELEGRAM_POSTED_STATUS", "POSTED_TELEGRAM").upper()
+
+    bot_free = env("TELEGRAM_BOT_TOKEN_FREE")
+    chat_free = env("TELEGRAM_CHAT_ID_FREE")
+    bot_vip = env("TELEGRAM_BOT_TOKEN_VIP")
+    chat_vip = env("TELEGRAM_CHAT_ID_VIP")
+
+    if not bot_free or not chat_free:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN_FREE or TELEGRAM_CHAT_ID_FREE")
+    if not bot_vip or not chat_vip:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN_VIP or TELEGRAM_CHAT_ID_VIP")
+
     stripe = env("STRIPE_LINK")
-    max_posts = int(env_first(["TELEGRAM_MAX_POSTS_PER_RUN"], "1"))
-    
-    log.info(f"📄 Tab: {tab}")
-    log.info(f"🔎 Filter: {status_col} == {required}")
-    log.info(f"✅ Promote to: {posted}")
-    log.info(f"📱 Template: {template} (mode: {mode})")
-    log.info(f"📊 Max posts: {max_posts}")
-    log.info("="*60)
-    
+    redirect_base = env("REDIRECT_BASE_URL")  # optional
+    max_posts = int(env("TELEGRAM_MAX_POSTS_PER_RUN", "1"))
+
     gc = gs_client()
     ws = gc.open_by_key(sheet_id).worksheet(tab)
-    log.info(f"✅ Connected to: {ws.title}")
-    
+
     rows = ws.get_all_values()
     if not rows or len(rows) < 2:
         log.info("No data rows")
         return 0
-    
+
     headers = rows[0]
     idx = {h: i for i, h in enumerate(headers)}
-    
     if status_col not in idx:
         raise RuntimeError(f"Column '{status_col}' not found")
-    
+
     sent = 0
-    considered = 0
-    failed = 0
-    
+
     for r in range(1, len(rows)):
         if sent >= max_posts:
             break
-        
+
         row = rows[r]
         row_num = r + 1
-        
-        current_status = row[idx[status_col]].strip().upper()
+
+        current_status = (row[idx[status_col]] if idx[status_col] < len(row) else "").strip().upper()
         if current_status != required:
             continue
-        
-        considered += 1
-        
-        data = {}
-        for h, i in idx.items():
-            data[h] = row[i] if i < len(row) else ""
-        
-        msg = build_message(data, mode, template, stripe)
-        ok, err = send_telegram(bot, chat, msg)
-        
-        if not ok:
-            failed += 1
-            log.error(f"❌ Row {row_num}: {err}")
-            continue
-        
+
+        data: Dict[str, str] = {h: (row[i] if i < len(row) else "") for h, i in idx.items()}
+        deal_id = (data.get("deal_id") or "").strip()
+
+        already_free = (data.get("posted_to_free") or "").strip().upper() == "TRUE"
+        already_vip = (data.get("posted_to_vip") or "").strip().upper() == "TRUE"
+
+        raw_free = (data.get("booking_link_free") or "").strip() or (data.get("affiliate_url") or "").strip()
+        raw_vip = (data.get("booking_link_vip") or "").strip() or (data.get("affiliate_url") or "").strip()
+
+        free_link = wrap_link(deal_id, "free", raw_free, redirect_base) if deal_id else raw_free
+        vip_link = wrap_link(deal_id, "vip", raw_vip, redirect_base) if deal_id else raw_vip
+
+        free_text = free_message(data, stripe, free_link)
+        vip_text = vip_message(data, vip_link)
+
+        updates: Dict[str, str] = {}
+
         try:
-            ws.update_cell(row_num, idx[status_col] + 1, posted)
+            if not already_free:
+                ok, err, msg_id = send_telegram(bot_free, chat_free, free_text)
+                if not ok:
+                    raise RuntimeError(f"FREE send failed: {err}")
+                updates["posted_to_free"] = "TRUE"
+                updates["telegram_free_msg_id"] = msg_id
+                time.sleep(0.5)
+
+            if not already_vip:
+                ok, err, msg_id = send_telegram(bot_vip, chat_vip, vip_text)
+                if not ok:
+                    raise RuntimeError(f"VIP send failed: {err}")
+                updates["posted_to_vip"] = "TRUE"
+                updates["telegram_vip_msg_id"] = msg_id
+
+            final_free = already_free or updates.get("posted_to_free") == "TRUE"
+            final_vip = already_vip or updates.get("posted_to_vip") == "TRUE"
+
+            if final_free and final_vip:
+                updates[status_col] = posted
+                updates["published_timestamp"] = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+            update_cells(ws, row_num, headers, updates)
             sent += 1
-            log.info(f"✅ Posted row {row_num}")
+            log.info(f"✅ Posted row {row_num} (FREE+VIP)")
             time.sleep(0.6)
+
         except Exception as e:
-            failed += 1
-            log.error(f"❌ Sheet update failed row {row_num}: {e}")
-    
-    log.info("="*60)
-    log.info("📊 SUMMARY")
-    log.info("="*60)
-    log.info(f"🔎 Considered: {considered}")
-    log.info(f"✅ Published: {sent}")
-    log.info(f"❌ Failed: {failed}")
-    log.info("="*60)
-    
+            log.error(f"❌ Row {row_num}: {e}")
+            # Only set error status if you use it; otherwise leave row for retry.
+            if status_col in idx:
+                try:
+                    update_cells(ws, row_num, headers, {status_col: "ERROR_TELEGRAM"})
+                except Exception:
+                    pass
+
+    log.info(f"🏁 Done. Published {sent} row(s).")
     return 0
 
+
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as e:
-        log.error(f"❌ Worker failed: {e}")
-        raise
+    raise SystemExit(main())

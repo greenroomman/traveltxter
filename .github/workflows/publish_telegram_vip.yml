@@ -2,7 +2,7 @@ name: Publish Telegram Deal (VIP – V4)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "0 * * * *"  # Every hour (VIP gets deals immediately)
   workflow_dispatch:
 
 jobs:
@@ -11,36 +11,46 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: 'pip'
 
-      - run: pip install -r requirements.txt
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
 
       - name: Publish Deal to Telegram (VIP)
         env:
           PYTHONPATH: ${{ github.workspace }}
 
+          # Google Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}  # FIXED: Was missing!
+          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}  # Fallback compatibility
           DEALS_SHEET_NAME: RAW_DEALS
 
+          # Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_VIP_CHANNEL }}
 
+          # Status tracking
           TELEGRAM_STATUS_COLUMN: raw_status
           TELEGRAM_REQUIRED_STATUS: READY_TO_POST
-          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM
+          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM_VIP  # Different from FREE!
 
-          TELEGRAM_ALLOW_VERDICTS: "GOOD"
-          TELEGRAM_MIN_AI_SCORE: "0"
+          # Filtering
+          TELEGRAM_ALLOW_VERDICTS: "GOOD"  # VIP only gets GOOD deals
+          TELEGRAM_MIN_AI_SCORE: "7.0"     # VIP only gets high-scoring deals
 
+          # V4 Monetization
           TG_TEMPLATE_VERSION: "v4"
           TG_MODE: "vip"
-          DEAL_PREMIUM_FILTER: "premium_only"
+          DEAL_PREMIUM_FILTER: "all"  # VIP gets everything (or "premium_only" for business class only)
+          
+          TELEGRAM_MAX_POSTS_PER_RUN: "3"  # VIP can post more per run
 
-        run: python workers/telegram_publisher_v4.py
-
+        run: python workers/telegram_publisher_v4.py  # V4 script!

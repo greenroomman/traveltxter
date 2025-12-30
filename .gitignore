@@ -5,3 +5,8 @@ __pycache__/
 service_account.json
 gcp_sa_one_line.txt
 sheet_id.txt
+sa.json
+.env
+.env.example
+fix_status_backlog.py
+run_*.sh

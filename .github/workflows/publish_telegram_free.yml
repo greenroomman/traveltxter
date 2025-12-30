@@ -2,8 +2,8 @@ name: Publish Telegram Deal (FREE – V4)
 
 on:
   schedule:
-    - cron: "30 7 * * *"
-    - cron: "30 16 * * *"
+    - cron: "30 7 * * *"   # 7:30 AM UTC
+    - cron: "30 16 * * *"  # 4:30 PM UTC
   workflow_dispatch:
 
 jobs:
@@ -28,26 +28,31 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
 
+          # Google Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}
+          SPREADSHEET_ID: ${{ secrets.SHEET_ID }}  # Fallback compatibility
           DEALS_SHEET_NAME: RAW_DEALS
 
+          # Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}  # Use secret, not hardcoded
 
+          # Status tracking
           TELEGRAM_STATUS_COLUMN: raw_status
           TELEGRAM_REQUIRED_STATUS: READY_TO_POST
-          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM
+          TELEGRAM_POSTED_STATUS: POSTED_TELEGRAM_FREE  # Different from VIP!
 
+          # Filtering
           TELEGRAM_ALLOW_VERDICTS: "GOOD,AVERAGE"
           TELEGRAM_MIN_AI_SCORE: "0"
 
-          # 🔽 V4 monetisation flags (SAFE)
+          # V4 Monetization
           TG_TEMPLATE_VERSION: "v4"
           TG_MODE: "free"
           STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
-          DEAL_PREMIUM_FILTER: "free_only"
+          DEAL_PREMIUM_FILTER: "free_only"  # CRITICAL: Only free-tier deals!
+          
+          TELEGRAM_MAX_POSTS_PER_RUN: "1"
 
-        run: python workers/telegram_publisher_v4.py
-
+        run: python workers/telegram_publisher_v4.py  # V4 script!

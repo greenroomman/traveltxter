@@ -1,4 +1,4 @@
-name: v4_2_pipeline
+name: v4_2_pipeline_final
 
 on:
   schedule:
@@ -29,7 +29,9 @@ jobs:
           pip install \
             "gspread==6.2.1" \
             "google-auth==2.41.1" \
-            "requests==2.32.5"
+            "requests==2.32.5" \
+            "openai==1.57.4" \
+            "httpx<0.28"
 
       - name: Set RUN_SLOT (AM/PM based on UTC hour)
         run: |
@@ -42,27 +44,43 @@ jobs:
           echo "UTC hour: $HOUR"
           echo "RUN_SLOT set to: $RUN_SLOT"
 
-      - name: Run TravelTxter V4.2 Pipeline (A+B LOCK)
+      - name: Run TravelTxter V4.2 Pipeline FINAL
         env:
           # Google Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          CONFIG_TAB: "CONFIG"
 
-          # Rendering service (PythonAnywhere)
+          # Duffel (optional - set DUFFEL_ENABLED=false to disable)
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          DUFFEL_ENABLED: "true"
+          DUFFEL_MAX_INSERTS: "20"
+          DUFFEL_ROUTES_PER_RUN: "2"
+
+          # OpenAI (optional - works without it)
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: "gpt-4o-mini"
+
+          # Rendering service (REQUIRED)
           RENDER_URL: ${{ secrets.RENDER_URL }}
 
-          # Instagram
+          # Instagram (REQUIRED)
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-          # Telegram FREE (map from your existing secret TELEGRAM_CHANNEL)
+          # Telegram VIP (REQUIRED)
+          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+          TELEGRAM_VIP_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+
+          # Telegram FREE (REQUIRED)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_FREE_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
 
-          # Telegram VIP (map from your existing secret TELEGRAM_CHANNEL_VIP)
-          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_VIP_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+          # Skyscanner & Stripe (optional)
+          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }}
+          STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
+          STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
 
           # Tier gating
           RUN_SLOT: ${{ env.RUN_SLOT }}

@@ -1,5 +1,5 @@
 # .github/workflows/v4_pipeline.yml
-name: V4 Pipeline
+name: V4.1 Unified Pipeline
 
 on:
   workflow_dispatch:
@@ -14,6 +14,7 @@ concurrency:
 jobs:
   pipeline:
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,34 +24,51 @@ jobs:
         with:
           python-version: "3.11"
 
-     - name: Install deps (PINNED to fix OpenAI/httpx proxies crash)
+      - name: Install deps (PINNED - fixes OpenAI/httpx proxies crash)
         run: |
           python -m pip install --upgrade pip
-          
-          # ✅ EXACT PINNING REQUIRED:
-          pip install \
+
+          # IMPORTANT:
+          # - GitHub runner was installing httpx 0.28.x which breaks OpenAI SDK init (proxies kwarg)
+          # - Pin httpx < 0.28 to keep compatibility
+          pip install --no-cache-dir \
             gspread==6.2.1 \
             google-auth==2.41.1 \
             requests==2.32.5 \
             "openai==1.57.4" \
-            "httpx<0.28" # This is the crucial line
             "httpx<0.28"
 
-      - name: Run unified pipeline (Duffel → Score → Render → IG → Telegram)
+      - name: Print installed versions (sanity check)
+        run: |
+          python -c "import openai, httpx; print('openai', openai.__version__); print('httpx', httpx.__version__)"
+
+      - name: Duffel Feeder (optional but keeps it explicit)
+        env:
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          RAW_STATUS_NEW: "NEW"
+          MAX_INSERTS: "3"
+          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }}
+          ORIGIN_IATA: "LON"
+          DEST_IATA: "BCN"
+          DAYS_AHEAD: "60"
+          TRIP_LENGTH_DAYS: "5"
+        run: |
+          python workers/duffel_feeder_v4_affiliate_safe.py
+
+      - name: Unified Worker (Score → Render → IG → Telegram)
         env:
           # --- Google Sheets ---
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
 
-          # --- Duffel ---
+          # --- Duffel (THIS IS WHAT PREVENTS "Duffel: DISABLED") ---
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           DUFFEL_MAX_INSERTS: "3"
           CONFIG_TAB: "CONFIG"
-          ORIGIN_IATA: "LON"
-          DEST_IATA: "BCN"
-          DAYS_AHEAD: "60"
-          TRIP_LENGTH_DAYS: "5"
 
           # --- AI Scoring ---
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -63,10 +81,10 @@ jobs:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-          # --- Telegram ---
+          # --- Telegram (Free + Paid) ---
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_FREE_CHANNEL: "-1003505750272"
-          TELEGRAM_MONTHLY_CHANNEL: "-1003517970522"
-          TELEGRAM_ANNUAL_CHANNEL: "-1003517970522"
+          TELEGRAM_VIP_CHANNEL: "-1003517970522"
+          STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
         run: |
           python workers/unified_pipeline_worker.py

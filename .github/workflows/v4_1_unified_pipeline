@@ -1,5 +1,4 @@
-# .github/workflows/v4_pipeline.yml
-name: V4.1 Unified Pipeline
+name: v4_pipeline
 
 on:
   workflow_dispatch:
@@ -8,83 +7,61 @@ on:
     - cron: "30 16 * * *"
 
 concurrency:
-  group: traveltxter-v4-pipeline
+  group: v4_pipeline
   cancel-in-progress: false
 
 jobs:
   pipeline:
     runs-on: ubuntu-24.04
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (PINNED - fixes OpenAI/httpx proxies crash)
+      - name: Install deps (PINNED)
         run: |
           python -m pip install --upgrade pip
+          pip install             gspread==6.2.1             google-auth==2.41.1             requests==2.32.5             "openai==1.57.4"             "httpx<0.28"
 
-          # IMPORTANT:
-          # - GitHub runner was installing httpx 0.28.x which breaks OpenAI SDK init (proxies kwarg)
-          # - Pin httpx < 0.28 to keep compatibility
-          pip install --no-cache-dir \
-            gspread==6.2.1 \
-            google-auth==2.41.1 \
-            requests==2.32.5 \
-            "openai==1.57.4" \
-            "httpx<0.28"
-
-      - name: Print installed versions (sanity check)
-        run: |
-          python -c "import openai, httpx; print('openai', openai.__version__); print('httpx', httpx.__version__)"
-
-      - name: Duffel Feeder (optional but keeps it explicit)
+      - name: Run unified pipeline
         env:
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          # Google / Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          RAW_STATUS_NEW: "NEW"
+
+          # Duffel
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           MAX_INSERTS: "3"
-          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }}
           ORIGIN_IATA: "LON"
           DEST_IATA: "BCN"
           DAYS_AHEAD: "60"
           TRIP_LENGTH_DAYS: "5"
-        run: |
-          python workers/duffel_feeder_v4_affiliate_safe.py
 
-      - name: Unified Worker (Score → Render → IG → Telegram)
-        env:
-          # --- Google Sheets ---
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-
-          # --- Duffel (THIS IS WHAT PREVENTS "Duffel: DISABLED") ---
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          DUFFEL_MAX_INSERTS: "3"
-          CONFIG_TAB: "CONFIG"
-
-          # --- AI Scoring ---
+          # OpenAI
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
-          # --- Render ---
+          # Render / IG
           RENDER_URL: ${{ secrets.RENDER_URL }}
-
-          # --- Instagram ---
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-          # --- Telegram (Free + Paid) ---
+          # Telegram (Free + VIP)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_FREE_CHANNEL: "-1003505750272"
-          TELEGRAM_VIP_CHANNEL: "-1003517970522"
-          STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+          TELEGRAM_VIP_DELAY_HOURS: "24"
+
+          # Stripe links (locked)
+          STRIPE_RAMBLER_FREE: "https://buy.stripe.com/8x2eV60fIfps3Ik3qde7m09"
+          STRIPE_ADVENTURER_MONTHLY: "https://buy.stripe.com/3cI14g3rU4KOdiUbWJe7m08"
+          STRIPE_NOMAD_ANNUAL: "https://buy.stripe.com/9B67sE2nQa586Uw3qde7m07"
+
         run: |
           python workers/unified_pipeline_worker.py

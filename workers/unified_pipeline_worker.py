@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.2 Unified Pipeline - Production Ready
+TravelTxter V4.2 Unified Pipeline - Production Ready FINAL
 
 Features:
 1) Duffel FEED with deterministic route rotation
 2) AI scoring with human-like copy (no emojis)
-3) Instagram publishing (theme-based informative posts)
-4) Telegram VIP (24h early access)
-5) Telegram FREE (with 24h delay + upsell)
-6) City names (not airport codes) in all user-facing text
+3) Rendering service integration (solari board graphics)
+4) Instagram publishing (simple CTA captions - graphic shows all details)
+5) Telegram VIP (24h early access with booking links)
+6) Telegram FREE (with 24h delay + upsell)
+7) City names (not airport codes) in all user-facing content
 """
 
 import os
 import json
 import uuid
 import datetime as dt
+import re
 from typing import Dict, Any, List, Tuple, Optional
 
 import requests
@@ -275,7 +277,7 @@ def duffel_run_and_insert(ws: gspread.Worksheet, headers: List[str]) -> int:
     today = dt.date.today()
 
     for (origin, dest) in routes:
-        # IMPROVED: Search 21 days ahead (good balance for deals)
+        # Search 21 days ahead (good balance for deals)
         out_date = today + dt.timedelta(days=21)
         ret_date = out_date + dt.timedelta(days=TRIP_LENGTH_DAYS)
 
@@ -394,7 +396,7 @@ def openai_client() -> OpenAI:
 
 def score_and_caption_deal(row: Dict[str, str]) -> Tuple[str, str, str]:
     """
-    Score a deal and generate human-like caption (NO EMOJIS).
+    Score a deal and generate human-like explanation (NO EMOJIS).
     Returns: (ai_score, ai_verdict, why_its_good)
     """
     client = openai_client()
@@ -567,6 +569,7 @@ def stage_scoring(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1) 
 def stage_rendering(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1) -> int:
     """
     Call rendering service for deals with READY_TO_POST status.
+    Sends: origin_city, destination_city, price_gbp, dates (for solari board graphic)
     Transitions to READY_TO_PUBLISH.
     """
     if not RENDER_URL:
@@ -614,6 +617,7 @@ def stage_rendering(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1
 
         log(f"Rendering row {i}")
 
+        # Send city names (not airport codes) to renderer
         payload = {
             "origin": safe_get(row, "origin_city") or safe_get(row, "origin_iata"),
             "destination": safe_get(row, "destination_city") or safe_get(row, "destination_iata"),
@@ -653,65 +657,70 @@ def stage_rendering(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1
 # =========================
 # INSTAGRAM
 # =========================
-def generate_instagram_caption(row: Dict[str, str], theme: str) -> str:
+def generate_instagram_caption(row: Dict[str, str]) -> str:
     """
-    Generate informative, travel-writer style Instagram caption based on theme.
-    NO EMOJIS. Human, conversational, informative.
+    Generate simple, enticing Instagram caption that drives sign-ups.
+    The graphic (solari board) shows all the deal details, so copy is short and CTA-focused.
+    NO EMOJIS. Human, conversational.
     """
     client = openai_client()
 
     dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
-    dest_country = safe_get(row, "destination_country") or ""
     price = safe_get(row, "price_gbp")
-    out_date = safe_get(row, "outbound_date")
-
-    # Parse theme or use generic
-    theme_prompt = f"Theme: {theme}" if theme else "General travel inspiration"
+    origin_city = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
 
     prompt = f"""
-You are a travel writer creating an Instagram post.
+You are writing a short Instagram caption for a flight deal post.
 
-Destination: {dest_city}, {dest_country}
-Flight Price: £{price}
-Departure: {out_date}
-{theme_prompt}
+The graphic (solari board style) already shows all details:
+- {origin_city} to {dest_city}
+- £{price}
+- Exact dates
 
-Write an informative, engaging Instagram caption (150-250 words) that:
-- Highlights what makes {dest_city} special (culture, food, sights, experiences)
-- Mentions the deal casually but doesn't make it the focus
-- Sounds like a knowledgeable friend giving travel advice
-- Is conversational but informative
-- NO EMOJIS, no hashtags (we add those separately)
-- Ends with a subtle call-to-action about following for more deals
+Write a SHORT caption (2-4 sentences, max 60 words) that:
+- Sounds natural and conversational (no emojis, no excessive excitement)
+- Mentions VIP members get these deals 24 hours early
+- Encourages people to sign up / link in bio
+- Creates FOMO without being pushy
 
-Example tone: "If you've never been to Porto, January through March might be the best time. The crowds thin out after Christmas, but the city stays vibrant. You can spend entire afternoons getting lost in the Ribeira district, ducking into azulejo-covered churches and family-run tascas serving francesinha that will ruin you for all other sandwiches. The Douro Valley is half an hour away if you want to escape the city. Flights from London are sitting at £89 right now - worth keeping an eye on if you're planning a winter break. Follow @traveltxter for more deals like this."
+Good examples:
+"London to Bordeaux for £105. Our VIP members saw this yesterday. Link in bio to join."
 
-Write the caption now:
+"Spotted Barcelona at £89. By the time it's on Instagram, our paid members have had 24 hours to book. Want early access? Bio link."
+
+"Manchester to Reykjavik, £103. VIP members got this deal yesterday morning. Follow for more, or join the VIP list in bio for early access."
+
+Write caption now (no hashtags, no emojis):
 """.strip()
 
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are a travel writer. Write informative, human captions. Never use emojis."},
+                {"role": "system", "content": "You are a copywriter. Write short, conversational captions. Never use emojis. Be natural and human."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.8,
-            max_tokens=400
+            temperature=0.7,
+            max_tokens=120
         )
 
         caption = resp.choices[0].message.content.strip()
+        
+        # Remove any emojis that might have slipped through
+        caption = re.sub(r'[^\w\s.,!?£\'\"-]', '', caption)
+        
         return caption
 
     except Exception as e:
         log(f"Instagram caption generation error: {e}")
         # Fallback
-        return f"Just spotted flights to {dest_city} for £{price}. {dest_city} is worth a visit if you haven't been - great food, interesting history, and easy to explore over a long weekend. Follow @traveltxter for more deals."
+        return f"{origin_city} to {dest_city} for £{price}. Our VIP members saw this 24 hours ago. Link in bio to join TravelTxter for early access."
 
 
 def stage_instagram(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1) -> int:
     """
-    Post deals to Instagram with informative, theme-based captions.
+    Post deals to Instagram with simple, CTA-focused captions.
+    Graphic shows all deal details (solari board style).
     Transitions to POSTED_INSTAGRAM.
     """
     if not IG_ACCESS_TOKEN or not IG_USER_ID:
@@ -738,16 +747,15 @@ def stage_instagram(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1
             log(f"Row {i} missing graphic_url - skipping Instagram")
             continue
 
-        theme = safe_get(row, "theme")
         dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
 
         log(f"Posting to Instagram: row {i} ({dest_city})")
 
-        # Generate theme-based caption
-        caption = generate_instagram_caption(row, theme)
+        # Generate short, CTA-focused caption
+        caption = generate_instagram_caption(row)
 
         # Add hashtags
-        hashtags = "\n\n#TravelDeals #CheapFlights #FlightDeals #TravelTips #UKTravel #TravelCommunity #Wanderlust #TravelInspiration"
+        hashtags = "\n\n#TravelDeals #CheapFlights #FlightDeals #TravelTips #UKTravel #TravelCommunity"
         full_caption = caption + hashtags
 
         try:
@@ -833,6 +841,7 @@ def tg_send(bot_token: str, channel: str, msg: str, parse_mode: str = "HTML") ->
 def format_telegram_vip(row: Dict[str, str]) -> str:
     """
     Format VIP Telegram message with booking link.
+    Uses CITY NAMES (not airport codes).
     """
     price = safe_get(row, "price_gbp")
     dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
@@ -870,6 +879,7 @@ def format_telegram_vip(row: Dict[str, str]) -> str:
 def format_telegram_free(row: Dict[str, str]) -> str:
     """
     Format FREE Telegram message with upsell.
+    Uses CITY NAMES (not airport codes).
     """
     price = safe_get(row, "price_gbp")
     dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
@@ -1048,7 +1058,7 @@ def stage_telegram_free(ws: gspread.Worksheet, headers: List[str], max_rows: int
 # =========================
 def main() -> None:
     log("=" * 70)
-    log("TRAVELTXTER V4.2 UNIFIED PIPELINE")
+    log("TRAVELTXTER V4.2 UNIFIED PIPELINE - FINAL")
     log("=" * 70)
     log(f"Sheet: {SPREADSHEET_ID[:20]}...")
     log(f"Tab: {RAW_DEALS_TAB}")

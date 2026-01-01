@@ -32,125 +32,113 @@ import requests
 
 
 # =========================
-# THEME POOLS & AIRPORT ROTATION (V4.2)
+# CONFIG-BASED ROUTING (V4.2)
+# Reads routes from CONFIG spreadsheet tab
 # =========================
 
-# Airport rotation by theme (maximizes deal variety)
-AIRPORT_ROTATION = {
-    "WINTER_SUN": {
-        "airports": ["STN", "LGW", "LTN", "BRS"],  # Budget airlines
-        "destinations": ["AGP", "PMI", "FAO", "LPA", "TFS"],
-        "days_ahead": 30,
-        "trip_length": 5,
-    },
-    "CITY_BREAKS": {
-        "airports": ["STN", "BRS", "MAN", "LPL", "BHX"],  # Student cities
-        "destinations": ["BCN", "PRG", "BUD", "KRK", "AMS", "DUB"],
-        "days_ahead": 45,
-        "trip_length": 3,
-    },
-    "SNOW": {
-        "airports": ["EDI", "MAN", "LGW"],  # Northern + major
-        "destinations": ["KEF", "OSL", "CPH", "HEL"],
-        "days_ahead": 60,
-        "trip_length": 5,
-    },
-    "FOODIE": {
-        "airports": ["LGW", "BHX", "MAN", "STN"],
-        "destinations": ["ROM", "NAP", "LIS", "BCN", "LYS", "BOL"],
-        "days_ahead": 45,
-        "trip_length": 4,
-    },
-    "LONG_HAUL": {
-        "airports": ["LHR", "MAN", "LGW"],  # Major hubs only
-        "destinations": ["JFK", "DXB", "BKK"],
-        "days_ahead": 120,  # Book far ahead
-        "trip_length": 7,
-    },
-    "SURF": {
-        "airports": ["LTN", "STN", "LGW"],
-        "destinations": ["FAO", "LIS", "AGP"],
-        "days_ahead": 30,
-        "trip_length": 5,
-    },
-    "SURPRISE": {
-        "airports": ["LGW", "STN", "MAN"],  # Mix of major + budget
-        "destinations": ["BCN", "AMS", "DUB", "PRG", "LIS"],
-        "days_ahead": 45,
-        "trip_length": 4,
-    },
-}
-
-# Theme schedule (day of week → theme)
-THEME_SCHEDULE = {
-    "MON": "WINTER_SUN",
-    "TUE": "CITY_BREAKS",
-    "WED": "SNOW",
-    "THU": "FOODIE",
-    "FRI": "LONG_HAUL",
-    "SAT": "SURF",
-    "SUN": "SURPRISE",
-}
-
-# Display names for airports (user-facing)
-AIRPORT_NAMES = {
-    "LHR": "London",
-    "LGW": "London",
-    "STN": "London",
-    "LTN": "London",
-    "LCY": "London",
-    "BRS": "Bristol",
-    "MAN": "Manchester",
-    "EDI": "Edinburgh",
-    "BHX": "Birmingham",
-    "LPL": "Liverpool",
-    "GLA": "Glasgow",
-    "NCL": "Newcastle",
-}
-
-
-def utc_day_key() -> str:
-    """Get 3-letter day code (MON, TUE, etc)."""
-    return dt.datetime.utcnow().strftime("%a").upper()[:3]
-
-
-def utc_run_slot() -> int:
-    """0 for morning (<12 UTC), 1 for afternoon (>=12 UTC)."""
-    return 0 if dt.datetime.utcnow().hour < 12 else 1
-
-
-def pick_airport_and_route() -> Dict[str, Any]:
-    """Pick airport, destination, and search params based on today's theme."""
-    day = utc_day_key()
-    theme_key = THEME_SCHEDULE.get(day, "SURPRISE").upper()
+def get_enabled_routes_from_config(ws_config) -> List[Dict[str, Any]]:
+    """
+    Read enabled routes from CONFIG sheet.
     
-    if theme_key not in AIRPORT_ROTATION:
-        theme_key = "SURPRISE"
+    Returns list of route configs with:
+    - origin_iata, origin_city
+    - destination_iata, destination_city, destination_country
+    - trip_length_days, max_connections, cabin_class
+    - days_ahead, theme
+    """
+    try:
+        rows = ws_config.get_all_values()
+        if len(rows) < 2:
+            log("  ⚠️  CONFIG sheet has no data")
+            return []
+        
+        headers = [h.strip().lower() for h in rows[0]]
+        hmap = {h: i for i, h in enumerate(headers)}
+        
+        # Required columns
+        required = ['enabled', 'origin_iata', 'destination_iata', 'theme']
+        if not all(col in hmap for col in required):
+            log(f"  ⚠️  CONFIG missing required columns: {required}")
+            return []
+        
+        routes = []
+        for row_idx in range(1, len(rows)):
+            row = rows[row_idx]
+            
+            # Check if enabled
+            enabled = (row[hmap['enabled']] if hmap['enabled'] < len(row) else "").strip().upper()
+            if enabled != "TRUE":
+                continue
+            
+            # Build route config
+            route = {
+                'origin_iata': (row[hmap['origin_iata']] if hmap['origin_iata'] < len(row) else "").strip().upper(),
+                'origin_city': (row[hmap.get('origin_city', 0)] if 'origin_city' in hmap and hmap['origin_city'] < len(row) else "").strip(),
+                'destination_iata': (row[hmap['destination_iata']] if hmap['destination_iata'] < len(row) else "").strip().upper(),
+                'destination_city': (row[hmap.get('destination_city', 0)] if 'destination_city' in hmap and hmap['destination_city'] < len(row) else "").strip(),
+                'destination_country': (row[hmap.get('destination_country', 0)] if 'destination_country' in hmap and hmap['destination_country'] < len(row) else "").strip(),
+                'trip_length_days': int((row[hmap.get('trip_length_days', 0)] if 'trip_length_days' in hmap and hmap['trip_length_days'] < len(row) else "5").strip() or "5"),
+                'max_connections': int((row[hmap.get('max_connections', 0)] if 'max_connections' in hmap and hmap['max_connections'] < len(row) else "1").strip() or "1"),
+                'cabin_class': (row[hmap.get('cabin_class', 0)] if 'cabin_class' in hmap and hmap['cabin_class'] < len(row) else "economy").strip().lower(),
+                'days_ahead': int((row[hmap.get('days_ahead', 0)] if 'days_ahead' in hmap and hmap['days_ahead'] < len(row) else "62").strip() or "62"),
+                'theme': (row[hmap.get('theme', 0)] if 'theme' in hmap and hmap['theme'] < len(row) else "").strip().upper(),
+            }
+            
+            # Validate required fields
+            if route['origin_iata'] and route['destination_iata']:
+                routes.append(route)
+        
+        return routes
+        
+    except Exception as e:
+        log(f"  ⚠️  Error reading CONFIG: {e}")
+        return []
+
+
+def pick_route_from_config() -> Optional[Dict[str, Any]]:
+    """
+    Pick a route from CONFIG sheet based on deterministic rotation.
     
-    config = AIRPORT_ROTATION[theme_key]
-    
-    # Deterministic rotation based on day of year + run slot
-    doy = int(dt.datetime.utcnow().strftime("%j"))
-    slot = utc_run_slot()
-    
-    airports = config["airports"]
-    destinations = config["destinations"]
-    
-    # Different rotation speeds for variety
-    airport_idx = (doy * 2 + slot) % len(airports)
-    dest_idx = (doy * 3 + slot) % len(destinations)
-    
-    origin_code = airports[airport_idx].upper()
-    dest_code = destinations[dest_idx].upper()
-    
-    return {
-        "theme": theme_key,
-        "origin_code": origin_code,
-        "origin_city": AIRPORT_NAMES.get(origin_code, origin_code),
-        "destination_code": dest_code,
-        "days_ahead": config["days_ahead"],
-        "trip_length": config["trip_length"],
-    }
+    Strategy:
+    - Read all enabled routes from CONFIG tab
+    - Group by theme (optional)
+    - Rotate through routes deterministically (day of year + run slot)
+    """
+    try:
+        # Get CONFIG sheet
+        gc = gs_client()
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        
+        # Try to get CONFIG sheet
+        try:
+            ws_config = sh.worksheet("CONFIG")
+        except:
+            log("  ⚠️  CONFIG sheet not found, using fallback")
+            return None
+        
+        # Get enabled routes
+        routes = get_enabled_routes_from_config(ws_config)
+        
+        if not routes:
+            log("  ⚠️  No enabled routes in CONFIG")
+            return None
+        
+        log(f"  📋 Found {len(routes)} enabled routes in CONFIG")
+        
+        # Deterministic selection based on day of year + run slot
+        doy = int(dt.datetime.utcnow().strftime("%j"))
+        slot = 0 if dt.datetime.utcnow().hour < 12 else 1
+        
+        idx = (doy * 2 + slot) % len(routes)
+        selected = routes[idx]
+        
+        log(f"  ✅ Selected route {idx + 1}/{len(routes)}: {selected['origin_iata']} → {selected['destination_iata']}")
+        
+        return selected
+        
+    except Exception as e:
+        log(f"  ❌ Error picking route from CONFIG: {e}")
+        return None
 
 
 # =========================
@@ -287,11 +275,11 @@ def duffel_headers() -> Dict[str, str]:
 
 def feed_new_deals() -> int:
     """
-    Feed new deals from Duffel API using multi-airport rotation.
+    Feed new deals from Duffel API using CONFIG-based routing.
     
-    V4.2 STRATEGY:
-    - Rotate UK airports by theme (budget vs major hubs)
-    - Theme-specific search windows (30d for budget, 120d for long-haul)
+    V4.2 CONFIG STRATEGY:
+    - Reads enabled routes from CONFIG spreadsheet tab
+    - Rotates through routes deterministically
     - Insert ALL offers (up to 20) from each search
     - Let AI scorer pick best deals later
     
@@ -302,26 +290,35 @@ def feed_new_deals() -> int:
         return 0
     
     try:
-        # Pick today's route (airport + destination based on theme)
-        route = pick_airport_and_route()
+        # Pick route from CONFIG
+        route = pick_route_from_config()
         
-        theme = route["theme"]
-        origin_code = route["origin_code"]
-        origin_city = route["origin_city"]
-        dest_code = route["destination_code"]
-        days_ahead = route["days_ahead"]
-        trip_length = route["trip_length"]
+        if not route:
+            log("   ⚠️  No route selected from CONFIG")
+            return 0
+        
+        origin_code = route['origin_iata']
+        origin_city = route.get('origin_city') or origin_code
+        dest_code = route['destination_iata']
+        dest_city = route.get('destination_city') or dest_code
+        dest_country = route.get('destination_country', '')
+        days_ahead = route.get('days_ahead', 62)
+        trip_length = route.get('trip_length_days', 5)
+        cabin_class = route.get('cabin_class', 'economy')
+        max_connections = route.get('max_connections', 1)
+        theme = route.get('theme', '')
         
         # Calculate dates
         from datetime import date, timedelta
         out_date = date.today() + timedelta(days=days_ahead)
         ret_date = out_date + timedelta(days=trip_length)
         
-        log(f"\n🔍 DUFFEL FEEDER (V4.2 Multi-Airport)")
+        log(f"\n🔍 DUFFEL FEEDER (V4.2 CONFIG-Based)")
         log(f"   Theme: {theme}")
-        log(f"   Route: {origin_code} ({origin_city}) → {dest_code}")
+        log(f"   Route: {origin_code} ({origin_city}) → {dest_code} ({dest_city})")
         log(f"   Dates: {out_date} to {ret_date} ({trip_length} days)")
         log(f"   Search window: {days_ahead} days ahead")
+        log(f"   Cabin: {cabin_class}, Max stops: {max_connections}")
         log(f"   Max offers: {DUFFEL_MAX_INSERTS}")
         
         # Create offer request
@@ -340,8 +337,8 @@ def feed_new_deals() -> int:
                     }
                 ],
                 "passengers": [{"type": "adult"}],
-                "cabin_class": "economy",
-                "max_connections": 1,
+                "cabin_class": cabin_class,
+                "max_connections": max_connections,
             }
         }
         
@@ -408,9 +405,9 @@ def feed_new_deals() -> int:
                 # Build deal record
                 deal = {
                     "deal_id": str(uuid.uuid4()),
-                    "origin_city": origin_city,  # Display name (London, Manchester, etc)
-                    "destination_city": dest_code,  # Will show as airport code for now
-                    "destination_country": "",
+                    "origin_city": origin_city,
+                    "destination_city": dest_city,
+                    "destination_country": dest_country,
                     "price_gbp": price,
                     "outbound_date": out,
                     "return_date": ret,
@@ -418,7 +415,7 @@ def feed_new_deals() -> int:
                     "stops": str(stops),
                     "airline": airline,
                     "theme": theme,
-                    "deal_source": f"DUFFEL_V4.2_{origin_code}",
+                    "deal_source": f"DUFFEL_V4.2_CONFIG_{origin_code}",
                     "date_added": date.today().isoformat(),
                     "status": "NEW",
                 }
@@ -448,6 +445,8 @@ def feed_new_deals() -> int:
             
     except Exception as e:
         log(f"   ❌ Duffel feeder error: {e}")
+        import traceback
+        log(f"   Traceback: {traceback.format_exc()}")
         return 0
 
 

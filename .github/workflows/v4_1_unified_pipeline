@@ -4,11 +4,12 @@ name: V4 Pipeline
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 7 * * *"   # 07:30 UTC
-    - cron: "30 16 * * *"  # 16:30 UTC
+    # 07:30 UTC + 16:30 UTC every day (matches your spec)
+    - cron: "30 7 * * *"
+    - cron: "30 16 * * *"
 
 concurrency:
-  group: v4_pipeline
+  group: traveltxter-v4-pipeline
   cancel-in-progress: false
 
 jobs:
@@ -18,66 +19,49 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        shell: bash
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install gspread google-auth requests openai
-          fi
+          # Keep it simple + deterministic for Actions
+          pip install gspread google-auth requests openai
 
-      - name: Run unified pipeline (feeder + score + render + publish)
-        shell: bash
+      - name: Run unified pipeline (Duffel → Score → Render → IG → Telegram)
         env:
-          # === Google Sheets ===
+          # --- Google Sheets ---
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
 
-          # === Duffel (MUST be present for seeding when sheet is empty) ===
+          # --- Duffel (THIS FIXES YOUR "Duffel: DISABLED" PROBLEM) ---
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-
-          # Quick-start fallback route if CONFIG tab is missing/empty
-          # (Use AIRPORT IATA codes, not city codes like LON)
+          DUFFEL_MAX_INSERTS: "3"          # keep within free tier
+          CONFIG_TAB: "CONFIG"             # V4.2 routes tab (optional but recommended)
+          # Fallback single-route search if CONFIG tab missing/empty:
           ORIGIN_IATA: "LHR"
           DEST_IATA: "BCN"
-
-          # How far ahead + trip duration
           DAYS_AHEAD: "60"
           TRIP_LENGTH_DAYS: "5"
 
-          # Insert cap (keep low for free tier)
-          DUFFEL_MAX_INSERTS: "3"
-
-          # Optional affiliate
-          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }}
-
-          # === OpenAI (scoring/copy) ===
+          # --- AI Scoring ---
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
-          # === Renderer ===
+          # --- Render ---
           RENDER_URL: ${{ secrets.RENDER_URL }}
 
-          # === Instagram ===
+          # --- Instagram ---
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-          # === Telegram FREE ===
+          # --- Telegram (FREE + paid tiers) ---
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_FREE_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
-
-          # === Telegram VIP ===
-          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_VIP_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
-
+          TELEGRAM_FREE_CHANNEL: "-1003505750272"
+          TELEGRAM_MONTHLY_CHANNEL: "-1003517970522"
+          TELEGRAM_ANNUAL_CHANNEL: "-1003517970522"
         run: |
           python workers/unified_pipeline_worker.py

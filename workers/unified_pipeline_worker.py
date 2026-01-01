@@ -17,11 +17,13 @@ import json
 import uuid
 import datetime as dt
 import re
+import time
 from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from openai import OpenAI
 from openai import OpenAI
 
 
@@ -617,15 +619,21 @@ def stage_rendering(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1
 
         log(f"Rendering row {i}")
 
-        # Send city names (not airport codes) to renderer
+        # Send payload matching render service expectations (V3 format)
         payload = {
-            "origin": safe_get(row, "origin_city") or safe_get(row, "origin_iata"),
-            "destination": safe_get(row, "destination_city") or safe_get(row, "destination_iata"),
-            "price": safe_get(row, "price_gbp"),
+            "deal_id": safe_get(row, "deal_id"),
+            "origin_city": safe_get(row, "origin_city") or safe_get(row, "origin_iata"),
+            "destination_city": safe_get(row, "destination_city") or safe_get(row, "destination_iata"),
+            "destination_country": safe_get(row, "destination_country"),
+            "price_gbp": safe_get(row, "price_gbp"),
             "outbound_date": safe_get(row, "outbound_date"),
             "return_date": safe_get(row, "return_date"),
+            "trip_length_days": safe_get(row, "trip_length_days"),
+            "stops": safe_get(row, "stops"),
             "airline": safe_get(row, "airline"),
-            "stops": safe_get(row, "stops")
+            "ai_score": safe_get(row, "ai_score"),
+            "ai_verdict": safe_get(row, "ai_verdict"),
+            "ai_caption": safe_get(row, "ai_caption"),
         }
 
         try:
@@ -721,6 +729,7 @@ def stage_instagram(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1
     """
     Post deals to Instagram with simple, CTA-focused captions.
     Graphic shows all deal details (solari board style).
+    Includes proper status checking before publishing.
     Transitions to POSTED_INSTAGRAM.
     """
     if not IG_ACCESS_TOKEN or not IG_USER_ID:
@@ -759,7 +768,7 @@ def stage_instagram(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1
         full_caption = caption + hashtags
 
         try:
-            # Create media container
+            # Step 1: Create media container
             create_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media"
             create_payload = {
                 "image_url": graphic_url,
@@ -767,20 +776,64 @@ def stage_instagram(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1
                 "access_token": IG_ACCESS_TOKEN
             }
 
+            log(f"Creating Instagram media container...")
             r1 = requests.post(create_url, data=create_payload, timeout=30)
             if r1.status_code != 200:
                 log(f"IG create failed: {r1.status_code} {r1.text[:200]}")
                 continue
 
             creation_id = r1.json().get("id")
+            log(f"Media container created: {creation_id}")
 
-            # Publish
+            # Step 2: Poll for media readiness
+            # time already imported at top
+            max_wait_seconds = 60
+            poll_interval = 2
+            waited = 0
+            media_ready = False
+
+            log(f"Waiting for Instagram to process image...")
+            while waited < max_wait_seconds:
+                status_url = f"https://graph.facebook.com/v18.0/{creation_id}"
+                status_params = {
+                    "fields": "status_code",
+                    "access_token": IG_ACCESS_TOKEN
+                }
+                
+                r_status = requests.get(status_url, params=status_params, timeout=10)
+                if r_status.status_code == 200:
+                    status_data = r_status.json()
+                    status_code = status_data.get("status_code", "")
+                    
+                    log(f"Media status: {status_code} (waited {waited}s)")
+                    
+                    if status_code == "FINISHED":
+                        media_ready = True
+                        log(f"Media ready after {waited}s")
+                        break
+                    elif status_code == "ERROR":
+                        log(f"Media processing error - aborting")
+                        break
+                    elif status_code == "EXPIRED":
+                        log(f"Media container expired - aborting")
+                        break
+                    # If IN_PROGRESS or not set, continue waiting
+                
+                time.sleep(poll_interval)
+                waited += poll_interval
+
+            if not media_ready:
+                log(f"Media not ready after {waited}s - aborting publish")
+                continue
+
+            # Step 3: Publish
             publish_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media_publish"
             publish_payload = {
                 "creation_id": creation_id,
                 "access_token": IG_ACCESS_TOKEN
             }
 
+            log(f"Publishing to Instagram...")
             r2 = requests.post(publish_url, data=publish_payload, timeout=30)
             if r2.status_code == 200:
                 post_id = r2.json().get("id")
@@ -805,11 +858,6 @@ def stage_instagram(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1
             log(f"Instagram error: {e}")
 
     return posted
-
-
-# =========================
-# TELEGRAM
-# =========================
 def parse_ts(s: str) -> Optional[dt.datetime]:
     s = (s or "").strip()
     if not s:

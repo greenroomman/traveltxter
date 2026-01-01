@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4 Unified Pipeline (Practical Fix Version)
+TravelTxter V4.2 Unified Pipeline - Production Ready
 
-Fixes:
-1) Duffel FEED now runs inside this worker (no silent 'DISABLED' stage).
-2) VIP vs FREE Telegram gating:
-   - VIP posts on AM run
-   - FREE posts on PM run AND only if VIP was posted >= VIP_DELAY_HOURS ago
-3) Works with an empty sheet (header-only): it will still insert deals.
-
-This file is “colour-by-numbers” copy/paste safe (indentation preserved).
+Features:
+1) Duffel FEED with deterministic route rotation
+2) AI scoring with human-like copy (no emojis)
+3) Instagram publishing (theme-based informative posts)
+4) Telegram VIP (24h early access)
+5) Telegram FREE (with 24h delay + upsell)
+6) City names (not airport codes) in all user-facing text
 """
 
 import os
@@ -41,7 +40,6 @@ def now_utc() -> dt.datetime:
 # =========================
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", os.getenv("RAW_DEALS", "")).strip()
-
 CONFIG_TAB = os.getenv("CONFIG_TAB", "CONFIG").strip()
 
 GCP_SA_JSON = os.getenv("GCP_SA_JSON", "").strip()
@@ -53,15 +51,20 @@ DUFFEL_MAX_INSERTS = int(os.getenv("DUFFEL_MAX_INSERTS", "3"))
 DUFFEL_ROUTES_PER_RUN = int(os.getenv("DUFFEL_ROUTES_PER_RUN", "1"))
 DUFFEL_ENABLED = os.getenv("DUFFEL_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
 
-DEFAULT_ORIGIN_IATA = os.getenv("ORIGIN_IATA", "LHR").strip().upper()
-DEFAULT_DEST_IATA = os.getenv("DEST_IATA", "BCN").strip().upper()
+DEFAULT_ORIGIN_IATA = os.getenv("DEFAULT_ORIGIN_IATA", "LHR").strip().upper()
+DEFAULT_DEST_IATA = os.getenv("DEFAULT_DEST_IATA", "BCN").strip().upper()
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "60"))
 TRIP_LENGTH_DAYS = int(os.getenv("TRIP_LENGTH_DAYS", "5"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# Telegram (support both the old + new env var names)
+# Rendering & Instagram
+RENDER_URL = os.getenv("RENDER_URL", "").strip()
+IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN", "").strip()
+IG_USER_ID = os.getenv("IG_USER_ID", "").strip()
+
+# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL = (
     os.getenv("TELEGRAM_CHANNEL", "")
@@ -75,17 +78,24 @@ TELEGRAM_CHANNEL_VIP = (
     or os.getenv("TELEGRAM_VIP_CHANNEL", "")
 ).strip()
 
+# Subscription links
+STRIPE_LINK_MONTHLY = os.getenv("STRIPE_LINK_MONTHLY", "").strip()
+STRIPE_LINK_YEARLY = os.getenv("STRIPE_LINK_YEARLY", "").strip()
+SKYSCANNER_AFFILIATE_ID = os.getenv("SKYSCANNER_AFFILIATE_ID", "").strip()
+
 VIP_DELAY_HOURS = int(os.getenv("VIP_DELAY_HOURS", "24"))
 RUN_SLOT = os.getenv("RUN_SLOT", "AM").strip().upper()  # AM / PM
-
-STRIPE_LINK = os.getenv("STRIPE_LINK", "").strip()
 
 
 # =========================
 # Status constants
 # =========================
 STATUS_NEW = "NEW"
+STATUS_READY_TO_POST = "READY_TO_POST"
 STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
+STATUS_POSTED_INSTAGRAM = "POSTED_INSTAGRAM"
+STATUS_POSTED_TELEGRAM_VIP = "POSTED_TELEGRAM_VIP"
+STATUS_POSTED_TELEGRAM_FREE = "POSTED_TELEGRAM_FREE"
 STATUS_POSTED_ALL = "POSTED_ALL"
 
 
@@ -175,6 +185,40 @@ def load_routes_from_config(ws_parent: gspread.Spreadsheet) -> List[Tuple[str, s
     return out
 
 
+def select_route_deterministic(routes: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """
+    Select route deterministically based on day-of-year and AM/PM slot.
+    Ensures full rotation through all 60 routes.
+    """
+    if not routes:
+        return []
+    
+    day_of_year = dt.date.today().timetuple().tm_yday
+    slot_offset = 0 if RUN_SLOT == "AM" else 1
+    
+    # (day * 2 + slot) ensures AM and PM get different routes
+    # Modulo ensures we cycle through all routes
+    index = (day_of_year * 2 + slot_offset) % len(routes)
+    
+    return [routes[index]]
+
+
+# =========================
+# Skyscanner Affiliate Links
+# =========================
+def generate_skyscanner_link(origin_iata: str, dest_iata: str, 
+                            out_date: str, ret_date: str) -> str:
+    """
+    Generate Skyscanner affiliate link.
+    Format: https://www.skyscanner.net/transport/flights/ORIGIN/DEST/OUTDATE/RETDATE/?affiliateid=XXX
+    """
+    if not SKYSCANNER_AFFILIATE_ID:
+        # Fallback to non-affiliate link
+        return f"https://www.skyscanner.net/transport/flights/{origin_iata}/{dest_iata}/{out_date.replace('-', '')}/{ret_date.replace('-', '')}/"
+    
+    return f"https://www.skyscanner.net/transport/flights/{origin_iata}/{dest_iata}/{out_date.replace('-', '')}/{ret_date.replace('-', '')}/?affiliateid={SKYSCANNER_AFFILIATE_ID}"
+
+
 # =========================
 # Duffel
 # =========================
@@ -184,7 +228,7 @@ def duffel_offer_request(origin: str, dest: str, out_date: str, ret_date: str) -
         "Authorization": f"Bearer {DUFFEL_API_KEY}",
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Duffel-Version": DUFFEL_VERSION,  # v2 required
+        "Duffel-Version": DUFFEL_VERSION,
     }
     payload = {
         "data": {
@@ -215,9 +259,10 @@ def duffel_run_and_insert(ws: gspread.Worksheet, headers: List[str]) -> int:
     if not routes:
         routes = [(DEFAULT_ORIGIN_IATA, DEFAULT_DEST_IATA)]
 
-    routes = routes[: max(1, DUFFEL_ROUTES_PER_RUN)]
-    log(f"Duffel: ENABLED | routes_per_run={DUFFEL_ROUTES_PER_RUN} | max_inserts={DUFFEL_MAX_INSERTS}")
-    log(f"Routes selected: {routes}")
+    # FIXED: Deterministic route selection
+    routes = select_route_deterministic(routes)
+    log(f"Duffel: ENABLED | routes_per_run={len(routes)} | max_inserts={DUFFEL_MAX_INSERTS}")
+    log(f"Routes selected (deterministic): {routes}")
 
     hmap = header_map(headers)
 
@@ -230,7 +275,8 @@ def duffel_run_and_insert(ws: gspread.Worksheet, headers: List[str]) -> int:
     today = dt.date.today()
 
     for (origin, dest) in routes:
-        out_date = today + dt.timedelta(days=min(21, DAYS_AHEAD))
+        # IMPROVED: Search 21 days ahead (good balance for deals)
+        out_date = today + dt.timedelta(days=21)
         ret_date = out_date + dt.timedelta(days=TRIP_LENGTH_DAYS)
 
         log(f"Duffel search: {origin}->{dest} {iso_date(out_date)}->{iso_date(ret_date)}")
@@ -273,7 +319,7 @@ def duffel_run_and_insert(ws: gspread.Worksheet, headers: List[str]) -> int:
             row_obj["origin_iata"] = origin
             row_obj["destination_iata"] = dest
 
-            # Human-readable city/country if Duffel provides it
+            # Extract city/country names from Duffel
             origin_city = ""
             dest_city = ""
             dest_country = ""
@@ -318,10 +364,12 @@ def duffel_run_and_insert(ws: gspread.Worksheet, headers: List[str]) -> int:
 
             row_obj["status"] = STATUS_NEW
 
-            if "booking_link_free" in row_obj:
-                row_obj["booking_link_free"] = ""
+            # FIXED: Generate Skyscanner affiliate links
+            booking_link = generate_skyscanner_link(origin, dest, iso_date(out_date), iso_date(ret_date))
             if "booking_link_vip" in row_obj:
-                row_obj["booking_link_vip"] = ""
+                row_obj["booking_link_vip"] = booking_link
+            if "booking_link_free" in row_obj:
+                row_obj["booking_link_free"] = booking_link
 
             rows_to_append.append([row_obj.get(h, "") for h in headers])
             inserted += 1
@@ -336,7 +384,7 @@ def duffel_run_and_insert(ws: gspread.Worksheet, headers: List[str]) -> int:
 
 
 # =========================
-# SCORING
+# AI SCORING
 # =========================
 def openai_client() -> OpenAI:
     if not OPENAI_API_KEY:
@@ -344,28 +392,717 @@ def openai_client() -> OpenAI:
     return OpenAI(api_key=OPENAI_API_KEY)
 
 
-def score_caption(row: Dict[str, str]) -> Tuple[str, str, str]:
+def score_and_caption_deal(row: Dict[str, str]) -> Tuple[str, str, str]:
     """
-    returns: (ai_score, ai_verdict, ai_caption)
+    Score a deal and generate human-like caption (NO EMOJIS).
+    Returns: (ai_score, ai_verdict, why_its_good)
     """
     client = openai_client()
 
     origin = safe_get(row, "origin_city") or safe_get(row, "origin_iata") or "UK"
     dest = safe_get(row, "destination_city") or safe_get(row, "destination_iata") or "Somewhere"
+    dest_country = safe_get(row, "destination_country") or ""
     price = safe_get(row, "price_gbp") or "?"
     out_date = safe_get(row, "outbound_date")
     ret_date = safe_get(row, "return_date")
+    airline = safe_get(row, "airline") or "Unknown airline"
+    stops = safe_get(row, "stops") or "0"
 
     prompt = f"""
-You are a UK travel-deals copywriter.
-Write a short, punchy caption for a flight deal.
+You are a UK travel expert evaluating flight deals.
 
-Deal:
+Deal Details:
 - From: {origin}
-- To: {dest}
+- To: {dest}, {dest_country}
 - Price: £{price}
 - Dates: {out_date} to {ret_date}
+- Airline: {airline}
+- Stops: {stops}
 
-Return JSON with keys:
-ai_score (0-100 integer),
-ai_ve_
+Evaluate this deal and return JSON with:
+1. ai_score (0-100): How good is this price for this route? Consider seasonality, typical prices, stops.
+2. ai_verdict (GOOD/AVERAGE/POOR): Overall assessment
+3. why_its_good (1-2 sentences, max 150 chars): Explain why someone should book this. Be specific, human, conversational. NO EMOJIS. Examples:
+   - "Direct flights to Iceland for under £110 are rare outside January"
+   - "This undercuts the usual £180 fare by nearly 40 percent"
+   - "Weekend break in Barcelona for the price of a train ticket to Edinburgh"
+
+Return ONLY valid JSON, no markdown.
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a travel deals expert. Return only valid JSON. Never use emojis."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=250
+        )
+
+        text_out = resp.choices[0].message.content.strip()
+
+        # Clean markdown fences if present
+        if text_out.startswith("```json"):
+            text_out = text_out[7:]
+        if text_out.startswith("```"):
+            text_out = text_out[3:]
+        if text_out.endswith("```"):
+            text_out = text_out[:-3]
+        text_out = text_out.strip()
+
+        data = json.loads(text_out)
+
+        ai_score = str(data.get("ai_score", 60))
+        ai_verdict = str(data.get("ai_verdict", "AVERAGE")).upper()
+        why_its_good = str(data.get("why_its_good", "")).strip()
+
+        # Fallback if empty
+        if not why_its_good:
+            why_its_good = f"Return flights to {dest} for £{price}"
+
+        return ai_score, ai_verdict, why_its_good
+
+    except Exception as e:
+        log(f"OpenAI error: {e}")
+        # Fallback values
+        return "60", "AVERAGE", f"Return flights to {dest} for £{price}"
+
+
+def stage_scoring(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1) -> int:
+    """
+    Score NEW deals and promote BEST to READY_TO_POST (with freshness decay).
+    """
+    hmap = header_map(headers)
+
+    if "status" not in hmap:
+        raise RuntimeError("Missing 'status' column for scoring stage")
+
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return 0
+
+    # Score all NEW deals
+    deals_to_score = []
+    for i in range(2, len(rows) + 1):
+        row_vals = rows[i - 1]
+        row = {headers[c]: (row_vals[c] if c < len(row_vals) else "") for c in range(len(headers))}
+
+        status = safe_get(row, "status").upper()
+        if status != STATUS_NEW:
+            continue
+
+        # Skip if already scored
+        if safe_get(row, "ai_score"):
+            # Already scored, calculate final score with decay
+            ai_score = float(safe_get(row, "ai_score") or "0")
+            date_added_str = safe_get(row, "date_added")
+            age_days = 0
+            if date_added_str:
+                try:
+                    date_added = dt.datetime.fromisoformat(date_added_str.replace("Z", "+00:00"))
+                    age_days = (now_utc() - date_added).days
+                except Exception:
+                    pass
+            
+            # Apply freshness decay: 2 points per day
+            final_score = ai_score - (2.0 * age_days)
+            deals_to_score.append((i, final_score, row))
+            continue
+
+        # Score new deal
+        log(f"Scoring row {i}: {safe_get(row, 'origin_city')}->{safe_get(row, 'destination_city')}")
+
+        ai_score, ai_verdict, why_its_good = score_and_caption_deal(row)
+
+        # Update sheet with scores
+        updates = []
+        if "ai_score" in hmap:
+            updates.append(gspread.Cell(i, hmap["ai_score"], ai_score))
+        if "ai_verdict" in hmap:
+            updates.append(gspread.Cell(i, hmap["ai_verdict"], ai_verdict))
+        if "why_its_good" in hmap:
+            updates.append(gspread.Cell(i, hmap["why_its_good"], why_its_good))
+
+        if updates:
+            ws.update_cells(updates, value_input_option="USER_ENTERED")
+
+        # Calculate final score with freshness decay
+        date_added_str = safe_get(row, "date_added")
+        age_days = 0
+        if date_added_str:
+            try:
+                date_added = dt.datetime.fromisoformat(date_added_str.replace("Z", "+00:00"))
+                age_days = (now_utc() - date_added).days
+            except Exception:
+                pass
+
+        final_score = float(ai_score) - (2.0 * age_days)
+        deals_to_score.append((i, final_score, row))
+
+    # Promote BEST deal to READY_TO_POST
+    if deals_to_score and max_rows > 0:
+        # Sort by final score descending
+        deals_to_score.sort(key=lambda x: x[1], reverse=True)
+        
+        promoted = 0
+        for row_idx, final_score, row_data in deals_to_score:
+            if promoted >= max_rows:
+                break
+            
+            if "status" in hmap:
+                ws.update_cell(row_idx, hmap["status"], STATUS_READY_TO_POST)
+                log(f"Promoted row {row_idx} to READY_TO_POST (score: {final_score:.1f})")
+                promoted += 1
+
+        return promoted
+
+    return 0
+
+
+# =========================
+# RENDERING
+# =========================
+def stage_rendering(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1) -> int:
+    """
+    Call rendering service for deals with READY_TO_POST status.
+    Transitions to READY_TO_PUBLISH.
+    """
+    if not RENDER_URL:
+        log("RENDER_URL not set - skipping rendering, auto-promoting to READY_TO_PUBLISH")
+        # Auto-promote READY_TO_POST -> READY_TO_PUBLISH if no rendering
+        hmap = header_map(headers)
+        rows = ws.get_all_values()
+        promoted = 0
+        
+        for i in range(2, len(rows) + 1):
+            if promoted >= max_rows:
+                break
+            row_vals = rows[i - 1]
+            row = {headers[c]: (row_vals[c] if c < len(row_vals) else "") for c in range(len(headers))}
+            
+            if safe_get(row, "status").upper() == STATUS_READY_TO_POST:
+                if "status" in hmap:
+                    ws.update_cell(i, hmap["status"], STATUS_READY_TO_PUBLISH)
+                    promoted += 1
+        
+        return promoted
+
+    hmap = header_map(headers)
+    rows = ws.get_all_values()
+    rendered = 0
+
+    for i in range(2, len(rows) + 1):
+        if rendered >= max_rows:
+            break
+
+        row_vals = rows[i - 1]
+        row = {headers[c]: (row_vals[c] if c < len(row_vals) else "") for c in range(len(headers))}
+
+        status = safe_get(row, "status").upper()
+        if status != STATUS_READY_TO_POST:
+            continue
+
+        # Check if already rendered
+        if safe_get(row, "graphic_url"):
+            log(f"Row {i} already has graphic_url, promoting")
+            if "status" in hmap:
+                ws.update_cell(i, hmap["status"], STATUS_READY_TO_PUBLISH)
+            rendered += 1
+            continue
+
+        log(f"Rendering row {i}")
+
+        payload = {
+            "origin": safe_get(row, "origin_city") or safe_get(row, "origin_iata"),
+            "destination": safe_get(row, "destination_city") or safe_get(row, "destination_iata"),
+            "price": safe_get(row, "price_gbp"),
+            "outbound_date": safe_get(row, "outbound_date"),
+            "return_date": safe_get(row, "return_date"),
+            "airline": safe_get(row, "airline"),
+            "stops": safe_get(row, "stops")
+        }
+
+        try:
+            r = requests.post(RENDER_URL, json=payload, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                graphic_url = data.get("graphic_url", "")
+
+                updates = []
+                if graphic_url and "graphic_url" in hmap:
+                    updates.append(gspread.Cell(i, hmap["graphic_url"], graphic_url))
+                    log(f"Rendered: {graphic_url}")
+
+                if "status" in hmap:
+                    updates.append(gspread.Cell(i, hmap["status"], STATUS_READY_TO_PUBLISH))
+
+                if updates:
+                    ws.update_cells(updates, value_input_option="USER_ENTERED")
+
+                rendered += 1
+            else:
+                log(f"Render failed: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            log(f"Render error: {e}")
+
+    return rendered
+
+
+# =========================
+# INSTAGRAM
+# =========================
+def generate_instagram_caption(row: Dict[str, str], theme: str) -> str:
+    """
+    Generate informative, travel-writer style Instagram caption based on theme.
+    NO EMOJIS. Human, conversational, informative.
+    """
+    client = openai_client()
+
+    dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
+    dest_country = safe_get(row, "destination_country") or ""
+    price = safe_get(row, "price_gbp")
+    out_date = safe_get(row, "outbound_date")
+
+    # Parse theme or use generic
+    theme_prompt = f"Theme: {theme}" if theme else "General travel inspiration"
+
+    prompt = f"""
+You are a travel writer creating an Instagram post.
+
+Destination: {dest_city}, {dest_country}
+Flight Price: £{price}
+Departure: {out_date}
+{theme_prompt}
+
+Write an informative, engaging Instagram caption (150-250 words) that:
+- Highlights what makes {dest_city} special (culture, food, sights, experiences)
+- Mentions the deal casually but doesn't make it the focus
+- Sounds like a knowledgeable friend giving travel advice
+- Is conversational but informative
+- NO EMOJIS, no hashtags (we add those separately)
+- Ends with a subtle call-to-action about following for more deals
+
+Example tone: "If you've never been to Porto, January through March might be the best time. The crowds thin out after Christmas, but the city stays vibrant. You can spend entire afternoons getting lost in the Ribeira district, ducking into azulejo-covered churches and family-run tascas serving francesinha that will ruin you for all other sandwiches. The Douro Valley is half an hour away if you want to escape the city. Flights from London are sitting at £89 right now - worth keeping an eye on if you're planning a winter break. Follow @traveltxter for more deals like this."
+
+Write the caption now:
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a travel writer. Write informative, human captions. Never use emojis."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.8,
+            max_tokens=400
+        )
+
+        caption = resp.choices[0].message.content.strip()
+        return caption
+
+    except Exception as e:
+        log(f"Instagram caption generation error: {e}")
+        # Fallback
+        return f"Just spotted flights to {dest_city} for £{price}. {dest_city} is worth a visit if you haven't been - great food, interesting history, and easy to explore over a long weekend. Follow @traveltxter for more deals."
+
+
+def stage_instagram(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1) -> int:
+    """
+    Post deals to Instagram with informative, theme-based captions.
+    Transitions to POSTED_INSTAGRAM.
+    """
+    if not IG_ACCESS_TOKEN or not IG_USER_ID:
+        log("Instagram credentials missing - skipping")
+        return 0
+
+    hmap = header_map(headers)
+    rows = ws.get_all_values()
+    posted = 0
+
+    for i in range(2, len(rows) + 1):
+        if posted >= max_rows:
+            break
+
+        row_vals = rows[i - 1]
+        row = {headers[c]: (row_vals[c] if c < len(row_vals) else "") for c in range(len(headers))}
+
+        status = safe_get(row, "status").upper()
+        if status != STATUS_READY_TO_PUBLISH:
+            continue
+
+        graphic_url = safe_get(row, "graphic_url")
+        if not graphic_url:
+            log(f"Row {i} missing graphic_url - skipping Instagram")
+            continue
+
+        theme = safe_get(row, "theme")
+        dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
+
+        log(f"Posting to Instagram: row {i} ({dest_city})")
+
+        # Generate theme-based caption
+        caption = generate_instagram_caption(row, theme)
+
+        # Add hashtags
+        hashtags = "\n\n#TravelDeals #CheapFlights #FlightDeals #TravelTips #UKTravel #TravelCommunity #Wanderlust #TravelInspiration"
+        full_caption = caption + hashtags
+
+        try:
+            # Create media container
+            create_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media"
+            create_payload = {
+                "image_url": graphic_url,
+                "caption": full_caption[:2200],  # Instagram limit
+                "access_token": IG_ACCESS_TOKEN
+            }
+
+            r1 = requests.post(create_url, data=create_payload, timeout=30)
+            if r1.status_code != 200:
+                log(f"IG create failed: {r1.status_code} {r1.text[:200]}")
+                continue
+
+            creation_id = r1.json().get("id")
+
+            # Publish
+            publish_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media_publish"
+            publish_payload = {
+                "creation_id": creation_id,
+                "access_token": IG_ACCESS_TOKEN
+            }
+
+            r2 = requests.post(publish_url, data=publish_payload, timeout=30)
+            if r2.status_code == 200:
+                post_id = r2.json().get("id")
+                log(f"Posted to Instagram: {post_id}")
+
+                updates = []
+                if "instagram_post_id" in hmap:
+                    updates.append(gspread.Cell(i, hmap["instagram_post_id"], post_id))
+                if "instagram_caption" in hmap:
+                    updates.append(gspread.Cell(i, hmap["instagram_caption"], caption[:500]))
+                if "status" in hmap:
+                    updates.append(gspread.Cell(i, hmap["status"], STATUS_POSTED_INSTAGRAM))
+
+                if updates:
+                    ws.update_cells(updates, value_input_option="USER_ENTERED")
+
+                posted += 1
+            else:
+                log(f"IG publish failed: {r2.status_code} {r2.text[:200]}")
+
+        except Exception as e:
+            log(f"Instagram error: {e}")
+
+    return posted
+
+
+# =========================
+# TELEGRAM
+# =========================
+def parse_ts(s: str) -> Optional[dt.datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1]
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def tg_send(bot_token: str, channel: str, msg: str, parse_mode: str = "HTML") -> None:
+    if not bot_token or not channel:
+        raise RuntimeError("Missing TELEGRAM token or channel")
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": channel,
+        "text": msg,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": False
+    }
+    r = requests.post(url, json=payload, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text[:300]}")
+
+
+def format_telegram_vip(row: Dict[str, str]) -> str:
+    """
+    Format VIP Telegram message with booking link.
+    """
+    price = safe_get(row, "price_gbp")
+    dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
+    dest_country = safe_get(row, "destination_country")
+    origin_city = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
+    out_date = safe_get(row, "outbound_date")
+    ret_date = safe_get(row, "return_date")
+    why_good = safe_get(row, "why_its_good") or "Great value for this route"
+    booking_link = safe_get(row, "booking_link_vip")
+
+    dest_display = f"{dest_city}, {dest_country}" if dest_country else dest_city
+
+    message = f"""£{price} to {dest_display}
+
+<b>TO:</b> {dest_city.upper()}
+<b>FROM:</b> {origin_city}
+
+<b>OUT:</b>  {out_date}
+<b>BACK:</b> {ret_date}
+
+<b>Heads up:</b>
+• {why_good}
+• Availability is running low
+
+"""
+
+    if booking_link:
+        message += f'<a href="{booking_link}">BOOK NOW</a>'
+    else:
+        message += "Search on Skyscanner to book"
+
+    return message
+
+
+def format_telegram_free(row: Dict[str, str]) -> str:
+    """
+    Format FREE Telegram message with upsell.
+    """
+    price = safe_get(row, "price_gbp")
+    dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
+    dest_country = safe_get(row, "destination_country")
+    origin_city = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
+    out_date = safe_get(row, "outbound_date")
+    ret_date = safe_get(row, "return_date")
+    booking_link = safe_get(row, "booking_link_free")
+
+    dest_display = f"{dest_city}, {dest_country}" if dest_country else dest_city
+
+    message = f"""£{price} to {dest_display}
+
+<b>TO:</b> {dest_city.upper()}
+<b>FROM:</b> {origin_city}
+
+<b>OUT:</b>  {out_date}
+<b>BACK:</b> {ret_date}
+
+<b>Heads up:</b>
+• VIP members saw this 24 hours ago
+• Availability is running low
+• Best deals go to VIPs first
+
+"""
+
+    if booking_link:
+        message += f'<a href="{booking_link}">Book now</a>\n\n'
+    else:
+        message += "\n"
+
+    # Add upsell
+    message += "<b>Want instant access?</b>\nJoin TravelTxter Community\n\n"
+    message += "• Deals 24 hours early\n"
+    message += "• Direct booking links\n"
+    message += "• Exclusive mistake fares\n"
+    message += "• Cancel anytime\n\n"
+
+    if STRIPE_LINK_MONTHLY and STRIPE_LINK_YEARLY:
+        message += f'<a href="{STRIPE_LINK_MONTHLY}">Upgrade Monthly</a> | <a href="{STRIPE_LINK_YEARLY}">Upgrade Yearly</a>'
+    elif STRIPE_LINK_MONTHLY:
+        message += f'<a href="{STRIPE_LINK_MONTHLY}">Upgrade now</a>'
+
+    return message
+
+
+def stage_telegram_vip(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1) -> int:
+    """
+    Post to VIP Telegram (AM run only).
+    Transitions POSTED_INSTAGRAM -> POSTED_TELEGRAM_VIP.
+    """
+    if RUN_SLOT != "AM":
+        log("Telegram VIP: Skipping (PM run)")
+        return 0
+
+    if not TELEGRAM_BOT_TOKEN_VIP or not TELEGRAM_CHANNEL_VIP:
+        log("Telegram VIP: Missing credentials")
+        return 0
+
+    hmap = header_map(headers)
+    rows = ws.get_all_values()
+    posted = 0
+
+    for i in range(2, len(rows) + 1):
+        if posted >= max_rows:
+            break
+
+        row_vals = rows[i - 1]
+        row = {headers[c]: (row_vals[c] if c < len(row_vals) else "") for c in range(len(headers))}
+
+        status = safe_get(row, "status").upper()
+        if status != STATUS_POSTED_INSTAGRAM:
+            continue
+
+        # Check if already posted
+        if safe_get(row, "telegram_vip_posted_at"):
+            continue
+
+        log(f"Posting to Telegram VIP: row {i}")
+
+        message = format_telegram_vip(row)
+
+        try:
+            tg_send(TELEGRAM_BOT_TOKEN_VIP, TELEGRAM_CHANNEL_VIP, message)
+
+            ts = now_utc().replace(microsecond=0).isoformat() + "Z"
+            updates = []
+            if "telegram_vip_posted_at" in hmap:
+                updates.append(gspread.Cell(i, hmap["telegram_vip_posted_at"], ts))
+            if "status" in hmap:
+                updates.append(gspread.Cell(i, hmap["status"], STATUS_POSTED_TELEGRAM_VIP))
+
+            if updates:
+                ws.update_cells(updates, value_input_option="USER_ENTERED")
+
+            posted += 1
+            log(f"Posted to VIP Telegram successfully")
+
+        except Exception as e:
+            log(f"Telegram VIP error: {e}")
+
+    return posted
+
+
+def stage_telegram_free(ws: gspread.Worksheet, headers: List[str], max_rows: int = 1) -> int:
+    """
+    Post to FREE Telegram (PM run only, after 24h delay).
+    Transitions POSTED_TELEGRAM_VIP -> POSTED_ALL.
+    """
+    if RUN_SLOT != "PM":
+        log("Telegram FREE: Skipping (AM run)")
+        return 0
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL:
+        log("Telegram FREE: Missing credentials")
+        return 0
+
+    hmap = header_map(headers)
+    rows = ws.get_all_values()
+    posted = 0
+
+    for i in range(2, len(rows) + 1):
+        if posted >= max_rows:
+            break
+
+        row_vals = rows[i - 1]
+        row = {headers[c]: (row_vals[c] if c < len(row_vals) else "") for c in range(len(headers))}
+
+        status = safe_get(row, "status").upper()
+        if status != STATUS_POSTED_TELEGRAM_VIP:
+            continue
+
+        # Check if already posted to FREE
+        if safe_get(row, "telegram_free_posted_at"):
+            continue
+
+        # Enforce 24h delay
+        vip_ts = parse_ts(safe_get(row, "telegram_vip_posted_at"))
+        if not vip_ts:
+            log(f"Row {i}: Missing VIP timestamp, skipping")
+            continue
+
+        hours_since_vip = (now_utc() - vip_ts).total_seconds() / 3600.0
+        if hours_since_vip < VIP_DELAY_HOURS:
+            log(f"Row {i}: VIP posted {hours_since_vip:.1f}h ago, need {VIP_DELAY_HOURS}h")
+            continue
+
+        log(f"Posting to Telegram FREE: row {i} (delay: {hours_since_vip:.1f}h)")
+
+        message = format_telegram_free(row)
+
+        try:
+            tg_send(TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL, message)
+
+            ts = now_utc().replace(microsecond=0).isoformat() + "Z"
+            updates = []
+            if "telegram_free_posted_at" in hmap:
+                updates.append(gspread.Cell(i, hmap["telegram_free_posted_at"], ts))
+            if "status" in hmap:
+                updates.append(gspread.Cell(i, hmap["status"], STATUS_POSTED_ALL))
+
+            if updates:
+                ws.update_cells(updates, value_input_option="USER_ENTERED")
+
+            posted += 1
+            log(f"Posted to FREE Telegram successfully")
+
+        except Exception as e:
+            log(f"Telegram FREE error: {e}")
+
+    return posted
+
+
+# =========================
+# MAIN PIPELINE
+# =========================
+def main() -> None:
+    log("=" * 70)
+    log("TRAVELTXTER V4.2 UNIFIED PIPELINE")
+    log("=" * 70)
+    log(f"Sheet: {SPREADSHEET_ID[:20]}...")
+    log(f"Tab: {RAW_DEALS_TAB}")
+    log(f"Duffel: {'ENABLED' if DUFFEL_ENABLED else 'DISABLED'}")
+    log(f"RUN_SLOT: {RUN_SLOT} | VIP_DELAY: {VIP_DELAY_HOURS}h")
+    log(f"Instagram: {'ENABLED' if (IG_ACCESS_TOKEN and IG_USER_ID) else 'DISABLED'}")
+    log(f"Rendering: {'ENABLED' if RENDER_URL else 'DISABLED'}")
+    log("=" * 70)
+
+    try:
+        ws, headers = get_ws()
+        log(f"Connected to Google Sheets successfully")
+        log(f"Columns: {len(headers)}")
+
+        # Stage 1: Duffel Feed (insert NEW deals)
+        log("\n--- STAGE 1: DUFFEL FEED ---")
+        inserted = duffel_run_and_insert(ws, headers)
+        log(f"✓ Inserted {inserted} new deals")
+
+        # Stage 2: AI Scoring (NEW -> READY_TO_POST)
+        log("\n--- STAGE 2: AI SCORING ---")
+        scored = stage_scoring(ws, headers, max_rows=1)
+        log(f"✓ Scored and promoted {scored} deals")
+
+        # Stage 3: Rendering (READY_TO_POST -> READY_TO_PUBLISH)
+        log("\n--- STAGE 3: RENDERING ---")
+        rendered = stage_rendering(ws, headers, max_rows=1)
+        log(f"✓ Rendered {rendered} graphics")
+
+        # Stage 4: Instagram (READY_TO_PUBLISH -> POSTED_INSTAGRAM)
+        log("\n--- STAGE 4: INSTAGRAM ---")
+        ig_posted = stage_instagram(ws, headers, max_rows=1)
+        log(f"✓ Posted {ig_posted} to Instagram")
+
+        # Stage 5: Telegram VIP (POSTED_INSTAGRAM -> POSTED_TELEGRAM_VIP, AM only)
+        log("\n--- STAGE 5: TELEGRAM VIP ---")
+        vip_posted = stage_telegram_vip(ws, headers, max_rows=1)
+        log(f"✓ Posted {vip_posted} to VIP")
+
+        # Stage 6: Telegram FREE (POSTED_TELEGRAM_VIP -> POSTED_ALL, PM only, 24h delay)
+        log("\n--- STAGE 6: TELEGRAM FREE ---")
+        free_posted = stage_telegram_free(ws, headers, max_rows=1)
+        log(f"✓ Posted {free_posted} to FREE")
+
+        log("\n" + "=" * 70)
+        log("PIPELINE COMPLETE")
+        log("=" * 70)
+
+    except Exception as e:
+        log(f"FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+if __name__ == "__main__":
+    main()

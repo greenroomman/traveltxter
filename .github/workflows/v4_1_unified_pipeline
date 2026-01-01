@@ -4,7 +4,6 @@ name: V4 Pipeline
 on:
   workflow_dispatch:
   schedule:
-    # 07:30 UTC + 16:30 UTC every day (matches your spec)
     - cron: "30 7 * * *"
     - cron: "30 16 * * *"
 
@@ -24,11 +23,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (PINNED to fix OpenAI/httpx proxies crash)
         run: |
           python -m pip install --upgrade pip
-          # Keep it simple + deterministic for Actions
-          pip install gspread google-auth requests openai
+
+          # ✅ CRITICAL FIX:
+          # Your crash is caused by an incompatibility between:
+          #   openai (new) + httpx 0.28.x  → "Client.__init__() got an unexpected keyword argument 'proxies'"
+          # So we pin httpx < 0.28.
+          pip install \
+            gspread==6.2.1 \
+            google-auth==2.41.1 \
+            requests==2.32.5 \
+            "openai==1.57.4" \
+            "httpx<0.28"
 
       - name: Run unified pipeline (Duffel → Score → Render → IG → Telegram)
         env:
@@ -37,12 +45,11 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
 
-          # --- Duffel (THIS FIXES YOUR "Duffel: DISABLED" PROBLEM) ---
+          # --- Duffel ---
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          DUFFEL_MAX_INSERTS: "3"          # keep within free tier
-          CONFIG_TAB: "CONFIG"             # V4.2 routes tab (optional but recommended)
-          # Fallback single-route search if CONFIG tab missing/empty:
-          ORIGIN_IATA: "LHR"
+          DUFFEL_MAX_INSERTS: "3"
+          CONFIG_TAB: "CONFIG"
+          ORIGIN_IATA: "LON"
           DEST_IATA: "BCN"
           DAYS_AHEAD: "60"
           TRIP_LENGTH_DAYS: "5"
@@ -58,7 +65,7 @@ jobs:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-          # --- Telegram (FREE + paid tiers) ---
+          # --- Telegram ---
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_FREE_CHANNEL: "-1003505750272"
           TELEGRAM_MONTHLY_CHANNEL: "-1003517970522"

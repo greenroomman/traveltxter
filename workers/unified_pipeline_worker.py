@@ -32,21 +32,56 @@ import requests
 
 
 # =========================
-# THEME POOLS (7-day content calendar)
+# THEME POOLS & AIRPORT ROTATION (V4.2)
 # =========================
 
-THEME_POOLS: Dict[str, List[str]] = {
-    # Conservative pools - only use destinations you KNOW work
-    "WINTER_SUN": ["AGP", "PMI", "FAO"],  # Málaga, Palma, Faro
-    "SURF": ["FAO", "LIS"],                # Faro, Lisbon
-    "SNOW": ["KEF", "OSL"],                # Reykjavik, Oslo
-    "FOODIE": ["BCN", "LIS"],              # Barcelona, Lisbon
-    "CITY_BREAKS": ["BCN", "AMS", "DUB"], # Barcelona, Amsterdam, Dublin
-    "LONG_HAUL": ["DXB"],                  # Dubai (conservative)
-    "SURPRISE": ["BCN", "AMS"],            # Popular routes
+# Airport rotation by theme (maximizes deal variety)
+AIRPORT_ROTATION = {
+    "WINTER_SUN": {
+        "airports": ["STN", "LGW", "LTN", "BRS"],  # Budget airlines
+        "destinations": ["AGP", "PMI", "FAO", "LPA", "TFS"],
+        "days_ahead": 30,
+        "trip_length": 5,
+    },
+    "CITY_BREAKS": {
+        "airports": ["STN", "BRS", "MAN", "LPL", "BHX"],  # Student cities
+        "destinations": ["BCN", "PRG", "BUD", "KRK", "AMS", "DUB"],
+        "days_ahead": 45,
+        "trip_length": 3,
+    },
+    "SNOW": {
+        "airports": ["EDI", "MAN", "LGW"],  # Northern + major
+        "destinations": ["KEF", "OSL", "CPH", "HEL"],
+        "days_ahead": 60,
+        "trip_length": 5,
+    },
+    "FOODIE": {
+        "airports": ["LGW", "BHX", "MAN", "STN"],
+        "destinations": ["ROM", "NAP", "LIS", "BCN", "LYS", "BOL"],
+        "days_ahead": 45,
+        "trip_length": 4,
+    },
+    "LONG_HAUL": {
+        "airports": ["LHR", "MAN", "LGW"],  # Major hubs only
+        "destinations": ["JFK", "DXB", "BKK"],
+        "days_ahead": 120,  # Book far ahead
+        "trip_length": 7,
+    },
+    "SURF": {
+        "airports": ["LTN", "STN", "LGW"],
+        "destinations": ["FAO", "LIS", "AGP"],
+        "days_ahead": 30,
+        "trip_length": 5,
+    },
+    "SURPRISE": {
+        "airports": ["LGW", "STN", "MAN"],  # Mix of major + budget
+        "destinations": ["BCN", "AMS", "DUB", "PRG", "LIS"],
+        "days_ahead": 45,
+        "trip_length": 4,
+    },
 }
 
-# Default schedule (day of week → theme)
+# Theme schedule (day of week → theme)
 THEME_SCHEDULE = {
     "MON": "WINTER_SUN",
     "TUE": "CITY_BREAKS",
@@ -55,6 +90,22 @@ THEME_SCHEDULE = {
     "FRI": "LONG_HAUL",
     "SAT": "SURF",
     "SUN": "SURPRISE",
+}
+
+# Display names for airports (user-facing)
+AIRPORT_NAMES = {
+    "LHR": "London",
+    "LGW": "London",
+    "STN": "London",
+    "LTN": "London",
+    "LCY": "London",
+    "BRS": "Bristol",
+    "MAN": "Manchester",
+    "EDI": "Edinburgh",
+    "BHX": "Birmingham",
+    "LPL": "Liverpool",
+    "GLA": "Glasgow",
+    "NCL": "Newcastle",
 }
 
 
@@ -68,24 +119,38 @@ def utc_run_slot() -> int:
     return 0 if dt.datetime.utcnow().hour < 12 else 1
 
 
-def pick_theme_and_destination() -> Tuple[str, str]:
-    """Pick today's theme and deterministic destination from pool."""
+def pick_airport_and_route() -> Dict[str, Any]:
+    """Pick airport, destination, and search params based on today's theme."""
     day = utc_day_key()
     theme_key = THEME_SCHEDULE.get(day, "SURPRISE").upper()
     
-    if theme_key not in THEME_POOLS:
+    if theme_key not in AIRPORT_ROTATION:
         theme_key = "SURPRISE"
     
-    dests = THEME_POOLS[theme_key]
-    if not dests:
-        return "SURPRISE", "BCN"  # Fallback
+    config = AIRPORT_ROTATION[theme_key]
     
-    # Deterministic selection (day of year + run slot)
+    # Deterministic rotation based on day of year + run slot
     doy = int(dt.datetime.utcnow().strftime("%j"))
     slot = utc_run_slot()
-    idx = (doy * 2 + slot) % len(dests)
     
-    return theme_key, dests[idx].upper()
+    airports = config["airports"]
+    destinations = config["destinations"]
+    
+    # Different rotation speeds for variety
+    airport_idx = (doy * 2 + slot) % len(airports)
+    dest_idx = (doy * 3 + slot) % len(destinations)
+    
+    origin_code = airports[airport_idx].upper()
+    dest_code = destinations[dest_idx].upper()
+    
+    return {
+        "theme": theme_key,
+        "origin_code": origin_code,
+        "origin_city": AIRPORT_NAMES.get(origin_code, origin_code),
+        "destination_code": dest_code,
+        "days_ahead": config["days_ahead"],
+        "trip_length": config["trip_length"],
+    }
 
 
 # =========================
@@ -119,14 +184,13 @@ DUFFEL_API_KEY = env("DUFFEL_API_KEY")  # Optional
 DUFFEL_VERSION = "v2"
 DUFFEL_BASE_URL = "https://api.duffel.com/air"
 
-# CRITICAL: Duffel free-tier safety
-# Free tier = 100 searches/month = ~3 searches/day max
+# V4.2: MULTI-AIRPORT DEAL GENERATION
+# Strategy: Get ALL offers from each search (not just 1)
+# 2 searches/day × 20 offers = 40 offers/day = 1,200/month
+# Then AI scorer picks best 10-20% = 120-240 quality deals/month
 DUFFEL_ENABLED = bool(DUFFEL_API_KEY)
-DUFFEL_MAX_INSERTS = int(env("DUFFEL_MAX_INSERTS", "1"))  # Default 1 (was 3)
-DUFFEL_MAX_INSERTS = min(DUFFEL_MAX_INSERTS, 1)  # HARD CAP: 1 search per run
-DUFFEL_ORIGIN = env("DUFFEL_ORIGIN", "LHR").upper()  # Use LHR (Heathrow), not LON
-DUFFEL_DAYS_AHEAD = int(env("DUFFEL_DAYS_AHEAD", "60"))
-DUFFEL_TRIP_LENGTH = int(env("DUFFEL_TRIP_LENGTH", "5"))
+DUFFEL_MAX_INSERTS = int(env("DUFFEL_MAX_INSERTS", "20"))  # Get all offers
+DUFFEL_MAX_INSERTS = min(DUFFEL_MAX_INSERTS, 20)  # Cap at 20 per search
 
 RENDER_URL = env_any(["RENDER_URL", "RENDER_BASE_URL"])
 
@@ -223,12 +287,13 @@ def duffel_headers() -> Dict[str, str]:
 
 def feed_new_deals() -> int:
     """
-    Feed new deals from Duffel API.
+    Feed new deals from Duffel API using multi-airport rotation.
     
-    FREE-TIER SAFETY:
-    - Max 1 search per run (hardcoded)
-    - Only runs if DUFFEL_API_KEY is set
-    - Uses themed destinations for variety
+    V4.2 STRATEGY:
+    - Rotate UK airports by theme (budget vs major hubs)
+    - Theme-specific search windows (30d for budget, 120d for long-haul)
+    - Insert ALL offers (up to 20) from each search
+    - Let AI scorer pick best deals later
     
     Returns: Number of deals inserted
     """
@@ -237,32 +302,40 @@ def feed_new_deals() -> int:
         return 0
     
     try:
-        # Pick today's theme and destination
-        theme, dest = pick_theme_and_destination()
+        # Pick today's route (airport + destination based on theme)
+        route = pick_airport_and_route()
+        
+        theme = route["theme"]
+        origin_code = route["origin_code"]
+        origin_city = route["origin_city"]
+        dest_code = route["destination_code"]
+        days_ahead = route["days_ahead"]
+        trip_length = route["trip_length"]
         
         # Calculate dates
         from datetime import date, timedelta
-        out_date = date.today() + timedelta(days=DUFFEL_DAYS_AHEAD)
-        ret_date = out_date + timedelta(days=DUFFEL_TRIP_LENGTH)
+        out_date = date.today() + timedelta(days=days_ahead)
+        ret_date = out_date + timedelta(days=trip_length)
         
-        log(f"\n🔍 DUFFEL FEEDER")
+        log(f"\n🔍 DUFFEL FEEDER (V4.2 Multi-Airport)")
         log(f"   Theme: {theme}")
-        log(f"   Route: {DUFFEL_ORIGIN} → {dest}")
-        log(f"   Dates: {out_date} to {ret_date}")
-        log(f"   Max inserts: {DUFFEL_MAX_INSERTS}")
+        log(f"   Route: {origin_code} ({origin_city}) → {dest_code}")
+        log(f"   Dates: {out_date} to {ret_date} ({trip_length} days)")
+        log(f"   Search window: {days_ahead} days ahead")
+        log(f"   Max offers: {DUFFEL_MAX_INSERTS}")
         
         # Create offer request
         payload = {
             "data": {
                 "slices": [
                     {
-                        "origin": DUFFEL_ORIGIN,
-                        "destination": dest,
+                        "origin": origin_code,
+                        "destination": dest_code,
                         "departure_date": out_date.isoformat()
                     },
                     {
-                        "origin": dest,
-                        "destination": DUFFEL_ORIGIN,
+                        "origin": dest_code,
+                        "destination": origin_code,
                         "departure_date": ret_date.isoformat()
                     }
                 ],
@@ -284,7 +357,7 @@ def feed_new_deals() -> int:
         
         # Get offers
         r2 = requests.get(
-            f"{DUFFEL_BASE_URL}/offers?offer_request_id={offer_request_id}&limit=20",
+            f"{DUFFEL_BASE_URL}/offers?offer_request_id={offer_request_id}&limit=50",
             headers=duffel_headers(),
             timeout=30
         )
@@ -295,6 +368,8 @@ def feed_new_deals() -> int:
             log("   ⚠️  No offers returned by Duffel")
             return 0
         
+        log(f"   📦 Duffel returned {len(offers)} offers")
+        
         # Get worksheet
         ws = get_ws()
         headers = ws.row_values(1)
@@ -304,7 +379,7 @@ def feed_new_deals() -> int:
         
         hmap = {h.strip(): i for i, h in enumerate(headers)}
         
-        # Parse offers and insert (max DUFFEL_MAX_INSERTS)
+        # Parse offers and insert (up to DUFFEL_MAX_INSERTS)
         inserted = 0
         rows_to_insert = []
         
@@ -333,17 +408,17 @@ def feed_new_deals() -> int:
                 # Build deal record
                 deal = {
                     "deal_id": str(uuid.uuid4()),
-                    "origin_city": "London",  # Display name (LHR/LGW/STN all → London)
-                    "destination_city": dest,
+                    "origin_city": origin_city,  # Display name (London, Manchester, etc)
+                    "destination_city": dest_code,  # Will show as airport code for now
                     "destination_country": "",
                     "price_gbp": price,
                     "outbound_date": out,
                     "return_date": ret,
-                    "trip_length_days": str(DUFFEL_TRIP_LENGTH),
+                    "trip_length_days": str(trip_length),
                     "stops": str(stops),
                     "airline": airline,
                     "theme": theme,
-                    "deal_source": "DUFFEL_V4.1",
+                    "deal_source": f"DUFFEL_V4.2_{origin_code}",
                     "date_added": date.today().isoformat(),
                     "status": "NEW",
                 }
@@ -364,7 +439,8 @@ def feed_new_deals() -> int:
         # Insert rows
         if rows_to_insert:
             ws.append_rows(rows_to_insert, value_input_option="USER_ENTERED")
-            log(f"   ✅ Inserted {len(rows_to_insert)} deal(s)")
+            log(f"   ✅ Inserted {len(rows_to_insert)} offer(s)")
+            log(f"   📊 AI Scorer will pick best deals from this batch")
             return len(rows_to_insert)
         else:
             log("   ⚠️  No valid offers to insert")

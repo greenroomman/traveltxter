@@ -1,10 +1,10 @@
 name: v4_pipeline
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "30 7 * * *"
-    - cron: "30 16 * * *"
+    - cron: "30 7 * * *"   # 07:30 UTC
+    - cron: "30 16 * * *"  # 16:30 UTC
+  workflow_dispatch:
 
 concurrency:
   group: v4_pipeline
@@ -13,6 +13,7 @@ concurrency:
 jobs:
   pipeline:
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,23 +23,41 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (PINNED)
+      - name: Install deps (PINNED: avoids OpenAI/httpx proxies crash)
         run: |
           python -m pip install --upgrade pip
-          pip install             gspread==6.2.1             google-auth==2.41.1             requests==2.32.5             "openai==1.57.4"             "httpx<0.28"
+          pip install \
+            "gspread==6.2.1" \
+            "google-auth==2.41.1" \
+            "requests==2.32.5" \
+            "openai==2.14.0" \
+            "httpx<0.28"
 
-      - name: Run unified pipeline
+      - name: Set RUN_SLOT (AM/PM based on UTC hour)
+        run: |
+          HOUR="$(date -u +%H)"
+          if [ "$HOUR" = "07" ]; then
+            echo "RUN_SLOT=AM" >> $GITHUB_ENV
+          else
+            echo "RUN_SLOT=PM" >> $GITHUB_ENV
+          fi
+          echo "UTC hour: $HOUR"
+          echo "RUN_SLOT: $RUN_SLOT"
+
+      - name: Run unified pipeline (includes Duffel + Scoring + Render + Publish)
         env:
-          # Google / Sheets
+          # Google Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
 
-          # Duffel
+          # Duffel (NOW PASSED INTO THIS STEP)
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          MAX_INSERTS: "3"
-          ORIGIN_IATA: "LON"
-          DEST_IATA: "BCN"
+          DUFFEL_MAX_INSERTS: "3"          # keep low for safety
+          DUFFEL_ROUTES_PER_RUN: "1"       # 1 route per run (safe)
+          CONFIG_TAB: "CONFIG"             # optional; worker falls back if missing
+          DEFAULT_ORIGIN_IATA: "LON"       # fallback if CONFIG missing
+          DEFAULT_DEST_IATA: "BCN"         # fallback if CONFIG missing
           DAYS_AHEAD: "60"
           TRIP_LENGTH_DAYS: "5"
 
@@ -46,22 +65,22 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
-          # Render / IG
+          # Renderer + Instagram
           RENDER_URL: ${{ secrets.RENDER_URL }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-          # Telegram (Free + VIP)
+          # Telegram FREE
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+
+          # Telegram VIP
           TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
           TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
-          TELEGRAM_VIP_DELAY_HOURS: "24"
 
-          # Stripe links (locked)
-          STRIPE_RAMBLER_FREE: "https://buy.stripe.com/8x2eV60fIfps3Ik3qde7m09"
-          STRIPE_ADVENTURER_MONTHLY: "https://buy.stripe.com/3cI14g3rU4KOdiUbWJe7m08"
-          STRIPE_NOMAD_ANNUAL: "https://buy.stripe.com/9B67sE2nQa586Uw3qde7m07"
+          # Tier gating
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          VIP_DELAY_HOURS: "24"
 
         run: |
           python workers/unified_pipeline_worker.py

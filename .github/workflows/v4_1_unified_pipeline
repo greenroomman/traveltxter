@@ -38,12 +38,9 @@ jobs:
           RAW_DEALS_TAB: "RAW_DEALS"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          # Duffel feeder (optional - only runs if key is set)
+          # Duffel feeder (V4.2 - multi-airport, high volume)
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          DUFFEL_MAX_INSERTS: "1"
-          DUFFEL_ORIGIN: "LHR"
-          DUFFEL_DAYS_AHEAD: "60"
-          DUFFEL_TRIP_LENGTH: "5"
+          DUFFEL_MAX_INSERTS: "20"  # Get all offers (not just 1)
         run: python unified_pipeline_worker.py
 
       # ============================================================

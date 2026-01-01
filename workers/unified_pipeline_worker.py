@@ -1,842 +1,1061 @@
-# workers/unified_pipeline_worker.py
 #!/usr/bin/env python3
 """
-Traveltxter V4 Unified Pipeline Worker
+TravelTxter V4.1 — UNIFIED PIPELINE WORKER (FIXED)
 
-Stages:
-0) Duffel feeder (optional) -> inserts NEW rows into RAW_DEALS when empty/low
-1) AI scorer -> NEW -> READY_TO_PUBLISH
-2) Renderer -> adds graphic_url (or equivalent) and promotes READY_TO_PUBLISH -> READY_TO_POST
-3) Instagram publisher -> posts one READY_TO_POST -> POSTED_INSTAGRAM
-4) Telegram FREE -> posts one POSTED_INSTAGRAM -> POSTED_ALL
-5) Telegram VIP (optional) -> posts one READY_TO_POST (or VIP logic) -> POSTED_* (implementation dependent)
+✅ Themed destinations (variety every day)
+✅ Best-deal selection (not oldest first)
+✅ UK English spelling
+✅ Human-sounding copy (less AI)
+✅ Freshness decay prioritisation
 
-Key rules:
-- Uses single column: status
-- Header-map only (no hardcoded column numbers)
-- Guarded writes, idempotent behavior
+Pipeline stages:
+1. AI Scoring (NEW → READY_TO_POST) - picks BEST from batch
+2. Render (READY_TO_POST → READY_TO_PUBLISH)
+3. Instagram (READY_TO_PUBLISH → POSTED_INSTAGRAM)
+4. Telegram FREE (POSTED_INSTAGRAM → POSTED_TELEGRAM_FREE)
+5. Telegram VIP (POSTED_TELEGRAM_FREE → POSTED_ALL)
 """
 
 import os
 import sys
 import json
+import ssl
 import time
-import math
-import hashlib
+import uuid
 import datetime as dt
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
+from urllib.request import Request, urlopen
 
-import requests
 import gspread
 from google.oauth2.service_account import Credentials
-
-# OpenAI SDK (v1+)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+import requests
 
 
 # =========================
-# Logging
+# CONFIG-BASED ROUTING (V4.2)
+# Reads routes from CONFIG spreadsheet tab
 # =========================
 
-def log(msg: str) -> None:
-    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    print(f"{ts} | {msg}", flush=True)
-
-
-def die(msg: str, code: int = 1) -> None:
-    log(f"❌ {msg}")
-    raise SystemExit(code)
-
-
-# =========================
-# Env helpers
-# =========================
-
-def env(name: str, default: Optional[str] = None) -> str:
-    val = os.getenv(name, default)
-    return "" if val is None else str(val)
-
-
-def env_int(name: str, default: int) -> int:
+def get_enabled_routes_from_config(ws_config) -> List[Dict[str, Any]]:
+    """
+    Read enabled routes from CONFIG sheet.
+    
+    Returns list of route configs with:
+    - origin_iata, origin_city
+    - destination_iata, destination_city, destination_country
+    - trip_length_days, max_connections, cabin_class
+    - days_ahead, theme
+    """
     try:
-        return int(env(name, str(default)).strip() or str(default))
-    except Exception:
-        return default
-
-
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(env(name, str(default)).strip() or str(default))
-    except Exception:
-        return default
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    v = env(name, "").strip().lower()
-    if not v:
-        return default
-    return v in ("1", "true", "yes", "y", "on")
-
-
-# =========================
-# Google Sheets
-# =========================
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-STATUS_COLUMN = "status"
-
-RAW_STATUS_NEW = env("RAW_STATUS_NEW", "NEW").strip() or "NEW"
-RAW_DEALS_TAB = env("RAW_DEALS_TAB", "RAW_DEALS").strip() or "RAW_DEALS"
-
-STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
-STATUS_READY_TO_POST = "READY_TO_POST"
-STATUS_POSTED_INSTAGRAM = "POSTED_INSTAGRAM"
-STATUS_POSTED_ALL = "POSTED_ALL"
-STATUS_ERROR_HARD = "ERROR_HARD"
-
-# Processing caps
-MAX_SCORE_PER_RUN = env_int("MAX_SCORE_PER_RUN", 1)
-MAX_RENDER_PER_RUN = env_int("MAX_RENDER_PER_RUN", 1)
-MAX_IG_PER_RUN = env_int("MAX_IG_PER_RUN", 1)
-MAX_TG_FREE_PER_RUN = env_int("MAX_TG_FREE_PER_RUN", 1)
-MAX_TG_VIP_PER_RUN = env_int("MAX_TG_VIP_PER_RUN", 1)
-
-# Duffel caps
-DUFFEL_MAX_INSERTS = env_int("DUFFEL_MAX_INSERTS", 3)
-DUFFEL_MAX_INSERTS = min(DUFFEL_MAX_INSERTS, 20)  # hard safety ceiling
-
-FRESHNESS_DECAY_PER_DAY = env_float("FRESHNESS_DECAY_PER_DAY", 2.0)
-
-# Keys/tokens
-GCP_SA_JSON = env("GCP_SA_JSON", "").strip()
-SPREADSHEET_ID = env("SPREADSHEET_ID", "").strip()
-
-DUFFEL_API_KEY = env("DUFFEL_API_KEY", "").strip()
-
-OPENAI_API_KEY = env("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
-
-RENDER_URL = env("RENDER_URL", "").strip()
-
-IG_ACCESS_TOKEN = env("IG_ACCESS_TOKEN", "").strip()
-IG_USER_ID = env("IG_USER_ID", "").strip()
-
-TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_FREE_CHANNEL = env("TELEGRAM_FREE_CHANNEL", env("TELEGRAM_CHANNEL", "")).strip()
-
-TELEGRAM_BOT_TOKEN_VIP = env("TELEGRAM_BOT_TOKEN_VIP", "").strip()
-TELEGRAM_VIP_CHANNEL = env("TELEGRAM_VIP_CHANNEL", env("TELEGRAM_CHANNEL_VIP", "")).strip()
-
-STRIPE_LINK = env("STRIPE_LINK", "").strip()
-
-SKYSCANNER_AFFILIATE_ID = env("SKYSCANNER_AFFILIATE_ID", "").strip()
-
-
-def get_gspread_client() -> gspread.Client:
-    if not GCP_SA_JSON:
-        die("Missing GCP_SA_JSON secret/env")
-    info = json.loads(GCP_SA_JSON)
-    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    return gspread.authorize(creds)
-
-
-def get_ws(tab_name: str) -> gspread.Worksheet:
-    if not SPREADSHEET_ID:
-        die("Missing SPREADSHEET_ID")
-    gc = get_gspread_client()
-    sh = gc.open_by_key(SPREADSHEET_ID)
-    return sh.worksheet(tab_name)
-
-
-def read_headers(ws: gspread.Worksheet) -> List[str]:
-    headers = ws.row_values(1)
-    return [h.strip() for h in headers]
-
-
-def header_map(headers: List[str]) -> Dict[str, int]:
-    # map lower(header)->1-based col index
-    m = {}
-    for i, h in enumerate(headers, start=1):
-        if h:
-            m[h.strip().lower()] = i
-    return m
-
-
-def find_col(headers_map: Dict[str, int], name: str) -> int:
-    key = name.strip().lower()
-    if key not in headers_map:
-        die(f"Missing required column in sheet: {name}")
-    return headers_map[key]
-
-
-def get_all_values(ws: gspread.Worksheet) -> List[List[str]]:
-    return ws.get_all_values()
-
-
-def now_utc_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-# =========================
-# UTIL
-# =========================
-
-def safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(str(x).replace("£", "").replace(",", "").strip())
-    except Exception:
-        return default
-
-
-def sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
-
-
-def clamp(n: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, n))
-
-
-# =========================
-# Duffel feeder (Stage 0)
-# =========================
-
-DUFFEL_BASE = "https://api.duffel.com"
-
-
-def duffel_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {DUFFEL_API_KEY}",
-        "Duffel-Version": "v1",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+        rows = ws_config.get_all_values()
+        if len(rows) < 2:
+            log("  ⚠️  CONFIG sheet has no data")
+            return []
+        
+        headers = [h.strip().lower() for h in rows[0]]
+        hmap = {h: i for i, h in enumerate(headers)}
+        
+        # Required columns
+        required = ['enabled', 'origin_iata', 'destination_iata', 'theme']
+        if not all(col in hmap for col in required):
+            log(f"  ⚠️  CONFIG missing required columns: {required}")
+            return []
+        
+        routes = []
+        for row_idx in range(1, len(rows)):
+            row = rows[row_idx]
+            
+            # Check if enabled
+            enabled = (row[hmap['enabled']] if hmap['enabled'] < len(row) else "").strip().upper()
+            if enabled != "TRUE":
+                continue
+            
+            # Build route config
+            route = {
+                'origin_iata': (row[hmap['origin_iata']] if hmap['origin_iata'] < len(row) else "").strip().upper(),
+                'origin_city': (row[hmap.get('origin_city', 0)] if 'origin_city' in hmap and hmap['origin_city'] < len(row) else "").strip(),
+                'destination_iata': (row[hmap['destination_iata']] if hmap['destination_iata'] < len(row) else "").strip().upper(),
+                'destination_city': (row[hmap.get('destination_city', 0)] if 'destination_city' in hmap and hmap['destination_city'] < len(row) else "").strip(),
+                'destination_country': (row[hmap.get('destination_country', 0)] if 'destination_country' in hmap and hmap['destination_country'] < len(row) else "").strip(),
+                'trip_length_days': int((row[hmap.get('trip_length_days', 0)] if 'trip_length_days' in hmap and hmap['trip_length_days'] < len(row) else "5").strip() or "5"),
+                'max_connections': int((row[hmap.get('max_connections', 0)] if 'max_connections' in hmap and hmap['max_connections'] < len(row) else "1").strip() or "1"),
+                'cabin_class': (row[hmap.get('cabin_class', 0)] if 'cabin_class' in hmap and hmap['cabin_class'] < len(row) else "economy").strip().lower(),
+                'days_ahead': int((row[hmap.get('days_ahead', 0)] if 'days_ahead' in hmap and hmap['days_ahead'] < len(row) else "62").strip() or "62"),
+                'theme': (row[hmap.get('theme', 0)] if 'theme' in hmap and hmap['theme'] < len(row) else "").strip().upper(),
+            }
+            
+            # Validate required fields
+            if route['origin_iata'] and route['destination_iata']:
+                routes.append(route)
+        
+        return routes
+        
+    except Exception as e:
+        log(f"  ⚠️  Error reading CONFIG: {e}")
+        return []
 
 
 def pick_route_from_config() -> Optional[Dict[str, Any]]:
     """
-    Reads CONFIG tab and picks the next enabled route.
-
-    Expected headers (case-insensitive):
-      enabled, origin_iata, origin_city, destination_iata, destination_city, theme, max_connections, cabin_class
-
-    If CONFIG missing/empty, caller will handle fallback.
+    Pick a route from CONFIG sheet based on deterministic rotation.
+    
+    Strategy:
+    - Read all enabled routes from CONFIG tab
+    - Group by theme (optional)
+    - Rotate through routes deterministically (day of year + run slot)
     """
-    ws_cfg = get_ws("CONFIG")
-    vals = ws_cfg.get_all_values()
-    if len(vals) < 2:
-        return None
-
-    headers = [h.strip().lower() for h in vals[0]]
-    idx = {h: i for i, h in enumerate(headers)}
-    required = ["enabled", "origin_iata", "destination_iata"]
-    for r in required:
-        if r not in idx:
-            die(f"CONFIG tab missing header: {r}")
-
-    enabled_routes: List[Dict[str, Any]] = []
-    for row in vals[1:]:
-        if not row or len(row) < len(headers):
-            continue
-        enabled_raw = (row[idx["enabled"]] or "").strip().lower()
-        enabled = enabled_raw in ("true", "1", "yes", "y", "on")
-        if not enabled:
-            continue
-
-        route = {
-            "origin_iata": (row[idx["origin_iata"]] or "").strip(),
-            "origin_city": (row[idx.get("origin_city", -1)] if idx.get("origin_city", -1) >= 0 else "") or "",
-            "destination_iata": (row[idx["destination_iata"]] or "").strip(),
-            "destination_city": (row[idx.get("destination_city", -1)] if idx.get("destination_city", -1) >= 0 else "") or "",
-            "theme": (row[idx.get("theme", -1)] if idx.get("theme", -1) >= 0 else "") or "",
-            "max_connections": int((row[idx.get("max_connections", -1)] if idx.get("max_connections", -1) >= 0 else "1") or "1"),
-            "cabin_class": ((row[idx.get("cabin_class", -1)] if idx.get("cabin_class", -1) >= 0 else "economy") or "economy").strip().lower(),
-        }
-        if route["origin_iata"] and route["destination_iata"]:
-            enabled_routes.append(route)
-
-    if not enabled_routes:
-        return None
-
-    # Simple rotation: pick by day index
-    day_idx = int(dt.datetime.utcnow().strftime("%j"))  # 1..366
-    return enabled_routes[(day_idx - 1) % len(enabled_routes)]
-
-
-def duffel_search_roundtrip(
-    origin: str,
-    destination: str,
-    days_ahead: int,
-    trip_length_days: int,
-    cabin_class: str = "economy",
-    max_connections: int = 1,
-) -> List[Dict[str, Any]]:
-    """
-    Creates an offer request and returns offers.
-    """
-    depart_date = (dt.date.today() + dt.timedelta(days=max(1, days_ahead))).isoformat()
-    return_date = (dt.date.fromisoformat(depart_date) + dt.timedelta(days=max(1, trip_length_days))).isoformat()
-
-    payload = {
-        "data": {
-            "slices": [
-                {"origin": origin, "destination": destination, "departure_date": depart_date},
-                {"origin": destination, "destination": origin, "departure_date": return_date},
-            ],
-            "passengers": [{"type": "adult"}],
-            "cabin_class": cabin_class,
-            "max_connections": max_connections,
-        }
-    }
-
-    r = requests.post(f"{DUFFEL_BASE}/air/offer_requests", headers=duffel_headers(), json=payload, timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Duffel offer_requests failed ({r.status_code}): {r.text[:400]}")
-    offer_request = r.json()["data"]
-    offers = offer_request.get("offers", []) or []
-    return offers
-
-
-def upsert_rows(ws: gspread.Worksheet, headers: List[str], rows: List[Dict[str, Any]]) -> int:
-    """
-    Appends NEW rows to RAW_DEALS using header mapping.
-    """
-    hmap = header_map(headers)
-
-    def set_cell(buf: List[str], col: str, val: Any) -> None:
-        key = col.lower()
-        if key not in hmap:
-            return
-        idx = hmap[key] - 1
-        if idx >= len(buf):
-            buf.extend([""] * (idx + 1 - len(buf)))
-        buf[idx] = "" if val is None else str(val)
-
-    inserted = 0
-    for r in rows[:DUFFEL_MAX_INSERTS]:
-        buf = [""] * len(headers)
-        for k, v in r.items():
-            set_cell(buf, k, v)
-        ws.append_row(buf, value_input_option="USER_ENTERED")
-        inserted += 1
-    return inserted
-
-
-def run_duffel_feeder_if_needed(ws: gspread.Worksheet) -> int:
-    """
-    If RAW_DEALS has no data rows, try to seed from Duffel.
-    Requires DUFFEL_API_KEY (and CONFIG or ORIGIN_IATA/DEST_IATA fallback).
-    """
-    if not DUFFEL_API_KEY:
-        return 0
-
-    headers = read_headers(ws)
-    vals = ws.get_all_values()
-    data_rows = max(0, len(vals) - 1)
-    if data_rows > 0:
-        return 0
-
-    log("🧪 Stage 0: Duffel feeder (sheet empty)")
-
     try:
-        # Pick route from CONFIG (preferred).
-        # Fallback: ORIGIN_IATA + DEST_IATA envs for quick-start / debugging.
-        route = None
+        # Get CONFIG sheet
+        gc = gs_client()
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        
+        # Try to get CONFIG sheet
         try:
-            route = pick_route_from_config()
-        except Exception as e:
-            log(f"   ⚠️  CONFIG route selection failed: {e}")
-            route = None
+            ws_config = sh.worksheet("CONFIG")
+        except:
+            log("  ⚠️  CONFIG sheet not found, using fallback")
+            return None
+        
+        # Get enabled routes
+        routes = get_enabled_routes_from_config(ws_config)
 
-        if not route:
-            origin_env = os.getenv("ORIGIN_IATA", "").strip()
-            dest_env = os.getenv("DEST_IATA", "").strip()
-            if origin_env and dest_env:
-                route = {
-                    "origin_iata": origin_env,
-                    "origin_city": origin_env,
-                    "destination_iata": dest_env,
-                    "destination_city": dest_env,
-                    "theme": os.getenv("THEME", "default"),
-                    "max_connections": int(os.getenv("MAX_CONNECTIONS", "1")),
-                    "cabin_class": os.getenv("CABIN_CLASS", "economy"),
-                }
-                log("   ℹ️  Using ORIGIN_IATA/DEST_IATA fallback route (CONFIG missing/empty)")
-
-        if not route:
-            log("   ⚠️  No route selected (CONFIG empty/missing and no ORIGIN_IATA/DEST_IATA provided)")
-            return 0
-
-        origin_code = route['origin_iata']
-        dest_code = route["destination_iata"]
-        cabin_class = route.get("cabin_class", "economy") or "economy"
-        max_connections = int(route.get("max_connections", 1) or 1)
-
-        days_ahead = env_int("DAYS_AHEAD", 60)
-        trip_length = env_int("TRIP_LENGTH_DAYS", 5)
-
-        log(f"   🔎 Searching {origin_code} -> {dest_code} (days_ahead={days_ahead}, trip={trip_length}d)")
-        offers = duffel_search_roundtrip(
-            origin=origin_code,
-            destination=dest_code,
-            days_ahead=days_ahead,
-            trip_length_days=trip_length,
-            cabin_class=cabin_class,
-            max_connections=max_connections,
-        )
-        if not offers:
-            log("   ⚠️  Duffel returned 0 offers")
-            return 0
-
-        # Minimal normalization -> rows
-        rows: List[Dict[str, Any]] = []
-        for off in offers[:DUFFEL_MAX_INSERTS]:
-            total_amount = off.get("total_amount") or ""
-            total_currency = off.get("total_currency") or ""
-            price_gbp = total_amount  # leave as amount; your sheet formulas/currency handling can adjust
-
-            slices = off.get("slices") or []
-            out_depart = ""
-            ret_depart = ""
-            stops = "0"
-            airline = ""
-
-            if slices:
-                segs0 = (slices[0].get("segments") or [])
-                if segs0:
-                    out_depart = segs0[0].get("departing_at", "")[:10]
-                    airline = (segs0[0].get("marketing_carrier", {}) or {}).get("name", "") or airline
-                    stops = str(max(0, len(segs0) - 1))
-                if len(slices) > 1:
-                    segs1 = (slices[1].get("segments") or [])
-                    if segs1:
-                        ret_depart = segs1[0].get("departing_at", "")[:10]
-
-            deal_id = sha1(json.dumps(off, sort_keys=True)[:2000])
-
-            row = {
-                "deal_id": deal_id,
-                "origin_city": route.get("origin_city") or origin_code,
-                "destination_city": route.get("destination_city") or dest_code,
-                "destination_country": "",
-                "price_gbp": price_gbp,
-                "outbound_date": out_depart,
-                "return_date": ret_depart,
-                "trip_length_days": env_int("TRIP_LENGTH_DAYS", 5),
-                "stops": stops,
-                "baggage_included": "",
-                "airline": airline,
-                "deal_source": "Duffel",
-                "notes": "",
-                "date_added": now_utc_iso(),
-                "status": RAW_STATUS_NEW,
-            }
-            rows.append(row)
-
-        inserted = upsert_rows(ws, headers, rows)
-        log(f"   ✅ Inserted {inserted} new rows")
-        return inserted
-
+        # Fallback: if CONFIG is missing/empty, use env route (keeps the pipeline alive)
+        if not routes:
+            fallback_origin = env_any(["ORIGIN_IATA"], default=None)
+            fallback_dest   = env_any(["DEST_IATA"], default=None)
+            if fallback_origin and fallback_dest:
+                routes = [{
+                    "origin_iata": fallback_origin.strip().upper(),
+                    "dest_iata": fallback_dest.strip().upper(),
+                    "days_ahead": int(env_any(["DAYS_AHEAD"], default="60")),
+                    "trip_length_days": int(env_any(["TRIP_LENGTH_DAYS"], default="5")),
+                    "max_inserts": int(env_any(["MAX_INSERTS", "DUFFEL_MAX_INSERTS"], default=str(DUFFEL_MAX_INSERTS))),
+                    "theme": env_any(["THEME"], default="fallback"),
+                }]
+                log(f"⚠️ CONFIG empty — using fallback route: {routes[0]['origin_iata']} -> {routes[0]['dest_iata']}")
+        
+        if not routes:
+            log("  ⚠️  No enabled routes in CONFIG")
+            return None
+        
+        log(f"  📋 Found {len(routes)} enabled routes in CONFIG")
+        
+        # Deterministic selection based on day of year + run slot
+        doy = int(dt.datetime.utcnow().strftime("%j"))
+        slot = 0 if dt.datetime.utcnow().hour < 12 else 1
+        
+        idx = (doy * 2 + slot) % len(routes)
+        selected = routes[idx]
+        
+        log(f"  ✅ Selected route {idx + 1}/{len(routes)}: {selected['origin_iata']} → {selected['destination_iata']}")
+        
+        return selected
+        
     except Exception as e:
-        log(f"   ❌ Duffel feeder failed: {e}")
-        return 0
-
-
-# =========================
-# AI Scoring (Stage 1)
-# =========================
-
-def openai_client() -> Optional[Any]:
-    if not OPENAI_API_KEY or OpenAI is None:
+        log(f"  ❌ Error picking route from CONFIG: {e}")
         return None
-    return OpenAI(api_key=OPENAI_API_KEY)
 
 
-def score_deal_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns fields to write back: ai_score, ai_grading, ai_verdict, ai_caption, ai_notes, scored_timestamp
-    """
-    client = openai_client()
-    if client is None:
-        # deterministic fallback scoring
-        price = safe_float(row.get("price_gbp", 0.0), 9999.0)
-        stops = safe_float(row.get("stops", 0), 0.0)
-        score = clamp(100 - price * 0.2 - stops * 10, 0, 100)
-        verdict = "GOOD" if score >= 70 else ("AVERAGE" if score >= 45 else "POOR")
-        return {
-            "ai_score": round(score, 1),
-            "ai_grading": verdict,
-            "ai_verdict": verdict,
-            "ai_caption": "",
-            "ai_notes": "OpenAI disabled - fallback scoring",
-            "scored_timestamp": now_utc_iso(),
-        }
+# =========================
+# CONFIG
+# =========================
 
-    prompt = {
-        "role": "system",
-        "content": (
-            "You are a UK travel deal editor. "
-            "Given deal fields, output strict JSON with keys: "
-            "ai_score (0-100 number), ai_verdict (GOOD|AVERAGE|POOR), ai_caption (short IG caption), ai_notes (one line). "
-            "No extra keys."
-        ),
-    }
-    user = {
-        "role": "user",
-        "content": json.dumps(
-            {
-                "origin": row.get("origin_city"),
-                "destination": row.get("destination_city"),
-                "price_gbp": row.get("price_gbp"),
-                "outbound_date": row.get("outbound_date"),
-                "return_date": row.get("return_date"),
-                "trip_length_days": row.get("trip_length_days"),
-                "stops": row.get("stops"),
-                "airline": row.get("airline"),
-            },
-            ensure_ascii=False,
-        ),
-    }
+def env(key: str, default: str = "") -> str:
+    return (os.getenv(key) or default).strip()
 
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[prompt, user],
-        temperature=0.4,
-    )
-    txt = resp.choices[0].message.content.strip()
-    try:
-        data = json.loads(txt)
-    except Exception:
-        data = {"ai_score": 50, "ai_verdict": "AVERAGE", "ai_caption": "", "ai_notes": "Parse fail"}
+def env_any(keys: List[str], default: str = "") -> str:
+    for k in keys:
+        v = env(k)
+        if v:
+            return v
+    return default
 
-    score = float(data.get("ai_score", 50))
-    verdict = str(data.get("ai_verdict", "AVERAGE")).upper()
-    if verdict not in ("GOOD", "AVERAGE", "POOR"):
-        verdict = "AVERAGE"
+def log(msg: str) -> None:
+    ts = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    print(f"{ts} | {msg}", flush=True)
 
+
+SPREADSHEET_ID = env_any(["SPREADSHEET_ID", "SHEET_ID"])
+RAW_DEALS_TAB = env_any(["RAW_DEALS_TAB", "DEALS_SHEET_NAME"], "RAW_DEALS")
+STATUS_COLUMN = "status"
+
+OPENAI_API_KEY = env("OPENAI_API_KEY")
+OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
+
+# Duffel API (optional - for feeding new deals)
+DUFFEL_API_KEY = env("DUFFEL_API_KEY")  # Optional
+DUFFEL_VERSION = "v2"
+DUFFEL_BASE_URL = "https://api.duffel.com/air"
+
+# V4.2: MULTI-AIRPORT DEAL GENERATION
+# Strategy: Get ALL offers from each search (not just 1)
+# 2 searches/day × 20 offers = 40 offers/day = 1,200/month
+# Then AI scorer picks best 10-20% = 120-240 quality deals/month
+DUFFEL_ENABLED = bool(DUFFEL_API_KEY)
+DUFFEL_MAX_INSERTS = int(env("DUFFEL_MAX_INSERTS", "20"))  # Get all offers
+DUFFEL_MAX_INSERTS = min(DUFFEL_MAX_INSERTS, 20)  # Cap at 20 per search
+
+RENDER_URL = env_any(["RENDER_URL", "RENDER_BASE_URL"])
+
+IG_ACCESS_TOKEN = env_any(["IG_ACCESS_TOKEN", "FB_ACCESS_TOKEN"])
+IG_USER_ID = env("IG_USER_ID")
+
+# Telegram (Free vs VIP split)
+TELEGRAM_FREE_TOKEN = env_any(["TELEGRAM_BOT_TOKEN", "TELEGRAM_FREE_BOT_TOKEN"])
+TELEGRAM_VIP_TOKEN  = env_any(["TELEGRAM_BOT_TOKEN_VIP", "TELEGRAM_VIP_BOT_TOKEN"], default=TELEGRAM_FREE_TOKEN)
+
+# Channels (defaults are your locked IDs)
+TELEGRAM_FREE_CHANNEL   = env_any(["TELEGRAM_CHANNEL", "TELEGRAM_FREE_CHANNEL"], default="-1003505750272")
+TELEGRAM_MONTHLY_CHANNEL = env_any(["TELEGRAM_CHANNEL_VIP", "TELEGRAM_MONTHLY_CHANNEL"], default="-1003517970522")
+TELEGRAM_ANNUAL_CHANNEL  = env_any(["TELEGRAM_CHANNEL_VIP", "TELEGRAM_ANNUAL_CHANNEL"], default="-1003517970522")
+
+# Delay (VIP early access window before Free can post)
+TELEGRAM_VIP_DELAY_HOURS = int(env_any(["TELEGRAM_VIP_DELAY_HOURS"], default="24"))
+
+# 3-Tier Subscription Model
+STRIPE_RAMBLER_FREE = "https://buy.stripe.com/8x2eV60fIfps3Ik3qde7m09"        # £0
+STRIPE_ADVENTURER_MONTHLY = "https://buy.stripe.com/3cI14g3rU4KOdiUbWJe7m08"  # £3/month
+STRIPE_NOMAD_ANNUAL = "https://buy.stripe.com/9B67sE2nQa586Uw3qde7m07"        # £30/year
+
+# Freshness decay (prioritise newer deals)
+FRESHNESS_DECAY_PER_DAY = float(env("FRESHNESS_DECAY_PER_DAY", "2.0"))
+
+
+# =========================
+# THEME LABELS
+# =========================
+
+THEME_LABELS = {
+    "WINTER_SUN": "Winter Sun",
+    "SURF": "Surf Break",
+    "SNOW": "Snow",
+    "FOODIE": "Foodie Break",
+    "CITY_BREAKS": "City Break",
+    "LONG_HAUL": "Long-Haul",
+    "SURPRISE": "Surprise Deal",
+}
+
+def theme_label(theme_key: str) -> str:
+    k = (theme_key or "").strip().upper()
+    return THEME_LABELS.get(k, "Travel Deal")
+
+
+# =========================
+# GOOGLE SHEETS
+# =========================
+
+def gs_client():
+    sa_json = env_any(["GCP_SA_JSON", "GCP_SA_JSON_ONE_LINE"])
+    if not sa_json:
+        raise RuntimeError("Missing GCP_SA_JSON")
+    
+    info = json.loads(sa_json)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def get_ws():
+    gc = gs_client()
+    return gc.open_by_key(SPREADSHEET_ID).worksheet(RAW_DEALS_TAB)
+
+
+def col_to_a1(n: int) -> str:
+    out = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def update_cells(ws, row_num: int, headers: List[str], updates: Dict[str, str]) -> None:
+    hmap = {h.strip(): i + 1 for i, h in enumerate(headers) if h.strip()}
+    data = []
+    for k, v in updates.items():
+        if k in hmap:
+            col = hmap[k]
+            data.append({"range": f"{col_to_a1(col)}{row_num}", "values": [[v]]})
+    if data:
+        ws.batch_update(data)
+
+
+# =========================
+# DUFFEL FEEDER (Free-tier safe)
+# =========================
+
+def duffel_headers() -> Dict[str, str]:
+    """Duffel API headers."""
     return {
-        "ai_score": round(score, 1),
-        "ai_grading": verdict,
+        "Authorization": f"Bearer {DUFFEL_API_KEY}",
+        "Duffel-Version": DUFFEL_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def feed_new_deals() -> int:
+    """
+    Feed new deals from Duffel API using CONFIG-based routing.
+    
+    V4.2 CONFIG STRATEGY:
+    - Reads enabled routes from CONFIG spreadsheet tab
+    - Rotates through routes deterministically
+    - Insert ALL offers (up to 20) from each search
+    - Let AI scorer pick best deals later
+    
+    Returns: Number of deals inserted
+    """
+    if not DUFFEL_ENABLED:
+        log("  No DUFFEL_API_KEY, skipping feeder")
+        return 0
+    
+    try:
+        # Pick route from CONFIG
+        route = pick_route_from_config()
+        
+        if not route:
+            log("   ⚠️  No route selected from CONFIG")
+            return 0
+        
+        origin_code = route['origin_iata']
+        origin_city = route.get('origin_city') or origin_code
+        dest_code = route['destination_iata']
+        dest_city = route.get('destination_city') or dest_code
+        dest_country = route.get('destination_country', '')
+        days_ahead = route.get('days_ahead', 62)
+        trip_length = route.get('trip_length_days', 5)
+        cabin_class = route.get('cabin_class', 'economy')
+        max_connections = route.get('max_connections', 1)
+        theme = route.get('theme', '')
+        
+        # Calculate dates
+        from datetime import date, timedelta
+        out_date = date.today() + timedelta(days=days_ahead)
+        ret_date = out_date + timedelta(days=trip_length)
+        
+        log(f"\n🔍 DUFFEL FEEDER (V4.2 CONFIG-Based)")
+        log(f"   Theme: {theme}")
+        log(f"   Route: {origin_code} ({origin_city}) → {dest_code} ({dest_city})")
+        log(f"   Dates: {out_date} to {ret_date} ({trip_length} days)")
+        log(f"   Search window: {days_ahead} days ahead")
+        log(f"   Cabin: {cabin_class}, Max stops: {max_connections}")
+        log(f"   Max offers: {DUFFEL_MAX_INSERTS}")
+        
+        # Create offer request
+        payload = {
+            "data": {
+                "slices": [
+                    {
+                        "origin": origin_code,
+                        "destination": dest_code,
+                        "departure_date": out_date.isoformat()
+                    },
+                    {
+                        "origin": dest_code,
+                        "destination": origin_code,
+                        "departure_date": ret_date.isoformat()
+                    }
+                ],
+                "passengers": [{"type": "adult"}],
+                "cabin_class": cabin_class,
+                "max_connections": max_connections,
+            }
+        }
+        
+        # Request offers
+        r1 = requests.post(
+            f"{DUFFEL_BASE_URL}/offer_requests",
+            headers=duffel_headers(),
+            json=payload,
+            timeout=30
+        )
+        r1.raise_for_status()
+        offer_request_id = r1.json()["data"]["id"]
+        
+        # Get offers
+        r2 = requests.get(
+            f"{DUFFEL_BASE_URL}/offers?offer_request_id={offer_request_id}&limit=50",
+            headers=duffel_headers(),
+            timeout=30
+        )
+        r2.raise_for_status()
+        offers = r2.json()["data"]
+        
+        if not offers:
+            log("   ⚠️  No offers returned by Duffel")
+            return 0
+        
+        log(f"   📦 Duffel returned {len(offers)} offers")
+        
+        # Get worksheet
+        ws = get_ws()
+        headers = ws.row_values(1)
+        if not headers:
+            log("   ❌ Sheet has no headers")
+            return 0
+        
+        hmap = {h.strip(): i for i, h in enumerate(headers)}
+        
+        # Parse offers and insert (up to DUFFEL_MAX_INSERTS)
+        inserted = 0
+        rows_to_insert = []
+        
+        for offer in offers:
+            if inserted >= DUFFEL_MAX_INSERTS:
+                break
+            
+            try:
+                slices = offer.get("slices", [])
+                if len(slices) < 2:
+                    continue
+                
+                # Parse flight details
+                seg0 = slices[0].get("segments", [])
+                seg1 = slices[1].get("segments", [])
+                if not seg0 or not seg1:
+                    continue
+                
+                out = seg0[0]["departing_at"][:10]
+                ret = seg1[0]["departing_at"][:10]
+                
+                stops = (len(seg0) - 1) + (len(seg1) - 1)
+                airline = (offer.get("owner") or {}).get("name", "")
+                price = offer.get("total_amount", "")
+                
+                # Build deal record
+                deal = {
+                    "deal_id": str(uuid.uuid4()),
+                    "origin_city": origin_city,
+                    "destination_city": dest_city,
+                    "destination_country": dest_country,
+                    "price_gbp": price,
+                    "outbound_date": out,
+                    "return_date": ret,
+                    "trip_length_days": str(trip_length),
+                    "stops": str(stops),
+                    "airline": airline,
+                    "theme": theme,
+                    "deal_source": f"DUFFEL_V4.2_CONFIG_{origin_code}",
+                    "date_added": date.today().isoformat(),
+                    "status": "NEW",
+                }
+                
+                # Build row (only write columns that exist)
+                row = [""] * len(headers)
+                for key, val in deal.items():
+                    if key in hmap:
+                        row[hmap[key]] = str(val) if val else ""
+                
+                rows_to_insert.append(row)
+                inserted += 1
+                
+            except Exception as e:
+                log(f"   ⚠️  Failed to parse offer: {e}")
+                continue
+        
+        # Insert rows
+        if rows_to_insert:
+            ws.append_rows(rows_to_insert, value_input_option="USER_ENTERED")
+            log(f"   ✅ Inserted {len(rows_to_insert)} offer(s)")
+            log(f"   📊 AI Scorer will pick best deals from this batch")
+            return len(rows_to_insert)
+        else:
+            log("   ⚠️  No valid offers to insert")
+            return 0
+            
+    except Exception as e:
+        log(f"   ❌ Duffel feeder error: {e}")
+        import traceback
+        log(f"   Traceback: {traceback.format_exc()}")
+        return 0
+
+
+# =========================
+# FRESHNESS DECAY
+# =========================
+
+def age_days(rec: Dict[str, str]) -> int:
+    """Calculate days since deal was added."""
+    date_added = rec.get("date_added", "").strip()
+    if not date_added:
+        return 0
+    try:
+        added = dt.date.fromisoformat(date_added[:10])
+        return max(0, (dt.date.today() - added).days)
+    except:
+        return 0
+
+
+def effective_score(raw_score: float, age: int) -> float:
+    """Apply freshness decay to prioritise newer deals."""
+    return raw_score - (FRESHNESS_DECAY_PER_DAY * float(age))
+
+
+# =========================
+# AI SCORING (UK English, Human tone)
+# =========================
+
+def score_deal(rec: Dict[str, str]) -> Dict[str, str]:
+    """Score deal using OpenAI or fallback heuristic."""
+    if not OPENAI_API_KEY:
+        return score_heuristic(rec)
+    
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        
+        theme = rec.get("theme", "").strip()
+        origin = rec.get("origin_city", "London")
+        dest = rec.get("destination_city", "")
+        country = rec.get("destination_country", "")
+        price = rec.get("price_gbp", "")
+        
+        system_prompt = """You're a UK travel editor. Write like a real person texting their mate, not a corporate robot.
+Use British English. Be conversational and honest. Make people actually want to book.
+Instagram = marketing (inspire them → send to Telegram). No hard selling, just good vibes."""
+
+        user_prompt = f"""Score this honestly. Would YOU book it?
+
+Deal:
+- Theme: {theme_label(theme) if theme else 'General'}
+- Route: {origin} → {dest} ({country})
+- Price: £{price}
+- Dates: {rec.get('outbound_date')} to {rec.get('return_date')}
+- Trip: {rec.get('trip_length_days')} days
+- Stops: {rec.get('stops')}
+
+Return STRICT JSON:
+{{
+  "score": 1-10,
+  "verdict": "GOOD" or "AVERAGE" or "POOR",
+  "grading": "A" or "B" or "C",
+  "caption": "Instagram caption (mate-to-mate tone, British, benefit-led, CTA to Telegram, max 180 chars)"
+}}
+
+Caption must sound like a real person wrote it. Lead with feeling, not features. No corporate waffle."""
+
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,
+            max_tokens=300,
+            response_format={"type": "json_object"}
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        
+        return {
+            "ai_score": str(result.get("score", "5")),
+            "ai_verdict": result.get("verdict", "AVERAGE").upper(),
+            "ai_grading": result.get("grading", "B").upper(),
+            "ai_caption": result.get("caption", "")[:700],
+        }
+        
+    except Exception as e:
+        log(f"  OpenAI failed: {e}, using heuristic")
+        return score_heuristic(rec)
+
+
+def score_heuristic(rec: Dict[str, str]) -> Dict[str, str]:
+    """Fallback heuristic with human captions (British English)."""
+    try:
+        price = float(rec.get("price_gbp", "999").replace("£", ""))
+        stops = int(rec.get("stops", "0"))
+    except:
+        return {"ai_score": "5", "ai_verdict": "AVERAGE", "ai_grading": "B", "ai_caption": ""}
+    
+    score = 5
+    if price <= 60:
+        score = 9
+    elif price <= 100:
+        score = 7
+    elif price <= 150:
+        score = 6
+    
+    if stops == 0:
+        score = min(10, score + 1)
+    
+    verdict = "GOOD" if score >= 7 else "AVERAGE" if score >= 5 else "POOR"
+    grading = "A" if score >= 8 else "B" if score >= 6 else "C"
+    
+    # Human captions (sound like a real person, British English)
+    dest = rec.get("destination_city", "")
+    price_str = rec.get("price_gbp", "")
+    theme = theme_label(rec.get("theme", ""))
+    
+    # Mate-to-mate tone templates
+    templates = [
+        f"£{price_str} to {dest}. {theme} sorted. Check Telegram.",
+        f"{dest} for £{price_str}. Not bad. Details on Telegram.",
+        f"Found one: £{price_str} flights to {dest}. Link in bio.",
+        f"{theme} — {dest} for £{price_str}. Full story on Telegram.",
+        f"£{price_str} to {dest}. Because why not? Telegram's got details.",
+    ]
+    
+    import random
+    random.seed(rec.get("deal_id", ""))
+    caption = random.choice(templates)
+    
+    return {
+        "ai_score": str(score),
         "ai_verdict": verdict,
-        "ai_caption": str(data.get("ai_caption", "")).strip(),
-        "ai_notes": str(data.get("ai_notes", "")).strip(),
-        "scored_timestamp": now_utc_iso(),
+        "ai_grading": grading,
+        "ai_caption": caption[:700],
     }
 
 
-def stage_score(ws: gspread.Worksheet, headers: List[str]) -> int:
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        return 0
-    h = vals[0]
-    hmap = header_map(h)
-    status_col = find_col(hmap, STATUS_COLUMN)
-
-    updated = 0
-    for r_idx in range(2, len(vals) + 1):
-        row_vals = vals[r_idx - 1]
-        status = (row_vals[status_col - 1] if status_col - 1 < len(row_vals) else "").strip()
-        if status != RAW_STATUS_NEW:
-            continue
-
-        row_obj = {h[i].strip(): (row_vals[i] if i < len(row_vals) else "") for i in range(len(h))}
-        scored = score_deal_row(row_obj)
-
-        updates = []
-        for k, v in scored.items():
-            if k.lower() in hmap:
-                updates.append((r_idx, hmap[k.lower()], v))
-        # promote
-        updates.append((r_idx, status_col, STATUS_READY_TO_PUBLISH))
-
-        for rr, cc, vv in updates:
-            ws.update_cell(rr, cc, vv)
-
-        log(f"✅ Scored row {r_idx} -> {STATUS_READY_TO_PUBLISH}")
-        updated += 1
-        if updated >= MAX_SCORE_PER_RUN:
-            break
-
-    return updated
-
-
 # =========================
-# Render (Stage 2)
+# RENDER
 # =========================
 
-def render_image(row: Dict[str, Any]) -> Optional[str]:
+def render_deal(rec: Dict[str, str]) -> Optional[str]:
+    """Call render service."""
     if not RENDER_URL:
+        log("  No RENDER_URL, skipping")
         return None
-    payload = {
-        "origin": row.get("origin_city", ""),
-        "destination": row.get("destination_city", ""),
-        "price_gbp": row.get("price_gbp", ""),
-        "outbound_date": row.get("outbound_date", ""),
-        "return_date": row.get("return_date", ""),
-        "trip_length_days": row.get("trip_length_days", ""),
-    }
-    r = requests.post(RENDER_URL, json=payload, timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Render failed ({r.status_code}): {r.text[:300]}")
-    data = r.json()
-    return data.get("graphic_url") or data.get("image_url") or data.get("url")
-
-
-def stage_render(ws: gspread.Worksheet, headers: List[str]) -> int:
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        return 0
-    h = vals[0]
-    hmap = header_map(h)
-    status_col = find_col(hmap, STATUS_COLUMN)
-
-    # common output columns (safe if absent)
-    graphic_col = hmap.get("graphic_url", hmap.get("image_url", 0))
-
-    updated = 0
-    for r_idx in range(2, len(vals) + 1):
-        row_vals = vals[r_idx - 1]
-        status = (row_vals[status_col - 1] if status_col - 1 < len(row_vals) else "").strip()
-        if status != STATUS_READY_TO_PUBLISH:
-            continue
-
-        row_obj = {h[i].strip(): (row_vals[i] if i < len(row_vals) else "") for i in range(len(h))}
-        try:
-            url = render_image(row_obj)
-        except Exception as e:
-            log(f"⚠️ Render failed for row {r_idx}: {e}")
-            continue
-
-        if url and graphic_col:
-            ws.update_cell(r_idx, graphic_col, url)
-
-        ws.update_cell(r_idx, status_col, STATUS_READY_TO_POST)
-        log(f"✅ Rendered row {r_idx} -> {STATUS_READY_TO_POST}")
-        updated += 1
-        if updated >= MAX_RENDER_PER_RUN:
-            break
-
-    return updated
+    
+    try:
+        payload = {
+            "deal_id": rec.get("deal_id", ""),
+            "origin_city": rec.get("origin_city", ""),
+            "destination_city": rec.get("destination_city", ""),
+            "destination_country": rec.get("destination_country", ""),
+            "price_gbp": rec.get("price_gbp", ""),
+            "outbound_date": rec.get("outbound_date", ""),
+            "return_date": rec.get("return_date", ""),
+            "ai_grading": rec.get("ai_grading", "B"),
+            "theme": rec.get("theme", ""),
+        }
+        
+        body = json.dumps(payload).encode("utf-8")
+        req = Request(RENDER_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        ctx = ssl.create_default_context()
+        
+        with urlopen(req, timeout=30, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("graphic_url") or data.get("image_url")
+            
+    except Exception as e:
+        log(f"  Render failed: {e}")
+        return None
 
 
 # =========================
-# Instagram publish (Stage 3)
+# INSTAGRAM
 # =========================
 
-def ig_create_container(image_url: str, caption: str) -> str:
-    url = f"https://graph.facebook.com/v19.0/{IG_USER_ID}/media"
-    r = requests.post(
-        url,
-        data={"image_url": image_url, "caption": caption, "access_token": IG_ACCESS_TOKEN},
-        timeout=60,
-    )
-    if r.status_code >= 300:
-        raise RuntimeError(f"IG media create failed ({r.status_code}): {r.text[:300]}")
-    return r.json()["id"]
-
-
-def ig_publish_container(creation_id: str) -> str:
-    url = f"https://graph.facebook.com/v19.0/{IG_USER_ID}/media_publish"
-    r = requests.post(url, data={"creation_id": creation_id, "access_token": IG_ACCESS_TOKEN}, timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(f"IG publish failed ({r.status_code}): {r.text[:300]}")
-    return r.json().get("id", "")
-
-
-def stage_instagram(ws: gspread.Worksheet, headers: List[str]) -> int:
-    if not (IG_ACCESS_TOKEN and IG_USER_ID):
-        return 0
-
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        return 0
-    h = vals[0]
-    hmap = header_map(h)
-    status_col = find_col(hmap, STATUS_COLUMN)
-
-    graphic_col = hmap.get("graphic_url", hmap.get("image_url", 0))
-    caption_col = hmap.get("ai_caption", 0)
-    published_ts_col = hmap.get("published_timestamp", 0)
-
-    if not graphic_col:
-        log("⚠️ No graphic_url/image_url column found; IG stage cannot run")
-        return 0
-
-    updated = 0
-    for r_idx in range(2, len(vals) + 1):
-        row_vals = vals[r_idx - 1]
-        status = (row_vals[status_col - 1] if status_col - 1 < len(row_vals) else "").strip()
-        if status != STATUS_READY_TO_POST:
-            continue
-
-        image_url = row_vals[graphic_col - 1] if graphic_col - 1 < len(row_vals) else ""
-        caption = row_vals[caption_col - 1] if caption_col and caption_col - 1 < len(row_vals) else ""
-        if not image_url:
-            log(f"⚠️ Row {r_idx} missing image_url; skipping")
-            continue
-
-        creation_id = ig_create_container(image_url=image_url, caption=caption)
-        ig_publish_container(creation_id=creation_id)
-
-        if published_ts_col:
-            ws.update_cell(r_idx, published_ts_col, now_utc_iso())
-        ws.update_cell(r_idx, status_col, STATUS_POSTED_INSTAGRAM)
-        log(f"✅ Instagram posted row {r_idx} -> {STATUS_POSTED_INSTAGRAM}")
-
-        updated += 1
-        if updated >= MAX_IG_PER_RUN:
-            break
-
-    return updated
+def post_instagram(graphic_url: str, rec: Dict[str, str]) -> Optional[str]:
+    """Post to Instagram."""
+    if not IG_ACCESS_TOKEN or not IG_USER_ID:
+        log("  No Instagram credentials, skipping")
+        return None
+    
+    try:
+        caption = rec.get("ai_caption", "").strip()
+        
+        if not caption:
+            dest = rec.get("destination_city", "")
+            price = rec.get("price_gbp", "")
+            theme = theme_label(rec.get("theme", ""))
+            
+            caption = f"{theme} — £{price} to {dest}. Telegram's got details."
+        
+        # Ensure hashtags
+        if "#TravelTxter" not in caption:
+            caption += "\n\n#TravelTxter #CheapFlights #TravelDeals"
+        
+        # Create container
+        r1 = requests.post(
+            f"https://graph.facebook.com/v19.0/{IG_USER_ID}/media",
+            data={
+                "image_url": graphic_url,
+                "caption": caption,
+                "access_token": IG_ACCESS_TOKEN,
+            },
+            timeout=30
+        )
+        
+        if r1.status_code != 200:
+            log(f"  Instagram container failed: {r1.text[:200]}")
+            return None
+        
+        container_id = r1.json().get("id")
+        
+        # Publish
+        r2 = requests.post(
+            f"https://graph.facebook.com/v19.0/{IG_USER_ID}/media_publish",
+            data={
+                "creation_id": container_id,
+                "access_token": IG_ACCESS_TOKEN,
+            },
+            timeout=30
+        )
+        
+        if r2.status_code != 200:
+            log(f"  Instagram publish failed: {r2.text[:200]}")
+            return None
+        
+        return r2.json().get("id", "unknown")
+        
+    except Exception as e:
+        log(f"  Instagram error: {e}")
+        return None
 
 
 # =========================
-# Telegram (Stages 4/5)
+# TELEGRAM (UK English, human tone)
 # =========================
 
-def tg_send(token: str, chat_id: str, text: str) -> None:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    r = requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Telegram send failed ({r.status_code}): {r.text[:300]}")
+def _send_telegram(channel: str, rec: Dict[str, str], tier: str = "free") -> Optional[str]:
+    """Post to Telegram with 3-tier subscription model (British English, mate-to-mate tone).
+    
+    Args:
+        tier: "free", "monthly", or "annual"
+    """
+    token = TELEGRAM_FREE_TOKEN if tier == "free" else TELEGRAM_VIP_TOKEN
+    if not token:
+        log("  No Telegram token, skipping")
+        return None
+    
+    try:
+        origin = rec.get("origin_city", "London")
+        dest = rec.get("destination_city", "")
+        country = rec.get("destination_country", "")
+        price = rec.get("price_gbp", "")
+        out_date = rec.get("outbound_date", "")
+        ret_date = rec.get("return_date", "")
+        verdict = rec.get("ai_verdict", "")
+        theme = rec.get("theme", "")
+        graphic_url = rec.get("graphic_url", "")
+        
+        if tier == "free":
+            # FREE tier (promote monthly AND annual)
+            msg = f"<b>£{price} to {dest}</b>\n\n"
+            msg += f"TO: {dest.upper()}\n"
+            msg += f"FROM: {origin}\n\n"
+            if out_date and ret_date:
+                msg += f"OUT:  {out_date}\n"
+                msg += f"BACK: {ret_date}\n"
+            msg += "\nHeads up:\n"
+            msg += "• Paid members saw this 24 hours ago\n"
+            msg += "• Availability's running low\n"
+            msg += "• Best deals go to subscribers first\n\n"
+            msg += "<b>Want instant access?</b>\n\n"
+            msg += "<b>Adventurer (Monthly)</b> — £3/month\n"
+            msg += "• Deals 24 hours early\n"
+            msg += "• Direct booking links\n"
+            msg += "• Cancel anytime\n"
+            msg += f'<a href="{STRIPE_ADVENTURER_MONTHLY}">Subscribe monthly</a>\n\n'
+            msg += "<b>Nomad (Annual)</b> — £30/year\n"
+            msg += "• Everything in Monthly\n"
+            msg += "• Save £6 per year\n"
+            msg += "• Exclusive mistake fares\n"
+            msg += f'<a href="{STRIPE_NOMAD_ANNUAL}">Subscribe annually</a>'
+            
+        elif tier == "monthly":
+            # MONTHLY tier (Adventurer - £3/month)
+            msg = f"<b>ADVENTURER EARLY ACCESS</b>\n\n"
+            msg += f"£{price} to {dest}"
+            if country:
+                msg += f", {country}"
+            if theme:
+                msg += f" ({theme_label(theme)})"
+            msg += f"\n\n"
+            msg += f"TO: {dest.upper()}\n"
+            msg += f"FROM: {origin}\n\n"
+            if out_date and ret_date:
+                msg += f"OUT:  {out_date}\n"
+                msg += f"BACK: {ret_date}\n"
+            if verdict:
+                msg += f"\nVERDICT: {verdict}\n"
+            msg += "\nYou're seeing this 24 hours before free members."
+            
+        else:  # annual
+            # ANNUAL tier (Nomad - £30/year)
+            msg = f"<b>NOMAD EARLY ACCESS</b>\n\n"
+            msg += f"£{price} to {dest}"
+            if country:
+                msg += f", {country}"
+            if theme:
+                msg += f" ({theme_label(theme)})"
+            msg += f"\n\n"
+            msg += f"TO: {dest.upper()}\n"
+            msg += f"FROM: {origin}\n\n"
+            if out_date and ret_date:
+                msg += f"OUT:  {out_date}\n"
+                msg += f"BACK: {ret_date}\n"
+            if verdict:
+                msg += f"\nVERDICT: {verdict}\n"
+            msg += "\nYou're seeing this 24 hours before free members."
+        
+        # Send with photo if available
+        if graphic_url:
+            url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            payload = {
+                "chat_id": channel,
+                "photo": graphic_url,
+                "caption": msg,
+                "parse_mode": "HTML",
+            }
+        else:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                "chat_id": channel,
+                "text": msg,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            }
+        
+        response = requests.post(url, json=payload, timeout=30)
+        
+        if response.status_code == 200 and response.json().get("ok"):
+            return str(response.json().get("result", {}).get("message_id", "unknown"))
+        else:
+            log(f"  Telegram error: {response.text[:200]}")
+            return None
+            
+    except Exception as e:
+        log(f"  Telegram error: {e}")
+        return None
 
 
-def format_tg_message(row: Dict[str, Any], vip: bool = False) -> str:
-    price = row.get("price_gbp", "")
-    origin = row.get("origin_city", "")
-    dest = row.get("destination_city", "")
-    out_date = row.get("outbound_date", "")
-    ret_date = row.get("return_date", "")
+# =========================
+# MAIN PIPELINE
+# =========================
 
-    if vip:
-        upsell = ""
+
+def post_telegram(ws, headers, row_idx: int, row: Dict[str, str], tier: str = "free") -> bool:
+    """Sheet-aware wrapper used by main(): sends Telegram message for the correct tier."""
+    if tier == "free":
+        channel = TELEGRAM_FREE_CHANNEL
+    elif tier in ("vip", "monthly"):
+        channel = TELEGRAM_MONTHLY_CHANNEL
+    elif tier == "annual":
+        channel = TELEGRAM_ANNUAL_CHANNEL
     else:
-        upsell = f"\n\n💎 Want instant access?\nUpgrade: {STRIPE_LINK}" if STRIPE_LINK else ""
+        channel = TELEGRAM_FREE_CHANNEL
 
-    return (
-        f"🔥 <b>£{price}</b> to <b>{dest}</b>\n\n"
-        f"📍 From {origin}\n"
-        f"📅 {out_date} → {ret_date}"
-        f"{upsell}"
-    )
+    msg_id = _send_telegram(channel=channel, rec=row, tier=tier)
+    if not msg_id:
+        return False
 
+    # Best-effort writebacks (ignored if columns don't exist)
+    stamp = now_iso()
+    update_cells(ws, headers, row_idx, {
+        "telegram_message_id": msg_id,
+        "telegram_tier": tier,
+        "telegram_timestamp": stamp,
+    })
+    return True
 
-def stage_telegram_free(ws: gspread.Worksheet, headers: List[str]) -> int:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_FREE_CHANNEL):
-        return 0
-
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        return 0
-    h = vals[0]
-    hmap = header_map(h)
-    status_col = find_col(hmap, STATUS_COLUMN)
-
-    updated = 0
-    for r_idx in range(2, len(vals) + 1):
-        row_vals = vals[r_idx - 1]
-        status = (row_vals[status_col - 1] if status_col - 1 < len(row_vals) else "").strip()
-        if status != STATUS_POSTED_INSTAGRAM:
-            continue
-
-        row_obj = {h[i].strip(): (row_vals[i] if i < len(row_vals) else "") for i in range(len(h))}
-        msg = format_tg_message(row_obj, vip=False)
-        tg_send(TELEGRAM_BOT_TOKEN, TELEGRAM_FREE_CHANNEL, msg)
-
-        ws.update_cell(r_idx, status_col, STATUS_POSTED_ALL)
-        log(f"✅ Telegram FREE posted row {r_idx} -> {STATUS_POSTED_ALL}")
-
-        updated += 1
-        if updated >= MAX_TG_FREE_PER_RUN:
-            break
-
-    return updated
-
-
-def stage_telegram_vip(ws: gspread.Worksheet, headers: List[str]) -> int:
-    if not (TELEGRAM_BOT_TOKEN_VIP and TELEGRAM_VIP_CHANNEL):
-        return 0
-
-    vals = ws.get_all_values()
-    if len(vals) <= 1:
-        return 0
-    h = vals[0]
-    hmap = header_map(h)
-    status_col = find_col(hmap, STATUS_COLUMN)
-
-    updated = 0
-    for r_idx in range(2, len(vals) + 1):
-        row_vals = vals[r_idx - 1]
-        status = (row_vals[status_col - 1] if status_col - 1 < len(row_vals) else "").strip()
-        if status != STATUS_READY_TO_POST:
-            continue
-
-        row_obj = {h[i].strip(): (row_vals[i] if i < len(row_vals) else "") for i in range(len(h))}
-        msg = format_tg_message(row_obj, vip=True)
-        tg_send(TELEGRAM_BOT_TOKEN_VIP, TELEGRAM_VIP_CHANNEL, msg)
-
-        # VIP does not advance the main status by default (leave for IG->FREE progression)
-        log(f"✅ Telegram VIP posted row {r_idx}")
-
-        updated += 1
-        if updated >= MAX_TG_VIP_PER_RUN:
-            break
-
-    return updated
-
-
-# =========================
-# Main
-# =========================
-
-def main() -> None:
-    log("============================================================")
-    log("🚀 TRAVELTXTER V4 UNIFIED PIPELINE")
-    log("============================================================")
-    log(f"Sheet: {SPREADSHEET_ID[:6]}***" if SPREADSHEET_ID else "Sheet: (missing)")
+def main() -> int:
+    log("=" * 60)
+    log("🚀 TRAVELTXTER V4.1 UNIFIED PIPELINE")
+    log("=" * 60)
+    log(f"Sheet: {SPREADSHEET_ID}")
     log(f"Tab: {RAW_DEALS_TAB}")
-    log(f"Duffel: {'ENABLED' if DUFFEL_API_KEY else 'DISABLED'}")
+    log(f"Duffel: {'ENABLED' if DUFFEL_ENABLED else 'DISABLED'}")
     log(f"Freshness decay: {FRESHNESS_DECAY_PER_DAY}/day")
-    log("============================================================")
+    log("=" * 60)
+    
+    if not SPREADSHEET_ID:
+        log("❌ Missing SPREADSHEET_ID")
+        return 1
+    
+    # ============================================================
+    # STAGE 0: DUFFEL FEEDER (Optional - only if API key set)
+    # ============================================================
+    
+    if DUFFEL_ENABLED:
+        feed_new_deals()  # Inserts max 1 deal (free-tier safe)
+    
+    # ============================================================
+    # STAGE 1: SCORE & SELECT BEST NEW DEAL
+    # ============================================================
+    
+    ws = get_ws()
+    log(f"✅ Connected: {ws.title}")
+    
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        log("No data rows")
+        return 0
+    
+    headers = [h.strip() for h in rows[0]]
+    hmap = {h: i for i, h in enumerate(headers)}
+    
+    if STATUS_COLUMN not in hmap:
+        log(f"❌ Column '{STATUS_COLUMN}' not found")
+        return 1
+    
+    status_idx = hmap[STATUS_COLUMN]
+    
+    # ============================================================
+    # STAGE 1: SCORE & SELECT BEST NEW DEAL
+    # ============================================================
+    
+    new_candidates: List[Tuple[int, Dict[str, str], float]] = []
+    
+    for row_idx in range(1, len(rows)):
+        row = rows[row_idx]
+        row_num = row_idx + 1
+        
+        if status_idx >= len(row):
+            continue
+        
+        current_status = row[status_idx].strip().upper()
+        rec = {h: (row[hmap[h]] if hmap[h] < len(row) else "") for h in headers}
+        
+        if current_status == "NEW":
+            raw_score = float(rec.get("ai_score", "0") or "0")
+            
+            # Score if not scored yet
+            if raw_score == 0:
+                deal_id = rec.get("deal_id", "")
+                dest = rec.get("destination_city", "")
+                theme = rec.get("theme", "")
+                log(f"\n📊 Scoring NEW deal row {row_num} ({dest}, {theme})...")
+                
+                score_result = score_deal(rec)
+                
+                updates = {
+                    "ai_score": score_result["ai_score"],
+                    "ai_verdict": score_result["ai_verdict"],
+                    "ai_grading": score_result["ai_grading"],
+                    "ai_caption": score_result.get("ai_caption", ""),
+                    "scored_timestamp": dt.datetime.utcnow().isoformat() + "Z",
+                }
+                
+                update_cells(ws, row_num, headers, updates)
+                log(f"   Scored: {score_result['ai_score']}/10 ({score_result['ai_verdict']})")
+                
+                rec.update(updates)
+                raw_score = float(score_result["ai_score"])
+            
+            # Apply freshness decay
+            age = age_days(rec)
+            eff_score = effective_score(raw_score, age)
+            
+            new_candidates.append((row_num, rec, eff_score))
+            log(f"   Row {row_num}: score={raw_score}, age={age}d, effective={eff_score:.1f}")
+    
+    # Promote BEST deal
+    if new_candidates:
+        new_candidates.sort(key=lambda x: x[2], reverse=True)
+        best_row, best_rec, best_eff = new_candidates[0]
+        
+        log(f"\n✅ BEST DEAL: Row {best_row} (effective={best_eff:.1f})")
+        log(f"   Destination: {best_rec.get('destination_city', '')}")
+        log(f"   Theme: {best_rec.get('theme', '')}")
+        log(f"   Promoting to READY_TO_POST...")
+        
+        update_cells(ws, best_row, headers, {STATUS_COLUMN: "READY_TO_POST"})
+        return 0
+    
+    # ============================================================
+    # OTHER STAGES
+    # ============================================================
+    
+    for row_idx in range(1, len(rows)):
+        row = rows[row_idx]
+        row_num = row_idx + 1
+        
+        if status_idx >= len(row):
+            continue
+        
+        current_status = row[status_idx].strip().upper()
+        rec = {h: (row[hmap[h]] if hmap[h] < len(row) else "") for h in headers}
+        deal_id = rec.get("deal_id", "")
+        
+        if current_status == "READY_TO_POST":
+            log(f"\n🎨 Rendering row {row_num}...")
+            graphic_url = render_deal(rec)
+            
+            if graphic_url:
+                update_cells(ws, row_num, headers, {
+                    STATUS_COLUMN: "READY_TO_PUBLISH",
+                    "graphic_url": graphic_url,
+                    "rendered_timestamp": dt.datetime.utcnow().isoformat() + "Z",
+                })
+                log(f"✅ Rendered")
+            
+            return 0
+        
+        elif current_status == "READY_TO_PUBLISH":
+            log(f"\n📸 Instagram posting row {row_num}...")
+            graphic_url = rec.get("graphic_url", "")
+            
+            if graphic_url:
+                media_id = post_instagram(graphic_url, rec)
+                if media_id:
+                    update_cells(ws, row_num, headers, {
+                        STATUS_COLUMN: "POSTED_INSTAGRAM",
+                        "ig_media_id": media_id,
+                        "ig_published_timestamp": dt.datetime.utcnow().isoformat() + "Z",
+                    })
+                    log(f"✅ Posted to Instagram")
+            
+            return 0
+        
+        elif current_status == "POSTED_INSTAGRAM":
+        # VIP FIRST (Monthly/Annual both map to VIP channel)
+        ok = post_telegram(ws, headers, row_idx, row, tier="monthly")
+        if not ok:
+            update_cells(ws, headers, row_idx, {"status": "ERROR_HARD", "ai_notes": "Telegram VIP (monthly) post failed"})
+            return 1
 
-    ws = get_ws(RAW_DEALS_TAB)
-    log(f"✅ Connected: {RAW_DEALS_TAB}")
+        vip_ts = now_iso()
+        update_cells(ws, headers, row_idx, {
+            "status": "POSTED_TELEGRAM_VIP",
+            "vip_published_timestamp": vip_ts,
+            "published_timestamp": vip_ts,  # used for delay gating if vip_published_timestamp column doesn't exist
+        })
+        log(f"✅ Telegram VIP posted. Free will release after {TELEGRAM_VIP_DELAY_HOURS}h.")
+        return 0
 
-    vals = ws.get_all_values()
-    data_rows = max(0, len(vals) - 1)
+    elif current_status == "POSTED_TELEGRAM_VIP":
+        # Enforce VIP delay window before Free release
+        vip_ts_raw = row.get("vip_published_timestamp") or row.get("published_timestamp") or ""
+        vip_dt = parse_iso(vip_ts_raw)
+        if not vip_dt:
+            # Safety: if timestamp missing, treat as "just posted" and hold Free
+            log("⚠️ Missing VIP timestamp — holding Free release until next run.")
+            return 0
 
-    if data_rows == 0 and not DUFFEL_API_KEY:
-        die("No data rows and Duffel is DISABLED. Ensure DUFFEL_API_KEY is passed to this step in GitHub Actions.")
+        hours = (utcnow() - vip_dt).total_seconds() / 3600.0
+        if hours < TELEGRAM_VIP_DELAY_HOURS:
+            remaining = TELEGRAM_VIP_DELAY_HOURS - hours
+            log(f"⏳ VIP window active ({hours:.1f}h elapsed). Free releases in ~{remaining:.1f}h.")
+            return 0
 
-    # Stage 0: seed if empty
-    inserted = run_duffel_feeder_if_needed(ws)
+        ok = post_telegram(ws, headers, row_idx, row, tier="free")
+        if not ok:
+            update_cells(ws, headers, row_idx, {"status": "ERROR_HARD", "ai_notes": "Telegram Free post failed"})
+            return 1
 
-    # Refresh view after insert
-    headers = read_headers(ws)
-
-    # Stage 1: score
-    n1 = stage_score(ws, headers)
-
-    # Stage 2: render
-    n2 = stage_render(ws, headers)
-
-    # Stage 5: VIP (optional, before IG if you want early access)
-    n5 = stage_telegram_vip(ws, headers)
-
-    # Stage 3: IG
-    n3 = stage_instagram(ws, headers)
-
-    # Stage 4: Telegram FREE
-    n4 = stage_telegram_free(ws, headers)
-
-    log("============================================================")
-    log("✅ Pipeline run complete")
-    log(f"Inserted: {inserted} | Scored: {n1} | Rendered: {n2} | VIP TG: {n5} | IG: {n3} | FREE TG: {n4}")
-    log("============================================================")
+        free_ts = now_iso()
+        update_cells(ws, headers, row_idx, {
+            "status": "POSTED_ALL",
+            "free_published_timestamp": free_ts,
+            "published_timestamp": free_ts,
+        })
+        log("✅ Telegram Free posted. Deal lifecycle complete (POSTED_ALL).")
+        return 0
+    
+    log("\nNo deals to process")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as e:
+        log(f"❌ FATAL: {e}")
+        import traceback
+        log(traceback.format_exc())
+        sys.exit(1)

@@ -1,116 +1,68 @@
-name: V4.1 UNIFIED PIPELINE
-
-concurrency:
-  group: v4_1_unified
-  cancel-in-progress: true
+name: V4 UNIFIED PIPELINE
 
 on:
   schedule:
-    - cron: "30 7 * * *"   # 06:30 UTC
+    - cron: "30 7 * * *"   # 07:30 UTC
     - cron: "30 16 * * *"  # 16:30 UTC
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v4-unified-pipeline
+  cancel-in-progress: false
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 15
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      
-      - name: Install Dependencies
+
+      - name: Install deps
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install gspread google-auth requests openai
 
-      # ============================================================
-      # STAGE 1: AI SCORER (includes Duffel feeder if API key set)
-      # ============================================================
-      - name: "1️⃣ AI Scorer (+ Duffel Feeder)"
+      - name: Run unified pipeline (single source of truth)
         env:
+          # Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          # Duffel feeder (V4.2 - multi-airport, high volume)
+
+          # Duffel (THIS is what makes flights appear)
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          DUFFEL_MAX_INSERTS: "20"  # Get all offers (not just 1)
-        run: python unified_pipeline_worker.py
+          DUFFEL_MAX_INSERTS: "20"
 
-      # ============================================================
-      # STAGE 2: RENDER (READY_TO_POST → READY_TO_PUBLISH)
-      # ============================================================
-      - name: "2️⃣ Render Graphics"
-        env:
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: "RAW_DEALS"
+          # OpenAI
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: "gpt-4o-mini"
+
+          # Render
           RENDER_URL: ${{ secrets.RENDER_URL }}
-        run: python unified_pipeline_worker.py
 
-      # ============================================================
-      # STAGE 4: INSTAGRAM (READY_TO_PUBLISH → POSTED_INSTAGRAM)
-      # ============================================================
-      - name: "4️⃣ Instagram Publish"
-        env:
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: "RAW_DEALS"
+          # Instagram
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
-        run: python unified_pipeline_worker.py
 
-      # ============================================================
-      # STAGE 5: TELEGRAM FREE / RAMBLER (POSTED_INSTAGRAM → POSTED_TELEGRAM_FREE)
-      # ============================================================
-      - name: "5️⃣ Telegram FREE (Rambler)"
-        env:
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: "RAW_DEALS"
+          # Telegram (Free + VIP)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_FREE_CHANNEL: "-1003505750272"
-        run: python unified_pipeline_worker.py
 
-      # ============================================================
-      # STAGE 6: TELEGRAM MONTHLY / ADVENTURER (POSTED_TELEGRAM_FREE → POSTED_TELEGRAM_MONTHLY)
-      # ============================================================
-      - name: "6️⃣ Telegram MONTHLY (Adventurer - £3/month)"
-        env:
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: "RAW_DEALS"
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_MONTHLY_CHANNEL: "-1003517970522"
-        run: python unified_pipeline_worker.py
+          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+          TELEGRAM_VIP_CHANNEL: "-1003517970522"
 
-      # ============================================================
-      # STAGE 7: TELEGRAM ANNUAL / NOMAD (POSTED_TELEGRAM_MONTHLY → POSTED_ALL)
-      # ============================================================
-      - name: "7️⃣ Telegram ANNUAL (Nomad - £30/year)"
-        env:
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: "RAW_DEALS"
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_ANNUAL_CHANNEL: "-1003517970522"
-        run: python unified_pipeline_worker.py
+          # Stripe CTA
+          STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
 
-      # ============================================================
-      # SUMMARY
-      # ============================================================
-      - name: "📊 Pipeline Summary"
-        if: always()
         run: |
-          echo "==================================="
-          echo "V4.1 UNIFIED PIPELINE SUMMARY"
-          echo "==================================="
-          echo "All stages complete"
-          echo "Check logs for deal progression"
-          echo "==================================="
+          python unified_pipeline_worker.py

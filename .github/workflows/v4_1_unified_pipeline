@@ -56,17 +56,17 @@ jobs:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-          # Telegram VIP
-          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_VIP_CHANNEL: ${{ secrets.TELEGRAM_VIP_CHANNEL }}
-
-          # Telegram FREE
+          # Telegram FREE (map from your existing secret TELEGRAM_CHANNEL)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_FREE_CHANNEL: ${{ secrets.TELEGRAM_FREE_CHANNEL }}
+          TELEGRAM_FREE_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+
+          # Telegram VIP (map from your existing secret TELEGRAM_CHANNEL_VIP)
+          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+          TELEGRAM_VIP_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
 
           # Tier gating
           RUN_SLOT: ${{ env.RUN_SLOT }}
-          VIP_DELAY_HOURS: ${{ secrets.VIP_DELAY_HOURS }}
+          VIP_DELAY_HOURS: "24"
 
         run: |
           python workers/unified_pipeline_worker.py

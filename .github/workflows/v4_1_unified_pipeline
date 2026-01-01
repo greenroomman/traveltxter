@@ -88,28 +88,39 @@ jobs:
         run: python unified_pipeline_worker.py
 
       # ============================================================
-      # STAGE 5: TELEGRAM FREE (POSTED_INSTAGRAM → POSTED_TELEGRAM_FREE)
+      # STAGE 5: TELEGRAM FREE / RAMBLER (POSTED_INSTAGRAM → POSTED_TELEGRAM_FREE)
       # ============================================================
-      - name: "5️⃣ Telegram FREE"
+      - name: "5️⃣ Telegram FREE (Rambler)"
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_FREE_CHANNEL: "-1003505750272"
-          STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
         run: python unified_pipeline_worker.py
 
       # ============================================================
-      # STAGE 6: TELEGRAM VIP (POSTED_TELEGRAM_FREE → POSTED_ALL)
+      # STAGE 6: TELEGRAM MONTHLY / ADVENTURER (POSTED_TELEGRAM_FREE → POSTED_TELEGRAM_MONTHLY)
       # ============================================================
-      - name: "6️⃣ Telegram VIP"
+      - name: "6️⃣ Telegram MONTHLY (Adventurer - £3/month)"
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: "RAW_DEALS"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_VIP_CHANNEL: "-1003517970522"
+          TELEGRAM_MONTHLY_CHANNEL: "-1003517970522"
+        run: python unified_pipeline_worker.py
+
+      # ============================================================
+      # STAGE 7: TELEGRAM ANNUAL / NOMAD (POSTED_TELEGRAM_MONTHLY → POSTED_ALL)
+      # ============================================================
+      - name: "7️⃣ Telegram ANNUAL (Nomad - £30/year)"
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: "RAW_DEALS"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ANNUAL_CHANNEL: "-1003517970522"
         run: python unified_pipeline_worker.py
 
       # ============================================================

@@ -29,9 +29,7 @@ jobs:
           pip install \
             "gspread==6.2.1" \
             "google-auth==2.41.1" \
-            "requests==2.32.5" \
-            "openai==1.54.0" \
-            "httpx<0.28"
+            "requests==2.32.5"
 
       - name: Set RUN_SLOT (AM/PM based on UTC hour)
         run: |
@@ -44,30 +42,12 @@ jobs:
           echo "UTC hour: $HOUR"
           echo "RUN_SLOT set to: $RUN_SLOT"
 
-      - name: Run TravelTxter V4.2 Pipeline
+      - name: Run TravelTxter V4.2 Pipeline (A+B LOCK)
         env:
           # Google Sheets
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          CONFIG_TAB: "CONFIG"
-
-          # Duffel API
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          DUFFEL_VERSION: "v2"
-          DUFFEL_MAX_INSERTS: "3"
-          DUFFEL_ROUTES_PER_RUN: "1"
-          DUFFEL_ENABLED: "true"
-          
-          # Route fallbacks (if CONFIG tab missing/empty)
-          DEFAULT_ORIGIN_IATA: "LHR"
-          DEFAULT_DEST_IATA: "BCN"
-          DAYS_AHEAD: "60"
-          TRIP_LENGTH_DAYS: "5"
-
-          # OpenAI
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: "gpt-4o-mini"
 
           # Rendering service (PythonAnywhere)
           RENDER_URL: ${{ secrets.RENDER_URL }}
@@ -76,31 +56,24 @@ jobs:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-          # Telegram FREE tier
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-
-          # Telegram VIP tier
+          # Telegram VIP
           TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+          TELEGRAM_VIP_CHANNEL: ${{ secrets.TELEGRAM_VIP_CHANNEL }}
 
-          # Subscription links
-          STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
-          STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
-          
-          # Skyscanner affiliate
-          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }}
+          # Telegram FREE
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_FREE_CHANNEL: ${{ secrets.TELEGRAM_FREE_CHANNEL }}
 
           # Tier gating
           RUN_SLOT: ${{ env.RUN_SLOT }}
-          VIP_DELAY_HOURS: "24"
+          VIP_DELAY_HOURS: ${{ secrets.VIP_DELAY_HOURS }}
 
         run: |
           python workers/unified_pipeline_worker.py
 
       - name: Upload logs (on failure)
         if: failure()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: pipeline-logs
           path: |

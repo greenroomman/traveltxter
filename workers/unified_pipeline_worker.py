@@ -1002,12 +1002,13 @@ def main() -> int:
             
             return 0
         
-        elif current_status == "POSTED_INSTAGRAM":
-        # VIP FIRST (Monthly/Annual both map to VIP channel)
-        ok = post_telegram(ws, headers, row_idx, row, tier="monthly")
-        if not ok:
-            update_cells(ws, headers, row_idx, {"status": "ERROR_HARD", "ai_notes": "Telegram VIP (monthly) post failed"})
-            return 1
+    elif current_status == "POSTED_INSTAGRAM":
+            # VIP FIRST (Monthly/Annual both map to VIP channel)
+            # This line below MUST be indented further than the 'elif'
+            ok = post_telegram(ws, headers, row_idx, row, tier="monthly")
+            if not ok:
+                update_cells(ws, headers, row_idx, {"status": "ERROR_HARD", "ai_notes": "Telegram VIP (monthly) post failed"})
+                return 1
 
         vip_ts = now_iso()
         update_cells(ws, headers, row_idx, {

@@ -23,19 +23,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (PINNED to fix OpenAI/httpx proxies crash)
+     - name: Install deps (PINNED to fix OpenAI/httpx proxies crash)
         run: |
           python -m pip install --upgrade pip
-
-          # ✅ CRITICAL FIX:
-          # Your crash is caused by an incompatibility between:
-          #   openai (new) + httpx 0.28.x  → "Client.__init__() got an unexpected keyword argument 'proxies'"
-          # So we pin httpx < 0.28.
+          
+          # ✅ EXACT PINNING REQUIRED:
           pip install \
             gspread==6.2.1 \
             google-auth==2.41.1 \
             requests==2.32.5 \
             "openai==1.57.4" \
+            "httpx<0.28" # This is the crucial line
             "httpx<0.28"
 
       - name: Run unified pipeline (Duffel → Score → Render → IG → Telegram)

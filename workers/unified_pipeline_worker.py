@@ -124,7 +124,7 @@ DUFFEL_BASE_URL = "https://api.duffel.com/air"
 DUFFEL_ENABLED = bool(DUFFEL_API_KEY)
 DUFFEL_MAX_INSERTS = int(env("DUFFEL_MAX_INSERTS", "1"))  # Default 1 (was 3)
 DUFFEL_MAX_INSERTS = min(DUFFEL_MAX_INSERTS, 1)  # HARD CAP: 1 search per run
-DUFFEL_ORIGIN = env("DUFFEL_ORIGIN", "LON").upper()
+DUFFEL_ORIGIN = env("DUFFEL_ORIGIN", "LHR").upper()  # Use LHR (Heathrow), not LON
 DUFFEL_DAYS_AHEAD = int(env("DUFFEL_DAYS_AHEAD", "60"))
 DUFFEL_TRIP_LENGTH = int(env("DUFFEL_TRIP_LENGTH", "5"))
 
@@ -333,7 +333,7 @@ def feed_new_deals() -> int:
                 # Build deal record
                 deal = {
                     "deal_id": str(uuid.uuid4()),
-                    "origin_city": DUFFEL_ORIGIN,
+                    "origin_city": "London",  # Display name (LHR/LGW/STN all → London)
                     "destination_city": dest,
                     "destination_country": "",
                     "price_gbp": price,

@@ -20,6 +20,8 @@ import os
 import sys
 import json
 import ssl
+import time
+import uuid
 import datetime as dt
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.request import Request, urlopen
@@ -27,6 +29,63 @@ from urllib.request import Request, urlopen
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
+
+
+# =========================
+# THEME POOLS (7-day content calendar)
+# =========================
+
+THEME_POOLS: Dict[str, List[str]] = {
+    # Conservative pools - only use destinations you KNOW work
+    "WINTER_SUN": ["AGP", "PMI", "FAO"],  # Málaga, Palma, Faro
+    "SURF": ["FAO", "LIS"],                # Faro, Lisbon
+    "SNOW": ["KEF", "OSL"],                # Reykjavik, Oslo
+    "FOODIE": ["BCN", "LIS"],              # Barcelona, Lisbon
+    "CITY_BREAKS": ["BCN", "AMS", "DUB"], # Barcelona, Amsterdam, Dublin
+    "LONG_HAUL": ["DXB"],                  # Dubai (conservative)
+    "SURPRISE": ["BCN", "AMS"],            # Popular routes
+}
+
+# Default schedule (day of week → theme)
+THEME_SCHEDULE = {
+    "MON": "WINTER_SUN",
+    "TUE": "CITY_BREAKS",
+    "WED": "SNOW",
+    "THU": "FOODIE",
+    "FRI": "LONG_HAUL",
+    "SAT": "SURF",
+    "SUN": "SURPRISE",
+}
+
+
+def utc_day_key() -> str:
+    """Get 3-letter day code (MON, TUE, etc)."""
+    return dt.datetime.utcnow().strftime("%a").upper()[:3]
+
+
+def utc_run_slot() -> int:
+    """0 for morning (<12 UTC), 1 for afternoon (>=12 UTC)."""
+    return 0 if dt.datetime.utcnow().hour < 12 else 1
+
+
+def pick_theme_and_destination() -> Tuple[str, str]:
+    """Pick today's theme and deterministic destination from pool."""
+    day = utc_day_key()
+    theme_key = THEME_SCHEDULE.get(day, "SURPRISE").upper()
+    
+    if theme_key not in THEME_POOLS:
+        theme_key = "SURPRISE"
+    
+    dests = THEME_POOLS[theme_key]
+    if not dests:
+        return "SURPRISE", "BCN"  # Fallback
+    
+    # Deterministic selection (day of year + run slot)
+    doy = int(dt.datetime.utcnow().strftime("%j"))
+    slot = utc_run_slot()
+    idx = (doy * 2 + slot) % len(dests)
+    
+    return theme_key, dests[idx].upper()
 
 
 # =========================
@@ -54,6 +113,20 @@ STATUS_COLUMN = "status"
 
 OPENAI_API_KEY = env("OPENAI_API_KEY")
 OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
+
+# Duffel API (optional - for feeding new deals)
+DUFFEL_API_KEY = env("DUFFEL_API_KEY")  # Optional
+DUFFEL_VERSION = "v2"
+DUFFEL_BASE_URL = "https://api.duffel.com/air"
+
+# CRITICAL: Duffel free-tier safety
+# Free tier = 100 searches/month = ~3 searches/day max
+DUFFEL_ENABLED = bool(DUFFEL_API_KEY)
+DUFFEL_MAX_INSERTS = int(env("DUFFEL_MAX_INSERTS", "1"))  # Default 1 (was 3)
+DUFFEL_MAX_INSERTS = min(DUFFEL_MAX_INSERTS, 1)  # HARD CAP: 1 search per run
+DUFFEL_ORIGIN = env("DUFFEL_ORIGIN", "LON").upper()
+DUFFEL_DAYS_AHEAD = int(env("DUFFEL_DAYS_AHEAD", "60"))
+DUFFEL_TRIP_LENGTH = int(env("DUFFEL_TRIP_LENGTH", "5"))
 
 RENDER_URL = env_any(["RENDER_URL", "RENDER_BASE_URL"])
 
@@ -133,6 +206,173 @@ def update_cells(ws, row_num: int, headers: List[str], updates: Dict[str, str]) 
             data.append({"range": f"{col_to_a1(col)}{row_num}", "values": [[v]]})
     if data:
         ws.batch_update(data)
+
+
+# =========================
+# DUFFEL FEEDER (Free-tier safe)
+# =========================
+
+def duffel_headers() -> Dict[str, str]:
+    """Duffel API headers."""
+    return {
+        "Authorization": f"Bearer {DUFFEL_API_KEY}",
+        "Duffel-Version": DUFFEL_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def feed_new_deals() -> int:
+    """
+    Feed new deals from Duffel API.
+    
+    FREE-TIER SAFETY:
+    - Max 1 search per run (hardcoded)
+    - Only runs if DUFFEL_API_KEY is set
+    - Uses themed destinations for variety
+    
+    Returns: Number of deals inserted
+    """
+    if not DUFFEL_ENABLED:
+        log("  No DUFFEL_API_KEY, skipping feeder")
+        return 0
+    
+    try:
+        # Pick today's theme and destination
+        theme, dest = pick_theme_and_destination()
+        
+        # Calculate dates
+        from datetime import date, timedelta
+        out_date = date.today() + timedelta(days=DUFFEL_DAYS_AHEAD)
+        ret_date = out_date + timedelta(days=DUFFEL_TRIP_LENGTH)
+        
+        log(f"\n🔍 DUFFEL FEEDER")
+        log(f"   Theme: {theme}")
+        log(f"   Route: {DUFFEL_ORIGIN} → {dest}")
+        log(f"   Dates: {out_date} to {ret_date}")
+        log(f"   Max inserts: {DUFFEL_MAX_INSERTS}")
+        
+        # Create offer request
+        payload = {
+            "data": {
+                "slices": [
+                    {
+                        "origin": DUFFEL_ORIGIN,
+                        "destination": dest,
+                        "departure_date": out_date.isoformat()
+                    },
+                    {
+                        "origin": dest,
+                        "destination": DUFFEL_ORIGIN,
+                        "departure_date": ret_date.isoformat()
+                    }
+                ],
+                "passengers": [{"type": "adult"}],
+                "cabin_class": "economy",
+                "max_connections": 1,
+            }
+        }
+        
+        # Request offers
+        r1 = requests.post(
+            f"{DUFFEL_BASE_URL}/offer_requests",
+            headers=duffel_headers(),
+            json=payload,
+            timeout=30
+        )
+        r1.raise_for_status()
+        offer_request_id = r1.json()["data"]["id"]
+        
+        # Get offers
+        r2 = requests.get(
+            f"{DUFFEL_BASE_URL}/offers?offer_request_id={offer_request_id}&limit=20",
+            headers=duffel_headers(),
+            timeout=30
+        )
+        r2.raise_for_status()
+        offers = r2.json()["data"]
+        
+        if not offers:
+            log("   ⚠️  No offers returned by Duffel")
+            return 0
+        
+        # Get worksheet
+        ws = get_ws()
+        headers = ws.row_values(1)
+        if not headers:
+            log("   ❌ Sheet has no headers")
+            return 0
+        
+        hmap = {h.strip(): i for i, h in enumerate(headers)}
+        
+        # Parse offers and insert (max DUFFEL_MAX_INSERTS)
+        inserted = 0
+        rows_to_insert = []
+        
+        for offer in offers:
+            if inserted >= DUFFEL_MAX_INSERTS:
+                break
+            
+            try:
+                slices = offer.get("slices", [])
+                if len(slices) < 2:
+                    continue
+                
+                # Parse flight details
+                seg0 = slices[0].get("segments", [])
+                seg1 = slices[1].get("segments", [])
+                if not seg0 or not seg1:
+                    continue
+                
+                out = seg0[0]["departing_at"][:10]
+                ret = seg1[0]["departing_at"][:10]
+                
+                stops = (len(seg0) - 1) + (len(seg1) - 1)
+                airline = (offer.get("owner") or {}).get("name", "")
+                price = offer.get("total_amount", "")
+                
+                # Build deal record
+                deal = {
+                    "deal_id": str(uuid.uuid4()),
+                    "origin_city": DUFFEL_ORIGIN,
+                    "destination_city": dest,
+                    "destination_country": "",
+                    "price_gbp": price,
+                    "outbound_date": out,
+                    "return_date": ret,
+                    "trip_length_days": str(DUFFEL_TRIP_LENGTH),
+                    "stops": str(stops),
+                    "airline": airline,
+                    "theme": theme,
+                    "deal_source": "DUFFEL_V4.1",
+                    "date_added": date.today().isoformat(),
+                    "status": "NEW",
+                }
+                
+                # Build row (only write columns that exist)
+                row = [""] * len(headers)
+                for key, val in deal.items():
+                    if key in hmap:
+                        row[hmap[key]] = str(val) if val else ""
+                
+                rows_to_insert.append(row)
+                inserted += 1
+                
+            except Exception as e:
+                log(f"   ⚠️  Failed to parse offer: {e}")
+                continue
+        
+        # Insert rows
+        if rows_to_insert:
+            ws.append_rows(rows_to_insert, value_input_option="USER_ENTERED")
+            log(f"   ✅ Inserted {len(rows_to_insert)} deal(s)")
+            return len(rows_to_insert)
+        else:
+            log("   ⚠️  No valid offers to insert")
+            return 0
+            
+    except Exception as e:
+        log(f"   ❌ Duffel feeder error: {e}")
+        return 0
 
 
 # =========================
@@ -496,12 +736,24 @@ def main() -> int:
     log("=" * 60)
     log(f"Sheet: {SPREADSHEET_ID}")
     log(f"Tab: {RAW_DEALS_TAB}")
+    log(f"Duffel: {'ENABLED' if DUFFEL_ENABLED else 'DISABLED'}")
     log(f"Freshness decay: {FRESHNESS_DECAY_PER_DAY}/day")
     log("=" * 60)
     
     if not SPREADSHEET_ID:
         log("❌ Missing SPREADSHEET_ID")
         return 1
+    
+    # ============================================================
+    # STAGE 0: DUFFEL FEEDER (Optional - only if API key set)
+    # ============================================================
+    
+    if DUFFEL_ENABLED:
+        feed_new_deals()  # Inserts max 1 deal (free-tier safe)
+    
+    # ============================================================
+    # STAGE 1: SCORE & SELECT BEST NEW DEAL
+    # ============================================================
     
     ws = get_ws()
     log(f"✅ Connected: {ws.title}")

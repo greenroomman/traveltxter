@@ -35,6 +35,29 @@ except ImportError:
 
 
 # =========================
+# SECRET NAME COMPATIBILITY
+# =========================
+# Handle variations in secret names between different deployments
+def normalize_secrets():
+    """Map actual GitHub secret names to worker expected names"""
+    mappings = {
+        # Worker expects → Your actual GitHub secret name(s)
+        'SPREADSHEET_ID': ['SHEET_ID'],
+        'IG_ACCESS_TOKEN': ['META_ACCESS_TOKEN', 'FB_ACCESS_TOKEN'],
+        'GCP_SA_JSON': ['GCP_SA_JSON_ONE_LINE'],
+    }
+    
+    for target, aliases in mappings.items():
+        if not os.getenv(target):
+            for alias in aliases:
+                if os.getenv(alias):
+                    os.environ[target] = os.getenv(alias)
+                    break
+
+normalize_secrets()
+
+
+# =========================
 # ENV
 # =========================
 def env(name: str, default: str = "", required: bool = False) -> str:
@@ -74,8 +97,8 @@ TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
 TELEGRAM_CHANNEL = env("TELEGRAM_CHANNEL", required=True)
 
 SKYSCANNER_AFFILIATE_ID = env("SKYSCANNER_AFFILIATE_ID", "")
-STRIPE_LINK_MONTHLY = env("STRIPE_LINK_MONTHLY", "")
-STRIPE_LINK_YEARLY = env("STRIPE_LINK_YEARLY", "")
+STRIPE_LINK_MONTHLY = env("STRIPE_LINK_MONTHLY", "") or env("STRIPE_LINK", "")  # Fallback to STRIPE_LINK
+STRIPE_LINK_YEARLY = env("STRIPE_LINK_YEARLY", "") or env("STRIPE_LINK", "")    # Fallback to STRIPE_LINK
 
 VIP_DELAY_HOURS = int(env("VIP_DELAY_HOURS", "24"))
 RUN_SLOT = env("RUN_SLOT", "AM").upper()

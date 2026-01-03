@@ -65,6 +65,14 @@ def env(name: str, default: str = "", required: bool = False) -> str:
     if not v:
         v = default
     if required and not v:
+        # Debug: Show what env vars ARE set
+        import sys
+        print(f"ERROR: Missing required env var: {name}", file=sys.stderr)
+        print(f"Available env vars starting with same prefix:", file=sys.stderr)
+        prefix = name.split('_')[0]
+        for key in sorted(os.environ.keys()):
+            if key.startswith(prefix):
+                print(f"  - {key} = {os.environ[key][:20]}...", file=sys.stderr)
         raise RuntimeError(f"Missing env var: {name}")
     return v
 

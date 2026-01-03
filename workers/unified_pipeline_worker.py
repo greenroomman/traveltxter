@@ -1394,7 +1394,7 @@ def main():
             log(f"✓ {selected} promoted")
 
         # Stage 3b: Email feed (sheet-only)
-        log(\"\n[3b] EMAIL FEED")
+        log("\n[3b] EMAIL FEED")
         stage_update_mailerlite_feed(ws, headers)
 
         # Stage 3: Render

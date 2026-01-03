@@ -35,26 +35,22 @@ except ImportError:
 
 
 # =========================
-# SECRET NAME COMPATIBILITY
+# SECRET NAME COMPATIBILITY - FIX IMMEDIATELY
 # =========================
-# Handle variations in secret names between different deployments
-def normalize_secrets():
-    """Map actual GitHub secret names to worker expected names"""
-    mappings = {
-        # Worker expects → Your actual GitHub secret name(s)
-        'SPREADSHEET_ID': ['SHEET_ID'],
-        'IG_ACCESS_TOKEN': ['META_ACCESS_TOKEN', 'FB_ACCESS_TOKEN'],
-        'GCP_SA_JSON': ['GCP_SA_JSON_ONE_LINE'],
-    }
-    
-    for target, aliases in mappings.items():
-        if not os.getenv(target):
-            for alias in aliases:
-                if os.getenv(alias):
-                    os.environ[target] = os.getenv(alias)
-                    break
+# Map your actual GitHub secret names to worker expected names
+import os
 
-normalize_secrets()
+# Apply mappings BEFORE any env() calls
+_secret_mappings = {
+    'TELEGRAM_CHANNEL_VIP': 'TELEGRAM_VIP_CHANNEL',      # You have TELEGRAM_VIP_CHANNEL
+    'TELEGRAM_CHANNEL': 'TELEGRAM_FREE_CHANNEL',          # You have TELEGRAM_FREE_CHANNEL
+    'SPREADSHEET_ID': 'SHEET_ID',                         # Fallback to SHEET_ID
+    'IG_ACCESS_TOKEN': 'META_ACCESS_TOKEN',               # Fallback to META_ACCESS_TOKEN
+}
+
+for target, source in _secret_mappings.items():
+    if not os.getenv(target) and os.getenv(source):
+        os.environ[target] = os.getenv(source)
 
 
 # =========================

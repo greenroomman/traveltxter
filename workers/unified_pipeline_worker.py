@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.2 - PRODUCTION FINAL (100% Working)
+TravelTxter V4.5 - PRODUCTION (feature-led, human copy rules)
 
 Combines:
 - Refactored Best-of-Batch engine
@@ -168,6 +168,396 @@ def header_map(headers: List[str]) -> Dict[str, int]:
 # =========================
 # CONFIG Routes (if Duffel enabled)
 # =========================
+
+# =========================
+# V4.5: CONFIG_SIGNALS + Performance + MailerLite feed (sheet-only)
+# =========================
+
+CONFIG_SIGNALS_TAB = env("CONFIG_SIGNALS_TAB", "CONFIG_SIGNALS")
+PERFORMANCE_SIGNALS_TAB = env("PERFORMANCE_SIGNALS_TAB", "PERFORMANCE_SIGNALS")
+PERFORMANCE_SUMMARY_TAB = env("PERFORMANCE_SUMMARY_TAB", "PERFORMANCE_SUMMARY")
+MAILERLITE_FEED_TAB = env("MAILERLITE_FEED_TAB", "MAILERLITE_FEED")
+
+ENABLE_PERF_AGG = env("ENABLE_PERF_AGG", "1") == "1"
+ENABLE_EMAIL_FEED = env("ENABLE_EMAIL_FEED", "1") == "1"
+
+# Global caches (loaded once per run)
+_CONFIG_SIGNALS_BY_DESTKEY: Dict[str, Dict[str, str]] = {}
+_CONFIG_SIGNALS_BY_IATA: Dict[str, Dict[str, str]] = {}
+_PERF_BOOST_MAP: Dict[Tuple[str, str, str], float] = {}  # (destination_key, theme, channel) -> boost
+
+
+def _month_from_date(date_str: str) -> int:
+    """Return 1-12 month from YYYY-MM-DD (or empty -> 0)."""
+    try:
+        return int(date_str.strip()[5:7])
+    except Exception:
+        return 0
+
+
+def _get_cfg_value(cfg: Dict[str, str], prefix: str, month: int) -> str:
+    if not cfg or month < 1 or month > 12:
+        return ""
+    k = f"{prefix}_m{month:02d}"
+    return (cfg.get(k) or "").strip()
+
+
+def load_config_signals(sh: gspread.Spreadsheet) -> None:
+    """Load CONFIG_SIGNALS into fast lookup maps."""
+    global _CONFIG_SIGNALS_BY_DESTKEY, _CONFIG_SIGNALS_BY_IATA
+    _CONFIG_SIGNALS_BY_DESTKEY = {}
+    _CONFIG_SIGNALS_BY_IATA = {}
+
+    try:
+        ws = sh.worksheet(CONFIG_SIGNALS_TAB)
+    except Exception:
+        log(f"CONFIG_SIGNALS tab not found: {CONFIG_SIGNALS_TAB} (skipping)")
+        return
+
+    vals = ws.get_all_values()
+    if len(vals) < 2:
+        return
+
+    headers = vals[0]
+    for r in vals[1:]:
+        row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
+        dest_key = (row.get("destination_key") or "").strip()
+        iata = (row.get("iata_hint") or "").strip().upper()
+
+        if dest_key:
+            _CONFIG_SIGNALS_BY_DESTKEY[dest_key] = row
+        if iata:
+            _CONFIG_SIGNALS_BY_IATA[iata] = row
+
+
+def _lookup_cfg(row: Dict[str, str]) -> Dict[str, str]:
+    dest_key = (safe_get(row, "destination_key") or "").strip()
+    dest_iata = (safe_get(row, "destination_iata") or "").strip().upper()
+    if dest_key and dest_key in _CONFIG_SIGNALS_BY_DESTKEY:
+        return _CONFIG_SIGNALS_BY_DESTKEY[dest_key]
+    if dest_iata and dest_iata in _CONFIG_SIGNALS_BY_IATA:
+        return _CONFIG_SIGNALS_BY_IATA[dest_iata]
+    return {}
+
+
+def _theme_from_signals(cfg: Dict[str, str], month: int) -> str:
+    """Pick a single theme from signals for this month (order matters)."""
+    try:
+        snow = int(_get_cfg_value(cfg, "snow_score", month) or "0")
+        surf = int(_get_cfg_value(cfg, "surf_score", month) or "0")
+        sun = int(_get_cfg_value(cfg, "sun_score", month) or "0")
+    except Exception:
+        snow = surf = sun = 0
+
+    # Priority: activity-led themes first
+    if snow >= 2:
+        return "SNOW"
+    if surf >= 2:
+        return "SURF"
+    if sun >= 2 and month in (11, 12, 1, 2, 3):
+        return "WINTER_SUN"
+    return "CITY"
+
+
+def _activity_context(cfg: Dict[str, str], theme: str, month: int) -> str:
+    """Honest, historical-context blurb (not live conditions)."""
+    if not cfg or month < 1:
+        return ""
+
+    if theme == "SURF":
+        wt = _get_cfg_value(cfg, "surf_water_temp_c", month)
+        wl = _get_cfg_value(cfg, "surf_wave_level", month)
+        ws = _get_cfg_value(cfg, "surf_wetsuit_note", month)
+        bits = []
+        if wt:
+            bits.append(f"Avg water ~{wt}°C")
+        if wl:
+            bits.append(f"Waves: {wl.lower()}")
+        if ws:
+            bits.append(f"Wetsuit: {ws.replace('_','/').lower()}")
+        return " · ".join(bits)
+
+    if theme == "SNOW":
+        st = _get_cfg_value(cfg, "snow_temp_c", month)
+        sf = _get_cfg_value(cfg, "snow_snowfall_level", month)
+        br = _get_cfg_value(cfg, "snow_base_reliability", month)
+        bits = []
+        if st:
+            bits.append(f"Avg temps ~{st}°C")
+        if sf:
+            bits.append(f"Snowfall: {sf.lower()}")
+        if br:
+            bits.append(f"Base: {br.lower()}")
+        return " · ".join(bits)
+
+    # WINTER_SUN or CITY (sun context)
+    tt = _get_cfg_value(cfg, "sun_temp_c", month)
+    rl = _get_cfg_value(cfg, "sun_rain_level", month)
+    sl = _get_cfg_value(cfg, "sun_sunshine_level", month)
+    bits = []
+    if tt:
+        bits.append(f"Avg daytime ~{tt}°C")
+    if sl:
+        bits.append(f"Sun: {sl.lower()}")
+    if rl:
+        bits.append(f"Rain: {rl.lower()}")
+    return " · ".join(bits)
+
+
+def _timing_score(cfg: Dict[str, str], theme: str, month: int) -> int:
+    if not cfg or month < 1:
+        return 0
+    key = "sun_score" if theme in ("WINTER_SUN", "CITY") else ("surf_score" if theme == "SURF" else "snow_score")
+    try:
+        return int(_get_cfg_value(cfg, key, month) or "0")
+    except Exception:
+        return 0
+
+
+def _value_score(row: Dict[str, str]) -> int:
+    """Simple value proxy from price. Conservative and explainable."""
+    try:
+        p = float(safe_get(row, "price_gbp") or "0")
+    except Exception:
+        return 0
+    if p <= 60:
+        return 3
+    if p <= 120:
+        return 2
+    if p <= 200:
+        return 1
+    return 0
+
+
+def performance_aggregate(sh: gspread.Spreadsheet) -> None:
+    """Aggregate PERFORMANCE_SIGNALS -> PERFORMANCE_SUMMARY (fast, idempotent)."""
+    if not ENABLE_PERF_AGG:
+        return
+
+    try:
+        ws = sh.worksheet(PERFORMANCE_SIGNALS_TAB)
+    except Exception:
+        # Optional tab
+        return
+
+    try:
+        out = sh.worksheet(PERFORMANCE_SUMMARY_TAB)
+    except Exception:
+        out = sh.add_worksheet(title=PERFORMANCE_SUMMARY_TAB, rows=2000, cols=20)
+
+    vals = ws.get_all_values()
+    if len(vals) < 2:
+        return
+
+    headers = vals[0]
+    h = {name: idx for idx, name in enumerate(headers)}
+
+    def get(r, k):
+        i = h.get(k)
+        return (r[i] if i is not None and i < len(r) else "").strip()
+
+    VALID_CHANNELS = {"INSTAGRAM", "TELEGRAM", "EMAIL"}
+    WEIGHTS = {"VIEW": 1, "CLICK": 2, "SAVE": 5, "JOIN": 8, "VIP_JOIN": 12}
+
+    rows = []
+    bad = 0
+
+    for r in vals[1:]:
+        ts = get(r, "timestamp_utc")
+        dest = get(r, "destination_key") or get(r, "destination_iata")
+        theme = get(r, "theme") or "GENERAL"
+        channel = get(r, "channel").upper()
+        metric = get(r, "metric_type").upper()
+        try:
+            value = float(get(r, "metric_value") or "0")
+        except Exception:
+            value = 0.0
+
+        if not ts or not dest or channel not in VALID_CHANNELS or metric not in WEIGHTS:
+            bad += 1
+            continue
+
+        try:
+            dt_ts = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            bad += 1
+            continue
+
+        weight = WEIGHTS[metric]
+        score = value * weight
+        rows.append((dt_ts, dest, theme, channel, score))
+
+    # 14d half-life decay (configurable)
+    half_life_days = float(env("PERF_HALF_LIFE_DAYS", "14") or "14")
+    now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+
+    def decay_factor(ts):
+        age_days = (now - ts).total_seconds() / 86400.0
+        if age_days <= 0:
+            return 1.0
+        # exponential decay where half-life = half_life_days
+        return 0.5 ** (age_days / max(1e-6, half_life_days))
+
+    agg = {}
+    for ts, dest, theme, channel, score in rows:
+        key = (dest, theme, channel)
+        agg[key] = agg.get(key, 0.0) + score * decay_factor(ts)
+
+    # write summary
+    out_headers = ["destination_key", "theme", "channel", "boost_decay"]
+    out_rows = [out_headers]
+    for (dest, theme, channel), boost in sorted(agg.items(), key=lambda x: x[1], reverse=True):
+        out_rows.append([dest, theme, channel, round(boost, 3)])
+
+    out.clear()
+    out.update("A1", out_rows, value_input_option="USER_ENTERED")
+    log(f"Performance aggregation: {len(out_rows)-1} rows (skipped {bad})")
+
+
+def load_perf_boost_map(sh: gspread.Spreadsheet) -> None:
+    global _PERF_BOOST_MAP
+    _PERF_BOOST_MAP = {}
+
+    try:
+        ws = sh.worksheet(PERFORMANCE_SUMMARY_TAB)
+    except Exception:
+        return
+
+    vals = ws.get_all_values()
+    if len(vals) < 2:
+        return
+
+    headers = vals[0]
+    h = {name: idx for idx, name in enumerate(headers)}
+
+    def get(r, k):
+        i = h.get(k)
+        return (r[i] if i is not None and i < len(r) else "").strip()
+
+    for r in vals[1:]:
+        dest = get(r, "destination_key")
+        theme = get(r, "theme") or "GENERAL"
+        channel = get(r, "channel").upper()
+        try:
+            boost = float(get(r, "boost_decay") or "0")
+        except Exception:
+            boost = 0.0
+        if dest and channel:
+            _PERF_BOOST_MAP[(dest, theme, channel)] = boost
+
+
+def perf_boost(destination_key: str, theme: str, channel: str) -> float:
+    if not destination_key:
+        return 0.0
+    return float(_PERF_BOOST_MAP.get((destination_key, theme or "GENERAL", channel.upper()), 0.0) or 0.0)
+
+
+
+def stage_update_mailerlite_feed(ws: gspread.Worksheet, headers: List[str]) -> None:
+    """Write a clean weekly email feed into MAILERLITE_FEED (sheet-only).
+
+    This does NOT send emails. It only writes structured rows MailerLite can consume.
+    """
+    if not ENABLE_EMAIL_FEED:
+        return
+
+    sh = ws.spreadsheet
+    try:
+        out = sh.worksheet(MAILERLITE_FEED_TAB)
+    except Exception:
+        out = sh.add_worksheet(title=MAILERLITE_FEED_TAB, rows=2000, cols=30)
+
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return
+
+    hmap = header_map(headers)
+
+    def get(row, k):
+        return safe_get(row, k)
+
+    # Collect scored rows (prefer NEW, but include READY_TO_POST if needed)
+    candidates = []
+    for idx in range(2, len(rows) + 1):
+        rv = rows[idx - 1]
+        r = {headers[c]: (rv[c] if c < len(rv) else "") for c in range(len(headers))}
+        st = (get(r, "status") or "").upper()
+        if st not in {STATUS_NEW, STATUS_READY_TO_POST, STATUS_READY_TO_PUBLISH}:
+            continue
+        sc = get(r, "ai_score") or ""
+        if not sc:
+            continue
+        try:
+            score = float(sc)
+        except Exception:
+            continue
+        theme = (get(r, "theme") or "").strip().upper() or "CITY"
+        dest_key = (get(r, "destination_key") or get(r, "destination_iata") or "").strip()
+        boost = perf_boost(dest_key, theme, "EMAIL")
+        final_score = score + max(0.0, min(20.0, boost))
+        candidates.append((final_score, idx, r))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top = candidates[: int(env("EMAIL_FEED_TOP_N", "12") or "12")]
+
+    out_rows = [[
+        "generated_utc",
+        "destination_key",
+        "theme",
+        "headline",
+        "blurb",
+        "price_gbp",
+        "origin_iata",
+        "destination_iata",
+        "outbound_date",
+        "return_date",
+        "booking_url",
+        "context_blurb",
+        "score"
+    ]]
+
+    generated = now_utc()
+    for score, idx, r in top:
+        dest_city = get(r, "destination_city") or get(r, "destination_iata")
+        origin_city = get(r, "origin_city") or get(r, "origin_iata")
+        price = round_price_up(get(r, "price_gbp"))
+        theme = (get(r, "theme") or "").strip().upper() or "CITY"
+        context = get(r, "context_blurb") or ""
+        url = get(r, "booking_url") or get(r, "deep_link") or ""
+
+        headline = f"{origin_city} → {dest_city} from £{price}"
+        blurb_bits = []
+        if get(r, "outbound_date") and get(r, "return_date"):
+            blurb_bits.append(f"{get(r,'outbound_date')} to {get(r,'return_date')}")
+        if theme:
+            blurb_bits.append(theme.replace("_", " ").title())
+        if context:
+            blurb_bits.append(context)
+        blurb = " · ".join([b for b in blurb_bits if b])
+
+        out_rows.append([
+            generated,
+            get(r, "destination_key") or "",
+            theme,
+            headline,
+            blurb,
+            get(r, "price_gbp") or "",
+            get(r, "origin_iata") or "",
+            get(r, "destination_iata") or "",
+            get(r, "outbound_date") or "",
+            get(r, "return_date") or "",
+            url,
+            context,
+            round(score, 2),
+        ])
+
+    out.clear()
+    out.update("A1", out_rows, value_input_option="USER_ENTERED")
+    log(f"MailerLite feed updated: {len(out_rows)-1} rows")
+
+
+
+
 def load_routes_from_config(ws_parent: gspread.Spreadsheet) -> List[Tuple[int, str, str, str, str, int]]:
     """Load enabled routes from CONFIG tab"""
     try:
@@ -372,64 +762,110 @@ def run_duffel_feeder(ws: gspread.Worksheet, headers: List[str]) -> int:
 # =========================
 # AI Scoring (if OpenAI enabled)
 # =========================
+
 def score_deal_with_ai(row: Dict[str, str]) -> Dict[str, Any]:
-    """Score deal with OpenAI"""
-    if not OPENAI_API_KEY:
-        return {
-            "ai_score": 60,
-            "ai_verdict": "AVERAGE",
-            "ai_caption": f"Return flights to {safe_get(row, 'destination_city')}",
-            "is_instagram_eligible": False,
-            "telegram_priority": "Low"
-        }
+    """V4.5 scoring: deterministic signals first, optional AI only for light classification.
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    Output fields are intentionally simple:
+      - ai_score (0-100)
+      - ai_verdict (GOOD / AVERAGE / POOR)
+      - theme (SURF / SNOW / WINTER_SUN / CITY)
+      - context_blurb (historical averages, never live claims)
+      - score_components (JSON string)
+      - ai_caption (kept for backward compatibility; generated deterministically)
+    """
+    cfg = _lookup_cfg(row)
+    month = _month_from_date(safe_get(row, "outbound_date"))
 
-    origin_city = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
+    # Theme: prefer existing theme column; else infer from signals
+    theme = (safe_get(row, "theme") or "").strip().upper()
+    if not theme:
+        theme = _theme_from_signals(cfg, month)
+
+    # Component scores (0-3 each)
+    value = _value_score(row)
+    timing = _timing_score(cfg, theme, month)
+
+    # Conservative weighting into a 0-100 score
+    # Value matters most; timing is a kicker; performance is applied later at selection time
+    score = (value * 25) + (timing * 10)
+
+    # Light AI assist (optional): only to refine verdict banding on ambiguous prices
+    if OPENAI_API_KEY:
+        try:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            origin = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
+            dest = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
+            price = safe_get(row, "price_gbp")
+            out_date = safe_get(row, "outbound_date")
+            ret_date = safe_get(row, "return_date")
+            stops = safe_get(row, "stops") or "0"
+
+            prompt = f"""Classify this flight deal into one theme: SURF, SNOW, WINTER_SUN, CITY.
+Return JSON with keys: theme (one of those), value_hint (0-3), notes (max 12 words).
+Facts:
+- From: {origin}
+- To: {dest}
+- Price GBP: {price}
+- Dates: {out_date} to {ret_date}
+- Stops (outbound): {stops}
+Rules:
+- Do not write marketing copy.
+- Do not claim live conditions or scarcity.
+"""
+
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.2,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            obj = json.loads(resp.choices[0].message.content)
+            t2 = str(obj.get("theme", "")).strip().upper()
+            if t2 in {"SURF", "SNOW", "WINTER_SUN", "CITY"}:
+                theme = t2
+
+            try:
+                vh = int(obj.get("value_hint", value))
+                if 0 <= vh <= 3:
+                    value = vh
+            except Exception:
+                pass
+
+            score = (value * 25) + (timing * 10)
+        except Exception as e:
+            log(f"AI classify failed (non-fatal): {e}")
+
+    verdict = "POOR"
+    if score >= 70:
+        verdict = "GOOD"
+    elif score >= 40:
+        verdict = "AVERAGE"
+
+    context = _activity_context(cfg, theme, month)
+
+    # Backwards-compatible caption: feature-led, plain.
     dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
-    price = safe_get(row, "price_gbp")
+    price_txt = safe_get(row, "price_gbp")
+    caption = f"Return flights to {dest_city} from £{round_price_up(price_txt)}"
+    if context:
+        caption += f". {context}."
 
-    prompt = f"""
-Score this UK flight deal (0-100):
-- {origin_city} to {dest_city}
-- £{price}
+    components = {
+        "value_score_0_3": value,
+        "timing_score_0_3": timing,
+        "theme": theme,
+        "month": month
+    }
 
-Return JSON:
-{{"ai_score": 0-100, "ai_verdict": "EXCELLENT/GOOD/AVERAGE/POOR", "ai_caption": "1 sentence why it's good (max 100 chars, NO EMOJIS)"}}
-""".strip()
-
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": "Return only valid JSON. Never use emojis."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=200
-        )
-
-        text_out = resp.choices[0].message.content.strip()
-        text_out = text_out.replace("```json", "").replace("```", "").strip()
-        data = json.loads(text_out)
-
-        ai_score = int(data.get("ai_score", 60))
-        return {
-            "ai_score": ai_score,
-            "ai_verdict": str(data.get("ai_verdict", "AVERAGE")).upper(),
-            "ai_caption": str(data.get("ai_caption", "")).strip() or f"Flights to {dest_city}",
-            "is_instagram_eligible": ai_score >= 90,
-            "telegram_priority": "High" if ai_score >= 85 else ("Medium" if ai_score >= 70 else "Low")
-        }
-    except Exception as e:
-        log(f"OpenAI error: {e}")
-        return {
-            "ai_score": 60,
-            "ai_verdict": "AVERAGE",
-            "ai_caption": f"Flights to {dest_city} for £{price}",
-            "is_instagram_eligible": False,
-            "telegram_priority": "Low"
-        }
+    return {
+        "ai_score": int(round(score)),
+        "ai_verdict": verdict,
+        "ai_caption": caption,
+        "theme": theme,
+        "context_blurb": context,
+        "score_components": json.dumps(components, separators=(",", ":"))
+    }
 
 
 def stage_score_all_new(ws: gspread.Worksheet, headers: List[str]) -> int:
@@ -461,6 +897,12 @@ def stage_score_all_new(ws: gspread.Worksheet, headers: List[str]) -> int:
             updates.append(gspread.Cell(i, hmap["ai_verdict"], result["ai_verdict"]))
         if "ai_caption" in hmap:
             updates.append(gspread.Cell(i, hmap["ai_caption"], result["ai_caption"]))
+        if "theme" in hmap and result.get("theme"):
+            updates.append(gspread.Cell(i, hmap["theme"], result["theme"]))
+        if "context_blurb" in hmap and result.get("context_blurb") is not None:
+            updates.append(gspread.Cell(i, hmap["context_blurb"], result.get("context_blurb","")))
+        if "score_components" in hmap and result.get("score_components"):
+            updates.append(gspread.Cell(i, hmap["score_components"], result["score_components"]))
 
         if updates:
             ws.update_cells(updates, value_input_option="USER_ENTERED")
@@ -495,7 +937,14 @@ def stage_select_best(ws: gspread.Worksheet, headers: List[str]) -> int:
         except:
             continue
 
-        candidates.append((i, ai_score, row))
+        # V4.5: performance boost (ranking only; never treated as a factual claim)
+        dest_key = (safe_get(row, "destination_key") or safe_get(row, "destination_iata") or "").strip()
+        theme = (safe_get(row, "theme") or "GENERAL").strip().upper()
+        boost = perf_boost(dest_key, theme, "TELEGRAM")
+        # keep boost bounded so it can't swamp price/timing
+        boosted_score = ai_score + max(0.0, min(20.0, boost))
+
+        candidates.append((i, boosted_score, row))
 
     if not candidates:
         return 0
@@ -912,7 +1361,7 @@ def post_telegram_free(ws: gspread.Worksheet, headers: List[str]) -> int:
 # =========================
 def main():
     log("=" * 70)
-    log("TRAVELTXTER V4.2 - PRODUCTION FINAL")
+    log("TRAVELTXTER V4.5 - PRODUCTION")
     log("=" * 70)
     log(f"RUN_SLOT: {RUN_SLOT} | VIP_DELAY: {VIP_DELAY_HOURS}h")
     log(f"Duffel: {'ON' if DUFFEL_ENABLED else 'OFF'} | OpenAI: {'ON' if OPENAI_API_KEY else 'OFF'}")
@@ -921,6 +1370,12 @@ def main():
     try:
         ws, headers = get_ws()
         log(f"Connected | Columns: {len(headers)}")
+
+        # V4.5: load destination signals + performance boosts
+        sh = ws.spreadsheet
+        load_config_signals(sh)
+        performance_aggregate(sh)
+        load_perf_boost_map(sh)
 
         # Stage 1: Duffel (if enabled)
         if DUFFEL_ENABLED and DUFFEL_API_KEY:
@@ -937,6 +1392,10 @@ def main():
             log("\n[3] SELECT BEST")
             selected = stage_select_best(ws, headers)
             log(f"✓ {selected} promoted")
+
+        # Stage 3b: Email feed (sheet-only)
+        log(\"\n[3b] EMAIL FEED\")
+        stage_update_mailerlite_feed(ws, headers)
 
         # Stage 3: Render
         log("\n[4] RENDER")

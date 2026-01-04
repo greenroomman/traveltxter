@@ -92,7 +92,7 @@ jobs:
           RECENCY_FILTER_HOURS: "48"
 
         run: |
-          python workers/unified_pipeline_worker.py
+          python workers/pipeline_worker.py
 
       - name: Upload logs (on failure)
         if: failure()

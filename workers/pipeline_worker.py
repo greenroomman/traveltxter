@@ -223,30 +223,61 @@ def load_config_signals(ws_parent: gspread.Spreadsheet) -> Dict[str, Dict[str, A
     Load CONFIG_SIGNALS using actual schema:
     - Key column: iata_hint
     - Score columns: sun_score_m01, surf_score_m01, snow_score_m01, etc.
+
+    Hardened:
+    - Never crashes if iata_hint is blank/NaN/number
+    - Only accepts valid 3-letter IATA keys
     """
+
+    def _safe_text(v: Any) -> str:
+        # Convert Google Sheet weirdness (None/NaN/float) into safe text
+        if v is None:
+            return ""
+        # gspread sometimes returns floats for blank cells (e.g., NaN)
+        if isinstance(v, float):
+            try:
+                # NaN check
+                if v != v:  # NaN is never equal to itself
+                    return ""
+            except Exception:
+                return ""
+            # If someone typed a number, it's not a valid IATA anyway
+            return ""
+        # Fall back to string
+        try:
+            return str(v)
+        except Exception:
+            return ""
+
     try:
         signals_ws = ws_parent.worksheet(CONFIG_SIGNALS_TAB)
-    except:
+    except Exception:
         log("CONFIG_SIGNALS tab not found")
         return {}
 
     try:
         records = signals_ws.get_all_records()
-    except:
+    except Exception:
         log("CONFIG_SIGNALS empty")
         return {}
 
-    signals_map = {}
+    signals_map: Dict[str, Dict[str, Any]] = {}
+
+    bad_rows = 0
     for rec in records:
-        # Use iata_hint as primary key
-        iata = (rec.get('iata_hint') or "").strip().upper()
-        
-        if iata:
+        raw_iata = _safe_text(rec.get("iata_hint"))
+        iata = raw_iata.strip().upper()
+
+        # Only accept strict 3-letter keys (BCN, BGO, TFS, etc.)
+        if len(iata) == 3 and iata.isalpha():
             signals_map[iata] = rec
+        else:
+            # Skip junk rows safely
+            if raw_iata != "":
+                bad_rows += 1
 
-    log(f"Loaded CONFIG_SIGNALS for {len(signals_map)} destinations")
+    log(f"Loaded CONFIG_SIGNALS for {len(signals_map)} destinations (skipped {bad_rows} bad iata_hint rows)")
     return signals_map
-
 
 def get_activity_scores(signals: Dict[str, Any], month: int) -> Dict[str, float]:
     """

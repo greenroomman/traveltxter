@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5.1 — PRODUCTION READY (Matches Real Schema)
+TravelTxter V4.5.2 — WATERWHEEL PRODUCTION READY (Non-tech safe)
+
+KEY FIXES (Dragon-proof):
+1) DEADLOCK FIX:
+   - NEW is only for "unprocessed"
+   - After scoring, rows become SCORED
+   - Editorial selection ONLY considers SCORED
+   => Stops "publishing ancient rows" (e.g., row 544)
+
+2) WATERWHEEL LOGIC:
+   - Themes are SOFT WEIGHTS (preference), not hard filters
+   - Price outliers can override theme (honest "wildcard")
+   - Strong diversity circuit breaker:
+       - hard-avoid last 3 destinations if possible
+       - DEST_REPEAT_PENALTY default recommended = 50
+
+3) DAILY THEMES:
+   - A simple theme schedule per weekday
+   - Still allows wildcards when value is exceptional
+
+4) LOGGING:
+   - Logs EXACT reason for choice (theme match vs wildcard vs repeat penalty)
 
 SCHEMA MATCH:
-- CONFIG_SIGNALS: Uses actual columns (sun_score_m01, surf_score_m01, etc.)
-- Keying: Uses iata_hint (your actual key column)
-- Theme derivation: Based on highest activity score per month
-- Safe defaults: MAX_INSERTS=3, 48h recency filter
+- CONFIG_SIGNALS: iata_hint keys, and columns like sun_score_m01, surf_score_m01, snow_score_m01
+- RAW_DEALS: status, ai_score/stotal, auto_theme, theme_strength, angle_type, etc.
 
-DEPLOY CHECKLIST:
-[ ] Fix CONFIG: Bergen = BGO (not BOD)
-[ ] Set DUFFEL_MAX_INSERTS=3
-[ ] Verify STRIPE_LINK_MONTHLY and STRIPE_LINK_YEARLY
+NOTE:
+- We DO NOT rely on Google Sheets formulas for theme (no resolved_theme required).
 """
 
 import os
@@ -27,31 +44,6 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-
-
-# =========================
-# SECRET NAME COMPATIBILITY - FIX IMMEDIATELY
-# =========================
-# Map your actual GitHub secret names to worker expected names
-import os
-
-# Apply mappings BEFORE any env() calls
-_secret_mappings = {
-    'TELEGRAM_CHANNEL_VIP': 'TELEGRAM_VIP_CHANNEL',      # You have TELEGRAM_VIP_CHANNEL
-    'TELEGRAM_CHANNEL': 'TELEGRAM_FREE_CHANNEL',          # You have TELEGRAM_FREE_CHANNEL
-    'SPREADSHEET_ID': 'SHEET_ID',                         # Fallback to SHEET_ID
-    'IG_ACCESS_TOKEN': 'META_ACCESS_TOKEN',               # Fallback to META_ACCESS_TOKEN
-}
-
-for target, source in _secret_mappings.items():
-    if not os.getenv(target) and os.getenv(source):
-        os.environ[target] = os.getenv(source)
-
 
 # =========================
 # ENV
@@ -61,14 +53,6 @@ def env(name: str, default: str = "", required: bool = False) -> str:
     if not v:
         v = default
     if required and not v:
-        # Debug: Show what env vars ARE set
-        import sys
-        print(f"ERROR: Missing required env var: {name}", file=sys.stderr)
-        print(f"Available env vars starting with same prefix:", file=sys.stderr)
-        prefix = name.split('_')[0]
-        for key in sorted(os.environ.keys()):
-            if key.startswith(prefix):
-                print(f"  - {key} = {os.environ[key][:20]}...", file=sys.stderr)
         raise RuntimeError(f"Missing env var: {name}")
     return v
 
@@ -86,9 +70,6 @@ DUFFEL_MAX_INSERTS = int(env("DUFFEL_MAX_INSERTS", "3"))
 DUFFEL_ROUTES_PER_RUN = int(env("DUFFEL_ROUTES_PER_RUN", "2"))
 DUFFEL_ENABLED = env("DUFFEL_ENABLED", "true").lower() in ("1", "true", "yes")
 
-OPENAI_API_KEY = env("OPENAI_API_KEY", "")
-OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
-
 RENDER_URL = env("RENDER_URL", required=True)
 
 IG_ACCESS_TOKEN = env("IG_ACCESS_TOKEN", required=True)
@@ -101,23 +82,31 @@ TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
 TELEGRAM_CHANNEL = env("TELEGRAM_CHANNEL", required=True)
 
 SKYSCANNER_AFFILIATE_ID = env("SKYSCANNER_AFFILIATE_ID", "")
-STRIPE_LINK_MONTHLY = env("STRIPE_LINK_MONTHLY", "") or env("STRIPE_LINK", "")  # Fallback to STRIPE_LINK
-STRIPE_LINK_YEARLY = env("STRIPE_LINK_YEARLY", "") or env("STRIPE_LINK", "")    # Fallback to STRIPE_LINK
 
+# Stripe links (your repo sometimes uses STRIPE_LINK only)
+STRIPE_LINK_MONTHLY = env("STRIPE_LINK_MONTHLY", "") or env("STRIPE_LINK", "")
+STRIPE_LINK_YEARLY = env("STRIPE_LINK_YEARLY", "") or env("STRIPE_LINK", "")
+
+# Timing / posting
 VIP_DELAY_HOURS = int(env("VIP_DELAY_HOURS", "24"))
-RUN_SLOT = env("RUN_SLOT", "AM").upper()
+RUN_SLOT = env("RUN_SLOT", "AM").upper()  # AM = VIP/IG path, PM = free release path
 
 # Editorial constraints
 VARIETY_LOOKBACK_HOURS = int(env("VARIETY_LOOKBACK_HOURS", "72"))
-DEST_REPEAT_PENALTY = float(env("DEST_REPEAT_PENALTY", "25.0"))
+DEST_REPEAT_PENALTY = float(env("DEST_REPEAT_PENALTY", "50.0"))   # IMPORTANT: boredom breaker
 THEME_REPEAT_PENALTY = float(env("THEME_REPEAT_PENALTY", "10.0"))
 RECENCY_FILTER_HOURS = int(env("RECENCY_FILTER_HOURS", "48"))
+
+# Scoring weights (baseline; price can override when outlier)
+THEME_WEIGHT_BASE = float(env("THEME_WEIGHT_BASE", "0.60"))
+PRICE_WEIGHT_BASE = float(env("PRICE_WEIGHT_BASE", "0.40"))
 
 
 # =========================
 # Status constants
 # =========================
 STATUS_NEW = "NEW"
+STATUS_SCORED = "SCORED"  # <-- DEADLOCK FIX
 STATUS_READY_TO_POST = "READY_TO_POST"
 STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
 STATUS_POSTED_INSTAGRAM = "POSTED_INSTAGRAM"
@@ -142,14 +131,19 @@ def safe_get(row: Dict[str, str], key: str) -> str:
 
 def safe_float(val: Any, default: float = 0.0) -> float:
     try:
-        return float(val) if val else default
+        if val is None:
+            return default
+        s = str(val).strip()
+        if s == "":
+            return default
+        return float(s)
     except:
         return default
 
 
 def round_price_up(price_str: str) -> int:
     try:
-        return math.ceil(float(price_str))
+        return math.ceil(float(str(price_str).strip()))
     except:
         return 0
 
@@ -159,21 +153,18 @@ def format_date_yymmdd(date_str: str) -> str:
         if not date_str:
             return ""
         date_str = date_str.strip()
-        
-        if '/' in date_str:
-            parts = date_str.split('/')
-            if len(parts) == 3:
-                mm, dd, yy = parts
-                return f"{yy.zfill(2)}{mm.zfill(2)}{dd.zfill(2)}"
-        
-        if '-' in date_str:
-            parts = date_str.split('-')
+        if "-" in date_str:
+            parts = date_str.split("-")
             if len(parts) == 3:
                 yy = parts[0][2:]
                 mm = parts[1].zfill(2)
                 dd = parts[2].zfill(2)
                 return f"{yy}{mm}{dd}"
-        
+        if "/" in date_str:
+            parts = date_str.split("/")
+            if len(parts) == 3:
+                mm, dd, yy = parts
+                return f"{yy.zfill(2)}{mm.zfill(2)}{dd.zfill(2)}"
         return ""
     except:
         return ""
@@ -190,8 +181,26 @@ def hours_since(ts: str) -> float:
 
 
 def stable_hash(text: str) -> int:
-    """Stable hash (not per-process random)"""
     return int(hashlib.md5(text.encode()).hexdigest(), 16)
+
+
+def today_theme() -> str:
+    """
+    Daily themes (simple schedule).
+    You can adjust this later via CONFIG if you want.
+    """
+    # Monday=0 ... Sunday=6
+    dow = dt.datetime.utcnow().weekday()
+    schedule = {
+        0: "city_breaks",  # Mon
+        1: "winter_sun",   # Tue
+        2: "surf",         # Wed
+        3: "snow",         # Thu
+        4: "city_breaks",  # Fri
+        5: "winter_sun",   # Sat
+        6: "winter_sun",   # Sun
+    }
+    return schedule.get(dow, "city_breaks")
 
 
 # =========================
@@ -207,7 +216,7 @@ def get_ws() -> Tuple[gspread.Worksheet, List[str]]:
     ws = sh.worksheet(RAW_DEALS_TAB)
     headers = ws.row_values(1)
     if not headers:
-        raise RuntimeError("No headers found")
+        raise RuntimeError("No headers found in RAW_DEALS")
     return ws, headers
 
 
@@ -219,34 +228,19 @@ def header_map(headers: List[str]) -> Dict[str, int]:
 # CONFIG_SIGNALS (Real Schema)
 # =========================
 def load_config_signals(ws_parent: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
-    """
-    Load CONFIG_SIGNALS using actual schema:
-    - Key column: iata_hint
-    - Score columns: sun_score_m01, surf_score_m01, snow_score_m01, etc.
-
-    Hardened:
-    - Never crashes if iata_hint is blank/NaN/number
-    - Only accepts valid 3-letter IATA keys
-    """
-
     def _safe_text(v: Any) -> str:
-        # Convert Google Sheet weirdness (None/NaN/float) into safe text
         if v is None:
             return ""
-        # gspread sometimes returns floats for blank cells (e.g., NaN)
         if isinstance(v, float):
             try:
-                # NaN check
-                if v != v:  # NaN is never equal to itself
+                if v != v:  # NaN
                     return ""
-            except Exception:
+            except:
                 return ""
-            # If someone typed a number, it's not a valid IATA anyway
             return ""
-        # Fall back to string
         try:
             return str(v)
-        except Exception:
+        except:
             return ""
 
     try:
@@ -258,91 +252,59 @@ def load_config_signals(ws_parent: gspread.Spreadsheet) -> Dict[str, Dict[str, A
     try:
         records = signals_ws.get_all_records()
     except Exception:
-        log("CONFIG_SIGNALS empty")
+        log("CONFIG_SIGNALS empty/unreadable")
         return {}
 
     signals_map: Dict[str, Dict[str, Any]] = {}
-
     bad_rows = 0
+
     for rec in records:
         raw_iata = _safe_text(rec.get("iata_hint"))
         iata = raw_iata.strip().upper()
-
-        # Only accept strict 3-letter keys (BCN, BGO, TFS, etc.)
         if len(iata) == 3 and iata.isalpha():
             signals_map[iata] = rec
         else:
-            # Skip junk rows safely
             if raw_iata != "":
                 bad_rows += 1
 
-    log(f"Loaded CONFIG_SIGNALS for {len(signals_map)} destinations (skipped {bad_rows} bad iata_hint rows)")
+    log(f"Loaded CONFIG_SIGNALS: {len(signals_map)} destinations (skipped {bad_rows} bad iata_hint rows)")
     return signals_map
 
+
 def get_activity_scores(signals: Dict[str, Any], month: int) -> Dict[str, float]:
-    """
-    Get sun/surf/snow scores for a given month.
-    
-    Returns: {'sun': 0-3, 'surf': 0-3, 'snow': 0-3}
-    """
     month_str = f"m{month:02d}"
-    
-    sun_score = safe_float(signals.get(f'sun_score_{month_str}'), 0.0)
-    surf_score = safe_float(signals.get(f'surf_score_{month_str}'), 0.0)
-    snow_score = safe_float(signals.get(f'snow_score_{month_str}'), 0.0)
-    
-    return {
-        'sun': sun_score,
-        'surf': surf_score,
-        'snow': snow_score
-    }
+    sun_score = safe_float(signals.get(f"sun_score_{month_str}"), 0.0)
+    surf_score = safe_float(signals.get(f"surf_score_{month_str}"), 0.0)
+    snow_score = safe_float(signals.get(f"snow_score_{month_str}"), 0.0)
+    return {"sun": sun_score, "surf": surf_score, "snow": snow_score}
 
 
 def derive_theme_from_signals(signals: Dict[str, Any], month: int) -> str:
     """
-    Derive theme from CONFIG_SIGNALS based on highest activity score.
-    
-    Logic:
-    1. Get sun/surf/snow scores for the month
-    2. Pick activity with highest score (>1.0 threshold)
-    3. Map to theme:
-       - snow → snow
-       - surf → surf
-       - sun (in winter months) → winter_sun
-       - sun (other months) → shoulder
-       - all low → city_breaks
-    
     Returns: winter_sun | surf | snow | city_breaks | shoulder
     """
     if not signals:
         return "shoulder"
-    
+
     scores = get_activity_scores(signals, month)
-    
-    # Find dominant activity (must be >1.0 to be relevant)
-    max_activity = max(scores.items(), key=lambda x: x[1])
-    activity_name, activity_score = max_activity
-    
+    activity_name, activity_score = max(scores.items(), key=lambda x: x[1])
+
     if activity_score <= 1.0:
-        # No strong activity signal, default to city_breaks
         return "city_breaks"
-    
-    # Theme mapping
-    if activity_name == 'snow' and activity_score >= 2.0:
+
+    if activity_name == "snow" and activity_score >= 2.0:
         return "snow"
-    
-    if activity_name == 'surf' and activity_score >= 2.0:
+
+    if activity_name == "surf" and activity_score >= 2.0:
         return "surf"
-    
-    if activity_name == 'sun':
-        # Winter sun if it's winter months (Nov-Mar) and good score
+
+    if activity_name == "sun":
         if month in [11, 12, 1, 2, 3] and activity_score >= 2.0:
             return "winter_sun"
-        elif activity_score >= 2.5:
-            return "winter_sun"  # Strong sun score any time
-        else:
-            return "shoulder"
-    
+        if activity_score >= 2.5:
+            return "winter_sun"
+        return "shoulder"
+
     return "city_breaks"
 
 
@@ -350,7 +312,6 @@ def derive_theme_from_signals(signals: Dict[str, Any], month: int) -> str:
 # CONFIG Routes
 # =========================
 def load_routes_from_config(ws_parent: gspread.Spreadsheet) -> List[Tuple[int, str, str, str, str, int]]:
-    """Load enabled routes from CONFIG tab"""
     try:
         cfg = ws_parent.worksheet(CONFIG_TAB)
     except:
@@ -363,8 +324,8 @@ def load_routes_from_config(ws_parent: gspread.Spreadsheet) -> List[Tuple[int, s
     headers = [h.strip() for h in values[0]]
     idx = {h: i for i, h in enumerate(headers) if h}
 
-    routes = []
-    
+    routes: List[Tuple[int, str, str, str, str, int]] = []
+
     for r in values[1:]:
         enabled = ""
         if "enabled" in idx and idx["enabled"] < len(r):
@@ -383,7 +344,7 @@ def load_routes_from_config(ws_parent: gspread.Spreadsheet) -> List[Tuple[int, s
         origin_city = (r[idx["origin_city"]] if "origin_city" in idx and idx["origin_city"] < len(r) else "").strip()
         dest_iata = (r[idx["destination_iata"]] if "destination_iata" in idx and idx["destination_iata"] < len(r) else "").strip().upper()
         dest_city = (r[idx["destination_city"]] if "destination_city" in idx and idx["destination_city"] < len(r) else "").strip()
-        
+
         days_ahead = 60
         if "days_ahead" in idx and idx["days_ahead"] < len(r):
             try:
@@ -399,87 +360,64 @@ def load_routes_from_config(ws_parent: gspread.Spreadsheet) -> List[Tuple[int, s
 
 
 def select_routes_rotating(routes: List[Tuple[int, str, str, str, str, int]], max_routes: int) -> List[Tuple[int, str, str, str, str, int]]:
-    """Deterministic route rotation"""
     if not routes or len(routes) <= max_routes:
         return routes
-    
     day_of_year = dt.date.today().timetuple().tm_yday
     slot_offset = 0 if RUN_SLOT == "AM" else 1
     start_idx = ((day_of_year * 2) + slot_offset) % len(routes)
-    
     selected = []
     for i in range(max_routes):
         idx = (start_idx + i) % len(routes)
         selected.append(routes[idx])
-    
     return selected
 
 
 # =========================
 # Duffel
 # =========================
-
-
-# ===================================================================
-# PHASE 1: ELASTIC SUPPLY - Auto-populate CONFIG if empty
-# ===================================================================
-
 DEFAULT_ROUTES = [
-    (1, 'LGW', 'London', 'KEF', 'Reykjavik', 'Iceland', 180, 5),
-    (1, 'LGW', 'London', 'BGO', 'Bergen', 'Norway', 150, 5),
-    (1, 'MAN', 'Manchester', 'KEF', 'Reykjavik', 'Iceland', 200, 5),
-    (2, 'LGW', 'London', 'FAO', 'Faro', 'Portugal', 120, 5),
-    (2, 'LGW', 'London', 'TFS', 'Tenerife', 'Spain', 150, 5),
-    (2, 'MAN', 'Manchester', 'FAO', 'Faro', 'Portugal', 140, 5),
-    (2, 'LGW', 'London', 'BCN', 'Barcelona', 'Spain', 90, 3),
-    (2, 'MAN', 'Manchester', 'BCN', 'Barcelona', 'Spain', 100, 3),
-    (3, 'STN', 'London Stansted', 'TFS', 'Tenerife', 'Spain', 160, 5),
-    (3, 'EDI', 'Edinburgh', 'KEF', 'Reykjavik', 'Iceland', 220, 5),
+    (1, "LGW", "London", "KEF", "Reykjavik", "Iceland", 180, 5),
+    (1, "LGW", "London", "BGO", "Bergen", "Norway", 150, 5),  # Bergen fixed to BGO
+    (1, "MAN", "Manchester", "KEF", "Reykjavik", "Iceland", 200, 5),
+    (2, "LGW", "London", "FAO", "Faro", "Portugal", 120, 5),
+    (2, "LGW", "London", "TFS", "Tenerife", "Spain", 150, 5),
+    (2, "MAN", "Manchester", "FAO", "Faro", "Portugal", 140, 5),
+    (2, "LGW", "London", "BCN", "Barcelona", "Spain", 90, 3),
+    (2, "MAN", "Manchester", "BCN", "Barcelona", "Spain", 100, 3),
 ]
 
 def populate_config_if_empty(ws_spreadsheet, config_tab_name: str) -> int:
-    """PHASE 1: Auto-populate CONFIG if empty"""
     try:
         cfg = ws_spreadsheet.worksheet(config_tab_name)
     except:
-        log("  Creating CONFIG tab...")
+        log("Creating CONFIG tab...")
         cfg = ws_spreadsheet.add_worksheet(title=config_tab_name, rows=100, cols=20)
-        headers = ['enabled', 'priority', 'origin_iata', 'origin_city',
-                   'destination_iata', 'destination_city', 'destination_country',
-                   'days_ahead', 'trip_length_days']
+        headers = ["enabled","priority","origin_iata","origin_city","destination_iata","destination_city","destination_country","days_ahead","trip_length_days"]
         cfg.append_row(headers)
-    
+
     try:
         values = cfg.get_all_values()
         if len(values) < 2:
             enabled_count = 0
         else:
             headers = [h.strip() for h in values[0]]
-            enabled_idx = headers.index('enabled') if 'enabled' in headers else 0
-            enabled_count = sum(
-                1 for row in values[1:] 
-                if len(row) > enabled_idx and row[enabled_idx].upper() in ('TRUE', '1', 'YES')
-            )
+            enabled_idx = headers.index("enabled") if "enabled" in headers else 0
+            enabled_count = sum(1 for row in values[1:] if len(row) > enabled_idx and (row[enabled_idx] or "").upper() in ("TRUE","1","YES"))
     except:
         enabled_count = 0
-    
+
     if enabled_count >= 3:
-        log(f"  CONFIG: {enabled_count} enabled routes found")
+        log(f"CONFIG: {enabled_count} enabled routes found")
         return 0
-    
-    log(f"  CONFIG: Only {enabled_count} routes - auto-populating")
+
+    log(f"CONFIG: Only {enabled_count} routes - auto-populating defaults")
     rows_to_add = []
     for route in DEFAULT_ROUTES:
         priority, origin_iata, origin_city, dest_iata, dest_city, dest_country, days_ahead, trip_length = route
-        rows_to_add.append([
-            'TRUE', str(priority), origin_iata, origin_city,
-            dest_iata, dest_city, dest_country,
-            str(days_ahead), str(trip_length)
-        ])
-    
+        rows_to_add.append(["TRUE", str(priority), origin_iata, origin_city, dest_iata, dest_city, dest_country, str(days_ahead), str(trip_length)])
+
     if rows_to_add:
-        cfg.append_rows(rows_to_add, value_input_option='USER_ENTERED')
-    
+        cfg.append_rows(rows_to_add, value_input_option="USER_ENTERED")
     return len(rows_to_add)
 
 
@@ -508,26 +446,23 @@ def duffel_offer_request(origin: str, dest: str, out_date: str, ret_date: str) -
 
 
 def run_duffel_feeder(ws: gspread.Worksheet, headers: List[str]) -> int:
-    """Feed deals with safe defaults (MAX_INSERTS=3)"""
     if not DUFFEL_ENABLED or not DUFFEL_API_KEY:
-        log("Duffel: DISABLED")
+        log("Duffel: DISABLED (or missing key)")
         return 0
 
     sh = ws.spreadsheet
-    # PHASE 1: Auto-populate CONFIG if empty
     routes_added = populate_config_if_empty(sh, CONFIG_TAB)
     if routes_added > 0:
-        log(f"✓ Auto-populated CONFIG with {routes_added} routes")
-    
+        log(f"Auto-populated CONFIG with {routes_added} routes")
+
     routes = load_routes_from_config(sh)
     if not routes:
-        log("⚠️  CONFIG still empty after auto-population")
+        log("CONFIG empty after auto-population")
         return 0
 
     selected_routes = select_routes_rotating(routes, DUFFEL_ROUTES_PER_RUN)
     log(f"Duffel: Searching {len(selected_routes)} routes (MAX_INSERTS={DUFFEL_MAX_INSERTS})")
 
-    hmap = header_map(headers)
     total_inserted = 0
 
     for priority, origin_iata, origin_city, dest_iata, dest_city, days_ahead in selected_routes:
@@ -535,15 +470,14 @@ def run_duffel_feeder(ws: gspread.Worksheet, headers: List[str]) -> int:
         out_date = today + dt.timedelta(days=days_ahead)
         ret_date = out_date + dt.timedelta(days=5)
 
-        log(f"  {origin_city} ({origin_iata}) → {dest_city} ({dest_iata})")
-        
+        log(f"  {origin_city or origin_iata} ({origin_iata}) → {dest_city or dest_iata} ({dest_iata})")
+
         try:
             data = duffel_offer_request(origin_iata, dest_iata, str(out_date), str(ret_date))
         except Exception as e:
             log(f"  Duffel error: {e}")
             continue
 
-        # Handle Duffel response structure
         offers = []
         if isinstance(data, dict):
             if "data" in data:
@@ -556,7 +490,7 @@ def run_duffel_feeder(ws: gspread.Worksheet, headers: List[str]) -> int:
                 offers = data["offers"]
 
         if not offers:
-            log(f"  0 offers")
+            log("  0 offers")
             continue
 
         rows_to_append = []
@@ -566,13 +500,14 @@ def run_duffel_feeder(ws: gspread.Worksheet, headers: List[str]) -> int:
             if inserted_for_route >= DUFFEL_MAX_INSERTS:
                 break
 
-            price = off.get("total_amount") or ""
             currency = off.get("total_currency") or "GBP"
             if currency != "GBP":
                 continue
 
+            price = off.get("total_amount") or ""
             airline = (off.get("owner") or {}).get("name") or ""
             slices = off.get("slices") or []
+
             stops = "0"
             try:
                 segs = (slices[0].get("segments") or [])
@@ -606,17 +541,13 @@ def run_duffel_feeder(ws: gspread.Worksheet, headers: List[str]) -> int:
             row_obj["date_added"] = now_utc()
             row_obj["airline"] = airline
             row_obj["stops"] = stops
-            row_obj["status"] = STATUS_NEW
+            row_obj["status"] = STATUS_NEW  # NEW = truly unprocessed
 
-            # Booking link
-            out_formatted = str(out_date).replace('-', '')
-            ret_formatted = str(ret_date).replace('-', '')
+            out_formatted = str(out_date).replace("-", "")
+            ret_formatted = str(ret_date).replace("-", "")
             base_url = f"https://www.skyscanner.net/transport/flights/{origin_iata}/{dest_iata}/{out_formatted}/{ret_formatted}/"
-            if SKYSCANNER_AFFILIATE_ID:
-                booking_link = f"{base_url}?affiliateid={SKYSCANNER_AFFILIATE_ID}"
-            else:
-                booking_link = base_url
-            
+            booking_link = f"{base_url}?affiliateid={SKYSCANNER_AFFILIATE_ID}" if SKYSCANNER_AFFILIATE_ID else base_url
+
             row_obj["booking_link_vip"] = booking_link
             row_obj["booking_link_free"] = booking_link
             row_obj["affiliate_url"] = booking_link
@@ -626,81 +557,165 @@ def run_duffel_feeder(ws: gspread.Worksheet, headers: List[str]) -> int:
 
         if rows_to_append:
             ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-            log(f"  ✓ Inserted {len(rows_to_append)} deals")
+            log(f"  Inserted {len(rows_to_append)} deals")
             total_inserted += len(rows_to_append)
 
     return total_inserted
 
 
 # =========================
-# AI Scoring
+# SCORING (Elastic / Soft Theme Weighting)
 # =========================
-def score_deal_with_ai(row: Dict[str, str], theme: str, signals_map: Dict, today: dt.date) -> Dict[str, Any]:
-    """PHASE 2: Mathematical Stotal scoring - replaces OpenAI"""
-    # Component 1: Theme score (0-1)
-    auto = str(row.get("auto_theme", "")).strip().lower()
-    theme_score = 0.75 if auto == theme else (0.35 if auto else 0.25)
-    
-    # Component 2: Value score (0-1) with price validation
-    price = safe_float(safe_get(row, "price_gbp") or safe_get(row, "price"), 0.0)
-    if price < 10 or price > 800:
-        value_score = 0.0
-    else:
-        value_score = max(0.0, min(1.0, (300.0 - price) / 290.0))
-    
-    # Component 3: Route score (0-1)
-    stops = safe_float(safe_get(row, "stops"), 0.0)
-    route_score = 0.9 if stops == 0 else (0.6 if stops <= 1 else 0.3)
-    
-    # Component 4: Timing score (0-1)
+def value_score_from_price(price: float) -> float:
+    """
+    0..1
+    Designed for UK audience short-haul + some long-haul.
+    Cheap flights score higher; clamps safe.
+    """
+    if price <= 0:
+        return 0.0
+    if price < 10 or price > 1200:
+        return 0.0
+    # Normalise around 300 being "meh"; below is better
+    return max(0.0, min(1.0, (350.0 - price) / 340.0))
+
+
+def route_score_from_stops(stops: float) -> float:
+    if stops <= 0:
+        return 0.90
+    if stops <= 1:
+        return 0.60
+    return 0.30
+
+
+def timing_score_from_outbound(outbound_date: str, today: dt.date) -> float:
+    """
+    0..1
+    Prefers 2-12 weeks out but still allows other dates.
+    """
     try:
-        dep_str = safe_get(row, "outbound_date")
-        if '-' in dep_str:
-            dep = dt.date.fromisoformat(dep_str)
-            days = (dep - today).days
-            timing_score = 0.8 if 14 <= days <= 90 else (0.6 if 7 <= days <= 180 else 0.3)
-        else:
-            timing_score = 0.5
+        dep = dt.date.fromisoformat(outbound_date)
+        days = (dep - today).days
+        if 14 <= days <= 90:
+            return 0.80
+        if 7 <= days <= 180:
+            return 0.60
+        if 181 <= days <= 365:
+            return 0.45
+        return 0.30
     except:
-        timing_score = 0.5
-    
-    # Calculate Stotal (weighted sum)
-    stotal = (theme_score * 0.45 + value_score * 0.30 + 
-              route_score * 0.15 + timing_score * 0.10) * 100
-    
-    # Determine theme strength
-    theme_strength = "primary" if theme_score >= 0.75 else ("adjacent" if theme_score >= 0.45 else "wildcard")
-    
-    # Determine angle type
-    if theme_strength == "wildcard":
-        angle_type = "price_led" if value_score >= 0.65 else ("routing_win" if route_score >= 0.75 else "price_led")
-    elif theme_strength == "adjacent":
-        angle_type = "smart_alternative"
-    else:
-        angle_type = "classic_theme"
-    
+        return 0.50
+
+
+def theme_alignment_score(deal_theme: str, target_theme: str) -> float:
+    """
+    Soft alignment:
+    - exact match: 1.0
+    - shoulder/city can be adjacent to most: 0.55
+    - otherwise mismatch: 0.25
+    """
+    d = (deal_theme or "").strip().lower()
+    t = (target_theme or "").strip().lower()
+    if not d or not t:
+        return 0.25
+    if d == t:
+        return 1.0
+    # Adjacent logic (simple, safe)
+    if t == "winter_sun" and d in ("shoulder", "city_breaks"):
+        return 0.55
+    if t == "city_breaks" and d in ("shoulder",):
+        return 0.55
+    if t in ("surf", "snow") and d in ("shoulder", "city_breaks"):
+        return 0.45
+    return 0.25
+
+
+def determine_strength_and_angle(align: float, val: float, route: float) -> Tuple[str, str]:
+    """
+    Returns (theme_strength, angle_type)
+    theme_strength: primary | adjacent | wildcard
+    angle_type: classic_theme | smart_alternative | price_led | routing_win | quiet_season
+    """
+    if align >= 0.90:
+        return "primary", "classic_theme"
+
+    if align >= 0.50:
+        # adjacent
+        return "adjacent", "smart_alternative"
+
+    # wildcard
+    if val >= 0.70:
+        return "wildcard", "price_led"
+    if route >= 0.80:
+        return "wildcard", "routing_win"
+    return "wildcard", "price_led"
+
+
+def score_deal_elastic(row: Dict[str, str], deal_theme: str, target_theme: str) -> Dict[str, Any]:
+    """
+    Elastic scorer:
+    - Base weights: Theme 0.60, Price 0.40
+    - BUT if price is an outlier (very high value_score), price weight can dominate.
+    """
+    price = safe_float(safe_get(row, "price_gbp") or safe_get(row, "price"), 0.0)
+    stops = safe_float(safe_get(row, "stops"), 0.0)
+
+    today = dt.date.today()
+    outbound_date = safe_get(row, "outbound_date")
+
+    align = theme_alignment_score(deal_theme, target_theme)
+    val = value_score_from_price(price)
+    route = route_score_from_stops(stops)
+    timing = timing_score_from_outbound(outbound_date, today)
+
+    # Adaptive weighting:
+    # If value score is very strong, allow it to override theme.
+    theme_w = THEME_WEIGHT_BASE
+    price_w = PRICE_WEIGHT_BASE
+    if val >= 0.85:
+        theme_w = 0.20
+        price_w = 0.80
+    elif val >= 0.70:
+        theme_w = 0.40
+        price_w = 0.60
+
+    # Composite score (0..100)
+    stotal = (
+        (align * theme_w) +
+        (val * price_w) +
+        (route * 0.10) +
+        (timing * 0.10)
+    ) * 100.0
+
+    strength, angle = determine_strength_and_angle(align, val, route)
+
     return {
         "stotal": round(stotal, 1),
         "ai_score": round(stotal, 1),
-        "theme_score": round(theme_score, 3),
-        "value_score": round(value_score, 3),
-        "route_score": round(route_score, 3),
-        "timing_score": round(timing_score, 3),
-        "theme_strength": theme_strength,
-        "angle_type": angle_type,
+        "theme_alignment": round(align, 3),
+        "value_score": round(val, 3),
+        "route_score": round(route, 3),
+        "timing_score": round(timing, 3),
+        "theme_strength": strength,
+        "angle_type": angle,
         "ai_verdict": "EXCELLENT" if stotal >= 90 else ("VERY_GOOD" if stotal >= 80 else ("GOOD" if stotal >= 70 else "ACCEPTABLE")),
-        "ai_caption": f"Flights to {safe_get(row, 'destination_city')}"
     }
 
 
 def stage_score_all_new(ws: gspread.Worksheet, headers: List[str], signals_map: Dict[str, Dict]) -> int:
-    """Score NEW deals and derive theme from CONFIG_SIGNALS"""
+    """
+    DEADLOCK FIX:
+    - Only reads NEW
+    - Writes scores + auto_theme
+    - Then sets status -> SCORED
+    """
     hmap = header_map(headers)
     rows = ws.get_all_values()
     if len(rows) < 2:
         return 0
 
     scored_count = 0
+    target = today_theme()
 
     for i in range(2, len(rows) + 1):
         row_vals = rows[i - 1]
@@ -709,145 +724,142 @@ def stage_score_all_new(ws: gspread.Worksheet, headers: List[str], signals_map: 
         if safe_get(row, "status").upper() != STATUS_NEW:
             continue
 
-        if safe_get(row, "ai_score"):
-            continue
-
-        # Derive theme from CONFIG_SIGNALS
-        dest_iata = safe_get(row, "destination_iata")
-        out_date = safe_get(row, "outbound_date")
-        
-        try:
-            if '-' in out_date:
-                month = int(out_date.split('-')[1])
-            elif '/' in out_date:
-                month = int(out_date.split('/')[0])
-            else:
-                month = dt.date.today().month
-        except:
-            month = dt.date.today().month
-        
-        signals = signals_map.get(dest_iata, {})
-        auto_theme = derive_theme_from_signals(signals, month)
-        
-        log(f"  Scoring row {i}: {safe_get(row, 'destination_city')} (theme: {auto_theme})")
-
-        # Score with AI
-        # Derive theme
-        dest_iata = safe_get(row, "destination_iata")
+        # derive month
         out_date = safe_get(row, "outbound_date")
         try:
-            month = int(out_date.split('-')[1]) if '-' in out_date else dt.date.today().month
+            month = int(out_date.split("-")[1]) if "-" in out_date else dt.date.today().month
         except:
             month = dt.date.today().month
-        signals = signals_map.get(dest_iata, {})
-        auto_theme = derive_theme_from_signals(signals, month)
-        
-        # PHASE 2: Calculate Stotal
-        today = dt.date.today()
-        result = score_deal_with_ai(row, auto_theme, signals_map, today)
 
-        # Update sheet
-        updates = []
-        if "ai_score" in hmap:
-            updates.append(gspread.Cell(i, hmap["ai_score"], result["ai_score"]))
-        if "stotal" in hmap:
-            updates.append(gspread.Cell(i, hmap["stotal"], result["stotal"]))
-        if "ai_verdict" in hmap:
-            updates.append(gspread.Cell(i, hmap["ai_verdict"], result["ai_verdict"]))
-        if "theme_score" in hmap:
-            updates.append(gspread.Cell(i, hmap["theme_score"], result["theme_score"]))
-        if "value_score" in hmap:
-            updates.append(gspread.Cell(i, hmap["value_score"], result["value_score"]))
-        if "route_score" in hmap:
-            updates.append(gspread.Cell(i, hmap["route_score"], result["route_score"]))
-        if "timing_score" in hmap:
-            updates.append(gspread.Cell(i, hmap["timing_score"], result["timing_score"]))
-        if "theme_strength" in hmap:
-            updates.append(gspread.Cell(i, hmap["theme_strength"], result["theme_strength"]))
-        if "angle_type" in hmap:
-            updates.append(gspread.Cell(i, hmap["angle_type"], result["angle_type"]))
-        if "ai_caption" in hmap:
-            updates.append(gspread.Cell(i, hmap["ai_caption"], result["ai_caption"]))
-        if "auto_theme" in hmap:
-            updates.append(gspread.Cell(i, hmap["auto_theme"], auto_theme))
+        dest_iata = safe_get(row, "destination_iata").upper()
+        signals = signals_map.get(dest_iata, {})
+        deal_theme = derive_theme_from_signals(signals, month)
+
+        result = score_deal_elastic(row, deal_theme=deal_theme, target_theme=target)
+
+        log(f"  Scoring row {i}: {safe_get(row, 'destination_city')} | deal_theme={deal_theme} | target_theme={target} | score={result['ai_score']}")
+
+        updates: List[gspread.Cell] = []
+
+        def put(col: str, val: Any):
+            if col in hmap:
+                updates.append(gspread.Cell(i, hmap[col], val))
+
+        put("stotal", result["stotal"])
+        put("ai_score", result["ai_score"])
+        put("ai_verdict", result["ai_verdict"])
+        put("theme_alignment", result["theme_alignment"])
+        put("value_score", result["value_score"])
+        put("route_score", result["route_score"])
+        put("timing_score", result["timing_score"])
+        put("theme_strength", result["theme_strength"])
+        put("angle_type", result["angle_type"])
+
+        put("auto_theme", deal_theme)
+        put("target_theme", target)  # optional helper column if you create it
+        put("scored_timestamp", now_utc())
+
+        # Ensure destination_key set
         if "destination_key" in hmap and not safe_get(row, "destination_key"):
-            updates.append(gspread.Cell(i, hmap["destination_key"], dest_iata))
+            put("destination_key", dest_iata)
+
+        # DEADLOCK FIX: move NEW -> SCORED
+        put("status", STATUS_SCORED)
 
         if updates:
             ws.update_cells(updates, value_input_option="USER_ENTERED")
-
-        scored_count += 1
+            scored_count += 1
 
     return scored_count
 
 
 # =========================
-# EDITORIAL SELECTION
+# EDITORIAL SELECTION (Diversity Force + Soft Weight)
 # =========================
-def get_recent_posts(rows: List[List[str]], headers: List[str], lookback_hours: int) -> Tuple[set, set]:
-    """Get recently posted destinations and themes"""
+def get_recent_posts(rows: List[List[str]], headers: List[str], lookback_hours: int) -> Tuple[set, set, List[str]]:
+    """
+    Returns:
+      recent_dests: destinations posted within lookback
+      recent_themes: themes posted within lookback
+      last3_dests: most recent 3 destinations (hard avoid if possible)
+    """
     cutoff = dt.datetime.utcnow() - dt.timedelta(hours=lookback_hours)
     recent_dests = set()
     recent_themes = set()
-    
+    timeline: List[Tuple[dt.datetime, str]] = []
+
     for i in range(1, len(rows)):
         row = {headers[c]: (rows[i][c] if c < len(rows[i]) else "") for c in range(len(headers))}
-        
         status = safe_get(row, "status").upper()
-        if status not in ["POSTED_INSTAGRAM", "POSTED_TELEGRAM_VIP", "POSTED_ALL"]:
+        if status not in (STATUS_POSTED_INSTAGRAM, STATUS_POSTED_TELEGRAM_VIP, STATUS_POSTED_ALL):
             continue
-        
-        posted_ts = safe_get(row, "ig_published_timestamp") or safe_get(row, "tg_monthly_timestamp")
+
+        posted_ts = safe_get(row, "ig_published_timestamp") or safe_get(row, "tg_monthly_timestamp") or safe_get(row, "tg_free_timestamp")
         if not posted_ts:
             continue
-        
+
         try:
             posted_dt = dt.datetime.fromisoformat(posted_ts.replace("Z", "+00:00"))
-            if posted_dt > cutoff:
-                dest_key = safe_get(row, "destination_key") or safe_get(row, "destination_iata")
-                theme = safe_get(row, "auto_theme") or safe_get(row, "theme") or ""
-                
-                if dest_key:
-                    recent_dests.add(dest_key.upper())
-                if theme:
-                    recent_themes.add(theme.lower())
         except:
-            pass
-    
-    return recent_dests, recent_themes
+            continue
+
+        dest_key = (safe_get(row, "destination_key") or safe_get(row, "destination_iata") or "").upper()
+        theme = (safe_get(row, "auto_theme") or safe_get(row, "theme") or "").lower()
+
+        # Timeline always for last-3
+        if dest_key:
+            timeline.append((posted_dt, dest_key))
+
+        # lookback sets
+        if posted_dt > cutoff:
+            if dest_key:
+                recent_dests.add(dest_key)
+            if theme:
+                recent_themes.add(theme)
+
+    # last 3 destinations by most recent timestamp
+    timeline.sort(key=lambda x: x[0], reverse=True)
+    last3 = [d for _, d in timeline[:3]]
+
+    return recent_dests, recent_themes, last3
 
 
 def stage_select_best(ws: gspread.Worksheet, headers: List[str]) -> int:
     """
-    Editorial selection with variety enforcement.
-    
-    Key: Groups by (destination_key, theme), applies penalties, selects winner.
+    Selection logic:
+    - ONLY considers SCORED (deadlock fix)
+    - Recency filter on date_added
+    - Applies repeat penalties (DEST + THEME)
+    - HARD avoid last 3 destinations if possible
+    - Still allows price-led wildcard to break theme on big value
     """
     hmap = header_map(headers)
     rows = ws.get_all_values()
     if len(rows) < 2:
         return 0
 
-    # Get recent posts
-    recent_dests, recent_themes = get_recent_posts(rows, headers, VARIETY_LOOKBACK_HOURS)
-    
-    if recent_dests:
-        log(f"  Recent destinations: {sorted(list(recent_dests))[:5]}")
-    if recent_themes:
-        log(f"  Recent themes: {sorted(list(recent_themes))}")
+    recent_dests, recent_themes, last3 = get_recent_posts(rows, headers, VARIETY_LOOKBACK_HOURS)
 
-    # Collect candidates (with recency filter)
+    if last3:
+        log(f"  Last 3 destinations: {last3}")
+    if recent_dests:
+        log(f"  Recent destinations (lookback): {sorted(list(recent_dests))[:8]}")
+    if recent_themes:
+        log(f"  Recent themes (lookback): {sorted(list(recent_themes))}")
+
     recency_cutoff = dt.datetime.utcnow() - dt.timedelta(hours=RECENCY_FILTER_HOURS)
+    target = today_theme()
+
     candidates = []
-    
+
     for i in range(2, len(rows) + 1):
         row_vals = rows[i - 1]
         row = {headers[c]: (row_vals[c] if c < len(row_vals) else "") for c in range(len(headers))}
 
-        if safe_get(row, "status").upper() != STATUS_NEW:
+        if safe_get(row, "status").upper() != STATUS_SCORED:
             continue
 
-        # Recency filter: only consider recent deals
+        # Recency filter (only recently added deals)
         date_added = safe_get(row, "date_added")
         if date_added:
             try:
@@ -857,82 +869,74 @@ def stage_select_best(ws: gspread.Worksheet, headers: List[str]) -> int:
             except:
                 pass
 
-        ai_score_str = safe_get(row, "ai_score")
-        if not ai_score_str:
-            continue
-
-        try:
-            ai_score = float(ai_score_str)
-        except:
+        ai_score = safe_float(safe_get(row, "ai_score"), 0.0)
+        if ai_score <= 0:
             continue
 
         dest_key = (safe_get(row, "destination_key") or safe_get(row, "destination_iata") or "").upper()
-        resolved_theme = (safe_get(row, "auto_theme") or safe_get(row, "theme") or "").lower()
-        
+        deal_theme = (safe_get(row, "auto_theme") or "").lower()
+
         if not dest_key:
             continue
 
-        # Apply penalties
+        # Base score is ai_score (already elastic)
         final_score = ai_score
-        penalties = []
-        
+        reasons = []
+
+        # Diversity penalties
         if dest_key in recent_dests:
             final_score -= DEST_REPEAT_PENALTY
-            penalties.append(f"dest:{dest_key}")
-        
-        if resolved_theme in recent_themes:
-            final_score -= THEME_REPEAT_PENALTY
-            penalties.append(f"theme:{resolved_theme}")
-        
-        penalty_str = ", ".join(penalties) if penalties else "none"
+            reasons.append(f"repeat_dest(-{DEST_REPEAT_PENALTY})")
 
+        if deal_theme and deal_theme in recent_themes:
+            final_score -= THEME_REPEAT_PENALTY
+            reasons.append(f"repeat_theme(-{THEME_REPEAT_PENALTY})")
+
+        # Extra hard avoid for "last 3" boredom loop
+        hard_block = dest_key in last3
+        if hard_block:
+            # we don't automatically discard yet; we mark it and only use if necessary
+            reasons.append("hard_block(last3)")
+
+        # Store
         candidates.append({
-            'row_idx': i,
-            'dest_key': dest_key,
-            'dest_city': safe_get(row, 'destination_city'),
-            'theme': resolved_theme,
-            'ai_score': ai_score,
-            'final_score': final_score,
-            'penalties': penalty_str,
-            'row_data': row
+            "row_idx": i,
+            "dest_key": dest_key,
+            "dest_city": safe_get(row, "destination_city") or dest_key,
+            "deal_theme": deal_theme or "unknown",
+            "ai_score": ai_score,
+            "final_score": final_score,
+            "hard_block": hard_block,
+            "reasons": ", ".join(reasons) if reasons else "none",
+            "row_data": row
         })
 
     if not candidates:
-        log("  No scored NEW deals found")
+        log("  No SCORED candidates found (nothing to select)")
         return 0
 
-    # Group by (destination_key, theme)
-    groups = {}
-    for c in candidates:
-        group_key = (c['dest_key'], c['theme'])
-        if group_key not in groups:
-            groups[group_key] = []
-        groups[group_key].append(c)
-    
-    log(f"  Candidates: {len(candidates)} deals in {len(groups)} groups")
+    # First try: any non-hard-block candidates?
+    non_blocked = [c for c in candidates if not c["hard_block"]]
+    pool = non_blocked if non_blocked else candidates
 
-    # Select best from each group
-    group_winners = []
-    for group_key, group_deals in groups.items():
-        group_deals.sort(key=lambda x: x['final_score'], reverse=True)
-        winner = group_deals[0]
-        group_winners.append(winner)
-        
-        log(f"    {group_key}: {winner['dest_city']} "
-            f"(score: {winner['ai_score']:.0f} → {winner['final_score']:.0f}, "
-            f"penalties: {winner['penalties']})")
+    # Rank by final_score
+    pool.sort(key=lambda x: x["final_score"], reverse=True)
+    selected = pool[0]
 
-    # Select best group winner
-    group_winners.sort(key=lambda x: x['final_score'], reverse=True)
-    selected = group_winners[0]
-    
+    # WHY chosen
+    log(f"  Candidates total: {len(candidates)} | non-blocked: {len(non_blocked)}")
     log(f"  ✓ SELECTED: {selected['dest_city']} ({selected['dest_key']})")
-    log(f"    Theme: {selected['theme']}")
-    log(f"    Score: {selected['ai_score']:.0f} → {selected['final_score']:.0f}")
-    
+    log(f"    deal_theme={selected['deal_theme']} | target_theme={target}")
+    log(f"    score={selected['ai_score']:.1f} → final={selected['final_score']:.1f}")
+    log(f"    selection_notes={selected['reasons']}")
+    if selected["hard_block"] and non_blocked == []:
+        log("    NOTE: Forced to pick from last-3 destinations because nothing else qualified")
+
     # Promote
     if "status" in hmap:
-        ws.update_cell(selected['row_idx'], hmap["status"], STATUS_READY_TO_POST)
+        ws.update_cell(selected["row_idx"], hmap["status"], STATUS_READY_TO_POST)
+        if "selected_timestamp" in hmap:
+            ws.update_cell(selected["row_idx"], hmap["selected_timestamp"], now_utc())
         return 1
 
     return 0
@@ -951,7 +955,6 @@ def render_image(row: Dict[str, str]) -> str:
         "outbound_date": safe_get(row, "outbound_date"),
         "return_date": safe_get(row, "return_date"),
     }
-
     r = requests.post(RENDER_URL, json=payload, timeout=30)
     r.raise_for_status()
     return r.json().get("graphic_url", "")
@@ -973,19 +976,15 @@ def stage_render(ws: gspread.Worksheet, headers: List[str]) -> int:
             continue
 
         log(f"  Rendering row {i}")
-        
         try:
             graphic_url = render_image(row)
-            
             updates = []
             if graphic_url and "graphic_url" in hmap:
                 updates.append(gspread.Cell(i, hmap["graphic_url"], graphic_url))
             if "status" in hmap:
                 updates.append(gspread.Cell(i, hmap["status"], STATUS_READY_TO_PUBLISH))
-
             if updates:
                 ws.update_cells(updates, value_input_option="USER_ENTERED")
-
             rendered += 1
         except Exception as e:
             log(f"  Render error: {e}")
@@ -999,18 +998,34 @@ def stage_render(ws: gspread.Worksheet, headers: List[str]) -> int:
 def instagram_caption_simple(row: Dict[str, str]) -> str:
     origin = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
     dest = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
-    price_raw = safe_get(row, "price_gbp")
-    price = f"£{round_price_up(price_raw)}"
+    price = f"£{round_price_up(safe_get(row, 'price_gbp'))}"
 
-    variants = [
-        f"{origin} to {dest} for {price}. VIPs saw this yesterday.",
-        f"{price} from {origin} to {dest}. Early access for VIP members.",
-        f"{dest} at {price}. Our community saw this first.",
-        f"{origin} to {dest}, {price}. VIPs got this 24h early.",
-    ]
+    # Use angle_type to keep it feeling varied + honest
+    angle = (safe_get(row, "angle_type") or "").lower()
+    variants = []
 
-    # Stable hash
-    idx = stable_hash(dest) % len(variants)
+    if angle == "price_led":
+        variants = [
+            f"{origin} → {dest} from {price}. Price dipped into the good zone — worth a look.",
+            f"{price} {origin} → {dest}. Not a promise, just a solid price right now.",
+        ]
+    elif angle == "routing_win":
+        variants = [
+            f"{origin} → {dest} from {price}. Good routing for the money (less faff).",
+            f"{price} {origin} → {dest}. If you hate connections, this one’s tidy.",
+        ]
+    elif angle == "smart_alternative":
+        variants = [
+            f"{origin} → {dest} from {price}. Theme-adjacent, but the value is real.",
+            f"{price} to {dest} from {origin}. Not the obvious pick — that’s the point.",
+        ]
+    else:
+        variants = [
+            f"{origin} → {dest} from {price}. Simple, bookable, and actually usable dates.",
+            f"{price} from {origin} to {dest}. Clean little find.",
+        ]
+
+    idx = stable_hash(dest + angle) % len(variants)
     return variants[idx]
 
 
@@ -1034,13 +1049,11 @@ def post_instagram(ws: gspread.Worksheet, headers: List[str]) -> int:
             continue
 
         log(f"  Posting to Instagram: row {i}")
-
         caption = instagram_caption_simple(row)
         cache_buster = int(time.time())
         image_url_cb = f"{graphic_url}?cb={cache_buster}"
 
         try:
-            # Create media
             create_url = f"https://graph.facebook.com/v20.0/{IG_USER_ID}/media"
             r1 = requests.post(create_url, data={
                 "image_url": image_url_cb,
@@ -1049,30 +1062,25 @@ def post_instagram(ws: gspread.Worksheet, headers: List[str]) -> int:
             }, timeout=30)
             r1.raise_for_status()
             creation_id = r1.json().get("id")
-
             if not creation_id:
                 continue
 
-            # Poll status
-            max_wait = 60
+            # Poll
             waited = 0
             media_ready = False
-
-            while waited < max_wait:
+            while waited < 60:
                 r_status = requests.get(
                     f"https://graph.facebook.com/v20.0/{creation_id}",
                     params={"fields": "status_code", "access_token": IG_ACCESS_TOKEN},
                     timeout=10
                 )
-                
                 if r_status.status_code == 200:
-                    status_code = r_status.json().get("status_code", "")
-                    if status_code == "FINISHED":
+                    sc = r_status.json().get("status_code", "")
+                    if sc == "FINISHED":
                         media_ready = True
                         break
-                    elif status_code in ("ERROR", "EXPIRED"):
+                    if sc in ("ERROR", "EXPIRED"):
                         break
-                
                 time.sleep(2)
                 waited += 2
 
@@ -1080,7 +1088,6 @@ def post_instagram(ws: gspread.Worksheet, headers: List[str]) -> int:
                 log(f"  Media not ready after {waited}s")
                 continue
 
-            # Publish
             r2 = requests.post(
                 f"https://graph.facebook.com/v20.0/{IG_USER_ID}/media_publish",
                 data={"creation_id": creation_id, "access_token": IG_ACCESS_TOKEN},
@@ -1098,7 +1105,7 @@ def post_instagram(ws: gspread.Worksheet, headers: List[str]) -> int:
                 ws.update_cells(updates, value_input_option="USER_ENTERED")
 
             posted += 1
-            log(f"  ✓ Posted to Instagram")
+            log("  ✓ Posted to Instagram")
 
         except Exception as e:
             log(f"  Instagram error: {e}")
@@ -1119,31 +1126,27 @@ def tg_send(token: str, chat: str, text: str) -> None:
 
 
 def format_telegram_vip(row: Dict[str, str]) -> str:
-    price_raw = safe_get(row, "price_gbp")
+    price_display = round_price_up(safe_get(row, "price_gbp"))
     dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
     dest_country = safe_get(row, "destination_country")
     origin_city = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
-    out_date = safe_get(row, "outbound_date")
-    ret_date = safe_get(row, "return_date")
-    ai_caption = safe_get(row, "ai_caption") or "Good value for this route"
+    out_date = format_date_yymmdd(safe_get(row, "outbound_date"))
+    ret_date = format_date_yymmdd(safe_get(row, "return_date"))
     booking_link = safe_get(row, "booking_link_vip") or safe_get(row, "affiliate_url")
 
-    price_display = round_price_up(price_raw)
-    out_display = format_date_yymmdd(out_date)
-    ret_display = format_date_yymmdd(ret_date)
+    angle = (safe_get(row, "angle_type") or "").replace("_", " ").strip()
+    theme = (safe_get(row, "auto_theme") or "").replace("_", " ").strip()
 
     dest_display = f"{dest_city}, {dest_country}" if dest_country else dest_city
 
     msg = f"""£{price_display} to {dest_display}
 
-<b>TO:</b> {dest_city.upper()}
 <b>FROM:</b> {origin_city}
+<b>OUT:</b>  {out_date}
+<b>BACK:</b> {ret_date}
 
-<b>OUT:</b>  {out_display}
-<b>BACK:</b> {ret_display}
-
-<b>Heads up:</b>
-• {ai_caption}
+<b>Angle:</b> {angle or "value"}
+<b>Theme:</b> {theme or "wildcard"}
 
 """
     if booking_link:
@@ -1153,27 +1156,21 @@ def format_telegram_vip(row: Dict[str, str]) -> str:
 
 
 def format_telegram_free(row: Dict[str, str]) -> str:
-    price_raw = safe_get(row, "price_gbp")
+    price_display = round_price_up(safe_get(row, "price_gbp"))
     dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
     dest_country = safe_get(row, "destination_country")
     origin_city = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
-    out_date = safe_get(row, "outbound_date")
-    ret_date = safe_get(row, "return_date")
+    out_date = format_date_yymmdd(safe_get(row, "outbound_date"))
+    ret_date = format_date_yymmdd(safe_get(row, "return_date"))
     booking_link = safe_get(row, "booking_link_free") or safe_get(row, "affiliate_url")
-
-    price_display = round_price_up(price_raw)
-    out_display = format_date_yymmdd(out_date)
-    ret_display = format_date_yymmdd(ret_date)
 
     dest_display = f"{dest_city}, {dest_country}" if dest_country else dest_city
 
     msg = f"""£{price_display} to {dest_display}
 
-<b>TO:</b> {dest_city.upper()}
 <b>FROM:</b> {origin_city}
-
-<b>OUT:</b>  {out_display}
-<b>BACK:</b> {ret_display}
+<b>OUT:</b>  {out_date}
+<b>BACK:</b> {ret_date}
 
 <b>Heads up:</b>
 • VIP members saw this 24 hours ago
@@ -1193,7 +1190,7 @@ def format_telegram_free(row: Dict[str, str]) -> str:
 
 
 def post_telegram_vip(ws: gspread.Worksheet, headers: List[str]) -> int:
-    """Post to VIP (AM only)"""
+    # VIP posts in AM run only
     if RUN_SLOT != "AM":
         return 0
 
@@ -1210,15 +1207,12 @@ def post_telegram_vip(ws: gspread.Worksheet, headers: List[str]) -> int:
 
         if safe_get(row, "status").upper() != STATUS_POSTED_INSTAGRAM:
             continue
-
         if safe_get(row, "tg_monthly_timestamp"):
             continue
 
         log(f"  Posting to VIP: row {i}")
-
         try:
-            msg = format_telegram_vip(row)
-            tg_send(TELEGRAM_BOT_TOKEN_VIP, TELEGRAM_CHANNEL_VIP, msg)
+            tg_send(TELEGRAM_BOT_TOKEN_VIP, TELEGRAM_CHANNEL_VIP, format_telegram_vip(row))
 
             updates = []
             if "tg_monthly_timestamp" in hmap:
@@ -1232,7 +1226,7 @@ def post_telegram_vip(ws: gspread.Worksheet, headers: List[str]) -> int:
                 ws.update_cells(updates, value_input_option="USER_ENTERED")
 
             posted += 1
-            log(f"  ✓ Posted to VIP")
+            log("  ✓ Posted to VIP")
 
         except Exception as e:
             log(f"  VIP error: {e}")
@@ -1241,7 +1235,7 @@ def post_telegram_vip(ws: gspread.Worksheet, headers: List[str]) -> int:
 
 
 def post_telegram_free(ws: gspread.Worksheet, headers: List[str]) -> int:
-    """Post to FREE (PM only, 24h delay)"""
+    # Free posts in PM run only after VIP delay
     if RUN_SLOT != "PM":
         return 0
 
@@ -1258,21 +1252,16 @@ def post_telegram_free(ws: gspread.Worksheet, headers: List[str]) -> int:
 
         if safe_get(row, "status").upper() != STATUS_POSTED_TELEGRAM_VIP:
             continue
-
         if safe_get(row, "tg_free_timestamp"):
             continue
 
         vip_ts = safe_get(row, "tg_monthly_timestamp")
-        hours = hours_since(vip_ts)
-        
-        if hours < VIP_DELAY_HOURS:
+        if hours_since(vip_ts) < VIP_DELAY_HOURS:
             continue
 
-        log(f"  Posting to FREE: row {i} (delay: {hours:.1f}h)")
-
+        log(f"  Posting to FREE: row {i}")
         try:
-            msg = format_telegram_free(row)
-            tg_send(TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL, msg)
+            tg_send(TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL, format_telegram_free(row))
 
             updates = []
             if "tg_free_timestamp" in hmap:
@@ -1286,7 +1275,7 @@ def post_telegram_free(ws: gspread.Worksheet, headers: List[str]) -> int:
                 ws.update_cells(updates, value_input_option="USER_ENTERED")
 
             posted += 1
-            log(f"  ✓ Posted to FREE")
+            log("  ✓ Posted to FREE")
 
         except Exception as e:
             log(f"  FREE error: {e}")
@@ -1299,66 +1288,62 @@ def post_telegram_free(ws: gspread.Worksheet, headers: List[str]) -> int:
 # =========================
 def main():
     log("=" * 70)
-    log("TRAVELTXTER V4.5 PHASE 1+2 (Elastic Supply + Stotal Scoring)")
+    log("TRAVELTXTER V4.5.2 — WATERWHEEL RUN")
     log("=" * 70)
     log(f"RUN_SLOT: {RUN_SLOT} | VIP_DELAY: {VIP_DELAY_HOURS}h")
-    log(f"Variety: {VARIETY_LOOKBACK_HOURS}h lookback, -{DEST_REPEAT_PENALTY} dest, -{THEME_REPEAT_PENALTY} theme")
-    log(f"Duffel: MAX_INSERTS={DUFFEL_MAX_INSERTS}, ROUTES_PER_RUN={DUFFEL_ROUTES_PER_RUN}")
+    log(f"Daily Theme (target): {today_theme()}")
+    log(f"Variety: lookback={VARIETY_LOOKBACK_HOURS}h | DEST_REPEAT_PENALTY={DEST_REPEAT_PENALTY} | THEME_REPEAT_PENALTY={THEME_REPEAT_PENALTY}")
+    log(f"Duffel: ENABLED={DUFFEL_ENABLED} | MAX_INSERTS={DUFFEL_MAX_INSERTS} | ROUTES_PER_RUN={DUFFEL_ROUTES_PER_RUN}")
     log("=" * 70)
 
-    try:
-        ws, headers = get_ws()
-        sh = ws.spreadsheet
-        log(f"Connected | Columns: {len(headers)}")
+    ws, headers = get_ws()
+    sh = ws.spreadsheet
+    log(f"Connected to sheet | Columns: {len(headers)} | Tab: {RAW_DEALS_TAB}")
 
-        # Load CONFIG_SIGNALS
-        signals_map = load_config_signals(sh)
+    signals_map = load_config_signals(sh)
 
-        # Stage 1: Duffel
-        if DUFFEL_ENABLED and DUFFEL_API_KEY:
-            log("\n[1] DUFFEL FEED")
-            inserted = run_duffel_feeder(ws, headers)
-            log(f"✓ {inserted} deals inserted")
+    # [1] Duffel
+    if DUFFEL_ENABLED and DUFFEL_API_KEY:
+        log("\n[1] DUFFEL FEED")
+        inserted = run_duffel_feeder(ws, headers)
+        log(f"✓ {inserted} deals inserted")
+    else:
+        log("\n[1] DUFFEL FEED")
+        log("✓ skipped (disabled or missing DUFFEL_API_KEY)")
 
-        # Stage 2: Scoring + Theme
-        log("\n[2] SCORING + THEME")
-        scored = stage_score_all_new(ws, headers, signals_map)
-        log(f"✓ {scored} deals scored")
+    # [2] Score NEW -> SCORED
+    log("\n[2] SCORING (NEW → SCORED)")
+    scored = stage_score_all_new(ws, headers, signals_map)
+    log(f"✓ {scored} deals scored")
 
-        # Stage 3: Editorial Selection
-        log("\n[3] EDITORIAL SELECTION")
-        selected = stage_select_best(ws, headers)
-        log(f"✓ {selected} promoted")
+    # [3] Select SCORED -> READY_TO_POST
+    log("\n[3] EDITORIAL SELECTION (SCORED → READY_TO_POST)")
+    selected = stage_select_best(ws, headers)
+    log(f"✓ {selected} promoted")
 
-        # Stage 4: Render
-        log("\n[4] RENDER")
-        rendered = stage_render(ws, headers)
-        log(f"✓ {rendered} rendered")
+    # [4] Render
+    log("\n[4] RENDER (READY_TO_POST → READY_TO_PUBLISH)")
+    rendered = stage_render(ws, headers)
+    log(f"✓ {rendered} rendered")
 
-        # Stage 5: Instagram
-        log("\n[5] INSTAGRAM")
-        ig_posted = post_instagram(ws, headers)
-        log(f"✓ {ig_posted} posted")
+    # [5] Instagram
+    log("\n[5] INSTAGRAM (READY_TO_PUBLISH → POSTED_INSTAGRAM)")
+    ig_posted = post_instagram(ws, headers)
+    log(f"✓ {ig_posted} posted")
 
-        # Stage 6: Telegram VIP
-        log("\n[6] TELEGRAM VIP")
-        vip_posted = post_telegram_vip(ws, headers)
-        log(f"✓ {vip_posted} posted")
+    # [6] Telegram VIP
+    log("\n[6] TELEGRAM VIP (AM only)")
+    vip_posted = post_telegram_vip(ws, headers)
+    log(f"✓ {vip_posted} posted")
 
-        # Stage 7: Telegram FREE
-        log("\n[7] TELEGRAM FREE")
-        free_posted = post_telegram_free(ws, headers)
-        log(f"✓ {free_posted} posted")
+    # [7] Telegram FREE
+    log("\n[7] TELEGRAM FREE (PM only, delayed)")
+    free_posted = post_telegram_free(ws, headers)
+    log(f"✓ {free_posted} posted")
 
-        log("\n" + "=" * 70)
-        log("COMPLETE")
-        log("=" * 70)
-
-    except Exception as e:
-        log(f"ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+    log("\n" + "=" * 70)
+    log("COMPLETE")
+    log("=" * 70)
 
 
 if __name__ == "__main__":

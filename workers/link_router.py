@@ -1,0 +1,141 @@
+# ============================================================
+# FILE: .github/workflows/pipeline_workflow.yml
+# (PASTE OVER YOUR EXISTING WORKFLOW FILE)
+# ============================================================
+
+name: v4_5_pipeline
+
+on:
+  schedule:
+    - cron: "30 7 * * *"   # 07:30 UTC (AM)
+    - cron: "30 16 * * *"  # 16:30 UTC (PM)
+  workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "AM or PM"
+        required: true
+        default: "AM"
+
+concurrency:
+  group: v4_5_pipeline
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ------------------------------------------------------------
+      # Determine RUN_SLOT cleanly (AM/PM)
+      # ------------------------------------------------------------
+      - name: Set RUN_SLOT
+        id: slot
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_SLOT=${{ inputs.run_slot }}" >> $GITHUB_ENV
+          else
+            # schedule: decide AM/PM based on cron expression
+            if [ "${{ github.event.schedule }}" = "30 7 * * *" ]; then
+              echo "RUN_SLOT=AM" >> $GITHUB_ENV
+            else
+              echo "RUN_SLOT=PM" >> $GITHUB_ENV
+            fi
+          fi
+
+      # ------------------------------------------------------------
+      # MAIN PIPELINE WORKER
+      # ------------------------------------------------------------
+      - name: Run pipeline_worker.py
+        env:
+          # Sheets
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+
+          # Duffel
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+          DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
+          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
+
+          # Budget governor (monthly cap)
+          DUFFEL_BUDGET_GBP: ${{ vars.DUFFEL_BUDGET_GBP }}
+          DUFFEL_EXCESS_SEARCH_USD: ${{ vars.DUFFEL_EXCESS_SEARCH_USD }}
+          USD_TO_GBP: ${{ vars.USD_TO_GBP }}
+          DUFFEL_ORDERS_THIS_MONTH: ${{ vars.DUFFEL_ORDERS_THIS_MONTH }}
+          DUFFEL_FREE_SEARCHES_PER_ORDER: ${{ vars.DUFFEL_FREE_SEARCHES_PER_ORDER }}
+          DUFFEL_SEARCH_DEDUPE_HOURS: ${{ vars.DUFFEL_SEARCH_DEDUPE_HOURS }}
+
+          # SW England origins boost
+          SW_ENGLAND_ORIGINS: ${{ vars.SW_ENGLAND_ORIGINS }}
+
+          # Duffel Links (to increase Orders on short-haul)
+          DUFFEL_LINKS_ENABLED: ${{ vars.DUFFEL_LINKS_ENABLED }}
+          DUFFEL_LINKS_MAX_PER_RUN: ${{ vars.DUFFEL_LINKS_MAX_PER_RUN }}
+          DUFFEL_LINKS_MAX_PRICE_GBP: ${{ vars.DUFFEL_LINKS_MAX_PRICE_GBP }}
+          REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
+
+          # Variety knobs
+          DEST_REPEAT_PENALTY: ${{ vars.DEST_REPEAT_PENALTY }}
+          VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
+
+          # Render + IG
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+
+          # Telegram
+          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+
+          # Stripe
+          STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
+          STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
+
+          # Slot + delay
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          VIP_DELAY_HOURS: "24"
+
+        run: |
+          python workers/pipeline_worker.py
+
+      # ------------------------------------------------------------
+      # LINK ROUTER (THIS IS WHAT BROKE FOR YOU)
+      # ------------------------------------------------------------
+      - name: Run link_router.py (Duffel short-haul, Skyscanner otherwise)
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
+
+          LINK_ROUTER_MAX_ROWS: "12"
+          DUFFEL_LINKS_MAX_PRICE_GBP: ${{ vars.DUFFEL_LINKS_MAX_PRICE_GBP }}
+
+        run: |
+          python workers/link_router.py
+
+      - name: Upload logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs
+          path: |
+            *.log
+          retention-days: 7

@@ -1,32 +1,57 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5.3 — WATERWHEEL (Theme rotation + soft weighting + diversity force)
+TravelTxter V4.5.3 — WATERWHEEL (Route-First + Theme Rotation + Direct/LCC Bias + Human Copy)
 
-GOALS (non-tech summary):
-- Feeder pulls enough variety (within Duffel free tier) so scoring can “sift like a human”
-- Themes are a PREFERENCE, not a hard gate (price outliers can break through)
-- Diversity penalties stop “boring Iceland loops”
-- Works from CONFIG first (product), then pipeline backwards to IG/TG output
+PASTE-READY SINGLE FILE
+=======================
+Drop this in:   workers/pipeline_worker.py
+Then run via GitHub Actions with RUN_SLOT=AM and RUN_SLOT=PM.
 
-REQUIRED SHEET TABS:
-- RAW_DEALS
-- CONFIG
-- CONFIG_SIGNALS (optional but supported)
+What this version fixes / adds
+------------------------------
+1) ✅ Theme rotation (daily) + Long-haul region rotation (Americas/Asia/Africa/Australasia)
+2) ✅ “Route-first” feeder: picks CONFIG routes that match today’s theme first (but never hard-blocks)
+3) ✅ Reverse-engineered Duffel request: tries direct-only + LCC airline bias FIRST, then auto-fallbacks if Duffel rejects fields
+4) ✅ Diversity circuit breaker: strong penalty if destination was posted recently (kills “Boring Iceland” loops)
+5) ✅ Datetime bug fix: no more offset-aware vs naive comparisons
+6) ✅ City names everywhere: feeder populates origin_city/destination_city from CONFIG (and signals fallback)
+7) ✅ Outputs: Instagram + Telegram VIP then Telegram Free (delay) + optional MailerLite feed export tab
 
-CONFIG (expected columns; flexible aliases supported):
-- enabled (TRUE/YES/1)
-- priority (1..n)
-- origin_iata (e.g., LGW)
-- origin_city (optional)
-- destination_iata (e.g., TFS)
-- destination_city (optional)
-- theme (e.g., winter_sun / snow / surf / city / foodie / longhaul_asia / etc.)
-- region (optional: americas/asia/africa/australasia/europe)
-- included_airlines (optional CSV: "U2,FR,W6,LS")
-- max_connections (optional int; 0 = direct only)
-- min_days_ahead / max_days_ahead (optional; else days_ahead)
-- trip_length_days (optional; default 5)
+IMPORTANT: Sheet ID vs Spreadsheet ID
+-------------------------------------
+- SPREADSHEET_ID = the long ID in the Google Sheets URL (e.g. 1qTwHlCaTayPzvMFcXuDtJOLoAQ4mINMYPwuitogZeTE)
+- SHEET_ID is NOT needed for Google Sheets access (people sometimes misuse it). We treat SHEET_ID as a fallback alias only.
+
+Secrets expected (matches your list)
+------------------------------------
+DUFFEL_API_KEY
+GCP_SA_JSON or GCP_SA_JSON_ONE_LINE
+SPREADSHEET_ID (or SHEET_ID fallback)
+RAW_DEALS_TAB
+RENDER_URL
+IG_ACCESS_TOKEN (or META_ACCESS_TOKEN fallback)
+IG_USER_ID
+TELEGRAM_BOT_TOKEN_VIP / TELEGRAM_CHANNEL_VIP
+TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL
+STRIPE_LINK (or STRIPE_LINK_MONTHLY / STRIPE_LINK_YEARLY if you add them)
+Optional: OPENAI_API_KEY (not used here), MAILERLITE_API_KEY (not used here), MAILERLITE_FEED_TAB
+
+CONFIG / CONFIG_SIGNALS
+-----------------------
+- CONFIG must contain *real airport codes only*. No LON.
+- This worker uses CONFIG columns if present:
+  enabled, priority, origin_iata, origin_city, destination_iata, destination_city, destination_country,
+  days_ahead, window_days, trip_length_days, max_connections, cabin_class, theme, included_airlines
+- CONFIG_SIGNALS is used only as a fallback to get nicer names and for auto-theme derivation if you want it.
+
+Run slots and posting SLA
+-------------------------
+- AM run: feeder -> score -> select -> render -> Instagram -> Telegram VIP
+- PM run: feeder -> score -> select -> render -> Instagram (optional) -> Telegram FREE (only when VIP delay satisfied)
+
 """
+
+from __future__ import annotations
 
 import os
 import json
@@ -43,159 +68,211 @@ from google.oauth2.service_account import Credentials
 
 
 # ============================================================
-# ENV + COMPAT (your repo has mixed secret naming historically)
+# ENV / SECRET COMPAT
 # ============================================================
 
-def _set_if_missing(target: str, source: str) -> None:
+# Map common alias secrets -> canonical names used by this worker
+_SECRET_MAPPINGS = {
+    # IG token
+    "IG_ACCESS_TOKEN": "META_ACCESS_TOKEN",
+    # Sheet ID alias (some repos used SHEET_ID)
+    "SPREADSHEET_ID": "SHEET_ID",
+}
+
+for target, source in _SECRET_MAPPINGS.items():
     if not os.getenv(target) and os.getenv(source):
         os.environ[target] = os.getenv(source)
 
-# Compatibility shims (safe)
-_set_if_missing("SPREADSHEET_ID", "SHEET_ID")               # Some builds used SHEET_ID for spreadsheet key
-_set_if_missing("IG_ACCESS_TOKEN", "META_ACCESS_TOKEN")     # Some builds used META_ACCESS_TOKEN
-_set_if_missing("TELEGRAM_CHANNEL_VIP", "TELEGRAM_VIP_CHANNEL")
-_set_if_missing("TELEGRAM_CHANNEL", "TELEGRAM_FREE_CHANNEL")
 
 def env(name: str, default: str = "", required: bool = False) -> str:
     v = (os.getenv(name) or "").strip()
     if not v:
         v = default
     if required and not v:
-        raise RuntimeError(f"Missing env var: {name}")
+        raise RuntimeError(f"Missing required env var: {name}")
     return v
 
-# Core
-SPREADSHEET_ID      = env("SPREADSHEET_ID", required=True)
-RAW_DEALS_TAB       = env("RAW_DEALS_TAB", "RAW_DEALS")
-CONFIG_TAB          = env("CONFIG_TAB", "CONFIG")
-CONFIG_SIGNALS_TAB  = env("CONFIG_SIGNALS_TAB", "CONFIG_SIGNALS")
-GCP_SA_JSON         = env("GCP_SA_JSON", required=True)
 
-# Duffel
-DUFFEL_API_KEY        = env("DUFFEL_API_KEY", "")
-DUFFEL_VERSION        = env("DUFFEL_VERSION", "v2")
-DUFFEL_ENABLED        = env("DUFFEL_ENABLED", "true").lower() in ("1", "true", "yes")
-DUFFEL_MAX_INSERTS    = int(env("DUFFEL_MAX_INSERTS", "3"))        # safety for free tier
-DUFFEL_ROUTES_PER_RUN = int(env("DUFFEL_ROUTES_PER_RUN", "3"))     # safety for free tier
+SPREADSHEET_ID = env("SPREADSHEET_ID", required=True)
+RAW_DEALS_TAB = env("RAW_DEALS_TAB", "RAW_DEALS")
+CONFIG_TAB = env("CONFIG_TAB", "CONFIG")
+CONFIG_SIGNALS_TAB = env("CONFIG_SIGNALS_TAB", "CONFIG_SIGNALS")
+MAILERLITE_FEED_TAB = env("MAILERLITE_FEED_TAB", "MAILERLITE_FEED")  # optional export tab
 
-# Posting
-RENDER_URL   = env("RENDER_URL", required=True)
+GCP_SA_JSON = env("GCP_SA_JSON", "") or env("GCP_SA_JSON_ONE_LINE", "")
+if not GCP_SA_JSON:
+    raise RuntimeError("Missing required env var: GCP_SA_JSON or GCP_SA_JSON_ONE_LINE")
+
+DUFFEL_API_KEY = env("DUFFEL_API_KEY", "")
+DUFFEL_VERSION = env("DUFFEL_VERSION", "v2")
+DUFFEL_ENABLED = env("DUFFEL_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# Free-tier safety knobs (keep these conservative)
+DUFFEL_ROUTES_PER_RUN = int(env("DUFFEL_ROUTES_PER_RUN", "2"))       # how many CONFIG routes to query per run
+DUFFEL_MAX_INSERTS = int(env("DUFFEL_MAX_INSERTS", "3"))             # how many offers saved per route request
+DUFFEL_MAX_SEARCHES_PER_RUN = int(env("DUFFEL_MAX_SEARCHES_PER_RUN", "4"))  # hard cap on offer_requests per run
+DUFFEL_MIN_OFFERS_FLOOR = int(env("DUFFEL_MIN_OFFERS_FLOOR", "6"))   # if we inserted < this, do 1 extra widening step
+
+# Request-level “quality” hints (auto-fallback if Duffel rejects fields)
+ENFORCE_DIRECT_FIRST = env("ENFORCE_DIRECT_FIRST", "true").lower() in ("1", "true", "yes")
+LCC_BIAS_FIRST = env("LCC_BIAS_FIRST", "true").lower() in ("1", "true", "yes")
+
+RENDER_URL = env("RENDER_URL", required=True)
+
 IG_ACCESS_TOKEN = env("IG_ACCESS_TOKEN", required=True)
-IG_USER_ID      = env("IG_USER_ID", required=True)
+IG_USER_ID = env("IG_USER_ID", required=True)
 
 TELEGRAM_BOT_TOKEN_VIP = env("TELEGRAM_BOT_TOKEN_VIP", required=True)
-TELEGRAM_CHANNEL_VIP   = env("TELEGRAM_CHANNEL_VIP", required=True)
-TELEGRAM_BOT_TOKEN     = env("TELEGRAM_BOT_TOKEN", required=True)
-TELEGRAM_CHANNEL       = env("TELEGRAM_CHANNEL", required=True)
+TELEGRAM_CHANNEL_VIP = env("TELEGRAM_CHANNEL_VIP", required=True)
 
-# Monetisation links
-STRIPE_LINK_MONTHLY = env("STRIPE_LINK_MONTHLY", "") or env("STRIPE_LINK", "")
-STRIPE_LINK_YEARLY  = env("STRIPE_LINK_YEARLY", "") or env("STRIPE_LINK", "")
+TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
+TELEGRAM_CHANNEL = env("TELEGRAM_CHANNEL", required=True)
 
-# Timing + waterwheel behaviour
-RUN_SLOT        = env("RUN_SLOT", "AM").upper()  # AM or PM (set by workflow)
+# Stripe
+STRIPE_LINK = env("STRIPE_LINK", "")
+STRIPE_LINK_MONTHLY = env("STRIPE_LINK_MONTHLY", "") or STRIPE_LINK
+STRIPE_LINK_YEARLY = env("STRIPE_LINK_YEARLY", "") or STRIPE_LINK
+
+# Timing / cadence
 VIP_DELAY_HOURS = int(env("VIP_DELAY_HOURS", "24"))
+RUN_SLOT = env("RUN_SLOT", "AM").upper()  # AM or PM
 
-# Variety / anti-boring controls
+# Variety / boredom circuit breaker
 VARIETY_LOOKBACK_HOURS = int(env("VARIETY_LOOKBACK_HOURS", "72"))
-DEST_REPEAT_PENALTY    = float(env("DEST_REPEAT_PENALTY", "50.0"))     # strong circuit breaker
-THEME_REPEAT_PENALTY   = float(env("THEME_REPEAT_PENALTY", "30.0"))
-RECENCY_FILTER_HOURS   = int(env("RECENCY_FILTER_HOURS", "72"))
+DEST_REPEAT_PENALTY = float(env("DEST_REPEAT_PENALTY", "50.0"))      # strong
+THEME_REPEAT_PENALTY = float(env("THEME_REPEAT_PENALTY", "30.0"))
+RECENCY_FILTER_HOURS = int(env("RECENCY_FILTER_HOURS", "48"))
 
-# Elastic scoring weights (theme is preferred, but outliers can win)
-THEME_WEIGHT_BASE = float(env("THEME_WEIGHT_BASE", "0.60"))
-PRICE_WEIGHT_BASE = float(env("PRICE_WEIGHT_BASE", "0.40"))
-OUTLIER_BOOST_THRESHOLD = float(env("OUTLIER_BOOST_THRESHOLD", "0.35"))  # if deal is “very cheap” -> price dominates
-
-
-# ============================================================
-# Status constants (tolerant)
-# ============================================================
-
-STATUS_NEW               = "NEW"
-STATUS_SCORED            = "SCORED"
-STATUS_READY_TO_POST     = "READY_TO_POST"
-STATUS_READY_TO_PUBLISH  = "READY_TO_PUBLISH"
-STATUS_POSTED_INSTAGRAM  = "POSTED_INSTAGRAM"
+# Status lifecycle (simple + stable)
+STATUS_NEW = "NEW"
+STATUS_SCORED = "SCORED"
+STATUS_READY_TO_POST = "READY_TO_POST"
+STATUS_READY_TO_PUBLISH = "READY_TO_PUBLISH"
+STATUS_POSTED_INSTAGRAM = "POSTED_INSTAGRAM"
 STATUS_POSTED_TELEGRAM_VIP = "POSTED_TELEGRAM_VIP"
-STATUS_POSTED_ALL        = "POSTED_ALL"
+STATUS_POSTED_ALL = "POSTED_ALL"
 
 
 # ============================================================
-# Utilities (safe + timezone correct)
+# LOGGING / TIME
 # ============================================================
 
-def now_utc_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def now_utc_dt() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def now_utc_str() -> str:
+    return now_utc_dt().replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
 
 def log(msg: str) -> None:
-    print(f"{now_utc_iso()} | {msg}", flush=True)
+    print(f"{now_utc_str()} | {msg}", flush=True)
 
-def _safe_text(v: Any) -> str:
+
+def stable_hash(text: str) -> int:
+    return int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16)
+
+
+def safe_text(v: Any) -> str:
     if v is None:
         return ""
     if isinstance(v, float):
-        # NaN
-        if v != v:
+        try:
+            if v != v:  # NaN
+                return ""
+        except Exception:
             return ""
-        # floats are not valid IATA anyway
         return ""
     try:
         return str(v)
     except Exception:
         return ""
 
+
 def safe_get(row: Dict[str, Any], key: str) -> str:
-    return (_safe_text(row.get(key))).strip()
+    return safe_text(row.get(key)).strip()
+
 
 def safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        if v is None:
-            return default
-        s = _safe_text(v).strip()
-        if not s:
-            return default
-        return float(s)
+        return float(v)
     except Exception:
         return default
 
-def stable_hash(text: str) -> int:
-    return int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16)
 
-def parse_iso_utc(ts: str) -> Optional[dt.datetime]:
+def parse_iso_utc(s: str) -> Optional[dt.datetime]:
     """
-    Returns timezone-aware UTC datetime, or None.
-    Accepts: "2026-01-04T11:44:38Z" or ISO with offset.
+    Parse timestamps like:
+    - 2026-01-04T11:44:38Z
+    - 2026-01-04T11:44:38+00:00
+    Returns timezone-aware dt in UTC.
     """
-    if not ts:
+    s = (s or "").strip()
+    if not s:
         return None
-    s = ts.strip()
     try:
         if s.endswith("Z"):
-            s = s.replace("Z", "+00:00")
+            return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
         d = dt.datetime.fromisoformat(s)
         if d.tzinfo is None:
-            # treat as UTC if naive
-            d = d.replace(tzinfo=dt.timezone.utc)
+            # assume UTC if naive
+            return d.replace(tzinfo=dt.timezone.utc)
         return d.astimezone(dt.timezone.utc)
     except Exception:
         return None
+
 
 def hours_since(ts: str) -> float:
     d = parse_iso_utc(ts)
     if not d:
         return 9999.0
-    return (dt.datetime.now(dt.timezone.utc) - d).total_seconds() / 3600.0
+    return (now_utc_dt() - d).total_seconds() / 3600.0
 
-def round_price_up(p: Any) -> int:
+
+def round_price_up(price_str: str) -> int:
     try:
-        return math.ceil(float(_safe_text(p)))
+        return int(math.ceil(float(price_str)))
     except Exception:
         return 0
 
 
 # ============================================================
-# Google Sheets
+# THEME ROTATION (daily + longhaul region)
+# ============================================================
+
+THEMES = ["city", "winter_sun", "surf", "snow", "foodie", "longhaul"]
+
+# Simple schedule you can tweak later
+# Monday..Sunday = 0..6
+WEEKLY_THEME_SCHEDULE = {
+    0: "city",
+    1: "winter_sun",
+    2: "surf",
+    3: "snow",
+    4: "city",
+    5: "winter_sun",
+    6: "longhaul",
+}
+
+LONGHAUL_REGIONS = ["americas", "asia", "africa", "australasia"]
+
+# LCC airline IATA codes (common)
+LCC_DEFAULT = ["U2", "FR", "W6", "LS"]  # easyJet, Ryanair, Wizz, Jet2
+
+
+def todays_theme_and_region(today: dt.date) -> Tuple[str, Optional[str]]:
+    theme = WEEKLY_THEME_SCHEDULE.get(today.weekday(), "city")
+    if theme != "longhaul":
+        return theme, None
+
+    # Rotate regions by ISO week number (stable + predictable)
+    week = int(today.isocalendar().week)
+    region = LONGHAUL_REGIONS[week % len(LONGHAUL_REGIONS)]
+    return theme, region
+
+
+# ============================================================
+# GOOGLE SHEETS
 # ============================================================
 
 def gs_client() -> gspread.Client:
@@ -205,242 +282,208 @@ def gs_client() -> gspread.Client:
     )
     return gspread.authorize(creds)
 
-def get_sheet() -> Tuple[gspread.Spreadsheet, gspread.Worksheet, List[str]]:
-    client = gs_client()
-    sh = client.open_by_key(SPREADSHEET_ID)
-    ws = sh.worksheet(RAW_DEALS_TAB)
-    headers = ws.row_values(1)
-    if not headers:
-        raise RuntimeError("RAW_DEALS has no headers row")
-    return sh, ws, headers
+
+def get_spreadsheet() -> gspread.Spreadsheet:
+    return gs_client().open_by_key(SPREADSHEET_ID)
+
+
+def get_ws(tab_name: str) -> gspread.Worksheet:
+    sh = get_spreadsheet()
+    return sh.worksheet(tab_name)
+
 
 def header_map(headers: List[str]) -> Dict[str, int]:
-    return {h.strip(): i + 1 for i, h in enumerate(headers) if h.strip()}
-
-def row_dict(headers: List[str], row_vals: List[str]) -> Dict[str, str]:
-    d = {}
-    for i, h in enumerate(headers):
-        d[h] = row_vals[i] if i < len(row_vals) else ""
-    return d
+    return {h.strip(): i + 1 for i, h in enumerate(headers) if (h or "").strip()}
 
 
-# ============================================================
-# Theme Rotation (includes longhaul regions)
-# ============================================================
-
-def daily_theme(date: dt.date, run_slot: str) -> str:
-    """
-    Rotation that:
-    - keeps core themes frequent
-    - introduces longhaul region rotations (esp weekends)
-    """
-    dow = date.weekday()  # Mon=0
-    # Two slots per day: AM “hero”, PM can be “secondary”
-    schedule_am = {
-        0: "city",            # Mon
-        1: "winter_sun",      # Tue
-        2: "surf",            # Wed
-        3: "snow",            # Thu
-        4: "foodie",          # Fri
-        5: "longhaul_americas",  # Sat
-        6: "longhaul_asia",      # Sun
-    }
-    schedule_pm = {
-        0: "winter_sun",
-        1: "city",
-        2: "city",
-        3: "winter_sun",
-        4: "city",
-        5: "longhaul_africa",
-        6: "longhaul_australasia",
-    }
-    return (schedule_am if run_slot == "AM" else schedule_pm).get(dow, "city")
-
-
-# ============================================================
-# CONFIG Loader (robust to duplicates/messy headers)
-# ============================================================
-
-def load_config_routes(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
-    """
-    Reads CONFIG using raw values so duplicate headers don't kill us.
-    """
+def ensure_tab(sh: gspread.Spreadsheet, title: str, headers: List[str]) -> gspread.Worksheet:
     try:
-        ws = sh.worksheet(CONFIG_TAB)
+        ws = sh.worksheet(title)
+        existing = ws.row_values(1)
+        if existing:
+            return ws
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+        return ws
     except Exception:
-        log("CONFIG tab not found")
-        return []
+        ws = sh.add_worksheet(title=title, rows=200, cols=max(20, len(headers) + 5))
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+        return ws
 
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
-        log("CONFIG empty")
-        return []
 
-    headers = [h.strip().lower() for h in values[0]]
-    rows = values[1:]
+# ============================================================
+# CONFIG_SIGNALS (optional helper for nicer names)
+# ============================================================
 
-    def col(*names: str) -> Optional[int]:
-        for n in names:
-            n = n.strip().lower()
-            if n in headers:
-                return headers.index(n)
-        return None
+def load_config_signals(sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
+    try:
+        ws = sh.worksheet(CONFIG_SIGNALS_TAB)
+    except Exception:
+        log("CONFIG_SIGNALS tab not found (ok)")
+        return {}
 
-    ix_enabled = col("enabled")
-    ix_priority = col("priority")
-    ix_origin_iata = col("origin_iata", "origin")
-    ix_origin_city = col("origin_city")
-    ix_dest_iata = col("destination_iata", "dest_iata", "destination")
-    ix_dest_city = col("destination_city")
-    ix_theme = col("theme")  # if duplicated, we take first
-    ix_region = col("region")
-    ix_airlines = col("included_airlines", "airlines", "carrier_bias")
-    ix_max_conn = col("max_connections", "max_conn", "connections")
-    ix_min_days = col("min_days_ahead", "days_ahead_min")
-    ix_max_days = col("max_days_ahead", "days_ahead_max")
-    ix_days_ahead = col("days_ahead")
-    ix_trip_len = col("trip_length_days", "trip_length")
+    try:
+        recs = ws.get_all_records()
+    except Exception:
+        return {}
 
-    out: List[Dict[str, Any]] = []
-
-    for r in rows:
-        enabled = (r[ix_enabled] if ix_enabled is not None and ix_enabled < len(r) else "").strip().upper()
-        if enabled not in ("TRUE", "YES", "1"):
-            continue
-
-        origin = (r[ix_origin_iata] if ix_origin_iata is not None and ix_origin_iata < len(r) else "").strip().upper()
-        dest   = (r[ix_dest_iata] if ix_dest_iata is not None and ix_dest_iata < len(r) else "").strip().upper()
-
-        # Only real airport codes (3 letters)
-        if len(origin) != 3 or len(dest) != 3:
-            continue
-
-        theme = (r[ix_theme] if ix_theme is not None and ix_theme < len(r) else "").strip().lower()
-        region = (r[ix_region] if ix_region is not None and ix_region < len(r) else "").strip().lower()
-
-        priority = 50
-        if ix_priority is not None and ix_priority < len(r):
-            try:
-                priority = int((r[ix_priority] or "50").strip())
-            except Exception:
-                priority = 50
-
-        airlines_raw = (r[ix_airlines] if ix_airlines is not None and ix_airlines < len(r) else "").strip()
-        included_airlines = [a.strip().upper() for a in airlines_raw.split(",") if a.strip()]
-
-        max_connections = None
-        if ix_max_conn is not None and ix_max_conn < len(r):
-            try:
-                max_connections = int((r[ix_max_conn] or "").strip())
-            except Exception:
-                max_connections = None
-
-        # days ahead window
-        min_days = None
-        max_days = None
-        if ix_min_days is not None and ix_min_days < len(r):
-            try:
-                min_days = int((r[ix_min_days] or "").strip())
-            except Exception:
-                min_days = None
-        if ix_max_days is not None and ix_max_days < len(r):
-            try:
-                max_days = int((r[ix_max_days] or "").strip())
-            except Exception:
-                max_days = None
-
-        if (min_days is None or max_days is None) and ix_days_ahead is not None and ix_days_ahead < len(r):
-            # fallback: single days_ahead means "depart around then"
-            try:
-                d = int((r[ix_days_ahead] or "").strip())
-                min_days = min_days if min_days is not None else max(7, d - 10)
-                max_days = max_days if max_days is not None else (d + 20)
-            except Exception:
-                pass
-
-        # final defaults
-        if min_days is None:
-            min_days = 14
-        if max_days is None:
-            max_days = 60
-
-        trip_len = 5
-        if ix_trip_len is not None and ix_trip_len < len(r):
-            try:
-                trip_len = int((r[ix_trip_len] or "5").strip())
-            except Exception:
-                trip_len = 5
-
-        origin_city = (r[ix_origin_city] if ix_origin_city is not None and ix_origin_city < len(r) else "").strip()
-        dest_city   = (r[ix_dest_city] if ix_dest_city is not None and ix_dest_city < len(r) else "").strip()
-
-        out.append({
-            "priority": priority,
-            "origin_iata": origin,
-            "origin_city": origin_city,
-            "destination_iata": dest,
-            "destination_city": dest_city,
-            "theme": theme,
-            "region": region,
-            "included_airlines": included_airlines,
-            "max_connections": max_connections,
-            "min_days_ahead": min_days,
-            "max_days_ahead": max_days,
-            "trip_length_days": trip_len
-        })
-
-    out.sort(key=lambda x: x["priority"])
-    log(f"CONFIG: Loaded {len(out)} enabled routes")
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in recs:
+        iata = safe_text(r.get("iata_hint")).strip().upper()
+        if len(iata) == 3 and iata.isalpha():
+            out[iata] = r
+    log(f"Loaded CONFIG_SIGNALS: {len(out)} destinations")
     return out
 
 
-def pick_routes_for_today(routes: List[Dict[str, Any]], target_theme: str, max_routes: int) -> List[Dict[str, Any]]:
-    """
-    Soft theme matching:
-    - Prefer exact theme
-    - Then adjacent themes
-    - Then wildcard anything
+def signals_city_name(signals: Dict[str, Any]) -> str:
+    # Try common column names people use
+    for k in ["city", "city_name", "place_name", "destination_city", "name"]:
+        v = safe_text(signals.get(k)).strip()
+        if v:
+            return v
+    return ""
 
-    Also rotates deterministically so you don’t keep hammering same origins.
+
+# ============================================================
+# CONFIG LOADING (route-first)
+# ============================================================
+
+def normalize_theme(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace(" ", "_")
+    return s
+
+
+def load_routes_from_config(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
     """
+    Reads CONFIG as rows of dict.
+    Very tolerant: ignores unknown columns; uses what exists.
+    """
+    try:
+        cfg = sh.worksheet(CONFIG_TAB)
+    except Exception:
+        log("CONFIG tab missing — create it and add routes.")
+        return []
+
+    values = cfg.get_all_values()
+    if not values or len(values) < 2:
+        return []
+
+    headers = [h.strip() for h in values[0]]
+    rows = []
+    for r in values[1:]:
+        row = {}
+        for i, h in enumerate(headers):
+            row[h] = r[i] if i < len(r) else ""
+        # enabled?
+        enabled = safe_text(row.get("enabled")).strip().upper()
+        if enabled not in ("TRUE", "1", "YES"):
+            continue
+
+        # require real IATA
+        o = safe_text(row.get("origin_iata")).strip().upper()
+        d = safe_text(row.get("destination_iata")).strip().upper()
+        if len(o) != 3 or len(d) != 3 or (not o.isalpha()) or (not d.isalpha()):
+            continue
+
+        # priority
+        pr = int(safe_float(row.get("priority"), 9999))
+        row["_priority"] = pr
+
+        # theme tag
+        row["_theme"] = normalize_theme(row.get("theme"))
+        row["_theme_name"] = safe_text(row.get("theme.1") or row.get("theme_name") or "").strip()
+
+        rows.append(row)
+
+    rows.sort(key=lambda x: x.get("_priority", 9999))
+    return rows
+
+
+def select_routes_for_today(
+    routes: List[Dict[str, Any]],
+    today_theme: str,
+    longhaul_region: Optional[str],
+    max_routes: int,
+    run_slot: str,
+) -> List[Dict[str, Any]]:
+    """
+    Route-first selection:
+    - Prefer rows where CONFIG.theme matches today_theme (soft, not hard)
+    - Then fill with any enabled routes (wildcards)
+    - Deterministic rotation (day-of-year + slot)
+    """
+
     if not routes:
         return []
 
-    # Define adjacency
-    adjacent = {
-        "winter_sun": ["surf", "city", "foodie"],
-        "snow": ["city", "foodie"],
-        "surf": ["winter_sun", "city"],
-        "city": ["foodie", "winter_sun"],
-        "foodie": ["city"],
-        "longhaul_americas": ["winter_sun", "city"],
-        "longhaul_asia": ["winter_sun", "city"],
-        "longhaul_africa": ["winter_sun", "surf"],
-        "longhaul_australasia": ["surf", "winter_sun"],
-    }.get(target_theme, ["city"])
+    theme = normalize_theme(today_theme)
 
-    exact = [r for r in routes if (r.get("theme") or "").strip().lower() == target_theme]
-    adj   = [r for r in routes if (r.get("theme") or "").strip().lower() in adjacent]
-    wild  = [r for r in routes if r not in exact and r not in adj]
+    # themed pool
+    themed = [r for r in routes if r.get("_theme") == theme]
 
-    pool = exact + adj + wild
+    # longhaul region pool (optional if you tag CONFIG rows like longhaul_asia, longhaul_americas, etc.)
+    if theme == "longhaul" and longhaul_region:
+        region_tag = f"longhaul_{normalize_theme(longhaul_region)}"
+        regioned = [r for r in routes if r.get("_theme") == region_tag]
+        if regioned:
+            themed = regioned  # strong preference
+
+    pool = themed if themed else routes
+
     if len(pool) <= max_routes:
         return pool
 
-    day = dt.date.today().timetuple().tm_yday
-    slot_offset = 0 if RUN_SLOT == "AM" else 1
-    start = ((day * 2) + slot_offset) % len(pool)
+    day_of_year = dt.date.today().timetuple().tm_yday
+    slot_offset = 0 if run_slot == "AM" else 1
+    start = ((day_of_year * 2) + slot_offset) % len(pool)
 
-    picked = []
+    selected = []
     for i in range(max_routes):
-        picked.append(pool[(start + i) % len(pool)])
-    return picked
+        selected.append(pool[(start + i) % len(pool)])
+
+    return selected
 
 
 # ============================================================
-# Duffel (tries quality params first; retries if Duffel rejects)
-# NOTE: Duffel supports airline filtering in offer requests. :contentReference[oaicite:0]{index=0}
+# DUFFEL (route-first, direct + LCC bias first, auto-fallback)
 # ============================================================
+
+def build_offer_request_payload(
+    origin: str,
+    dest: str,
+    out_date: str,
+    ret_date: str,
+    cabin_class: str = "economy",
+    max_connections: Optional[int] = None,
+    included_airlines: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Duffel offer_requests payload.
+    IMPORTANT: Some Duffel fields vary by API version/account.
+    We include optional fields, but we always auto-fallback if rejected.
+    """
+    data: Dict[str, Any] = {
+        "slices": [
+            {"origin": origin, "destination": dest, "departure_date": out_date},
+            {"origin": dest, "destination": origin, "departure_date": ret_date},
+        ],
+        "passengers": [{"type": "adult"}],
+        "cabin_class": cabin_class or "economy",
+    }
+
+    # Optional hints (guarded by fallback logic)
+    if max_connections is not None:
+        # Some Duffel implementations expect this in slice(s), some at root.
+        # We try root first; if rejected we retry with a plain payload.
+        data["max_connections"] = int(max_connections)
+
+    if included_airlines:
+        # Duffel commonly accepts 'included_airlines' on offer_requests
+        data["included_airlines"] = included_airlines
+
+    return {"data": data}
+
 
 def duffel_offer_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     url = "https://api.duffel.com/air/offer_requests"
@@ -450,383 +493,633 @@ def duffel_offer_request(payload: Dict[str, Any]) -> Dict[str, Any]:
         "Content-Type": "application/json",
         "Duffel-Version": DUFFEL_VERSION,
     }
-    r = requests.post(url, headers=headers, json={"data": payload}, timeout=60)
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
     if r.status_code >= 400:
-        raise RuntimeError(f"Duffel {r.status_code}: {r.text[:500]}")
+        raise RuntimeError(f"Duffel error {r.status_code}: {r.text[:500]}")
     return r.json()
+
 
 def extract_offers(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(resp, dict):
         return []
     data = resp.get("data")
-    if isinstance(data, dict):
-        offers = data.get("offers")
-        if isinstance(offers, list):
-            return offers
+    if isinstance(data, dict) and isinstance(data.get("offers"), list):
+        return data["offers"]
+    if isinstance(data, list):
+        return data
+    if isinstance(resp.get("offers"), list):
+        return resp["offers"]
     return []
 
-def build_offer_payload(origin: str, dest: str, out_date: str, ret_date: str,
-                        max_connections: Optional[int],
-                        included_airlines: List[str]) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "slices": [
-            {"origin": origin, "destination": dest, "departure_date": out_date},
-            {"origin": dest, "destination": origin, "departure_date": ret_date},
-        ],
-        "passengers": [{"type": "adult"}],
-        "cabin_class": "economy",
-    }
 
-    # Quality constraint: direct-only if asked
-    if max_connections is not None:
-        payload["max_connections"] = max_connections
+def request_offers_with_fallbacks(
+    origin: str,
+    dest: str,
+    out_date: str,
+    ret_date: str,
+    cabin_class: str,
+    max_connections: Optional[int],
+    included_airlines: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    """
+    Try:
+    1) direct + airline bias (if enabled)
+    2) direct only
+    3) airline bias only
+    4) plain request
+    """
+    attempts = []
 
-    # Carrier bias (Duffel supports included_airlines) :contentReference[oaicite:1]{index=1}
-    if included_airlines:
-        payload["included_airlines"] = included_airlines
+    base_max = max_connections
+    base_air = included_airlines or None
 
-    return payload
+    # Attempt 1: both
+    if ENFORCE_DIRECT_FIRST or LCC_BIAS_FIRST:
+        attempts.append((base_max, base_air))
 
-def run_duffel_feeder(ws: gspread.Worksheet, headers: List[str], routes_today: List[Dict[str, Any]]) -> int:
+    # Attempt 2: direct only
+    if ENFORCE_DIRECT_FIRST:
+        attempts.append((base_max, None))
+
+    # Attempt 3: airlines only
+    if LCC_BIAS_FIRST and base_air:
+        attempts.append((None, base_air))
+
+    # Attempt 4: plain
+    attempts.append((None, None))
+
+    last_err = None
+    for mc, ia in attempts:
+        try:
+            payload = build_offer_request_payload(
+                origin=origin,
+                dest=dest,
+                out_date=out_date,
+                ret_date=ret_date,
+                cabin_class=cabin_class,
+                max_connections=mc,
+                included_airlines=ia,
+            )
+            resp = duffel_offer_request(payload)
+            offers = extract_offers(resp)
+            return offers
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"Duffel request failed after fallbacks: {last_err}")
+
+
+# ============================================================
+# FEEDER (writes to RAW_DEALS)
+# ============================================================
+
+def compute_date_pair(days_ahead: int, window_offset_days: int, trip_len: int) -> Tuple[str, str]:
+    today = dt.date.today()
+    out = today + dt.timedelta(days=int(days_ahead) + int(window_offset_days))
+    ret = out + dt.timedelta(days=int(trip_len))
+    return str(out), str(ret)
+
+
+def get_raw_headers(ws: gspread.Worksheet) -> List[str]:
+    headers = ws.row_values(1)
+    if not headers:
+        raise RuntimeError("RAW_DEALS has no headers row")
+    return headers
+
+
+def get_city_name(
+    iata: str,
+    fallback_city: str,
+    signals_map: Dict[str, Dict[str, Any]],
+) -> str:
+    fallback_city = (fallback_city or "").strip()
+    if fallback_city and fallback_city.upper() != iata:
+        return fallback_city
+
+    sig = signals_map.get(iata.upper(), {})
+    name = signals_city_name(sig)
+    return name or fallback_city or iata.upper()
+
+
+def run_duffel_feeder(
+    raw_ws: gspread.Worksheet,
+    headers: List[str],
+    routes: List[Dict[str, Any]],
+    today_theme: str,
+    longhaul_region: Optional[str],
+    signals_map: Dict[str, Dict[str, Any]],
+) -> int:
     if not DUFFEL_ENABLED or not DUFFEL_API_KEY:
-        log("Duffel: DISABLED or missing DUFFEL_API_KEY")
+        log("Duffel: DISABLED")
         return 0
 
     hmap = header_map(headers)
-    inserted_total = 0
+    selected_routes = select_routes_for_today(
+        routes=routes,
+        today_theme=today_theme,
+        longhaul_region=longhaul_region,
+        max_routes=DUFFEL_ROUTES_PER_RUN,
+        run_slot=RUN_SLOT,
+    )
 
-    log(f"Duffel: Searching {len(routes_today)} routes (MAX_INSERTS={DUFFEL_MAX_INSERTS})")
+    if not selected_routes:
+        log("Duffel: No routes available (CONFIG empty?)")
+        return 0
 
-    for rt in routes_today:
-        origin = rt["origin_iata"]
-        dest   = rt["destination_iata"]
-        trip_len = int(rt.get("trip_length_days") or 5)
+    log(f"Duffel: Searching {len(selected_routes)} routes (MAX_INSERTS={DUFFEL_MAX_INSERTS}, SEARCH_CAP={DUFFEL_MAX_SEARCHES_PER_RUN})")
 
-        # Pick a departure date inside the window (rotates inside range)
-        today = dt.date.today()
-        min_days = int(rt.get("min_days_ahead") or 14)
-        max_days = int(rt.get("max_days_ahead") or 60)
-        if max_days < min_days:
-            max_days = min_days
+    total_inserted = 0
+    searches_used = 0
 
-        # Deterministic offset inside window
-        span = max(1, (max_days - min_days))
-        offset = stable_hash(f"{origin}-{dest}-{today.isoformat()}-{RUN_SLOT}") % span
-        depart = today + dt.timedelta(days=(min_days + offset))
-        ret    = depart + dt.timedelta(days=trip_len)
+    for r in selected_routes:
+        if searches_used >= DUFFEL_MAX_SEARCHES_PER_RUN:
+            break
 
-        out_date = str(depart)
-        ret_date = str(ret)
+        origin = safe_get(r, "origin_iata").upper()
+        dest = safe_get(r, "destination_iata").upper()
 
-        max_conn = rt.get("max_connections", None)
-        airlines = rt.get("included_airlines", []) or []
+        # Names from CONFIG (best), signals fallback
+        origin_city = get_city_name(origin, safe_get(r, "origin_city"), signals_map)
+        dest_city = get_city_name(dest, safe_get(r, "destination_city"), signals_map)
+        dest_country = safe_get(r, "destination_country")
 
-        log(f"  {origin} → {dest} | theme={rt.get('theme','')} | airlines={','.join(airlines) or 'none'} | max_conn={max_conn}")
+        # Window & trip settings
+        days_ahead = int(safe_float(r.get("days_ahead"), 45))
+        window_days = int(safe_float(r.get("window_days"), 0))
+        trip_len = int(safe_float(r.get("trip_length_days"), 5))
 
-        # Try best-quality query first, then fail-open
-        payload = build_offer_payload(origin, dest, out_date, ret_date, max_conn, airlines)
+        # request settings
+        cabin_class = safe_get(r, "cabin_class") or "economy"
+        max_conn = int(safe_float(r.get("max_connections"), 0))  # direct default
+
+        # included airlines: from CONFIG or theme bias
+        cfg_air = safe_get(r, "included_airlines")
+        included_airlines: Optional[List[str]] = None
+        if cfg_air:
+            included_airlines = [a.strip().upper() for a in cfg_air.split(",") if a.strip()]
+        else:
+            # Theme-based bias (soft)
+            if LCC_BIAS_FIRST and normalize_theme(today_theme) in ("winter_sun", "snow", "surf", "city", "foodie"):
+                included_airlines = LCC_DEFAULT.copy()
+
+        # First date attempt
+        out_date, ret_date = compute_date_pair(days_ahead, 0, trip_len)
+        log(f"  {origin_city} ({origin}) → {dest_city} ({dest}) | {out_date} +{trip_len}d")
 
         try:
-            resp = duffel_offer_request(payload)
-        except Exception as e1:
-            log(f"    Duffel rejected constrained query: {e1}")
-            # retry without max_connections
-            try:
-                payload2 = build_offer_payload(origin, dest, out_date, ret_date, None, airlines)
-                resp = duffel_offer_request(payload2)
-                log("    Retried without max_connections: OK")
-            except Exception as e2:
-                log(f"    Duffel retry failed: {e2}")
-                continue
-
-        offers = extract_offers(resp)
-        if not offers:
-            log("    0 offers")
+            offers = request_offers_with_fallbacks(
+                origin=origin,
+                dest=dest,
+                out_date=out_date,
+                ret_date=ret_date,
+                cabin_class=cabin_class,
+                max_connections=max_conn if ENFORCE_DIRECT_FIRST else None,
+                included_airlines=included_airlines if LCC_BIAS_FIRST else None,
+            )
+            searches_used += 1
+        except Exception as e:
+            log(f"  Duffel error: {e}")
             continue
 
-        rows_to_append = []
-        for off in offers:
-            if len(rows_to_append) >= DUFFEL_MAX_INSERTS:
-                break
+        if not offers:
+            log("  0 offers")
+            continue
 
-            price = off.get("total_amount")
-            currency = off.get("total_currency") or "GBP"
-            if currency != "GBP":
-                continue
+        # Insert up to DUFFEL_MAX_INSERTS offers
+        inserted_here = append_offers_to_sheet(
+            raw_ws=raw_ws,
+            headers=headers,
+            hmap=hmap,
+            offers=offers,
+            origin=origin,
+            origin_city=origin_city,
+            dest=dest,
+            dest_city=dest_city,
+            dest_country=dest_country,
+            out_date=out_date,
+            ret_date=ret_date,
+            trip_len=trip_len,
+            deal_source="DUFFEL",
+        )
+        total_inserted += inserted_here
+        log(f"  ✓ Inserted {inserted_here} deals")
 
-            owner = off.get("owner") or {}
-            airline_name = owner.get("name") or ""
+        # Elastic widening (only ONE extra attempt per route, and only if we’re under floor)
+        if window_days > 0 and searches_used < DUFFEL_MAX_SEARCHES_PER_RUN:
+            if total_inserted < DUFFEL_MIN_OFFERS_FLOOR:
+                widen = min(window_days, 7)  # keep it cheap
+                out2, ret2 = compute_date_pair(days_ahead, widen, trip_len)
+                log(f"  ↻ Widening (+{widen}d): {out2}")
 
-            # Stops proxy (outbound segments - 1)
+                try:
+                    offers2 = request_offers_with_fallbacks(
+                        origin=origin,
+                        dest=dest,
+                        out_date=out2,
+                        ret_date=ret2,
+                        cabin_class=cabin_class,
+                        max_connections=max_conn if ENFORCE_DIRECT_FIRST else None,
+                        included_airlines=included_airlines if LCC_BIAS_FIRST else None,
+                    )
+                    searches_used += 1
+                except Exception as e:
+                    log(f"  Duffel widening error: {e}")
+                    continue
+
+                if offers2:
+                    inserted2 = append_offers_to_sheet(
+                        raw_ws=raw_ws,
+                        headers=headers,
+                        hmap=hmap,
+                        offers=offers2,
+                        origin=origin,
+                        origin_city=origin_city,
+                        dest=dest,
+                        dest_city=dest_city,
+                        dest_country=dest_country,
+                        out_date=out2,
+                        ret_date=ret2,
+                        trip_len=trip_len,
+                        deal_source="DUFFEL",
+                    )
+                    total_inserted += inserted2
+                    log(f"  ✓ Inserted {inserted2} (widened)")
+
+    return total_inserted
+
+
+def append_offers_to_sheet(
+    raw_ws: gspread.Worksheet,
+    headers: List[str],
+    hmap: Dict[str, int],
+    offers: List[Dict[str, Any]],
+    origin: str,
+    origin_city: str,
+    dest: str,
+    dest_city: str,
+    dest_country: str,
+    out_date: str,
+    ret_date: str,
+    trip_len: int,
+    deal_source: str,
+) -> int:
+    rows_to_append: List[List[Any]] = []
+    inserted = 0
+
+    for off in offers:
+        if inserted >= DUFFEL_MAX_INSERTS:
+            break
+
+        currency = safe_text(off.get("total_currency") or "GBP").strip().upper()
+        if currency and currency != "GBP":
+            continue
+
+        price = safe_text(off.get("total_amount") or "").strip()
+        if not price:
+            continue
+
+        airline = ""
+        try:
+            airline = safe_text((off.get("owner") or {}).get("name") or "").strip()
+        except Exception:
+            airline = ""
+
+        stops = "0"
+        try:
+            slices = off.get("slices") or []
+            segs = (slices[0].get("segments") or []) if slices else []
+            stops = str(max(0, len(segs) - 1))
+        except Exception:
             stops = "0"
-            try:
-                slices = off.get("slices") or []
-                segs = (slices[0].get("segments") or [])
-                stops = str(max(0, len(segs) - 1))
-            except Exception:
-                pass
 
-            # Build row object with only known headers
-            row_obj = {h: "" for h in headers}
+        deal_id = str(uuid.uuid4())
 
-            deal_id = str(uuid.uuid4())
-            row_obj["deal_id"] = deal_id
-            row_obj["origin_iata"] = origin
-            row_obj["destination_iata"] = dest
-            row_obj["origin_city"] = rt.get("origin_city") or origin
-            row_obj["destination_city"] = rt.get("destination_city") or dest
-            row_obj["price_gbp"] = str(price)
-            row_obj["outbound_date"] = out_date
-            row_obj["return_date"] = ret_date
-            row_obj["trip_length_days"] = str(trip_len)
-            row_obj["stops"] = stops
-            row_obj["airline"] = airline_name
-            row_obj["deal_source"] = "DUFFEL"
-            row_obj["date_added"] = now_utc_iso()
-            row_obj["status"] = STATUS_NEW
+        row_obj = {h: "" for h in headers}
 
-            # For downstream: theme hints from CONFIG
-            if "theme" in row_obj:
-                row_obj["theme"] = (rt.get("theme") or "").strip().lower()
-            if "resolved_theme" in row_obj:
-                row_obj["resolved_theme"] = (rt.get("theme") or "").strip().lower()
-            if "destination_key" in row_obj:
-                row_obj["destination_key"] = dest
+        # Core fields (only write if header exists)
+        row_obj["deal_id"] = deal_id
+        row_obj["origin_iata"] = origin
+        row_obj["origin_city"] = origin_city
+        row_obj["destination_iata"] = dest
+        row_obj["destination_city"] = dest_city
+        row_obj["destination_country"] = dest_country
+        row_obj["outbound_date"] = out_date
+        row_obj["return_date"] = ret_date
+        row_obj["trip_length_days"] = str(trip_len)
+        row_obj["price_gbp"] = price
+        row_obj["airline"] = airline
+        row_obj["stops"] = stops
+        row_obj["deal_source"] = deal_source
+        row_obj["date_added"] = now_utc_str()
+        row_obj["status"] = STATUS_NEW
 
-            # Basic booking link (safe placeholder if you don’t have affiliate enrichment yet)
-            out_fmt = out_date.replace("-", "")
-            ret_fmt = ret_date.replace("-", "")
-            booking = f"https://www.skyscanner.net/transport/flights/{origin}/{dest}/{out_fmt}/{ret_fmt}/"
-            if "affiliate_url" in row_obj:
-                row_obj["affiliate_url"] = booking
-            if "booking_link_vip" in row_obj:
-                row_obj["booking_link_vip"] = booking
-            if "booking_link_free" in row_obj:
-                row_obj["booking_link_free"] = booking
+        # Destination key (for repeat detection)
+        row_obj["destination_key"] = dest
 
-            rows_to_append.append([row_obj.get(h, "") for h in headers])
+        # Booking link (Skyscanner deep link pattern)
+        out_fmt = out_date.replace("-", "")
+        ret_fmt = ret_date.replace("-", "")
+        booking = f"https://www.skyscanner.net/transport/flights/{origin}/{dest}/{out_fmt}/{ret_fmt}/"
+        row_obj["affiliate_url"] = booking
+        row_obj["booking_link_vip"] = booking
+        row_obj["booking_link_free"] = booking
 
-        if rows_to_append:
-            ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-            inserted_total += len(rows_to_append)
-            log(f"    Inserted {len(rows_to_append)} deals")
+        rows_to_append.append([row_obj.get(h, "") for h in headers])
+        inserted += 1
 
-    return inserted_total
+    if rows_to_append:
+        raw_ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+    return inserted
 
 
 # ============================================================
-# Elastic scoring (theme preferred, but outliers can win)
+# SCORING (Elastic Scorer: theme weight soft, price can break through)
 # ============================================================
 
-def elastic_score(deal_theme: str, target_theme: str, price_gbp: float, stops: float) -> Tuple[float, Dict[str, float]]:
-    """
-    Returns score 0..100 and components.
-    - Theme match drives brand consistency
-    - Price can dominate if it’s an outlier
-    - Stops penalized
-    """
-    # theme match score (soft)
-    theme_match = 1.0 if deal_theme == target_theme else (0.55 if deal_theme else 0.40)
-
-    # price score (rough but practical): cheaper is better
-    # scale assumes typical short haul 30..250
+def calc_value_score(price_gbp: float) -> float:
+    # 0..1 (rough, tune later)
     if price_gbp <= 0:
-        price_score = 0.20
+        return 0.0
+    if price_gbp < 15:
+        return 0.65  # suspiciously low, but not auto-0
+    if price_gbp > 900:
+        return 0.0
+    # map 30..300 to 1..0-ish
+    return max(0.0, min(1.0, (350.0 - price_gbp) / 320.0))
+
+
+def calc_route_score(stops: int) -> float:
+    if stops <= 0:
+        return 1.0
+    if stops == 1:
+        return 0.65
+    return 0.25
+
+
+def calc_timing_score(out_date: str) -> float:
+    try:
+        d = dt.date.fromisoformat(out_date)
+        days = (d - dt.date.today()).days
+        if 14 <= days <= 60:
+            return 1.0
+        if 7 <= days <= 120:
+            return 0.75
+        if 121 <= days <= 240:
+            return 0.55
+        return 0.35
+    except Exception:
+        return 0.5
+
+
+def determine_deal_theme_from_signals(dest_iata: str, out_date: str, signals_map: Dict[str, Dict[str, Any]]) -> str:
+    """
+    Lightweight: if you already have resolved_theme formulas you can ignore this,
+    but we keep it deterministic and safe.
+
+    If signals exist and have sun/surf/snow scores, you can extend this later.
+    For now:
+      - winter months => winter_sun bias only if you tag via CONFIG routes
+      - default => shoulder
+    """
+    _ = signals_map.get(dest_iata.upper(), {})
+    # Keep conservative; your CONFIG.theme is the primary “intent”
+    return "shoulder"
+
+
+def score_row_elastic(
+    row: Dict[str, Any],
+    target_theme: str,
+    recent_dest_penalty: bool,
+    recent_theme_penalty: bool,
+) -> Dict[str, Any]:
+    """
+    “Elastic scorer”:
+      - Theme is a soft weight
+      - Price weight ramps up if value is an outlier
+      - Diversity penalty is harsh (kills repeats)
+    """
+
+    dest = safe_get(row, "destination_iata").upper()
+    deal_theme = normalize_theme(safe_get(row, "deal_theme") or safe_get(row, "auto_theme") or safe_get(row, "resolved_theme") or "")
+
+    price = safe_float(safe_get(row, "price_gbp"), 0.0)
+    stops = int(safe_float(safe_get(row, "stops"), 0.0))
+    out_date = safe_get(row, "outbound_date")
+
+    value = calc_value_score(price)
+    route = calc_route_score(stops)
+    timing = calc_timing_score(out_date)
+
+    # Soft theme score: match -> 1.0, adjacent -> 0.6, wildcard -> 0.3
+    theme_match = (deal_theme == normalize_theme(target_theme))
+    theme_score = 1.0 if theme_match else (0.6 if deal_theme and normalize_theme(target_theme) in deal_theme else 0.3)
+
+    # Adaptive weights: if value is very strong, let it override theme
+    if value >= 0.85:
+        w_theme, w_value = 0.25, 0.55
     else:
-        price_score = max(0.0, min(1.0, (260.0 - price_gbp) / 230.0))  # 30->~1, 260->0
+        w_theme, w_value = 0.55, 0.30
 
-    # outlier boost: if very cheap, let price override theme a bit
-    # (e.g., £59 to Jordan or £199 longhaul)
-    outlier = 1.0 if price_score >= (1.0 - OUTLIER_BOOST_THRESHOLD) else 0.0
-    theme_w = THEME_WEIGHT_BASE * (1.0 - 0.35 * outlier)
-    price_w = PRICE_WEIGHT_BASE * (1.0 + 0.35 * outlier)
+    w_route, w_timing = 0.10, 0.05
 
-    # route score
-    route_score = 1.0 if stops <= 0 else (0.75 if stops <= 1 else 0.45)
+    stotal = (theme_score * w_theme + value * w_value + route * w_route + timing * w_timing) * 100.0
 
-    # final
-    score = (theme_w * theme_match + price_w * price_score + 0.15 * route_score) / (theme_w + price_w + 0.15)
-    return round(score * 100.0, 1), {
-        "theme_match": round(theme_match, 3),
-        "price_score": round(price_score, 3),
-        "route_score": round(route_score, 3),
-        "theme_w": round(theme_w, 3),
-        "price_w": round(price_w, 3),
+    # Apply boredom penalties
+    if recent_dest_penalty:
+        stotal -= DEST_REPEAT_PENALTY
+    if recent_theme_penalty:
+        stotal -= THEME_REPEAT_PENALTY
+
+    # Strength & angle type (simple, deterministic)
+    if theme_score >= 0.85:
+        theme_strength = "primary"
+        angle_type = "classic_theme"
+    elif theme_score >= 0.55:
+        theme_strength = "adjacent"
+        angle_type = "smart_alternative"
+    else:
+        theme_strength = "wildcard"
+        angle_type = "price_led" if value >= 0.6 else ("routing_win" if route >= 0.9 else "quiet_season")
+
+    angle_reason = (
+        "Theme match" if theme_strength == "primary" else
+        "Theme-adjacent" if theme_strength == "adjacent" else
+        "Wildcard value"
+    )
+
+    return {
+        "stotal": round(stotal, 1),
+        "theme_score": round(theme_score, 3),
+        "value_score": round(value, 3),
+        "route_score": round(route, 3),
+        "timing_score": round(timing, 3),
+        "theme_strength": theme_strength,
+        "angle_type": angle_type,
+        "angle_reason": angle_reason,
+        "deal_theme": deal_theme or "shoulder",
     }
 
 
-def stage_score(ws: gspread.Worksheet, headers: List[str], target_theme: str) -> int:
+def stage_score_new(raw_ws: gspread.Worksheet, headers: List[str], target_theme: str, signals_map: Dict[str, Dict[str, Any]]) -> int:
     hmap = header_map(headers)
-    rows = ws.get_all_values()
+    rows = raw_ws.get_all_values()
     if len(rows) < 2:
         return 0
 
     scored = 0
     for i in range(2, len(rows) + 1):
-        row = row_dict(headers, rows[i - 1])
-        status = safe_get(row, "status").upper()
+        vals = rows[i - 1]
+        row = {headers[c]: (vals[c] if c < len(vals) else "") for c in range(len(headers))}
 
-        if status not in (STATUS_NEW, STATUS_SCORED):
+        if safe_get(row, "status").upper() != STATUS_NEW:
             continue
 
-        # already scored?
-        if safe_get(row, "ai_score") or safe_get(row, "stotal"):
+        # If already scored, skip
+        if safe_get(row, "stotal") or safe_get(row, "ai_score"):
             continue
 
-        deal_theme = (safe_get(row, "resolved_theme") or safe_get(row, "theme")).lower()
-        price = safe_float(safe_get(row, "price_gbp"), 0.0)
-        stops = safe_float(safe_get(row, "stops"), 1.0)
+        dest = safe_get(row, "destination_iata").upper()
+        out_date = safe_get(row, "outbound_date")
+        deal_theme = determine_deal_theme_from_signals(dest, out_date, signals_map)
 
-        score, comps = elastic_score(deal_theme, target_theme, price, stops)
+        updates: List[gspread.Cell] = []
+        if "deal_theme" in hmap:
+            updates.append(gspread.Cell(i, hmap["deal_theme"], deal_theme))
 
-        updates = []
-        def put(col: str, val: Any):
-            if col in hmap:
-                updates.append(gspread.Cell(i, hmap[col], str(val)))
+        # placeholder penalties decided later at selection time
+        result = score_row_elastic(row, target_theme, False, False)
 
-        put("ai_score", score)
-        put("stotal", score)
-        put("theme_score", comps["theme_match"])
-        put("value_score", comps["price_score"])
-        put("route_score", comps["route_score"])
-        put("score_components", json.dumps(comps))
-        put("theme_final", deal_theme or target_theme)
-        put("resolved_theme", deal_theme or target_theme)
-        put("scored_timestamp", now_utc_iso())
-        put("status", STATUS_SCORED)
+        # write score components if columns exist
+        for k in ["stotal", "theme_score", "value_score", "route_score", "timing_score", "theme_strength", "angle_type", "angle_reason"]:
+            if k in hmap and k in result:
+                updates.append(gspread.Cell(i, hmap[k], result[k]))
+
+        # also mirror to ai_score if present (so older tabs still work)
+        if "ai_score" in hmap:
+            updates.append(gspread.Cell(i, hmap["ai_score"], result["stotal"]))
+        if "status" in hmap:
+            updates.append(gspread.Cell(i, hmap["status"], STATUS_SCORED))
+        if "scored_timestamp" in hmap:
+            updates.append(gspread.Cell(i, hmap["scored_timestamp"], now_utc_str()))
 
         if updates:
-            ws.update_cells(updates, value_input_option="USER_ENTERED")
-
-        scored += 1
+            raw_ws.update_cells(updates, value_input_option="USER_ENTERED")
+            scored += 1
 
     return scored
 
 
 # ============================================================
-# Variety tracking (timezone-safe)
+# SELECTION (diversity force + safe datetimes)
 # ============================================================
 
 def get_recent_posts(rows: List[List[str]], headers: List[str], lookback_hours: int) -> Tuple[set, set, List[str]]:
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=lookback_hours)
+    cutoff = now_utc_dt() - dt.timedelta(hours=lookback_hours)
+
     recent_dests = set()
     recent_themes = set()
-    last3_dests: List[str] = []
+    last3: List[str] = []
 
-    # Walk newest->oldest for last3
+    # Walk from newest to oldest
     for i in range(len(rows) - 1, 0, -1):
-        row = row_dict(headers, rows[i])
+        row = {headers[c]: (rows[i][c] if c < len(rows[i]) else "") for c in range(len(headers))}
         status = safe_get(row, "status").upper()
+
         if status not in (STATUS_POSTED_INSTAGRAM, STATUS_POSTED_TELEGRAM_VIP, STATUS_POSTED_ALL):
             continue
 
-        ts = safe_get(row, "ig_published_timestamp") or safe_get(row, "tg_monthly_timestamp") or safe_get(row, "published_timestamp")
-        posted_dt = parse_iso_utc(ts)
+        posted_ts = safe_get(row, "ig_published_timestamp") or safe_get(row, "tg_monthly_timestamp") or safe_get(row, "published_timestamp")
+        posted_dt = parse_iso_utc(posted_ts)
         if not posted_dt:
             continue
 
-        if posted_dt > cutoff:
-            dest = (safe_get(row, "destination_key") or safe_get(row, "destination_iata")).upper()
-            theme = (safe_get(row, "theme_final") or safe_get(row, "resolved_theme") or safe_get(row, "theme")).lower()
-
-            if dest:
-                recent_dests.add(dest)
-                if len(last3_dests) < 3:
-                    last3_dests.append(dest)
-            if theme:
-                recent_themes.add(theme)
-
-        if len(last3_dests) >= 3 and posted_dt <= cutoff:
+        if posted_dt <= cutoff:
             break
 
-    return recent_dests, recent_themes, last3_dests
+        dest_key = (safe_get(row, "destination_key") or safe_get(row, "destination_iata") or "").upper()
+        theme = normalize_theme(safe_get(row, "deal_theme") or safe_get(row, "resolved_theme") or safe_get(row, "auto_theme") or "")
+
+        if dest_key:
+            recent_dests.add(dest_key)
+            if len(last3) < 3:
+                last3.append(dest_key)
+
+        if theme:
+            recent_themes.add(theme)
+
+    return recent_dests, recent_themes, last3
 
 
-# ============================================================
-# Editorial selection (diversity force + fail-open)
-# ============================================================
-
-def stage_select_best(ws: gspread.Worksheet, headers: List[str], target_theme: str) -> int:
+def stage_select_best(raw_ws: gspread.Worksheet, headers: List[str], target_theme: str) -> int:
     hmap = header_map(headers)
-    rows = ws.get_all_values()
+    rows = raw_ws.get_all_values()
     if len(rows) < 2:
         return 0
 
     recent_dests, recent_themes, last3 = get_recent_posts(rows, headers, VARIETY_LOOKBACK_HOURS)
 
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=RECENCY_FILTER_HOURS)
+    recency_cutoff = now_utc_dt() - dt.timedelta(hours=RECENCY_FILTER_HOURS)
 
     candidates = []
     for i in range(2, len(rows) + 1):
-        row = row_dict(headers, rows[i - 1])
+        vals = rows[i - 1]
+        row = {headers[c]: (vals[c] if c < len(vals) else "") for c in range(len(headers))}
 
-        status = safe_get(row, "status").upper()
-        if status not in (STATUS_NEW, STATUS_SCORED):
+        if safe_get(row, "status").upper() != STATUS_SCORED:
             continue
 
-        # Must be scored
-        score = safe_float(safe_get(row, "ai_score") or safe_get(row, "stotal"), 0.0)
-        if score <= 0:
-            continue
-
-        # Recency
+        # recency filter on date_added
         added = parse_iso_utc(safe_get(row, "date_added"))
-        if added and added < cutoff:
+        if added and added < recency_cutoff:
             continue
 
-        dest = (safe_get(row, "destination_key") or safe_get(row, "destination_iata")).upper()
-        theme = (safe_get(row, "theme_final") or safe_get(row, "resolved_theme") or safe_get(row, "theme")).lower()
-        if not dest:
+        dest_key = (safe_get(row, "destination_key") or safe_get(row, "destination_iata") or "").upper()
+        if not dest_key:
             continue
 
-        # Soft weighting: prefer target theme but allow break-through
-        theme_match_bonus = 12.0 if theme == target_theme else (5.0 if theme else 0.0)
+        # recompute score WITH penalties applied
+        deal_theme = normalize_theme(safe_get(row, "deal_theme") or "")
+        r_dest = dest_key in recent_dests or dest_key in last3
+        r_theme = deal_theme in recent_themes if deal_theme else False
 
-        final_score = score + theme_match_bonus
+        scored = score_row_elastic(row, target_theme, r_dest, r_theme)
+        final_score = scored["stotal"]
 
-        penalties = []
-        if dest in recent_dests:
-            final_score -= DEST_REPEAT_PENALTY
-            penalties.append(f"dest_repeat:{dest}")
-        if theme in recent_themes and theme:
-            final_score -= THEME_REPEAT_PENALTY
-            penalties.append(f"theme_repeat:{theme}")
-        if dest in last3:
-            final_score -= (DEST_REPEAT_PENALTY * 0.75)
-            penalties.append(f"last3_block:{dest}")
-
-        candidates.append((final_score, i, dest, theme, score, ", ".join(penalties) if penalties else "none"))
+        candidates.append((final_score, i, dest_key, deal_theme, scored))
 
     if not candidates:
-        log("  No candidates found (scored NEW/SCORED).")
+        log("  No scored candidates available")
         return 0
 
     candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_row_idx, best_dest, best_theme, scored = candidates[0]
 
-    picked = candidates[0]
-    final_score, row_idx, dest, theme, base_score, penalties = picked
+    log(f"  ✓ SELECTED row {best_row_idx}: {best_dest} | theme={best_theme or 'n/a'} | score={best_score}")
 
-    log(f"  ✓ SELECTED row {row_idx}: dest={dest} theme={theme or 'unknown'} base={base_score:.1f} final={final_score:.1f} penalties={penalties}")
-
-    updates = []
-    if "status" in hmap:
-        updates.append(gspread.Cell(row_idx, hmap["status"], STATUS_READY_TO_POST))
+    updates: List[gspread.Cell] = []
     if "final_score" in hmap:
-        updates.append(gspread.Cell(row_idx, hmap["final_score"], str(round(final_score, 1))))
+        updates.append(gspread.Cell(best_row_idx, hmap["final_score"], best_score))
+    if "status" in hmap:
+        updates.append(gspread.Cell(best_row_idx, hmap["status"], STATUS_READY_TO_POST))
+
+    # also keep a “reasons” text if column exists
     if "reasons" in hmap:
-        updates.append(gspread.Cell(row_idx, hmap["reasons"], f"selected|target={target_theme}|penalties={penalties}"))
+        reason = f"Picked via elastic scorer. dest_repeat={'YES' if best_dest in recent_dests else 'NO'}; theme_repeat={'YES' if best_theme in recent_themes else 'NO'}"
+        updates.append(gspread.Cell(best_row_idx, hmap["reasons"], reason))
 
     if updates:
-        ws.update_cells(updates, value_input_option="USER_ENTERED")
+        raw_ws.update_cells(updates, value_input_option="USER_ENTERED")
         return 1
+
     return 0
 
 
 # ============================================================
-# Render
+# RENDER (ensure city names)
 # ============================================================
 
-def render_image(row: Dict[str, str]) -> str:
+def render_image(row: Dict[str, Any]) -> str:
     payload = {
         "deal_id": safe_get(row, "deal_id"),
         "origin_city": safe_get(row, "origin_city") or safe_get(row, "origin_iata"),
@@ -836,69 +1129,97 @@ def render_image(row: Dict[str, str]) -> str:
         "outbound_date": safe_get(row, "outbound_date"),
         "return_date": safe_get(row, "return_date"),
     }
-    r = requests.post(RENDER_URL, json=payload, timeout=45)
+    r = requests.post(RENDER_URL, json=payload, timeout=30)
     r.raise_for_status()
-    j = r.json()
-    return (j.get("graphic_url") or "").strip()
+    return safe_text(r.json().get("graphic_url")).strip()
 
-def stage_render(ws: gspread.Worksheet, headers: List[str]) -> int:
+
+def stage_render(raw_ws: gspread.Worksheet, headers: List[str]) -> int:
     hmap = header_map(headers)
-    rows = ws.get_all_values()
+    rows = raw_ws.get_all_values()
     if len(rows) < 2:
         return 0
 
     rendered = 0
     for i in range(2, len(rows) + 1):
-        row = row_dict(headers, rows[i - 1])
+        vals = rows[i - 1]
+        row = {headers[c]: (vals[c] if c < len(vals) else "") for c in range(len(headers))}
+
         if safe_get(row, "status").upper() != STATUS_READY_TO_POST:
             continue
 
         log(f"  Rendering row {i}")
         try:
-            graphic_url = render_image(row)
-            updates = []
-            if graphic_url and "graphic_url" in hmap:
-                updates.append(gspread.Cell(i, hmap["graphic_url"], graphic_url))
-            if "rendered_timestamp" in hmap:
-                updates.append(gspread.Cell(i, hmap["rendered_timestamp"], now_utc_iso()))
-            if "status" in hmap:
-                updates.append(gspread.Cell(i, hmap["status"], STATUS_READY_TO_PUBLISH))
-            if updates:
-                ws.update_cells(updates, value_input_option="USER_ENTERED")
-            rendered += 1
+            url = render_image(row)
         except Exception as e:
             log(f"  Render error: {e}")
+            if "render_error" in hmap:
+                raw_ws.update_cell(i, hmap["render_error"], str(e)[:250])
+            continue
+
+        updates: List[gspread.Cell] = []
+        if "graphic_url" in hmap:
+            updates.append(gspread.Cell(i, hmap["graphic_url"], url))
+        if "rendered_timestamp" in hmap:
+            updates.append(gspread.Cell(i, hmap["rendered_timestamp"], now_utc_str()))
+        if "status" in hmap:
+            updates.append(gspread.Cell(i, hmap["status"], STATUS_READY_TO_PUBLISH))
+
+        if updates:
+            raw_ws.update_cells(updates, value_input_option="USER_ENTERED")
+            rendered += 1
+
     return rendered
 
 
 # ============================================================
-# Instagram
+# INSTAGRAM (human-sounding, no hype, no AI mentions)
 # ============================================================
 
-def instagram_caption(row: Dict[str, str]) -> str:
+def instagram_caption(row: Dict[str, Any], target_theme: str) -> str:
     origin = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
     dest = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
-    price = f"£{round_price_up(safe_get(row,'price_gbp'))}"
+    price = f"£{round_price_up(safe_get(row, 'price_gbp'))}"
+    out_date = safe_get(row, "outbound_date")
+    ret_date = safe_get(row, "return_date")
 
-    # Human, low-hype, UK tone
-    variants = [
-        f"{price} from {origin} to {dest}. If you’re flexible, this is a tidy one.",
-        f"{origin} → {dest} for {price}. Handy dates if you can move quick.",
-        f"{price} to {dest} from {origin}. Worth a look if that’s been on your list.",
-        f"{origin} to {dest} for {price}. Prices move — double-check at checkout.",
+    angle = normalize_theme(safe_get(row, "angle_type"))
+    theme_strength = safe_get(row, "theme_strength") or "wildcard"
+
+    # Keep it honest + benefit-led
+    if angle == "routing_win":
+        hook = "Direct routing is doing the heavy lifting here."
+    elif angle == "quiet_season":
+        hook = "Quieter dates, usually easier on your wallet."
+    elif angle == "smart_alternative":
+        hook = "Not the obvious pick — that’s the point."
+    else:
+        hook = "Worth a look at this price."
+
+    caption = [
+        f"{origin} → {dest} for {price}",
+        "",
+        f"Dates: {out_date} to {ret_date}",
+        "",
+        hook,
+        f"Theme today: {normalize_theme(target_theme).replace('_',' ')} • {theme_strength}",
+        "",
+        "Link in bio for the free Telegram channel (VIP gets deals 24h early).",
     ]
-    idx = stable_hash(dest) % len(variants)
-    return variants[idx]
+    return "\n".join(caption)[:2200]
 
-def post_instagram(ws: gspread.Worksheet, headers: List[str]) -> int:
+
+def post_instagram(raw_ws: gspread.Worksheet, headers: List[str], target_theme: str) -> int:
     hmap = header_map(headers)
-    rows = ws.get_all_values()
+    rows = raw_ws.get_all_values()
     if len(rows) < 2:
         return 0
 
     posted = 0
     for i in range(2, len(rows) + 1):
-        row = row_dict(headers, rows[i - 1])
+        vals = rows[i - 1]
+        row = {headers[c]: (vals[c] if c < len(vals) else "") for c in range(len(headers))}
+
         if safe_get(row, "status").upper() != STATUS_READY_TO_PUBLISH:
             continue
 
@@ -906,264 +1227,398 @@ def post_instagram(ws: gspread.Worksheet, headers: List[str]) -> int:
         if not graphic_url:
             continue
 
-        caption = instagram_caption(row)
+        caption = instagram_caption(row, target_theme)
         cache_buster = int(time.time())
         image_url_cb = f"{graphic_url}?cb={cache_buster}"
 
-        log(f"  Posting IG row {i}")
-        try:
-            create_url = f"https://graph.facebook.com/v20.0/{IG_USER_ID}/media"
-            r1 = requests.post(create_url, data={
-                "image_url": image_url_cb,
-                "caption": caption[:2200],
-                "access_token": IG_ACCESS_TOKEN,
-            }, timeout=45)
-            r1.raise_for_status()
-            creation_id = r1.json().get("id")
-            if not creation_id:
-                continue
+        log(f"  Posting to Instagram row {i}")
 
-            # poll until finished
+        try:
+            # create media container
+            create_url = f"https://graph.facebook.com/v20.0/{IG_USER_ID}/media"
+            r1 = requests.post(
+                create_url,
+                data={
+                    "image_url": image_url_cb,
+                    "caption": caption,
+                    "access_token": IG_ACCESS_TOKEN,
+                },
+                timeout=30,
+            )
+            r1.raise_for_status()
+            creation_id = safe_text(r1.json().get("id")).strip()
+            if not creation_id:
+                raise RuntimeError("No creation_id returned")
+
+            # wait until finished
             waited = 0
-            while waited < 90:
+            while waited < 60:
                 rs = requests.get(
                     f"https://graph.facebook.com/v20.0/{creation_id}",
                     params={"fields": "status_code", "access_token": IG_ACCESS_TOKEN},
-                    timeout=15
+                    timeout=10,
                 )
-                if rs.status_code == 200 and rs.json().get("status_code") == "FINISHED":
-                    break
-                time.sleep(3)
-                waited += 3
+                if rs.status_code == 200:
+                    sc = safe_text(rs.json().get("status_code")).strip()
+                    if sc == "FINISHED":
+                        break
+                    if sc in ("ERROR", "EXPIRED"):
+                        raise RuntimeError(f"Media status: {sc}")
+                time.sleep(2)
+                waited += 2
 
+            # publish
             r2 = requests.post(
                 f"https://graph.facebook.com/v20.0/{IG_USER_ID}/media_publish",
                 data={"creation_id": creation_id, "access_token": IG_ACCESS_TOKEN},
-                timeout=45
+                timeout=30,
             )
             r2.raise_for_status()
-            media_id = r2.json().get("id", "")
+            media_id = safe_text(r2.json().get("id")).strip()
 
-            updates = []
+            updates: List[gspread.Cell] = []
             if "ig_creation_id" in hmap:
                 updates.append(gspread.Cell(i, hmap["ig_creation_id"], creation_id))
-            if "ig_media_id" in hmap:
+            if "ig_media_id" in hmap and media_id:
                 updates.append(gspread.Cell(i, hmap["ig_media_id"], media_id))
             if "ig_published_timestamp" in hmap:
-                updates.append(gspread.Cell(i, hmap["ig_published_timestamp"], now_utc_iso()))
+                updates.append(gspread.Cell(i, hmap["ig_published_timestamp"], now_utc_str()))
             if "published_timestamp" in hmap:
-                updates.append(gspread.Cell(i, hmap["published_timestamp"], now_utc_iso()))
+                updates.append(gspread.Cell(i, hmap["published_timestamp"], now_utc_str()))
             if "status" in hmap:
                 updates.append(gspread.Cell(i, hmap["status"], STATUS_POSTED_INSTAGRAM))
 
             if updates:
-                ws.update_cells(updates, value_input_option="USER_ENTERED")
+                raw_ws.update_cells(updates, value_input_option="USER_ENTERED")
 
             posted += 1
-            log("  ✓ IG posted")
+            log("  ✓ Posted to Instagram")
         except Exception as e:
-            log(f"  IG error: {e}")
+            log(f"  Instagram error: {e}")
+            if "last_error" in hmap:
+                raw_ws.update_cell(i, hmap["last_error"], str(e)[:250])
+
     return posted
 
 
 # ============================================================
-# Telegram (VIP AM, Free PM after delay)
+# TELEGRAM (VIP first, Free later)
 # ============================================================
 
-def tg_send(token: str, chat: str, text: str) -> None:
+def tg_send(token: str, chat: str, text: str) -> str:
     r = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-        timeout=45,
+        json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False},
+        timeout=30,
     )
     r.raise_for_status()
+    data = r.json()
+    try:
+        return str(data["result"]["message_id"])
+    except Exception:
+        return ""
 
-def format_tg_vip(row: Dict[str, str]) -> str:
-    price = f"£{round_price_up(safe_get(row,'price_gbp'))}"
+
+def fmt_date_short(iso_date: str) -> str:
+    try:
+        d = dt.date.fromisoformat(iso_date)
+        return d.strftime("%d %b %Y")
+    except Exception:
+        return iso_date
+
+
+def format_telegram_vip(row: Dict[str, Any]) -> str:
+    price = round_price_up(safe_get(row, "price_gbp"))
     dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
     dest_country = safe_get(row, "destination_country")
     origin_city = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
-    out_date = safe_get(row, "outbound_date")
-    ret_date = safe_get(row, "return_date")
+    out_date = fmt_date_short(safe_get(row, "outbound_date"))
+    ret_date = fmt_date_short(safe_get(row, "return_date"))
     link = safe_get(row, "booking_link_vip") or safe_get(row, "affiliate_url")
 
     where = f"{dest_city}, {dest_country}" if dest_country else dest_city
-    msg = f"""{price} to {where}
 
-<b>FROM:</b> {origin_city}
-<b>OUT:</b> {out_date}
-<b>BACK:</b> {ret_date}
+    angle = normalize_theme(safe_get(row, "angle_type"))
+    if angle == "routing_win":
+        why = "Direct routing — less faff, more time there."
+    elif angle == "quiet_season":
+        why = "Quieter dates — often better value."
+    elif angle == "smart_alternative":
+        why = "A smarter alternative to the usual hotspots."
+    else:
+        why = "Good value for the route."
 
-<b>VIP:</b> 24reduced noise — best pick for this run.
-"""
+    msg = (
+        f"<b>£{price} to {where}</b>\n\n"
+        f"<b>From:</b> {origin_city}\n"
+        f"<b>Out:</b> {out_date}\n"
+        f"<b>Back:</b> {ret_date}\n\n"
+        f"<b>Why it’s worth a look:</b>\n• {why}\n\n"
+    )
     if link:
-        msg += f'\n<a href="{link}">Book</a>'
+        msg += f'<a href="{link}">Book now</a>'
     return msg
 
-def format_tg_free(row: Dict[str, str]) -> str:
-    price = f"£{round_price_up(safe_get(row,'price_gbp'))}"
+
+def format_telegram_free(row: Dict[str, Any]) -> str:
+    price = round_price_up(safe_get(row, "price_gbp"))
     dest_city = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
     dest_country = safe_get(row, "destination_country")
     origin_city = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
-    out_date = safe_get(row, "outbound_date")
-    ret_date = safe_get(row, "return_date")
+    out_date = fmt_date_short(safe_get(row, "outbound_date"))
+    ret_date = fmt_date_short(safe_get(row, "return_date"))
     link = safe_get(row, "booking_link_free") or safe_get(row, "affiliate_url")
 
     where = f"{dest_city}, {dest_country}" if dest_country else dest_city
-    msg = f"""{price} to {where}
 
-<b>FROM:</b> {origin_city}
-<b>OUT:</b> {out_date}
-<b>BACK:</b> {ret_date}
-
-<b>Heads up:</b>
-• VIP members saw this 24h early
-"""
+    msg = (
+        f"<b>£{price} to {where}</b>\n\n"
+        f"<b>From:</b> {origin_city}\n"
+        f"<b>Out:</b> {out_date}\n"
+        f"<b>Back:</b> {ret_date}\n\n"
+        f"VIP members saw this <b>24 hours earlier</b>.\n\n"
+    )
     if link:
-        msg += f'\n<a href="{link}">Book</a>\n\n'
-
+        msg += f'<a href="{link}">Book now</a>\n\n'
+    msg += (
+        "<b>Want earlier access?</b>\n"
+        "• Deals 24h early\n"
+        "• Cancel anytime\n\n"
+    )
     if STRIPE_LINK_MONTHLY:
-        msg += "<b>Want earlier access?</b>\n"
-        msg += "• Deals 24h early\n"
-        msg += "• Less noise, better picks\n\n"
         msg += f'<a href="{STRIPE_LINK_MONTHLY}">Upgrade to VIP</a>'
     return msg
 
-def post_tg_vip(ws: gspread.Worksheet, headers: List[str]) -> int:
+
+def post_telegram_vip(raw_ws: gspread.Worksheet, headers: List[str]) -> int:
     if RUN_SLOT != "AM":
         return 0
+
     hmap = header_map(headers)
-    rows = ws.get_all_values()
+    rows = raw_ws.get_all_values()
     if len(rows) < 2:
         return 0
 
     posted = 0
     for i in range(2, len(rows) + 1):
-        row = row_dict(headers, rows[i - 1])
+        vals = rows[i - 1]
+        row = {headers[c]: (vals[c] if c < len(vals) else "") for c in range(len(headers))}
+
         if safe_get(row, "status").upper() != STATUS_POSTED_INSTAGRAM:
             continue
-        if safe_get(row, "tg_monthly_timestamp"):
+
+        if safe_get(row, "tg_monthly_timestamp") or safe_get(row, "telegram_vip_msg_id"):
             continue
 
-        msg = format_tg_vip(row)
-        log(f"  TG VIP row {i}")
+        log(f"  Telegram VIP post row {i}")
         try:
-            tg_send(TELEGRAM_BOT_TOKEN_VIP, TELEGRAM_CHANNEL_VIP, msg)
-            updates = []
+            msg = format_telegram_vip(row)
+            mid = tg_send(TELEGRAM_BOT_TOKEN_VIP, TELEGRAM_CHANNEL_VIP, msg)
+
+            updates: List[gspread.Cell] = []
             if "tg_monthly_timestamp" in hmap:
-                updates.append(gspread.Cell(i, hmap["tg_monthly_timestamp"], now_utc_iso()))
+                updates.append(gspread.Cell(i, hmap["tg_monthly_timestamp"], now_utc_str()))
+            if "telegram_vip_msg_id" in hmap and mid:
+                updates.append(gspread.Cell(i, hmap["telegram_vip_msg_id"], mid))
             if "posted_to_vip" in hmap:
                 updates.append(gspread.Cell(i, hmap["posted_to_vip"], "TRUE"))
             if "status" in hmap:
                 updates.append(gspread.Cell(i, hmap["status"], STATUS_POSTED_TELEGRAM_VIP))
+
             if updates:
-                ws.update_cells(updates, value_input_option="USER_ENTERED")
+                raw_ws.update_cells(updates, value_input_option="USER_ENTERED")
+
             posted += 1
+            log("  ✓ VIP posted")
         except Exception as e:
-            log(f"  TG VIP error: {e}")
+            log(f"  VIP error: {e}")
+            if "last_error" in hmap:
+                raw_ws.update_cell(i, hmap["last_error"], str(e)[:250])
+
     return posted
 
-def post_tg_free(ws: gspread.Worksheet, headers: List[str]) -> int:
+
+def post_telegram_free(raw_ws: gspread.Worksheet, headers: List[str]) -> int:
     if RUN_SLOT != "PM":
         return 0
+
     hmap = header_map(headers)
-    rows = ws.get_all_values()
+    rows = raw_ws.get_all_values()
     if len(rows) < 2:
         return 0
 
     posted = 0
     for i in range(2, len(rows) + 1):
-        row = row_dict(headers, rows[i - 1])
+        vals = rows[i - 1]
+        row = {headers[c]: (vals[c] if c < len(vals) else "") for c in range(len(headers))}
+
         if safe_get(row, "status").upper() != STATUS_POSTED_TELEGRAM_VIP:
             continue
-        if safe_get(row, "tg_free_timestamp"):
+
+        if safe_get(row, "tg_free_timestamp") or safe_get(row, "telegram_free_msg_id"):
             continue
 
         vip_ts = safe_get(row, "tg_monthly_timestamp")
         if hours_since(vip_ts) < VIP_DELAY_HOURS:
             continue
 
-        msg = format_tg_free(row)
-        log(f"  TG FREE row {i}")
+        log(f"  Telegram FREE post row {i}")
         try:
-            tg_send(TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL, msg)
-            updates = []
+            msg = format_telegram_free(row)
+            mid = tg_send(TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL, msg)
+
+            updates: List[gspread.Cell] = []
             if "tg_free_timestamp" in hmap:
-                updates.append(gspread.Cell(i, hmap["tg_free_timestamp"], now_utc_iso()))
+                updates.append(gspread.Cell(i, hmap["tg_free_timestamp"], now_utc_str()))
+            if "telegram_free_msg_id" in hmap and mid:
+                updates.append(gspread.Cell(i, hmap["telegram_free_msg_id"], mid))
             if "posted_for_free" in hmap:
                 updates.append(gspread.Cell(i, hmap["posted_for_free"], "TRUE"))
             if "status" in hmap:
                 updates.append(gspread.Cell(i, hmap["status"], STATUS_POSTED_ALL))
+
             if updates:
-                ws.update_cells(updates, value_input_option="USER_ENTERED")
+                raw_ws.update_cells(updates, value_input_option="USER_ENTERED")
+
             posted += 1
+            log("  ✓ FREE posted")
         except Exception as e:
-            log(f"  TG FREE error: {e}")
+            log(f"  FREE error: {e}")
+            if "last_error" in hmap:
+                raw_ws.update_cell(i, hmap["last_error"], str(e)[:250])
+
     return posted
+
+
+# ============================================================
+# OPTIONAL: MAILERLITE EXPORT TAB (for later integration)
+# ============================================================
+
+def stage_export_mailerlite(sh: gspread.Spreadsheet, raw_ws: gspread.Worksheet, headers: List[str]) -> int:
+    """
+    Writes a simple feed row into MAILERLITE_FEED for any deal that reached POSTED_ALL today.
+    This does NOT call MailerLite API. It just prepares a clean feed tab for an email workflow.
+    """
+    try:
+        ml_ws = ensure_tab(
+            sh,
+            MAILERLITE_FEED_TAB,
+            headers=["timestamp", "origin", "destination", "price_gbp", "outbound", "return", "theme", "angle", "link"],
+        )
+    except Exception:
+        return 0
+
+    hmap = header_map(headers)
+    rows = raw_ws.get_all_values()
+    if len(rows) < 2:
+        return 0
+
+    wrote = 0
+    today = dt.date.today()
+
+    for i in range(2, len(rows) + 1):
+        vals = rows[i - 1]
+        row = {headers[c]: (vals[c] if c < len(vals) else "") for c in range(len(headers))}
+        if safe_get(row, "status").upper() != STATUS_POSTED_ALL:
+            continue
+
+        ts = parse_iso_utc(safe_get(row, "tg_free_timestamp") or safe_get(row, "published_timestamp") or "")
+        if not ts:
+            continue
+        if ts.date() != today:
+            continue
+
+        origin = safe_get(row, "origin_city") or safe_get(row, "origin_iata")
+        dest = safe_get(row, "destination_city") or safe_get(row, "destination_iata")
+        price = safe_get(row, "price_gbp")
+        outd = safe_get(row, "outbound_date")
+        retd = safe_get(row, "return_date")
+        theme = safe_get(row, "deal_theme") or safe_get(row, "resolved_theme")
+        angle = safe_get(row, "angle_type")
+        link = safe_get(row, "affiliate_url") or safe_get(row, "booking_link_free")
+
+        ml_ws.append_row(
+            [now_utc_str(), origin, dest, price, outd, retd, theme, angle, link],
+            value_input_option="USER_ENTERED",
+        )
+        wrote += 1
+
+    return wrote
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
+def main() -> None:
+    today = dt.date.today()
+    daily_theme, longhaul_region = todays_theme_and_region(today)
+
     log("=" * 70)
     log("TRAVELTXTER V4.5.3 — WATERWHEEL RUN")
     log("=" * 70)
     log(f"RUN_SLOT: {RUN_SLOT} | VIP_DELAY: {VIP_DELAY_HOURS}h")
+    log(f"Daily Theme (target): {daily_theme}" + (f" | Longhaul region: {longhaul_region}" if longhaul_region else ""))
     log(f"Variety: lookback={VARIETY_LOOKBACK_HOURS}h | DEST_REPEAT_PENALTY={DEST_REPEAT_PENALTY} | THEME_REPEAT_PENALTY={THEME_REPEAT_PENALTY}")
-    log(f"Duffel: ENABLED={DUFFEL_ENABLED} | MAX_INSERTS={DUFFEL_MAX_INSERTS} | ROUTES_PER_RUN={DUFFEL_ROUTES_PER_RUN}")
+    log(f"Duffel: ENABLED={DUFFEL_ENABLED} | MAX_INSERTS={DUFFEL_MAX_INSERTS} | ROUTES_PER_RUN={DUFFEL_ROUTES_PER_RUN} | SEARCH_CAP={DUFFEL_MAX_SEARCHES_PER_RUN}")
     log("=" * 70)
 
-    sh, ws, headers = get_sheet()
+    sh = get_spreadsheet()
+    raw_ws = sh.worksheet(RAW_DEALS_TAB)
+    headers = get_raw_headers(raw_ws)
+
     log(f"Connected to sheet | Columns: {len(headers)} | Tab: {RAW_DEALS_TAB}")
 
-    target = daily_theme(dt.date.today(), RUN_SLOT)
-    log(f"Daily Theme (target): {target}")
+    signals_map = load_config_signals(sh)
+    routes = load_routes_from_config(sh)
+    log(f"Loaded CONFIG routes: {len(routes)} enabled")
 
-    # Load CONFIG and pick today’s routes
-    routes = load_config_routes(sh)
-    routes_today = pick_routes_for_today(routes, target, DUFFEL_ROUTES_PER_RUN)
-    log(f"Routes today: {len(routes_today)} (target={target})")
+    # 1) Feed
+    log("\n[1] DUFFEL FEED")
+    inserted = run_duffel_feeder(
+        raw_ws=raw_ws,
+        headers=headers,
+        routes=routes,
+        today_theme=daily_theme,
+        longhaul_region=longhaul_region,
+        signals_map=signals_map,
+    )
+    log(f"✓ {inserted} deals inserted")
 
-    # [1] Duffel feed
-    if DUFFEL_ENABLED and DUFFEL_API_KEY and routes_today:
-        log("\n[1] DUFFEL FEED")
-        inserted = run_duffel_feeder(ws, headers, routes_today)
-        log(f"✓ {inserted} deals inserted")
-    else:
-        log("\n[1] DUFFEL FEED")
-        log("Skipped (missing key/routes or disabled)")
-
-    # [2] Score (NEW/SCORED -> SCORED w scores)
+    # 2) Score
     log("\n[2] SCORING (NEW → SCORED)")
-    scored = stage_score(ws, headers, target)
+    scored = stage_score_new(raw_ws, headers, daily_theme, signals_map)
     log(f"✓ {scored} deals scored")
 
-    # [3] Select (SCORED -> READY_TO_POST)
+    # 3) Select
     log("\n[3] EDITORIAL SELECTION (SCORED → READY_TO_POST)")
-    selected = stage_select_best(ws, headers, target)
+    selected = stage_select_best(raw_ws, headers, daily_theme)
     log(f"✓ {selected} promoted")
 
-    # [4] Render
+    # 4) Render
     log("\n[4] RENDER (READY_TO_POST → READY_TO_PUBLISH)")
-    rendered = stage_render(ws, headers)
+    rendered = stage_render(raw_ws, headers)
     log(f"✓ {rendered} rendered")
 
-    # [5] Instagram
+    # 5) Instagram
     log("\n[5] INSTAGRAM (READY_TO_PUBLISH → POSTED_INSTAGRAM)")
-    ig_posted = post_instagram(ws, headers)
+    ig_posted = post_instagram(raw_ws, headers, daily_theme)
     log(f"✓ {ig_posted} posted")
 
-    # [6] Telegram VIP (AM)
+    # 6) Telegram VIP (AM)
     log("\n[6] TELEGRAM VIP (POSTED_INSTAGRAM → POSTED_TELEGRAM_VIP)")
-    vip_posted = post_tg_vip(ws, headers)
+    vip_posted = post_telegram_vip(raw_ws, headers)
     log(f"✓ {vip_posted} posted")
 
-    # [7] Telegram FREE (PM after delay)
+    # 7) Telegram FREE (PM after delay)
     log("\n[7] TELEGRAM FREE (POSTED_TELEGRAM_VIP → POSTED_ALL)")
-    free_posted = post_tg_free(ws, headers)
+    free_posted = post_telegram_free(raw_ws, headers)
     log(f"✓ {free_posted} posted")
+
+    # 8) Optional: export for MailerLite workflow
+    log("\n[8] MAILERLITE FEED EXPORT (optional)")
+    exported = stage_export_mailerlite(sh, raw_ws, headers)
+    log(f"✓ {exported} exported rows")
 
     log("\n" + "=" * 70)
     log("COMPLETE")

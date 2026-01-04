@@ -402,6 +402,17 @@ def build_offer_request_payload(
     max_connections: Optional[int] = None,
     included_airlines: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    # CRITICAL VALIDATION: Ensure cabin_class is valid
+    VALID_CABIN_CLASSES = ["economy", "premium_economy", "business", "first"]
+    if cabin_class not in VALID_CABIN_CLASSES:
+        log(f"ERROR: Invalid cabin_class '{cabin_class}' - forcing to 'economy'")
+        cabin_class = "economy"
+    
+    # CRITICAL VALIDATION: Remove B2 from airlines if present
+    if included_airlines and "B2" in included_airlines:
+        log(f"ERROR: B2 (Belavia) found in included_airlines - removing it!")
+        included_airlines = [x for x in included_airlines if x != "B2"]
+    
     data: Dict[str, Any] = {
         "slices": [
             {"origin": origin, "destination": dest, "departure_date": out_date},
@@ -414,6 +425,12 @@ def build_offer_request_payload(
         data["max_connections"] = int(max_connections)
     if included_airlines:
         data["included_airlines"] = included_airlines
+    
+    # DEBUG: Log the payload being sent (first time only to avoid spam)
+    if not hasattr(build_offer_request_payload, '_logged_sample'):
+        log(f"DEBUG: Sample Duffel payload: cabin_class={cabin_class}, airlines={included_airlines}")
+        build_offer_request_payload._logged_sample = True
+    
     return {"data": data}
 
 def duffel_offer_request(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -669,8 +686,26 @@ def load_routes_from_config(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
 
         included_airlines_raw = gv(r, "included_airlines") or ""
         included_airlines = [x.strip().upper() for x in included_airlines_raw.split(",") if x.strip()]
+        
+        # CRITICAL FIX: Remove B2 (Belavia - unsupported/sanctioned airline)
+        if "B2" in included_airlines:
+            log(f"WARNING: Removing B2 (Belavia) from route {origin}→{dest} - unsupported airline")
+            included_airlines = [x for x in included_airlines if x != "B2"]
 
-        cabin_class = (gv(r, "cabin_class") or "economy").strip().lower()
+        cabin_class_raw = (gv(r, "cabin_class") or "economy").strip().lower()
+        
+        # CRITICAL FIX: Validate cabin_class - reject B2 or any invalid value
+        VALID_CABIN_CLASSES = ["economy", "premium_economy", "business", "first"]
+        if cabin_class_raw not in VALID_CABIN_CLASSES:
+            if cabin_class_raw.upper() == "B2":
+                log(f"ERROR: Route {origin}→{dest} has cabin_class='B2' - this is INVALID! Using 'economy' instead.")
+                log(f"       B2 is an airline code (Belavia), not a cabin class!")
+                log(f"       Valid cabin classes: {', '.join(VALID_CABIN_CLASSES)}")
+            else:
+                log(f"WARNING: Route {origin}→{dest} has invalid cabin_class='{cabin_class_raw}' - using 'economy'")
+            cabin_class = "economy"
+        else:
+            cabin_class = cabin_class_raw
 
         trip_len_min = int(safe_float(gv(r, "trip_len_min") or "4", 4))
         trip_len_max = int(safe_float(gv(r, "trip_len_max") or "7", 7))

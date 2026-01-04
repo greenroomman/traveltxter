@@ -124,7 +124,7 @@ DUFFEL_API_BASE = "https://api.duffel.com"
 def duffel_headers(api_key: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
-        "Duffel-Version": "v1",
+        "Duffel-Version": "v2",
         "Content-Type": "application/json",
     }
 

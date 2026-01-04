@@ -87,8 +87,8 @@ jobs:
           RUN_SLOT: ${{ env.RUN_SLOT }}
           VIP_DELAY_HOURS: "24"
           VARIETY_LOOKBACK_HOURS: "72"
-          DEST_REPEAT_PENALTY: "25.0"
-          THEME_REPEAT_PENALTY: "10.0"
+          DEST_REPEAT_PENALTY: "50.0"
+          THEME_REPEAT_PENALTY: "30.0"
           RECENCY_FILTER_HOURS: "48"
 
         run: |

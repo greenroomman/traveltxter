@@ -402,7 +402,7 @@ def duffel_search_oneway_return(
     out_date: str,
     ret_date: str,
     cabin: str = "economy",
-    max_connections: int = 1,
+    max_connections: int = 2,
 ) -> List[Dict[str, Any]]:
     """
     Minimal Duffel offer request.

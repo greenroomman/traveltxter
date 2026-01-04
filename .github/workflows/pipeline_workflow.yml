@@ -61,9 +61,9 @@ jobs:
 
           # Telegram (using your actual secret names)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_FREE_CHANNEL: ${{ secrets.TELEGRAM_FREE_CHANNEL }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_VIP_CHANNEL: ${{ secrets.TELEGRAM_VIP_CHANNEL }}
+          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
 
           # Duffel
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
@@ -92,7 +92,7 @@ jobs:
           RECENCY_FILTER_HOURS: "48"
 
         run: |
-          python workers/pipeline_worker.py
+          python workers/unified_pipeline_worker.py
 
       - name: Upload logs (on failure)
         if: failure()

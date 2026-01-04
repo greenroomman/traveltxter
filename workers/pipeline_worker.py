@@ -779,50 +779,59 @@ def stage_score_all_new(ws: gspread.Worksheet, headers: List[str], signals_map: 
 def get_recent_posts(rows: List[List[str]], headers: List[str], lookback_hours: int) -> Tuple[set, set, List[str]]:
     """
     Returns:
-      recent_dests: destinations posted within lookback
-      recent_themes: themes posted within lookback
-      last3_dests: most recent 3 destinations (hard avoid if possible)
+      recent_dests: set of destination keys posted recently
+      recent_themes: set of themes posted recently
+      last3: list of last 3 posted destination keys (most recent first)
+    Fix: uses timezone-aware UTC datetimes to avoid naive/aware comparison errors.
     """
-    cutoff = dt.datetime.utcnow() - dt.timedelta(hours=lookback_hours)
+    # Always use timezone-aware UTC for comparisons
+    now_utc_dt = dt.datetime.now(dt.timezone.utc)
+    cutoff = now_utc_dt - dt.timedelta(hours=lookback_hours)
+
     recent_dests = set()
     recent_themes = set()
-    timeline: List[Tuple[dt.datetime, str]] = []
+
+    # Track last 3 posts by timestamp
+    posted_items: List[Tuple[dt.datetime, str]] = []
 
     for i in range(1, len(rows)):
         row = {headers[c]: (rows[i][c] if c < len(rows[i]) else "") for c in range(len(headers))}
+
         status = safe_get(row, "status").upper()
-        if status not in (STATUS_POSTED_INSTAGRAM, STATUS_POSTED_TELEGRAM_VIP, STATUS_POSTED_ALL):
+        if status not in ["POSTED_INSTAGRAM", "POSTED_TELEGRAM_VIP", "POSTED_ALL"]:
             continue
 
-        posted_ts = safe_get(row, "ig_published_timestamp") or safe_get(row, "tg_monthly_timestamp") or safe_get(row, "tg_free_timestamp")
+        posted_ts = safe_get(row, "ig_published_timestamp") or safe_get(row, "tg_monthly_timestamp") or safe_get(row, "published_timestamp")
         if not posted_ts:
             continue
 
         try:
+            # Parse ISO timestamps; accept Z or +00:00; force UTC-aware
             posted_dt = dt.datetime.fromisoformat(posted_ts.replace("Z", "+00:00"))
-        except:
+            if posted_dt.tzinfo is None:
+                posted_dt = posted_dt.replace(tzinfo=dt.timezone.utc)
+            else:
+                posted_dt = posted_dt.astimezone(dt.timezone.utc)
+        except Exception:
             continue
 
-        dest_key = (safe_get(row, "destination_key") or safe_get(row, "destination_iata") or "").upper()
-        theme = (safe_get(row, "auto_theme") or safe_get(row, "theme") or "").lower()
-
-        # Timeline always for last-3
-        if dest_key:
-            timeline.append((posted_dt, dest_key))
-
-        # lookback sets
+        # Only consider within lookback window
         if posted_dt > cutoff:
+            dest_key = (safe_get(row, "destination_key") or safe_get(row, "destination_iata") or "").upper()
+            theme = (safe_get(row, "auto_theme") or safe_get(row, "theme") or safe_get(row, "resolved_theme") or "").lower()
+
             if dest_key:
                 recent_dests.add(dest_key)
+                posted_items.append((posted_dt, dest_key))
             if theme:
                 recent_themes.add(theme)
 
-    # last 3 destinations by most recent timestamp
-    timeline.sort(key=lambda x: x[0], reverse=True)
-    last3 = [d for _, d in timeline[:3]]
+    # Last 3 posted destinations (most recent first)
+    posted_items.sort(key=lambda x: x[0], reverse=True)
+    last3 = [dk for _, dk in posted_items[:3]]
 
     return recent_dests, recent_themes, last3
-
+   
 
 def stage_select_best(ws: gspread.Worksheet, headers: List[str]) -> int:
     """

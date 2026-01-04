@@ -14,22 +14,8 @@ jobs:
   pipeline:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Set RUN_SLOT from schedule
-        id: runslot
-        shell: bash
-        run: |
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            if [[ "${{ github.event.schedule }}" == "30 7 * * *" ]]; then
-              echo "RUN_SLOT=AM" >> $GITHUB_ENV
-            else
-              echo "RUN_SLOT=PM" >> $GITHUB_ENV
-            fi
-          else
-            echo "RUN_SLOT=AM" >> $GITHUB_ENV
-          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -41,58 +27,75 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run V4.5 Pipeline (Elastic Supply + Stotal Scoring)
+      # ============================================================
+      # MAIN PIPELINE (your existing worker)
+      # ============================================================
+      - name: Run V4.5 Pipeline (Feeder -> Scoring -> Editorial -> Render -> Publish)
         env:
           # Google Sheets
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          CONFIG_TAB: "CONFIG"
-          CONFIG_SIGNALS_TAB: "CONFIG_SIGNALS"
-
-          # Render + Instagram
-          RENDER_URL: ${{ secrets.RENDER_URL }}
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
-          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-
-          # Telegram (using your actual secret names)
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
 
           # Duffel
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          DUFFEL_ENABLED: "true"
-          DUFFEL_MAX_INSERTS: "3"
-          DUFFEL_ROUTES_PER_RUN: "2"
+          DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+          DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
+          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
 
-          # OpenAI (optional - Phase 2 doesn't use it, but keeping for compatibility)
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          # Variety / penalties
+          DEST_REPEAT_PENALTY: ${{ vars.DEST_REPEAT_PENALTY }}
+          VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
 
-          # Stripe
-          STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
+          # Render
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+
+          # Instagram
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+
+          # Telegram
+          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+
+          # Stripe links
           STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
           STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
 
-          # Skyscanner
-          SKYSCANNER_AFFILIATE_ID: ${{ secrets.SKYSCANNER_AFFILIATE_ID }}
-
-          # Runtime config
-          RUN_SLOT: ${{ env.RUN_SLOT }}
+          # Run slot
+          RUN_SLOT: ${{ github.event_name == 'schedule' && (github.event.schedule == '30 7 * * *' && 'AM' || 'PM') || 'AM' }}
           VIP_DELAY_HOURS: "24"
-          VARIETY_LOOKBACK_HOURS: "72"
-          DEST_REPEAT_PENALTY: "50.0"
-          THEME_REPEAT_PENALTY: "30.0"
-          RECENCY_FILTER_HOURS: "48"
+
+          # Optional base URL for Duffel Links returns
+          REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
 
         run: |
           python workers/pipeline_worker.py
+
+      # ============================================================
+      # HYBRID LINK ROUTER (NEW)
+      # ============================================================
+      - name: Route booking links (Duffel short-haul, Skyscanner everything else)
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
+
+          # Safe defaults (can be overridden in Vars if you want)
+          LINK_ROUTER_MAX_ROWS: "8"
+          DUFFEL_MAX_PRICE_GBP: "220"
+          DUFFEL_MIN_TRIP_DAYS: "2"
+          DUFFEL_MAX_TRIP_DAYS: "10"
+          # Optional: restrict Duffel to certain themes only (leave blank = allow all)
+          # DUFFEL_THEMES: "CITY,WINTER SUN,SURF,FOODIE"
+
+        run: |
+          python workers/link_router.py
 
       - name: Upload logs (on failure)
         if: failure()

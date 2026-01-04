@@ -1,10 +1,20 @@
+# ============================================================
+# FILE: .github/workflows/pipeline_workflow.yml
+# (PASTE OVER YOUR EXISTING WORKFLOW FILE)
+# ============================================================
+
 name: v4_5_pipeline
 
 on:
   schedule:
-    - cron: "30 7 * * *"   # 07:30 UTC (AM run)
-    - cron: "30 16 * * *"  # 16:30 UTC (PM run)
+    - cron: "30 7 * * *"   # 07:30 UTC (AM)
+    - cron: "30 16 * * *"  # 16:30 UTC (PM)
   workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "AM or PM"
+        required: true
+        default: "AM"
 
 concurrency:
   group: v4_5_pipeline
@@ -13,6 +23,7 @@ concurrency:
 jobs:
   pipeline:
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -27,12 +38,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ============================================================
-      # MAIN PIPELINE (your existing worker)
-      # ============================================================
-      - name: Run V4.5 Pipeline (Feeder -> Scoring -> Editorial -> Render -> Publish)
+      # ------------------------------------------------------------
+      # Determine RUN_SLOT cleanly (AM/PM)
+      # ------------------------------------------------------------
+      - name: Set RUN_SLOT
+        id: slot
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_SLOT=${{ inputs.run_slot }}" >> $GITHUB_ENV
+          else
+            # schedule: decide AM/PM based on cron expression
+            if [ "${{ github.event.schedule }}" = "30 7 * * *" ]; then
+              echo "RUN_SLOT=AM" >> $GITHUB_ENV
+            else
+              echo "RUN_SLOT=PM" >> $GITHUB_ENV
+            fi
+          fi
+
+      # ------------------------------------------------------------
+      # MAIN PIPELINE WORKER
+      # ------------------------------------------------------------
+      - name: Run pipeline_worker.py
         env:
-          # Google Sheets
+          # Sheets
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
@@ -43,14 +71,29 @@ jobs:
           DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
           DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
 
-          # Variety / penalties
+          # Budget governor (monthly cap)
+          DUFFEL_BUDGET_GBP: ${{ vars.DUFFEL_BUDGET_GBP }}
+          DUFFEL_EXCESS_SEARCH_USD: ${{ vars.DUFFEL_EXCESS_SEARCH_USD }}
+          USD_TO_GBP: ${{ vars.USD_TO_GBP }}
+          DUFFEL_ORDERS_THIS_MONTH: ${{ vars.DUFFEL_ORDERS_THIS_MONTH }}
+          DUFFEL_FREE_SEARCHES_PER_ORDER: ${{ vars.DUFFEL_FREE_SEARCHES_PER_ORDER }}
+          DUFFEL_SEARCH_DEDUPE_HOURS: ${{ vars.DUFFEL_SEARCH_DEDUPE_HOURS }}
+
+          # SW England origins boost
+          SW_ENGLAND_ORIGINS: ${{ vars.SW_ENGLAND_ORIGINS }}
+
+          # Duffel Links (to increase Orders on short-haul)
+          DUFFEL_LINKS_ENABLED: ${{ vars.DUFFEL_LINKS_ENABLED }}
+          DUFFEL_LINKS_MAX_PER_RUN: ${{ vars.DUFFEL_LINKS_MAX_PER_RUN }}
+          DUFFEL_LINKS_MAX_PRICE_GBP: ${{ vars.DUFFEL_LINKS_MAX_PRICE_GBP }}
+          REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
+
+          # Variety knobs
           DEST_REPEAT_PENALTY: ${{ vars.DEST_REPEAT_PENALTY }}
           VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
 
-          # Render
+          # Render + IG
           RENDER_URL: ${{ secrets.RENDER_URL }}
-
-          # Instagram
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
@@ -60,39 +103,30 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
 
-          # Stripe links
+          # Stripe
           STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
           STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
 
-          # Run slot
-          RUN_SLOT: ${{ github.event_name == 'schedule' && (github.event.schedule == '30 7 * * *' && 'AM' || 'PM') || 'AM' }}
+          # Slot + delay
+          RUN_SLOT: ${{ env.RUN_SLOT }}
           VIP_DELAY_HOURS: "24"
-
-          # Optional base URL for Duffel Links returns
-          REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
 
         run: |
           python workers/pipeline_worker.py
 
-      # ============================================================
-      # HYBRID LINK ROUTER (NEW)
-      # ============================================================
-      - name: Route booking links (Duffel short-haul, Skyscanner everything else)
+      # ------------------------------------------------------------
+      # LINK ROUTER (THIS IS WHAT BROKE FOR YOU)
+      # ------------------------------------------------------------
+      - name: Run link_router.py (Duffel short-haul, Skyscanner otherwise)
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
 
-          # Safe defaults (can be overridden in Vars if you want)
-          LINK_ROUTER_MAX_ROWS: "8"
-          DUFFEL_MAX_PRICE_GBP: "220"
-          DUFFEL_MIN_TRIP_DAYS: "2"
-          DUFFEL_MAX_TRIP_DAYS: "10"
-          # Optional: restrict Duffel to certain themes only (leave blank = allow all)
-          # DUFFEL_THEMES: "CITY,WINTER SUN,SURF,FOODIE"
+          LINK_ROUTER_MAX_ROWS: "12"
+          DUFFEL_LINKS_MAX_PRICE_GBP: ${{ vars.DUFFEL_LINKS_MAX_PRICE_GBP }}
 
         run: |
           python workers/link_router.py

@@ -5,12 +5,18 @@
 """
 Traveltxter — Hybrid Link Router (Duffel short-haul, Skyscanner everything else)
 
-Why you got "on:" SyntaxError:
-- You accidentally pasted YAML (the workflow file) into workers/link_router.py.
-- Python sees "on:" and crashes.
+Fix for your error:
+- GitHub Actions can't find this file because it doesn't exist in your repo yet.
+- Create it at: workers/link_router.py (exact path + filename)
 
-Fix:
-- Replace the ENTIRE contents of workers/link_router.py with this Python file only.
+What this does:
+- Reads RAW_DEALS
+- For publishable rows (SCORED / READY_TO_POST / READY_TO_PUBLISH) where booking_link_vip is empty:
+    - If "Duffel-eligible" (short-haul, direct, good price), create Duffel Links session URL
+      then write booking_link_vip + affiliate_source="DUFFEL_LINKS"
+    - Else set booking_link_vip = affiliate_url (Skyscanner) + affiliate_source="SKYSCANNER"
+
+No emojis are added (only links).
 """
 
 from __future__ import annotations
@@ -18,16 +24,16 @@ from __future__ import annotations
 import os
 import json
 import datetime as dt
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# =========================
+# ============================================================
 # Helpers
-# =========================
+# ============================================================
 
 def env(name: str, default: str = "", required: bool = False) -> str:
     v = (os.getenv(name) or "").strip()
@@ -40,6 +46,9 @@ def env(name: str, default: str = "", required: bool = False) -> str:
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     print(f"{ts} | {msg}", flush=True)
+
+def now_utc_str() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def safe_text(v: Any) -> str:
     if v is None:
@@ -68,9 +77,9 @@ def normalize_status(s: str) -> str:
     return (s or "").strip().upper()
 
 
-# =========================
+# ============================================================
 # ENV
-# =========================
+# ============================================================
 
 SPREADSHEET_ID = env("SPREADSHEET_ID", env("SHEET_ID", ""), required=True)
 RAW_DEALS_TAB = env("RAW_DEALS_TAB", "RAW_DEALS")
@@ -82,44 +91,33 @@ if not GCP_SA_JSON:
 DUFFEL_API_KEY = env("DUFFEL_API_KEY", required=True)
 DUFFEL_VERSION = env("DUFFEL_VERSION", "v2")
 
+# Redirect base URL for Duffel Links returns (recommended)
 REDIRECT_BASE_URL = env("REDIRECT_BASE_URL", "").strip()
-DUFFEL_LINKS_SUCCESS_URL = env(
-    "DUFFEL_LINKS_SUCCESS_URL",
-    (REDIRECT_BASE_URL.rstrip("/") + "/success") if REDIRECT_BASE_URL else ""
-)
-DUFFEL_LINKS_FAILURE_URL = env(
-    "DUFFEL_LINKS_FAILURE_URL",
-    (REDIRECT_BASE_URL.rstrip("/") + "/failure") if REDIRECT_BASE_URL else ""
-)
-DUFFEL_LINKS_ABANDON_URL = env(
-    "DUFFEL_LINKS_ABANDON_URL",
-    (REDIRECT_BASE_URL.rstrip("/") + "/abandon") if REDIRECT_BASE_URL else ""
-)
+DUFFEL_LINKS_SUCCESS_URL = env("DUFFEL_LINKS_SUCCESS_URL", (REDIRECT_BASE_URL.rstrip("/") + "/success") if REDIRECT_BASE_URL else "")
+DUFFEL_LINKS_FAILURE_URL = env("DUFFEL_LINKS_FAILURE_URL", (REDIRECT_BASE_URL.rstrip("/") + "/failure") if REDIRECT_BASE_URL else "")
+DUFFEL_LINKS_ABANDON_URL = env("DUFFEL_LINKS_ABANDON_URL", (REDIRECT_BASE_URL.rstrip("/") + "/abandon") if REDIRECT_BASE_URL else "")
 
+# Router limits
 MAX_ROWS_PER_RUN = safe_int(env("LINK_ROUTER_MAX_ROWS", "12"), 12)
 
+# Eligibility thresholds
 MAX_PRICE_DUFFEL_GBP = safe_float(env("DUFFEL_LINKS_MAX_PRICE_GBP", "220"), 220.0)
 MIN_TRIP_DAYS = safe_int(env("DUFFEL_MIN_TRIP_DAYS", "2"), 2)
 MAX_TRIP_DAYS = safe_int(env("DUFFEL_MAX_TRIP_DAYS", "10"), 10)
 
+# Optional: restrict Duffel Links to certain themes
 DUFFEL_THEMES = [t.strip().upper() for t in env("DUFFEL_THEMES", "").split(",") if t.strip()]
 
-DUFFEL_COUNTRY_ALLOWLIST = set(
-    x.strip().upper()
-    for x in env(
-        "DUFFEL_COUNTRY_ALLOWLIST",
-        "ICELAND,IRELAND,FRANCE,SPAIN,PORTUGAL,ITALY,GERMANY,NETHERLANDS,BELGIUM,DENMARK,"
-        "NORWAY,SWEDEN,FINLAND,POLAND,CZECHIA,AUSTRIA,SWITZERLAND,HUNGARY,GREECE,CROATIA,"
-        "SLOVENIA,SLOVAKIA,BULGARIA,ROMANIA,LITHUANIA,LATVIA,ESTONIA,MALTA,CYPRUS,TURKEY,"
-        "MOROCCO,EGYPT,TUNISIA"
-    ).split(",")
-    if x.strip()
-)
+# Country allowlist for short-haul Duffel conversions
+DUFFEL_COUNTRY_ALLOWLIST = set([x.strip().upper() for x in env(
+    "DUFFEL_COUNTRY_ALLOWLIST",
+    "ICELAND,IRELAND,FRANCE,SPAIN,PORTUGAL,ITALY,GERMANY,NETHERLANDS,BELGIUM,DENMARK,NORWAY,SWEDEN,FINLAND,POLAND,CZECHIA,AUSTRIA,SWITZERLAND,HUNGARY,GREECE,CROATIA,SLOVENIA,SLOVAKIA,BULGARIA,ROMANIA,LITHUANIA,LATVIA,ESTONIA,MALTA,CYPRUS,TURKEY,MOROCCO,EGYPT,TUNISIA"
+).split(",") if x.strip()])
 
 
-# =========================
+# ============================================================
 # Google Sheets
-# =========================
+# ============================================================
 
 def get_spreadsheet() -> gspread.Spreadsheet:
     creds_json = json.loads(GCP_SA_JSON)
@@ -131,17 +129,23 @@ def get_spreadsheet() -> gspread.Spreadsheet:
     gc = gspread.authorize(creds)
     return gc.open_by_key(SPREADSHEET_ID)
 
+def get_headers(ws: gspread.Worksheet) -> List[str]:
+    headers = ws.row_values(1)
+    if not headers:
+        raise RuntimeError("No headers found in sheet")
+    return headers
+
 def header_map(headers: List[str]) -> Dict[str, int]:
     return {h: i + 1 for i, h in enumerate(headers) if h}
 
 
-# =========================
+# ============================================================
 # Duffel Links
-# =========================
+# ============================================================
 
 def create_duffel_links_session(reference: str) -> str:
     """
-    Creates Duffel Links session and returns hosted session URL.
+    Creates Duffel Links session and returns the hosted session URL.
     """
     if not (DUFFEL_LINKS_SUCCESS_URL and DUFFEL_LINKS_FAILURE_URL and DUFFEL_LINKS_ABANDON_URL):
         raise RuntimeError("Duffel Links redirect URLs not set. Set REDIRECT_BASE_URL or DUFFEL_LINKS_*_URL")
@@ -178,27 +182,32 @@ def create_duffel_links_session(reference: str) -> str:
     return session_url
 
 
-# =========================
+# ============================================================
 # Eligibility rules
-# =========================
+# ============================================================
 
 def is_duffel_eligible(row: Dict[str, Any]) -> Tuple[bool, str]:
+    # Direct flights only (best conversion)
     stops = safe_int(safe_get(row, "stops"), 99)
     if stops != 0:
         return False, "not_direct"
 
+    # Price cap
     price = safe_float(safe_get(row, "price_gbp"), 999999.0)
     if price > MAX_PRICE_DUFFEL_GBP:
         return False, "too_expensive"
 
+    # Trip length if present
     trip_days = safe_int(safe_get(row, "trip_length_days"), 0)
     if trip_days and (trip_days < MIN_TRIP_DAYS or trip_days > MAX_TRIP_DAYS):
         return False, "trip_length_out_of_range"
 
+    # Country allowlist
     country = safe_get(row, "destination_country").upper().strip()
     if country and country not in DUFFEL_COUNTRY_ALLOWLIST:
         return False, "country_not_allowed"
 
+    # Optional theme gating
     if DUFFEL_THEMES:
         theme = (safe_get(row, "theme_final") or safe_get(row, "resolved_theme") or safe_get(row, "theme")).upper().strip()
         if theme and theme not in DUFFEL_THEMES:
@@ -207,9 +216,9 @@ def is_duffel_eligible(row: Dict[str, Any]) -> Tuple[bool, str]:
     return True, "ok"
 
 
-# =========================
+# ============================================================
 # Main
-# =========================
+# ============================================================
 
 def main() -> None:
     log("=" * 72)
@@ -219,17 +228,18 @@ def main() -> None:
 
     sh = get_spreadsheet()
     ws = sh.worksheet(RAW_DEALS_TAB)
-    headers = ws.row_values(1)
-    if not headers:
-        raise RuntimeError("RAW_DEALS has no headers row")
-
+    headers = get_headers(ws)
     hmap = header_map(headers)
 
-    for col in ("status", "affiliate_url", "booking_link_vip"):
-        if col not in hmap:
-            raise RuntimeError(f"RAW_DEALS missing required column: {col}")
+    # Required columns (minimal)
+    must = ["status", "affiliate_url", "booking_link_vip"]
+    for c in must:
+        if c not in hmap:
+            raise RuntimeError(f"RAW_DEALS missing required column: {c}")
 
-    has_source_col = "affiliate_source" in hmap
+    # Optional but recommended
+    if "affiliate_source" not in hmap:
+        log("NOTE: Column 'affiliate_source' not found — links will still route, but source won’t be written.")
 
     all_values = ws.get_all_values()
     if len(all_values) < 2:
@@ -237,6 +247,7 @@ def main() -> None:
         return
 
     publishable = {"SCORED", "READY_TO_POST", "READY_TO_PUBLISH"}
+
     processed = 0
     updates: List[gspread.Cell] = []
 
@@ -247,11 +258,12 @@ def main() -> None:
         vals = all_values[r_idx - 1]
         row = {headers[c]: (vals[c] if c < len(vals) else "") for c in range(len(headers))}
 
-        if normalize_status(safe_get(row, "status")) not in publishable:
+        status = normalize_status(safe_get(row, "status"))
+        if status not in publishable:
             continue
 
         if safe_get(row, "booking_link_vip"):
-            continue
+            continue  # already set
 
         affiliate_url = safe_get(row, "affiliate_url")
         deal_id = safe_get(row, "deal_id") or f"row_{r_idx}"
@@ -261,13 +273,14 @@ def main() -> None:
             try:
                 session_url = create_duffel_links_session(reference=f"tx_{deal_id}")
                 updates.append(gspread.Cell(r_idx, hmap["booking_link_vip"], session_url))
-                if has_source_col:
+                if "affiliate_source" in hmap:
                     updates.append(gspread.Cell(r_idx, hmap["affiliate_source"], "DUFFEL_LINKS"))
                 log(f"Row {r_idx}: DUFFEL_LINKS ({reason}) | {deal_id}")
             except Exception as e:
+                # fall back to Skyscanner
                 if affiliate_url:
                     updates.append(gspread.Cell(r_idx, hmap["booking_link_vip"], affiliate_url))
-                    if has_source_col:
+                    if "affiliate_source" in hmap:
                         updates.append(gspread.Cell(r_idx, hmap["affiliate_source"], "SKYSCANNER_FALLBACK"))
                     log(f"Row {r_idx}: Duffel Links failed -> SKYSCANNER_FALLBACK | {deal_id} | {e}")
                 else:
@@ -275,7 +288,7 @@ def main() -> None:
         else:
             if affiliate_url:
                 updates.append(gspread.Cell(r_idx, hmap["booking_link_vip"], affiliate_url))
-                if has_source_col:
+                if "affiliate_source" in hmap:
                     updates.append(gspread.Cell(r_idx, hmap["affiliate_source"], "SKYSCANNER"))
                 log(f"Row {r_idx}: SKYSCANNER ({reason}) | {deal_id}")
             else:
@@ -285,9 +298,9 @@ def main() -> None:
 
     if updates:
         ws.update_cells(updates, value_input_option="USER_ENTERED")
-        log(f"Updated {len(updates)} cells across {processed} routed rows.")
+        log(f"Updated {len(updates)} cells across {processed} rows.")
     else:
-        log("No updates needed (nothing publishable missing booking_link_vip).")
+        log("No updates needed.")
 
     log("Done.")
 

@@ -92,6 +92,15 @@ jobs:
         run: |
           python workers/pipeline_worker.py
 
+      - name: Run ai_scorer.py
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          SCORER_MAX_ROWS: "6"
+        run: |
+          python workers/ai_scorer.py
+
       - name: Run link_router.py (Duffel short-haul, Skyscanner otherwise)
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}

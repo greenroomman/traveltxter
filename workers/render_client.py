@@ -2,37 +2,23 @@
 """
 TravelTxter V4.5x — Render Client Worker (GitHub Actions)
 
-Purpose:
-- Convert READY_TO_POST -> READY_TO_PUBLISH by calling PythonAnywhere render API
-- Writes graphic_url + rendered_timestamp
+Reads rows with status == READY_TO_POST
+Calls PythonAnywhere RENDER_URL with locked payload:
+  TO: <City>
+  FROM: <City>
+  OUT: ddmmyy
+  IN: ddmmyy
+  PRICE: £xxx  (rounded up)
+
+Writes:
+  graphic_url
+  rendered_timestamp
+  status -> READY_TO_PUBLISH
 
 IMPORTANT:
-- This is an HTTP client only. No PIL / Pillow. No local image rendering.
-
-Env required:
-- SPREADSHEET_ID
-- RAW_DEALS_TAB (default: RAW_DEALS)
-- GCP_SA_JSON_ONE_LINE
-- RENDER_URL  (e.g. https://<user>.pythonanywhere.com/api/render)
-
-Locked payload contract (DO NOT CHANGE):
-TO: <City>
-FROM: <City>
-OUT: ddmmyy
-IN: ddmmyy
-PRICE: £xxx  (rounded up)
-
-Sheet columns used/written (created if missing):
-- status
-- origin_city
-- destination_city
-- outbound_date
-- return_date
-- price_gbp
-- graphic_url
-- rendered_timestamp
-- render_error
-- render_response_snippet
+- No PIL / Pillow here.
+- Robust column fallbacks (supports your current RAW_DEALS reality where
+  origin_city/destination_city/etc are blank but origin/dest/out_date/ret_date/price exist).
 """
 
 import os
@@ -40,7 +26,7 @@ import json
 import time
 import math
 import datetime as dt
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 import gspread
@@ -60,7 +46,7 @@ def log(msg: str) -> None:
 
 
 # -------------------------
-# Env helpers
+# Env
 # -------------------------
 def env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
@@ -75,7 +61,7 @@ def env_int(name: str, default: int) -> int:
 
 
 # -------------------------
-# Sheets helpers
+# Sheets
 # -------------------------
 def get_client() -> gspread.Client:
     sa = env("GCP_SA_JSON_ONE_LINE")
@@ -136,28 +122,60 @@ def batch_update(ws: gspread.Worksheet, data: List[Dict[str, Any]], tries: int =
 # Data formatting
 # -------------------------
 def to_ddmmyy(date_iso: str) -> str:
-    # date_iso = YYYY-MM-DD
+    # YYYY-MM-DD -> ddmmyy
     try:
-        d = dt.date.fromisoformat(date_iso)
+        d = dt.date.fromisoformat(str(date_iso).strip())
         return d.strftime("%d%m%y")
     except Exception:
         return ""
 
 
-def money_round_up(price_gbp: str) -> str:
+def money_round_up(price_any: str) -> str:
     # PRICE must be "£xxx" rounded up
     try:
-        p = float(str(price_gbp).strip())
+        p = float(str(price_any).strip())
         return f"£{int(math.ceil(p))}"
     except Exception:
         return ""
+
+
+# Minimal IATA -> City mapping (extend as needed)
+IATA_TO_CITY = {
+    # UK origins (common)
+    "LHR": "London", "LGW": "London", "STN": "London", "LTN": "London", "LCY": "London", "SEN": "London",
+    "BRS": "Bristol", "MAN": "Manchester", "BHX": "Birmingham", "EDI": "Edinburgh", "GLA": "Glasgow",
+    "NQY": "Newquay", "EXT": "Exeter", "SOU": "Southampton", "CWL": "Cardiff",
+    # Popular destinations
+    "BCN": "Barcelona", "AGP": "Málaga", "FAO": "Faro", "ALC": "Alicante", "PMI": "Palma",
+    "TFS": "Tenerife", "LIS": "Lisbon", "OPO": "Porto", "AMS": "Amsterdam", "CDG": "Paris",
+    "FCO": "Rome", "MXP": "Milan", "ATH": "Athens", "DUB": "Dublin", "KEF": "Reykjavík",
+}
+
+
+def iata_to_city(code_or_city: str) -> str:
+    v = (code_or_city or "").strip()
+    if not v:
+        return ""
+    if len(v) == 3 and v.upper() == v:
+        return IATA_TO_CITY.get(v.upper(), v)  # fallback to code if unknown
+    return v
+
+
+def get_first(row: List[str], hm: Dict[str, int], *cols: str) -> str:
+    for c in cols:
+        idx = hm.get(c, -1)
+        if idx >= 0 and idx < len(row):
+            val = str(row[idx]).strip()
+            if val and val.lower() != "nan":
+                return val
+    return ""
 
 
 def main() -> int:
     spreadsheet_id = env("SPREADSHEET_ID")
     tab = env("RAW_DEALS_TAB", "RAW_DEALS")
     render_url = env("RENDER_URL")
-    max_rows = env_int("RENDER_MAX_ROWS", 3)
+    max_rows = env_int("RENDER_MAX_ROWS", 1)
 
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
@@ -174,17 +192,19 @@ def main() -> int:
     sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(tab)
 
+    # We support both your intended columns AND the ones actually populated today
     hm = ensure_cols(ws, [
         "status",
-        "origin_city",
-        "destination_city",
-        "outbound_date",
-        "return_date",
-        "price_gbp",
+        "origin_city", "destination_city",
+        "origin_iata", "destination_iata",
+        "outbound_date", "return_date",
+        "out_date", "ret_date",           # currently populated in your CSV
+        "price_gbp", "price", "currency", # currently populated in your CSV
         "graphic_url",
         "rendered_timestamp",
         "render_error",
         "render_response_snippet",
+        "origin", "dest",                 # currently populated in your CSV
     ])
 
     values = ws.get_all_values()
@@ -193,37 +213,38 @@ def main() -> int:
         return 0
 
     data = values[1:]
-
-    def get(row: List[str], col: str) -> str:
-        i = hm.get(col, -1)
-        return row[i].strip() if i >= 0 and i < len(row) else ""
-
     rendered = 0
 
     for sheet_row, row in enumerate(data, start=2):
         if rendered >= max_rows:
             break
 
-        status = get(row, "status").upper()
+        status = get_first(row, hm, "status").upper()
         if status != "READY_TO_POST":
             continue
 
-        to_city = get(row, "destination_city")
-        from_city = get(row, "origin_city")
-        out_iso = get(row, "outbound_date")
-        in_iso = get(row, "return_date")
-        price = money_round_up(get(row, "price_gbp"))
+        # --- Pull best available fields (city preferred, else IATA, else origin/dest) ---
+        from_raw = get_first(row, hm, "origin_city", "origin", "origin_iata")
+        to_raw   = get_first(row, hm, "destination_city", "dest", "destination_iata")
 
-        # Must have all required fields for locked payload
+        out_iso  = get_first(row, hm, "outbound_date", "out_date")
+        in_iso   = get_first(row, hm, "return_date", "ret_date")
+
+        price_any = get_first(row, hm, "price_gbp", "price")
+        price = money_round_up(price_any)
+
+        from_city = iata_to_city(from_raw)
+        to_city   = iata_to_city(to_raw)
+
         missing = []
-        if not to_city: missing.append("destination_city")
-        if not from_city: missing.append("origin_city")
-        if not out_iso: missing.append("outbound_date")
-        if not in_iso: missing.append("return_date")
-        if not price: missing.append("price_gbp")
+        if not to_city: missing.append("TO")
+        if not from_city: missing.append("FROM")
+        if not out_iso: missing.append("OUT")
+        if not in_iso: missing.append("IN")
+        if not price: missing.append("PRICE")
 
         if missing:
-            msg = f"Missing fields for render: {missing}"
+            msg = f"Missing fields for render payload: {missing}"
             log(f"❌ Row {sheet_row}: {msg}")
             batch_update(ws, [
                 {"range": a1(sheet_row, hm["render_error"]), "values": [[msg]]},
@@ -273,7 +294,7 @@ def main() -> int:
             ])
             continue
 
-        image_url = j.get("image_url") or j.get("graphic_url") or ""
+        image_url = (j.get("image_url") or j.get("graphic_url") or "").strip()
         if not image_url:
             msg = "Render returned no image_url"
             log(f"❌ {msg} :: {snippet}")
@@ -283,7 +304,7 @@ def main() -> int:
             ])
             continue
 
-        # Success: write graphic_url + promote status
+        # Success
         batch_update(ws, [
             {"range": a1(sheet_row, hm["graphic_url"]), "values": [[image_url]]},
             {"range": a1(sheet_row, hm["rendered_timestamp"]), "values": [[now_utc()]]},

@@ -87,6 +87,15 @@ jobs:
         run: |
           python workers/link_router.py
 
+      - name: Render (PythonAnywhere) -> write graphic_url
+        run: python workers/render_client.py
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          RENDER_MAX_ROWS: 1
+
       - name: Publish Instagram (instagram_publisher.py)
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}

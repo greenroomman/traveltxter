@@ -1,184 +1,226 @@
 #!/usr/bin/env python3
-import os, json
+import os
+import json
 import datetime as dt
 from typing import Any, Dict, List, Optional
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
 
-def now_utc_dt() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
 
 def now_utc_str() -> str:
-    return now_utc_dt().replace(microsecond=0).isoformat().replace("+00:00","Z")
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
 
 def log(msg: str) -> None:
     print(f"{now_utc_str()} | {msg}", flush=True)
 
-def env_str(name: str, default: str="") -> str:
+
+def env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
+
 def env_int(name: str, default: int) -> int:
-    v = env_str(name,"")
+    v = env(name, "")
     try:
         return int(v) if v else default
     except Exception:
         return default
 
-def a1_update(ws: gspread.Worksheet, a1: str, value: Any) -> None:
-    ws.update([[value]], a1)
 
-def col_letter(n: int) -> str:
-    s=""
+def col_letter(n1: int) -> str:
+    s = ""
+    n = n1
     while n:
-        n,r=divmod(n-1,26)
-        s=chr(65+r)+s
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
     return s
 
-def a1_for(row: int, col0: int) -> str:
-    return f"{col_letter(col0+1)}{row}"
+
+def a1(row: int, col0: int) -> str:
+    return f"{col_letter(col0 + 1)}{row}"
+
+
+def batch_update_with_backoff(ws: gspread.Worksheet, data: List[Dict[str, Any]], tries: int = 6) -> None:
+    delay = 1.0
+    for _ in range(tries):
+        try:
+            ws.batch_update(data)
+            return
+        except APIError as e:
+            if "429" in str(e) or "Quota exceeded" in str(e):
+                log(f"⚠️ Sheets quota 429. Backoff {delay:.1f}s")
+                import time
+                time.sleep(delay)
+                delay = min(delay * 2, 20.0)
+                continue
+            raise
+
 
 def get_client() -> gspread.Client:
-    sa = env_str("GCP_SA_JSON_ONE_LINE")
+    sa = env("GCP_SA_JSON_ONE_LINE")
+    if not sa:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE")
     info = json.loads(sa)
-    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    creds = Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
     return gspread.authorize(creds)
 
-def ensure_columns(ws: gspread.Worksheet, required: List[str]) -> Dict[str,int]:
+
+def ensure_cols(ws: gspread.Worksheet, needed: List[str]) -> Dict[str, int]:
     headers = ws.row_values(1)
-    changed=False
-    for c in required:
+    changed = False
+    for c in needed:
         if c not in headers:
-            headers.append(c); changed=True
+            headers.append(c)
+            changed = True
     if changed:
         ws.update([headers], "A1")
-    return {h:i for i,h in enumerate(headers)}
+    return {h: i for i, h in enumerate(headers)}
 
-def send_telegram(bot_token: str, chat_id: str, text: str, buttons: Optional[List[List[Dict[str,str]]]]=None) -> str:
+
+def tg_send(bot_token: str, chat_id: str, text: str) -> str:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    if buttons:
-        payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
-    r = requests.post(url, data=payload, timeout=45)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Telegram send failed: {r.status_code} {r.text[:300]}")
-    return str(r.json().get("result", {}).get("message_id",""))
+    r = requests.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False}, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    return str(data.get("result", {}).get("message_id", ""))
 
-def strip_emojis(text: str) -> str:
-    # Telegram: no emojis at all (simple conservative filter).
-    return "".join(ch for ch in text if ord(ch) < 0x1F000)
+
+def parse_utc(ts: str) -> Optional[dt.datetime]:
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1]
+        return dt.datetime.fromisoformat(ts).replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
 
 def main() -> int:
-    spreadsheet_id = env_str("SPREADSHEET_ID")
-    raw_tab = env_str("RAW_DEALS_TAB","RAW_DEALS")
-    run_slot = env_str("RUN_SLOT","AM").upper()
+    run_slot = env("RUN_SLOT", "AM").upper()
     vip_delay_hours = env_int("VIP_DELAY_HOURS", 24)
-
-    bot_vip = env_str("TELEGRAM_BOT_TOKEN_VIP")
-    chat_vip = env_str("TELEGRAM_CHANNEL_VIP")
-    bot_free = env_str("TELEGRAM_BOT_TOKEN")
-    chat_free = env_str("TELEGRAM_CHANNEL")
-
-    monthly = env_str("STRIPE_MONTHLY_LINK")
-    yearly = env_str("STRIPE_YEARLY_LINK")
-
-    if not spreadsheet_id:
-        raise RuntimeError("Missing SPREADSHEET_ID")
-    if not (bot_vip and chat_vip and bot_free and chat_free):
-        raise RuntimeError("Missing Telegram creds")
 
     log("============================================================")
     log(f"✉️ Telegram publisher starting RUN_SLOT={run_slot}")
     log("============================================================")
 
-    gc = get_client()
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(raw_tab)
+    sid = env("SPREADSHEET_ID")
+    tab = env("RAW_DEALS_TAB", "RAW_DEALS")
 
-    cols = [
-        "status","caption_final","booking_link_vip","affiliate_url",
-        "tg_monthly_message_id","tg_monthly_timestamp",
-        "tg_free_message_id","tg_free_timestamp",
-        "is_telegram_eligible"
-    ]
-    hm = ensure_columns(ws, cols)
+    bot_free = env("TELEGRAM_BOT_TOKEN")
+    chan_free = env("TELEGRAM_CHANNEL")
+    bot_vip = env("TELEGRAM_BOT_TOKEN_VIP")
+    chan_vip = env("TELEGRAM_CHANNEL_VIP")
+
+    if not sid:
+        raise RuntimeError("Missing SPREADSHEET_ID")
+
+    gc = get_client()
+    sh = gc.open_by_key(sid)
+    ws = sh.worksheet(tab)
+
+    hm = ensure_cols(ws, [
+        "status",
+        "caption_final",
+        "tg_free_message_id", "tg_free_timestamp",
+        "tg_monthly_message_id", "tg_monthly_timestamp",  # VIP
+        "ig_published_timestamp",
+        "last_error", "fail_count",
+    ])
 
     rows = ws.get_all_values()
-    def get(r: List[str], col: str) -> str:
-        idx = hm[col]
-        return r[idx].strip() if idx < len(r) else ""
+    if len(rows) <= 1:
+        log("No rows.")
+        return 0
 
-    # VIP in AM after IG posted
     if run_slot == "AM":
-        for i, row in enumerate(rows[1:], start=2):
-            if get(row,"status").upper() != "POSTED_INSTAGRAM":
-                continue
-            if get(row,"is_telegram_eligible").upper() != "TRUE":
-                continue
-            if get(row,"tg_monthly_message_id"):
-                continue
+        # VIP post: only after Instagram posted
+        if not (bot_vip and chan_vip):
+            log("VIP bot/channel missing; skipping.")
+            return 0
 
-            caption = strip_emojis(get(row,"caption_final") or "")
-            if not caption:
-                continue
-
-            link = get(row,"booking_link_vip") or get(row,"affiliate_url")
-            # VIP message: caption + booking link line (no emojis)
-            text = f"{caption}\n\nBook: {link}"
-
-            try:
-                mid = send_telegram(bot_vip, chat_vip, text)
-                a1_update(ws, a1_for(i, hm["tg_monthly_message_id"]), mid)
-                a1_update(ws, a1_for(i, hm["tg_monthly_timestamp"]), now_utc_str())
-                a1_update(ws, a1_for(i, hm["status"]), "POSTED_TELEGRAM_VIP")
-                log(f"✅ VIP TG posted row {i} message_id={mid}")
+        target = None
+        for i, r in enumerate(rows[1:], start=2):
+            status = (r[hm["status"]] if hm["status"] < len(r) else "").strip().upper()
+            ig_ts = (r[hm["ig_published_timestamp"]] if hm["ig_published_timestamp"] < len(r) else "").strip()
+            vip_id = (r[hm["tg_monthly_message_id"]] if hm["tg_monthly_message_id"] < len(r) else "").strip()
+            if status == "POSTED_INSTAGRAM" and ig_ts and not vip_id:
+                target = (i, r)
                 break
-            except Exception as e:
-                log(f"❌ VIP TG error row {i}: {e}")
 
-    # FREE in PM after delay
-    if run_slot == "PM":
-        for i, row in enumerate(rows[1:], start=2):
-            if get(row,"status").upper() != "POSTED_TELEGRAM_VIP":
-                continue
-            if get(row,"tg_free_message_id"):
-                continue
+        if not target:
+            log("No eligible VIP row (need status=POSTED_INSTAGRAM and not already TG VIP).")
+            return 0
 
-            vip_ts = get(row,"tg_monthly_timestamp")
-            if not vip_ts:
-                continue
-            try:
-                vip_time = dt.datetime.fromisoformat(vip_ts.replace("Z","+00:00"))
-            except Exception:
-                continue
-            if now_utc_dt() < vip_time + dt.timedelta(hours=vip_delay_hours):
-                continue
+        sheet_row, r = target
+        text = (r[hm["caption_final"]] if hm["caption_final"] < len(r) else "").strip() or "New deal"
 
-            caption = strip_emojis(get(row,"caption_final") or "")
-            if not caption:
-                continue
+        try:
+            mid = tg_send(bot_vip, chan_vip, text)
+            batch_update_with_backoff(ws, [
+                {"range": a1(sheet_row, hm["tg_monthly_message_id"]), "values": [[mid]]},
+                {"range": a1(sheet_row, hm["tg_monthly_timestamp"]), "values": [[now_utc_str()]]},
+                {"range": a1(sheet_row, hm["status"]), "values": [["POSTED_TELEGRAM_VIP"]]},
+                {"range": a1(sheet_row, hm["last_error"]), "values": [[""]]},
+            ])
+            log(f"✅ TG VIP posted row {sheet_row} -> message_id={mid}")
+            return 0
+        except Exception as e:
+            err = str(e)[:400]
+            log(f"❌ TG VIP failed row {sheet_row}: {err}")
+            return 0
 
-            link = get(row,"affiliate_url") or get(row,"booking_link_vip")
-            text = f"{caption}\n\nBook: {link}"
+    # PM slot: FREE post only after VIP delay window
+    if not (bot_free and chan_free):
+        log("FREE bot/channel missing; skipping.")
+        return 0
 
-            buttons = [[
-                {"text":"Monthly", "url": monthly},
-                {"text":"Yearly", "url": yearly},
-            ]]
+    now_dt = dt.datetime.now(dt.timezone.utc)
 
-            try:
-                mid = send_telegram(bot_free, chat_free, text, buttons=buttons)
-                a1_update(ws, a1_for(i, hm["tg_free_message_id"]), mid)
-                a1_update(ws, a1_for(i, hm["tg_free_timestamp"]), now_utc_str())
-                a1_update(ws, a1_for(i, hm["status"]), "POSTED_ALL")
-                log(f"✅ FREE TG posted row {i} message_id={mid}")
-                break
-            except Exception as e:
-                log(f"❌ FREE TG error row {i}: {e}")
+    target = None
+    for i, r in enumerate(rows[1:], start=2):
+        status = (r[hm["status"]] if hm["status"] < len(r) else "").strip().upper()
+        vip_ts = (r[hm["tg_monthly_timestamp"]] if hm["tg_monthly_timestamp"] < len(r) else "").strip()
+        free_id = (r[hm["tg_free_message_id"]] if hm["tg_free_message_id"] < len(r) else "").strip()
 
-    log("Done.")
-    return 0
+        if status != "POSTED_TELEGRAM_VIP":
+            continue
+        if free_id:
+            continue
+        vip_dt = parse_utc(vip_ts)
+        if not vip_dt:
+            continue
+        if (now_dt - vip_dt).total_seconds() < vip_delay_hours * 3600:
+            continue
+
+        target = (i, r)
+        break
+
+    if not target:
+        log("No eligible FREE row (need status=POSTED_TELEGRAM_VIP and VIP delay satisfied).")
+        return 0
+
+    sheet_row, r = target
+    text = (r[hm["caption_final"]] if hm["caption_final"] < len(r) else "").strip() or "New deal"
+
+    try:
+        mid = tg_send(bot_free, chan_free, text)
+        batch_update_with_backoff(ws, [
+            {"range": a1(sheet_row, hm["tg_free_message_id"]), "values": [[mid]]},
+            {"range": a1(sheet_row, hm["tg_free_timestamp"]), "values": [[now_utc_str()]]},
+            {"range": a1(sheet_row, hm["status"]), "values": [["POSTED_ALL"]]},
+            {"range": a1(sheet_row, hm["last_error"]), "values": [[""]]},
+        ])
+        log(f"✅ TG FREE posted row {sheet_row} -> message_id={mid}")
+        return 0
+    except Exception as e:
+        err = str(e)[:400]
+        log(f"❌ TG FREE failed row {sheet_row}: {err}")
+        return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

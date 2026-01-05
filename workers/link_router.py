@@ -1,24 +1,39 @@
-# ============================================================
-# FILE: workers/link_router.py
-# (PASTE OVER YOUR EXISTING FILE)
-# ============================================================
-
 #!/usr/bin/env python3
 """
-TravelTxter — Hybrid Link Router (Duffel Links for short-haul, Skyscanner fallback)
+TravelTxter V4.5x — link_router.py (VIP booking link routing)
 
-Reads:  RAW_DEALS rows
-Writes: booking_link_vip (+ optional affiliate_source)
+Purpose:
+- Populate booking_link_vip for rows that need it (idempotent).
+- Uses Duffel Links session URL for eligible short-haul/direct deals.
+- Falls back to existing affiliate_url if not eligible or any error occurs.
+- Never changes statuses.
 
-Goal:
-- For eligible short-haul, direct-ish, price-capped deals → create Duffel Links session URL (VIP link)
-- Otherwise → leave booking_link_vip empty (Skyscanner remains in affiliate_url)
+Reads:
+- RAW_DEALS rows (any status) where booking_link_vip is blank and affiliate_url exists or Duffel can be used.
 
-Notes:
-- This script should NEVER crash on SA JSON formatting quirks; it should handle:
-  - one-line JSON
-  - JSON with literal newlines
-  - JSON with escaped "\\n" inside private_key
+Writes:
+- booking_link_vip
+- affiliate_source  (duffel_links / skyscanner / existing)
+- (optional) render_response_snippet is not used here
+
+Env required:
+- SPREADSHEET_ID
+- GCP_SA_JSON_ONE_LINE
+- RAW_DEALS_TAB (default RAW_DEALS)
+
+Duffel Links (optional):
+- DUFFEL_API_KEY
+- REDIRECT_BASE_URL   (must be a real URL base, e.g. https://greenroomman.pythonanywhere.com)
+
+Limits / controls:
+- MAX_LINK_ROWS_PER_RUN (default 5)
+- DUFFEL_LINKS_PRICE_CAP_GBP (default 120)
+- DUFFEL_LINKS_REQUIRE_DIRECT (default 1)
+
+Eligibility:
+- stops == 0 (if require direct)
+- price_gbp <= cap
+- origin_iata + destination_iata exist
 """
 
 from __future__ import annotations
@@ -26,256 +41,224 @@ from __future__ import annotations
 import os
 import json
 import datetime as dt
-from typing import Any, Dict, List, Optional
+from typing import Dict, Any, List, Optional
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# -----------------------------
-# Logging / time
-# -----------------------------
+# ============================================================
+# Logging
+# ============================================================
 
-def now_utc_str() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def utcnow() -> dt.datetime:
+    return dt.datetime.utcnow()
 
+def ts() -> str:
+    return utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def log(msg: str) -> None:
-    print(f"{now_utc_str()} | {msg}", flush=True)
+    print(f"{ts()} | {msg}", flush=True)
 
 
-# -----------------------------
-# Env helpers
-# -----------------------------
+# ============================================================
+# Env
+# ============================================================
 
-def env_str(name: str, default: str = "") -> str:
-    return (os.getenv(name) or default).strip()
+def env_str(k: str, default: str = "") -> str:
+    return os.environ.get(k, default).strip()
 
-
-def env_int(name: str, default: int) -> int:
-    v = env_str(name, "")
+def env_int(k: str, default: int) -> int:
     try:
-        return int(v) if v != "" else default
+        return int(env_str(k, str(default)))
     except Exception:
         return default
 
-
-def env_float(name: str, default: float) -> float:
-    v = env_str(name, "")
+def env_float(k: str, default: float) -> float:
     try:
-        return float(v) if v != "" else default
+        return float(env_str(k, str(default)))
     except Exception:
         return default
 
+def clean_url(u: str) -> str:
+    return (u or "").strip().replace(" ", "")
 
-# -----------------------------
-# Google Sheets auth (ROBUST)
-# -----------------------------
 
-def get_gspread_client() -> gspread.Client:
-    """
-    Robust loader for SA JSON stored in env vars.
+# ============================================================
+# Sheets
+# ============================================================
 
-    Supports:
-    - GCP_SA_JSON_ONE_LINE (preferred)
-    - GCP_SA_JSON (fallback)
-
-    Handles:
-    - Escaped newlines (\\n) inside private_key
-    - Literal newlines in the secret value
-    """
-    sa_json = env_str("GCP_SA_JSON_ONE_LINE", "") or env_str("GCP_SA_JSON", "")
-    if not sa_json:
-        raise RuntimeError("Missing service account JSON: set GCP_SA_JSON_ONE_LINE (or GCP_SA_JSON).")
-
-    # Try strict parse first
+def get_client() -> gspread.Client:
+    sa = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
+    if not sa:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE (recommended) or GCP_SA_JSON")
     try:
-        info = json.loads(sa_json)
+        info = json.loads(sa)
     except json.JSONDecodeError:
-        # Common case: escaped newlines in private_key
-        try:
-            info = json.loads(sa_json.replace("\\n", "\n"))
-        except json.JSONDecodeError as e:
-            # Do not print secret content. Provide a deterministic fix instruction.
-            raise RuntimeError(
-                "Service account JSON secret is not valid JSON in this runner.\n"
-                "Fix (recommended): recreate GCP_SA_JSON_ONE_LINE as true one-line JSON:\n"
-                "1) Save the raw SA JSON to sa.json\n"
-                "2) Run: python -c \"import json;print(json.dumps(json.load(open('sa.json'))))\"\n"
-                "3) Paste the output into the GitHub Secret: GCP_SA_JSON_ONE_LINE"
-            ) from e
+        info = json.loads(sa.replace("\\n", "\n"))
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
     return gspread.authorize(creds)
 
+def col_letter(n1: int) -> str:
+    s = ""
+    n = n1
+    while n:
+        n, rr = divmod(n - 1, 26)
+        s = chr(65 + rr) + s
+    return s
 
-# -----------------------------
-# Duffel Links (best-effort)
-# -----------------------------
-
-DUFFEL_API_BASE = "https://api.duffel.com"
-
-
-def duffel_headers(api_key: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Duffel-Version": "v2",
-        "Content-Type": "application/json",
-    }
+def a1(rownum: int, col0: int) -> str:
+    return f"{col_letter(col0 + 1)}{rownum}"
 
 
-def looks_like_valid_url(base: str) -> bool:
-    if not base:
-        return False
-    if base in ("http://", "https://"):
-        return False
-    return base.startswith("http://") or base.startswith("https://")
+# ============================================================
+# Duffel Links
+# ============================================================
 
+DUFFEL_LINKS_URL = "https://api.duffel.com/air/order_links"
 
-def create_duffel_link(
-    api_key: str,
-    origin: str,
-    destination: str,
-    outbound_date: str,
-    return_date: str,
-    redirect_base_url: str,
-) -> Optional[str]:
-    """
-    Creates a Duffel Links session URL (if enabled in your Duffel account).
-    Returns URL string or None.
-    """
-    if not looks_like_valid_url(redirect_base_url):
+def parse_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(str(x).replace("£", "").strip())
+    except Exception:
         return None
 
-    url = f"{DUFFEL_API_BASE}/air/links/sessions"
-    payload = {
+def parse_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(float(str(x).strip()))
+    except Exception:
+        return None
+
+def create_duffel_link(duffel_key: str, offer_id: str, redirect_url: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {duffel_key}",
+        "Content-Type": "application/json",
+        "Duffel-Version": "v2",
+    }
+    body = {
         "data": {
-            "slices": [
-                {"origin": origin, "destination": destination, "departure_date": outbound_date},
-                {"origin": destination, "destination": origin, "departure_date": return_date},
-            ],
-            "passengers": [{"type": "adult"}],
-            "redirect_urls": {
-                "success": f"{redirect_base_url.rstrip('/')}/success",
-                "cancel": f"{redirect_base_url.rstrip('/')}/cancel",
-            },
+            "selected_offers": [offer_id],
+            "redirect_url": redirect_url,
         }
     }
+    r = requests.post(DUFFEL_LINKS_URL, headers=headers, json=body, timeout=45)
+    j = r.json()
+    if r.status_code >= 400:
+        raise RuntimeError(f"Duffel Links failed {r.status_code}: {j}")
+    url = (((j.get("data") or {}).get("url")) or "").strip()
+    if not url:
+        raise RuntimeError(f"Duffel Links missing url: {j}")
+    return url
 
-    r = requests.post(url, headers=duffel_headers(api_key), json=payload, timeout=40)
-    if r.status_code >= 300:
-        return None
 
-    data = r.json().get("data") or {}
-    return data.get("url")
-
-
-# -----------------------------
+# ============================================================
 # Main
-# -----------------------------
+# ============================================================
 
 def main() -> int:
     spreadsheet_id = env_str("SPREADSHEET_ID")
-    raw_tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-    api_key = env_str("DUFFEL_API_KEY")
-    redirect_base = env_str("REDIRECT_BASE_URL", "")
-
-    max_rows = env_int("LINK_ROUTER_MAX_ROWS", 12)
-    max_price = env_float("DUFFEL_LINKS_MAX_PRICE_GBP", 220.0)
-
+    tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
-    if not api_key:
-        raise RuntimeError("Missing DUFFEL_API_KEY")
 
-    log("============================================================")
-    log("🔗 Hybrid Link Router starting")
-    log("============================================================")
+    max_rows = env_int("MAX_LINK_ROWS_PER_RUN", 5)
+    price_cap = env_float("DUFFEL_LINKS_PRICE_CAP_GBP", 120.0)
+    require_direct = env_int("DUFFEL_LINKS_REQUIRE_DIRECT", 1) == 1
 
-    if not looks_like_valid_url(redirect_base):
-        log("⚠️ REDIRECT_BASE_URL is missing/invalid. Duffel Links will be skipped until set correctly.")
+    duffel_key = env_str("DUFFEL_API_KEY")
+    redirect_base = clean_url(env_str("REDIRECT_BASE_URL"))
 
-    gc = get_gspread_client()
+    gc = get_client()
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(raw_tab)
+    ws = sh.worksheet(tab)
 
     values = ws.get_all_values()
-    if len(values) <= 1:
-        log(f"No data rows in {raw_tab}")
+    if not values or len(values) < 2:
+        log("Sheet empty. Nothing to route.")
         return 0
 
-    headers = values[0]
+    headers = [h.strip() for h in values[0]]
     rows = values[1:]
+    h = {name: i for i, name in enumerate(headers)}
 
-    def idx(col: str) -> int:
-        try:
-            return headers.index(col)
-        except ValueError:
-            return -1
+    needed = ["booking_link_vip", "affiliate_url", "affiliate_source", "price_gbp", "stops", "deal_id"]
+    for c in needed:
+        if c not in h:
+            raise RuntimeError(f"Missing required column in RAW_DEALS: {c}")
 
-    i_origin = idx("origin_iata")
-    i_dest = idx("destination_iata")
-    i_out = idx("outbound_date")
-    i_ret = idx("return_date")
-    i_price = idx("price_gbp")
-    i_aff = idx("affiliate_url")
-    i_vip = idx("booking_link_vip")
+    # Optional but strongly recommended if you want Duffel Links eligibility:
+    # offer_id from Duffel would need to be stored by the feeder in a column like "duffel_offer_id"
+    offer_id_col = h.get("duffel_offer_id")
+    origin_iata_col = h.get("origin_iata")
+    dest_iata_col = h.get("destination_iata")
 
-    required = {
-        "origin_iata": i_origin,
-        "destination_iata": i_dest,
-        "outbound_date": i_out,
-        "return_date": i_ret,
-        "price_gbp": i_price,
-        "affiliate_url": i_aff,
-        "booking_link_vip": i_vip,
-    }
-    missing = [k for k, v in required.items() if v < 0]
-    if missing:
-        raise RuntimeError(f"Missing required columns in {raw_tab}: {', '.join(missing)}")
+    routed = 0
 
-    updated = 0
+    for rownum, r in enumerate(rows, start=2):
+        if routed >= max_rows:
+            break
 
-    # Process oldest-first so links fill in a stable order
-    for sheet_row_idx, r in enumerate(rows[:max_rows], start=2):  # sheet rows start at 2
-        vip_link = (r[i_vip] or "").strip()
-        if vip_link:
+        booking = (r[h["booking_link_vip"]] if h["booking_link_vip"] < len(r) else "").strip()
+        if booking:
             continue
 
-        origin = (r[i_origin] or "").strip()
-        dest = (r[i_dest] or "").strip()
-        out_date = (r[i_out] or "").strip()
-        ret_date = (r[i_ret] or "").strip()
+        affiliate = (r[h["affiliate_url"]] if h["affiliate_url"] < len(r) else "").strip()
+        price = parse_float(r[h["price_gbp"]] if h["price_gbp"] < len(r) else "")
+        stops = parse_int(r[h["stops"]] if h["stops"] < len(r) else "") or 0
+        deal_id = (r[h["deal_id"]] if h["deal_id"] < len(r) else "").strip()
 
-        try:
-            price = float((r[i_price] or "0").strip())
-        except Exception:
-            price = 0.0
+        # Default route: fall back to affiliate_url if present
+        chosen_url = affiliate
+        chosen_source = "existing" if affiliate else ""
 
-        if not origin or not dest or not out_date or not ret_date:
+        # Duffel Links attempt only if we have what we need
+        eligible = True
+        if not duffel_key or not redirect_base:
+            eligible = False
+        if price is None or price > price_cap:
+            eligible = False
+        if require_direct and stops != 0:
+            eligible = False
+        if offer_id_col is None:
+            eligible = False
+        if origin_iata_col is None or dest_iata_col is None:
+            eligible = False
+
+        if eligible:
+            offer_id = (r[offer_id_col] if offer_id_col < len(r) else "").strip()
+            origin_iata = (r[origin_iata_col] if origin_iata_col < len(r) else "").strip().upper()
+            dest_iata = (r[dest_iata_col] if dest_iata_col < len(r) else "").strip().upper()
+            if offer_id and origin_iata and dest_iata and deal_id:
+                redirect_url = f"{redirect_base}/r/vip/{deal_id}?url={affiliate}" if affiliate else f"{redirect_base}/r/vip/{deal_id}?url=https://skyscanner.net"
+                try:
+                    chosen_url = create_duffel_link(duffel_key, offer_id, redirect_url=redirect_url)
+                    chosen_source = "duffel_links"
+                    log(f"✅ Duffel Links for row {rownum} deal_id={deal_id}")
+                except Exception as e:
+                    # Soft-fail to affiliate
+                    log(f"⚠️  Duffel Links failed row {rownum}: {e}")
+
+        # If we still have no URL, skip
+        if not chosen_url:
+            log(f"⏭️  Skip row {rownum}: no link available")
             continue
 
-        # Price gate
-        if price <= 0 or price > max_price:
-            continue
+        ws.batch_update([
+            {"range": a1(rownum, h["booking_link_vip"]), "values": [[chosen_url]]},
+            {"range": a1(rownum, h["affiliate_source"]), "values": [[chosen_source or "skyscanner"]]},
+        ])
+        routed += 1
 
-        link = create_duffel_link(api_key, origin, dest, out_date, ret_date, redirect_base)
-        if not link:
-            continue
-
-        # gspread v6 update(values, range_name)
-        cell_a1 = gspread.utils.rowcol_to_a1(sheet_row_idx, i_vip + 1)
-        ws.update([[link]], cell_a1)
-
-        updated += 1
-        log(f"✓ VIP link set row {sheet_row_idx}: {origin}->{dest} £{price:.0f}")
-
-    log(f"Done. Updated {updated} rows.")
+    log(f"Done. routed={routed}")
     return 0
 
 

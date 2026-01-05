@@ -1,135 +1,175 @@
 #!/usr/bin/env python3
-import os, json
+import os
+import json
 import datetime as dt
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
+
 
 def now_utc_str() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
 
 def log(msg: str) -> None:
     print(f"{now_utc_str()} | {msg}", flush=True)
 
-def env_str(name: str, default: str="") -> str:
+
+def env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
-def a1_update(ws: gspread.Worksheet, a1: str, value: Any) -> None:
-    ws.update([[value]], a1)
 
-def col_letter(n: int) -> str:
-    s=""
+def col_letter(n1: int) -> str:
+    s = ""
+    n = n1
     while n:
-        n,r=divmod(n-1,26)
-        s=chr(65+r)+s
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
     return s
 
-def a1_for(row: int, col0: int) -> str:
-    return f"{col_letter(col0+1)}{row}"
+
+def a1(row: int, col0: int) -> str:
+    return f"{col_letter(col0 + 1)}{row}"
+
+
+def batch_update_with_backoff(ws: gspread.Worksheet, data: List[Dict[str, Any]], tries: int = 6) -> None:
+    delay = 1.0
+    for _ in range(tries):
+        try:
+            ws.batch_update(data)
+            return
+        except APIError as e:
+            if "429" in str(e) or "Quota exceeded" in str(e):
+                log(f"⚠️ Sheets quota 429. Backoff {delay:.1f}s")
+                import time
+                time.sleep(delay)
+                delay = min(delay * 2, 20.0)
+                continue
+            raise
+
 
 def get_client() -> gspread.Client:
-    sa = env_str("GCP_SA_JSON_ONE_LINE")
+    sa = env("GCP_SA_JSON_ONE_LINE")
+    if not sa:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE")
     info = json.loads(sa)
-    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    creds = Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
     return gspread.authorize(creds)
 
-def ensure_columns(ws: gspread.Worksheet, required: List[str]) -> Dict[str,int]:
+
+def ensure_cols(ws: gspread.Worksheet, needed: List[str]) -> Dict[str, int]:
     headers = ws.row_values(1)
-    changed=False
-    for c in required:
+    changed = False
+    for c in needed:
         if c not in headers:
-            headers.append(c); changed=True
+            headers.append(c)
+            changed = True
     if changed:
         ws.update([headers], "A1")
-    return {h:i for i,h in enumerate(headers)}
+    return {h: i for i, h in enumerate(headers)}
 
-def contains_non_flag_emoji(text: str) -> bool:
-    # Hard rule: IG allows ONLY flag emojis.
-    # Implementation: detect common emoji ranges excluding flags is hard without libs.
-    # Practical enforcement: block if any emoji char outside regional indicator range.
-    # Regional indicator symbols: U+1F1E6–U+1F1FF (flags are pairs).
-    for ch in text:
-        o = ord(ch)
-        if 0x1F1E6 <= o <= 0x1F1FF:
-            continue
-        if o >= 0x1F300:  # broad emoji blocks
-            return True
-    return False
 
-def ig_create_container(ig_user_id: str, access_token: str, image_url: str, caption: str) -> str:
+def ig_create_container(ig_user_id: str, token: str, image_url: str, caption: str) -> str:
     url = f"https://graph.facebook.com/v19.0/{ig_user_id}/media"
-    r = requests.post(url, data={"image_url": image_url, "caption": caption, "access_token": access_token}, timeout=45)
-    if r.status_code >= 300:
-        raise RuntimeError(f"IG media create failed: {r.status_code} {r.text[:300]}")
-    return r.json()["id"]
+    r = requests.post(url, data={"image_url": image_url, "caption": caption, "access_token": token}, timeout=60)
+    r.raise_for_status()
+    return r.json().get("id", "")
 
-def ig_publish_container(ig_user_id: str, access_token: str, creation_id: str) -> str:
+
+def ig_publish_container(ig_user_id: str, token: str, creation_id: str) -> str:
     url = f"https://graph.facebook.com/v19.0/{ig_user_id}/media_publish"
-    r = requests.post(url, data={"creation_id": creation_id, "access_token": access_token}, timeout=45)
-    if r.status_code >= 300:
-        raise RuntimeError(f"IG publish failed: {r.status_code} {r.text[:300]}")
-    return r.json().get("id","")
+    r = requests.post(url, data={"creation_id": creation_id, "access_token": token}, timeout=60)
+    r.raise_for_status()
+    return r.json().get("id", "")
+
 
 def main() -> int:
-    spreadsheet_id = env_str("SPREADSHEET_ID")
-    raw_tab = env_str("RAW_DEALS_TAB","RAW_DEALS")
-    token = env_str("IG_ACCESS_TOKEN")
-    ig_user_id = env_str("IG_USER_ID")
-
-    if not (spreadsheet_id and token and ig_user_id):
-        raise RuntimeError("Missing IG creds or SPREADSHEET_ID")
-
     log("============================================================")
     log("📸 Instagram publisher starting")
     log("============================================================")
 
-    gc = get_client()
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(raw_tab)
+    sid = env("SPREADSHEET_ID")
+    tab = env("RAW_DEALS_TAB", "RAW_DEALS")
+    ig_token = env("IG_ACCESS_TOKEN")
+    ig_user_id = env("IG_USER_ID")
 
-    cols = ["status","graphic_url","caption_final","is_instagram_eligible","ig_creation_id","ig_media_id","ig_published_timestamp","ig_processing_lock","ig_locked_by"]
-    hm = ensure_columns(ws, cols)
+    if not (sid and ig_token and ig_user_id):
+        raise RuntimeError("Missing SPREADSHEET_ID / IG_ACCESS_TOKEN / IG_USER_ID")
+
+    gc = get_client()
+    sh = gc.open_by_key(sid)
+    ws = sh.worksheet(tab)
+
+    hm = ensure_cols(ws, [
+        "status",
+        "graphic_url",
+        "caption_final",
+        "ig_creation_id",
+        "ig_media_id",
+        "ig_published_timestamp",
+        "last_error",
+        "fail_count",
+    ])
 
     rows = ws.get_all_values()
-    def get(r: List[str], col: str) -> str:
-        idx = hm[col]
-        return r[idx].strip() if idx < len(r) else ""
+    if len(rows) <= 1:
+        log("No rows.")
+        return 0
 
-    for i, row in enumerate(rows[1:], start=2):
-        if get(row,"status").upper() != "READY_TO_PUBLISH":
-            continue
-        if get(row,"is_instagram_eligible").upper() != "TRUE":
-            continue
-        if not get(row,"graphic_url"):
-            continue
+    target = None
+    for i, r in enumerate(rows[1:], start=2):
+        status = (r[hm["status"]] if hm["status"] < len(r) else "").strip().upper()
+        graphic = (r[hm["graphic_url"]] if hm["graphic_url"] < len(r) else "").strip()
+        ig_media = (r[hm["ig_media_id"]] if hm["ig_media_id"] < len(r) else "").strip()
+        if status == "READY_TO_PUBLISH" and graphic and not ig_media:
+            target = (i, r)
+            break
 
-        caption = get(row,"caption_final")
-        if not caption:
-            continue
+    if not target:
+        log("No eligible IG row (need status=READY_TO_PUBLISH + graphic_url, and not already posted).")
+        return 0
 
-        # Enforce emoji rule
-        if contains_non_flag_emoji(caption):
-            log(f"🛑 Blocked row {i}: caption contains non-flag emoji")
-            continue
+    sheet_row, r = target
+    graphic = (r[hm["graphic_url"]] if hm["graphic_url"] < len(r) else "").strip()
+    caption = (r[hm["caption_final"]] if hm["caption_final"] < len(r) else "").strip()
 
+    if not caption:
+        caption = ""  # allow blank but better than crash
+
+    try:
+        creation_id = ig_create_container(ig_user_id, ig_token, graphic, caption)
+        media_id = ig_publish_container(ig_user_id, ig_token, creation_id)
+
+        batch_update_with_backoff(ws, [
+            {"range": a1(sheet_row, hm["ig_creation_id"]), "values": [[creation_id]]},
+            {"range": a1(sheet_row, hm["ig_media_id"]), "values": [[media_id]]},
+            {"range": a1(sheet_row, hm["ig_published_timestamp"]), "values": [[now_utc_str()]]},
+            {"range": a1(sheet_row, hm["status"]), "values": [["POSTED_INSTAGRAM"]]},
+            {"range": a1(sheet_row, hm["last_error"]), "values": [[""]]},
+        ])
+        log(f"✅ IG posted row {sheet_row} -> media_id={media_id}")
+        return 0
+
+    except Exception as e:
+        err = str(e)[:400]
+        log(f"❌ IG failed row {sheet_row}: {err}")
+        # increment fail_count
         try:
-            creation_id = ig_create_container(ig_user_id, token, get(row,"graphic_url"), caption)
-            media_id = ig_publish_container(ig_user_id, token, creation_id)
+            fc = int((r[hm["fail_count"]] if hm["fail_count"] < len(r) else "0") or "0")
+        except Exception:
+            fc = 0
+        fc += 1
+        batch_update_with_backoff(ws, [
+            {"range": a1(sheet_row, hm["fail_count"]), "values": [[str(fc)]]},
+            {"range": a1(sheet_row, hm["last_error"]), "values": [[err]]},
+        ])
+        return 0
 
-            a1_update(ws, a1_for(i, hm["ig_creation_id"]), creation_id)
-            a1_update(ws, a1_for(i, hm["ig_media_id"]), media_id)
-            a1_update(ws, a1_for(i, hm["ig_published_timestamp"]), now_utc_str())
-            a1_update(ws, a1_for(i, hm["status"]), "POSTED_INSTAGRAM")
-
-            log(f"✅ IG posted row {i} media_id={media_id}")
-            break  # 1 per run
-        except Exception as e:
-            log(f"❌ IG error row {i}: {e}")
-
-    log("Done.")
-    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

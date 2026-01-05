@@ -1,174 +1,211 @@
 #!/usr/bin/env python3
 import os
 import json
+import math
 import datetime as dt
 from typing import Any, Dict, List, Optional
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
 
 
-def now_utc_str() -> str:
+def now_utc() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-
 def log(msg: str) -> None:
-    print(f"{now_utc_str()} | {msg}", flush=True)
-
+    print(f"{now_utc()} | {msg}", flush=True)
 
 def env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
+def clean_url(u: str) -> str:
+    # remove ALL whitespace that can break URLs in captions
+    return "".join((u or "").split())
 
-def col_letter(n1: int) -> str:
-    s = ""
-    n = n1
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
+COUNTRY_FLAG = {
+    "SPAIN": "🇪🇸",
+    "ICELAND": "🇮🇸",
+    "PORTUGAL": "🇵🇹",
+    "FRANCE": "🇫🇷",
+    "ITALY": "🇮🇹",
+    "GREECE": "🇬🇷",
+    "THAILAND": "🇹🇭",
+    "JAPAN": "🇯🇵",
+    "MEXICO": "🇲🇽",
+}
 
+def to_ddmmyy(date_iso: str) -> str:
+    try:
+        d = dt.date.fromisoformat(str(date_iso).strip())
+        return d.strftime("%d%m%y")
+    except Exception:
+        return str(date_iso).strip()
 
-def a1(row: int, col0: int) -> str:
-    return f"{col_letter(col0 + 1)}{row}"
+def money_2dp(x: Any) -> str:
+    try:
+        return f"£{float(x):.2f}"
+    except Exception:
+        return ""
 
+def build_locked_caption(row: Dict[str, str]) -> str:
+    # Inputs (fallbacks to your “real” columns)
+    country = (row.get("destination_country") or "").strip()
+    to_city = (row.get("destination_city") or row.get("dest") or row.get("destination_iata") or "").strip()
+    from_city = (row.get("origin_city") or row.get("origin") or row.get("origin_iata") or "").strip()
 
-def batch_update_with_backoff(ws: gspread.Worksheet, data: List[Dict[str, Any]], tries: int = 6) -> None:
-    delay = 1.0
-    for _ in range(tries):
-        try:
-            ws.batch_update(data)
-            return
-        except APIError as e:
-            if "429" in str(e) or "Quota exceeded" in str(e):
-                log(f"⚠️ Sheets quota 429. Backoff {delay:.1f}s")
-                import time
-                time.sleep(delay)
-                delay = min(delay * 2, 20.0)
-                continue
-            raise
+    out_iso = (row.get("outbound_date") or row.get("out_date") or "").strip()
+    back_iso = (row.get("return_date") or row.get("ret_date") or "").strip()
+
+    price = money_2dp(row.get("price_gbp") or row.get("price") or "")
+
+    flag = COUNTRY_FLAG.get(country.upper(), "")
+    headline = f"{price} to {country.title()}" if country else f"{price} to {to_city}"
+    if flag:
+        headline = f"{headline} {flag}"  # flags only
+
+    monthly = clean_url(env("STRIPE_MONTHLY_LINK", ""))
+    yearly = clean_url(env("STRIPE_YEARLY_LINK", ""))
+
+    lines = [
+        headline,
+        f"TO: {to_city.upper()}",
+        f"FROM: {from_city}",
+        f"OUT: {out_iso}",
+        f"BACK: {back_iso}",
+        "",
+        "Heads up:",
+        "• VIP members saw this 24 hours ago",
+        "• Availability is running low",
+        "• Best deals go to VIPs first",
+        "",
+        "Want instant access?",
+        "Join TravelTxter Nomad",
+        "for £7.99 / month:",
+        "",
+        "• Deals 24 hours early",
+        "• Direct booking links",
+        "• Exclusive mistake fares",
+        "• Cancel anytime",
+        "",
+    ]
+
+    # Keep URLs on their own lines so IG never breaks them
+    if monthly:
+        lines.append(f"Upgrade now (Monthly): {monthly}")
+    if yearly:
+        lines.append(f"Upgrade now (Yearly): {yearly}")
+
+    return "\n".join(lines).strip()
 
 
 def get_client() -> gspread.Client:
     sa = env("GCP_SA_JSON_ONE_LINE")
-    if not sa:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE")
     info = json.loads(sa)
     creds = Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return gspread.authorize(creds)
 
 
-def ensure_cols(ws: gspread.Worksheet, needed: List[str]) -> Dict[str, int]:
-    headers = ws.row_values(1)
-    changed = False
-    for c in needed:
-        if c not in headers:
-            headers.append(c)
-            changed = True
-    if changed:
-        ws.update([headers], "A1")
-    return {h: i for i, h in enumerate(headers)}
-
-
-def ig_create_container(ig_user_id: str, token: str, image_url: str, caption: str) -> str:
-    url = f"https://graph.facebook.com/v19.0/{ig_user_id}/media"
-    r = requests.post(url, data={"image_url": image_url, "caption": caption, "access_token": token}, timeout=60)
-    r.raise_for_status()
-    return r.json().get("id", "")
-
-
-def ig_publish_container(ig_user_id: str, token: str, creation_id: str) -> str:
-    url = f"https://graph.facebook.com/v19.0/{ig_user_id}/media_publish"
-    r = requests.post(url, data={"creation_id": creation_id, "access_token": token}, timeout=60)
-    r.raise_for_status()
-    return r.json().get("id", "")
-
-
 def main() -> int:
-    log("============================================================")
-    log("📸 Instagram publisher starting")
-    log("============================================================")
-
-    sid = env("SPREADSHEET_ID")
+    spreadsheet_id = env("SPREADSHEET_ID")
     tab = env("RAW_DEALS_TAB", "RAW_DEALS")
     ig_token = env("IG_ACCESS_TOKEN")
-    ig_user_id = env("IG_USER_ID")
+    ig_user = env("IG_USER_ID")
 
-    if not (sid and ig_token and ig_user_id):
-        raise RuntimeError("Missing SPREADSHEET_ID / IG_ACCESS_TOKEN / IG_USER_ID")
+    if not (spreadsheet_id and ig_token and ig_user):
+        raise RuntimeError("Missing one of: SPREADSHEET_ID, IG_ACCESS_TOKEN, IG_USER_ID")
 
     gc = get_client()
-    sh = gc.open_by_key(sid)
+    sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(tab)
 
-    hm = ensure_cols(ws, [
-        "status",
-        "graphic_url",
-        "caption_final",
-        "ig_creation_id",
-        "ig_media_id",
-        "ig_published_timestamp",
-        "last_error",
-        "fail_count",
-    ])
+    values = ws.get_all_values()
+    headers = values[0]
+    rows = values[1:]
+    hmap = {h: i for i, h in enumerate(headers)}
 
-    rows = ws.get_all_values()
-    if len(rows) <= 1:
-        log("No rows.")
-        return 0
+    def cell(row: List[str], key: str) -> str:
+        i = hmap.get(key, -1)
+        return row[i].strip() if i >= 0 and i < len(row) else ""
 
-    target = None
-    for i, r in enumerate(rows[1:], start=2):
-        status = (r[hm["status"]] if hm["status"] < len(r) else "").strip().upper()
-        graphic = (r[hm["graphic_url"]] if hm["graphic_url"] < len(r) else "").strip()
-        ig_media = (r[hm["ig_media_id"]] if hm["ig_media_id"] < len(r) else "").strip()
-        if status == "READY_TO_PUBLISH" and graphic and not ig_media:
-            target = (i, r)
+    # Find one READY_TO_PUBLISH row with graphic_url
+    target_idx = None
+    for idx, r in enumerate(rows, start=2):
+        status = cell(r, "status").upper()
+        if status != "READY_TO_PUBLISH":
+            continue
+        graphic_url = cell(r, "graphic_url")
+        if graphic_url:
+            target_idx = idx
             break
 
-    if not target:
-        log("No eligible IG row (need status=READY_TO_PUBLISH + graphic_url, and not already posted).")
+    if not target_idx:
+        log("No READY_TO_PUBLISH rows with graphic_url found. Nothing to post.")
         return 0
 
-    sheet_row, r = target
-    graphic = (r[hm["graphic_url"]] if hm["graphic_url"] < len(r) else "").strip()
-    caption = (r[hm["caption_final"]] if hm["caption_final"] < len(r) else "").strip()
+    r = rows[target_idx - 2]
 
-    if not caption:
-        caption = ""  # allow blank but better than crash
+    # Build row dict for template
+    rowdict: Dict[str, str] = {h: (r[i] if i < len(r) else "") for h, i in hmap.items()}
 
-    try:
-        creation_id = ig_create_container(ig_user_id, ig_token, graphic, caption)
-        media_id = ig_publish_container(ig_user_id, ig_token, creation_id)
+    image_url = rowdict.get("graphic_url", "").strip()
+    caption = build_locked_caption(rowdict)
 
-        batch_update_with_backoff(ws, [
-            {"range": a1(sheet_row, hm["ig_creation_id"]), "values": [[creation_id]]},
-            {"range": a1(sheet_row, hm["ig_media_id"]), "values": [[media_id]]},
-            {"range": a1(sheet_row, hm["ig_published_timestamp"]), "values": [[now_utc_str()]]},
-            {"range": a1(sheet_row, hm["status"]), "values": [["POSTED_INSTAGRAM"]]},
-            {"range": a1(sheet_row, hm["last_error"]), "values": [[""]]},
-        ])
-        log(f"✅ IG posted row {sheet_row} -> media_id={media_id}")
-        return 0
+    log(f"📸 Posting IG for row {target_idx}")
 
-    except Exception as e:
-        err = str(e)[:400]
-        log(f"❌ IG failed row {sheet_row}: {err}")
-        # increment fail_count
-        try:
-            fc = int((r[hm["fail_count"]] if hm["fail_count"] < len(r) else "0") or "0")
-        except Exception:
-            fc = 0
-        fc += 1
-        batch_update_with_backoff(ws, [
-            {"range": a1(sheet_row, hm["fail_count"]), "values": [[str(fc)]]},
-            {"range": a1(sheet_row, hm["last_error"]), "values": [[err]]},
-        ])
-        return 0
+    # Create media container
+    create_url = f"https://graph.facebook.com/v20.0/{ig_user}/media"
+    resp = requests.post(create_url, data={
+        "image_url": image_url,
+        "caption": caption,
+        "access_token": ig_token,
+    }, timeout=60)
+    j = resp.json()
+    if "id" not in j:
+        raise RuntimeError(f"IG create failed: {j}")
+
+    creation_id = j["id"]
+
+    # Publish media container
+    publish_url = f"https://graph.facebook.com/v20.0/{ig_user}/media_publish"
+    resp2 = requests.post(publish_url, data={
+        "creation_id": creation_id,
+        "access_token": ig_token,
+    }, timeout=60)
+    j2 = resp2.json()
+    if "id" not in j2:
+        raise RuntimeError(f"IG publish failed: {j2}")
+
+    media_id = j2["id"]
+
+    # Update sheet (status + timestamps)
+    def col_letter(n1: int) -> str:
+        s = ""
+        n = n1
+        while n:
+            n, rr = divmod(n - 1, 26)
+            s = chr(65 + rr) + s
+        return s
+
+    def a1(rownum: int, col0: int) -> str:
+        return f"{col_letter(col0 + 1)}{rownum}"
+
+    updates = []
+    if "status" in hmap:
+        updates.append({"range": a1(target_idx, hmap["status"]), "values": [["POSTED_INSTAGRAM"]]})
+    if "ig_media_id" in hmap:
+        updates.append({"range": a1(target_idx, hmap["ig_media_id"]), "values": [[media_id]]})
+    if "ig_published_timestamp" in hmap:
+        updates.append({"range": a1(target_idx, hmap["ig_published_timestamp"]), "values": [[now_utc()]]})
+
+    if updates:
+        ws.batch_update(updates)
+
+    log(f"✅ IG posted row {target_idx} -> media_id={media_id}")
+    return 0
 
 
 if __name__ == "__main__":

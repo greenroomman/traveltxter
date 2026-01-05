@@ -1,34 +1,27 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — ai_scorer.py (SCORING + WINNER SELECTION)
+TravelTxter V4.5x — ai_scorer.py (SCORING + WINNER SELECTION, SELF-HEALING HEADERS)
+
+Fixes:
+- If scoring columns are missing in RAW_DEALS, this script APPENDS them to the header row automatically:
+    deal_score, dest_variety_score, theme_variety_score, scored_timestamp
+- Header-mapped only. No column numbers.
+- No creative captions.
 
 Purpose:
-- Read RAW_DEALS rows where status == NEW
-- Compute a deterministic deal_score (0-100) using simple explainable components
-- Write:
-    deal_score
-    dest_variety_score
-    theme_variety_score
-- Promote:
-    NEW -> SCORED
-- Select exactly ONE winner per run:
-    SCORED -> READY_TO_POST
-
-Hard rules:
-- Header-mapped writes ONLY (no column numbers)
-- Status gating only (never skip statuses)
-- No creative captions or AI text generation
+- Score NEW -> promote to SCORED
+- Promote exactly ONE winner SCORED -> READY_TO_POST
 
 Env required:
 - SPREADSHEET_ID
-- GCP_SA_JSON_ONE_LINE
+- GCP_SA_JSON_ONE_LINE (or GCP_SA_JSON)
 - RAW_DEALS_TAB (default RAW_DEALS)
 
 Env optional:
-- MAX_ROWS_PER_RUN (default 25)    # how many NEW rows to score in a run
-- WINNERS_PER_RUN (default 1)      # always keep 1 in production
+- MAX_ROWS_PER_RUN (default 25)
+- WINNERS_PER_RUN (default 1)
 - VARIETY_LOOKBACK_HOURS (default 120)
-- DEST_REPEAT_PENALTY (default 80) # used by winner selection
+- DEST_REPEAT_PENALTY (default 80)
 """
 
 from __future__ import annotations
@@ -90,7 +83,6 @@ def get_client() -> gspread.Client:
     )
     return gspread.authorize(creds)
 
-
 def col_letter(n1: int) -> str:
     s = ""
     n = n1
@@ -101,6 +93,22 @@ def col_letter(n1: int) -> str:
 
 def a1(rownum: int, col0: int) -> str:
     return f"{col_letter(col0 + 1)}{rownum}"
+
+
+def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
+    """
+    Appends any missing required columns to the header row and writes back to the sheet.
+    Returns the updated headers list.
+    """
+    missing = [c for c in required if c not in headers]
+    if not missing:
+        return headers
+
+    new_headers = headers + missing
+    # gspread v6 safe: ws.update(values, range_name)
+    ws.update([new_headers], "A1")
+    log(f"🛠️  Added missing columns to header: {missing}")
+    return new_headers
 
 
 # ============================================================
@@ -143,13 +151,6 @@ def days_until(date_str: str) -> Optional[int]:
 
 
 def score_price(price_gbp: float) -> float:
-    """
-    Cheap flights score higher. This is a simple curve:
-    <= 40 => 100
-    40..120 => 100..40
-    120..250 => 40..10
-    >250 => 10
-    """
     if price_gbp <= 40:
         return 100.0
     if price_gbp <= 120:
@@ -158,27 +159,16 @@ def score_price(price_gbp: float) -> float:
         return 40.0 - ((price_gbp - 120.0) * (30.0 / 130.0))
     return 10.0
 
-
 def score_timing(days_out: int) -> float:
-    """
-    Sweet spot: 20-60 days out.
-    Too soon or too far reduces score.
-    """
     if days_out < 0:
         return 0.0
     if 20 <= days_out <= 60:
         return 100.0
     if days_out < 20:
-        # 0..19 => 40..95
         return clamp(40.0 + (days_out * 3.0), 40.0, 95.0)
-    # >60: decay down to 40 by 180 days
     return clamp(100.0 - ((days_out - 60) * (60.0 / 120.0)), 40.0, 100.0)
 
-
 def score_stops(stops: int) -> float:
-    """
-    0 stops best, 1 ok, 2+ penalised.
-    """
     if stops <= 0:
         return 100.0
     if stops == 1:
@@ -187,14 +177,7 @@ def score_stops(stops: int) -> float:
         return 40.0
     return 20.0
 
-
 def compute_deal_score(price_gbp: float, days_out: int, stops: int) -> float:
-    """
-    Weighted blend:
-      Price 55%
-      Timing 30%
-      Stops 15%
-    """
     p = score_price(price_gbp)
     t = score_timing(days_out)
     s = score_stops(stops)
@@ -202,7 +185,7 @@ def compute_deal_score(price_gbp: float, days_out: int, stops: int) -> float:
 
 
 # ============================================================
-# Variety scoring (lightweight + deterministic)
+# Variety scoring
 # ============================================================
 
 def parse_iso_ts(s: str) -> Optional[dt.datetime]:
@@ -214,14 +197,7 @@ def parse_iso_ts(s: str) -> Optional[dt.datetime]:
     except Exception:
         return None
 
-
 def recent_counts(rows: List[Dict[str, str]], lookback_hours: int) -> Tuple[Dict[str, int], Dict[str, int]]:
-    """
-    Counts destinations + themes seen recently (for variety scoring).
-    Looks for any of these timestamp cols if present:
-      posted_instagram_at, rendered_timestamp, scored_timestamp, created_at, scanned_at
-    Falls back: counts all rows if no timestamps exist.
-    """
     cutoff = utcnow() - dt.timedelta(hours=lookback_hours)
     dest_counts: Dict[str, int] = {}
     theme_counts: Dict[str, int] = {}
@@ -232,10 +208,9 @@ def recent_counts(rows: List[Dict[str, str]], lookback_hours: int) -> Tuple[Dict
         d[k] = d.get(k, 0) + 1
 
     for r in rows:
-        d = (r.get("destination_city") or r.get("destination_iata") or "").strip().upper()
-        th = (r.get("deal_theme") or "").strip().upper()
+        dest_key = (r.get("destination_city") or r.get("destination_iata") or "").strip().upper()
+        theme_key = (r.get("deal_theme") or "").strip().upper()
 
-        # Choose best timestamp we can find
         ts_s = (
             r.get("posted_instagram_at")
             or r.get("rendered_timestamp")
@@ -246,25 +221,16 @@ def recent_counts(rows: List[Dict[str, str]], lookback_hours: int) -> Tuple[Dict
         )
         t = parse_iso_ts(ts_s)
         if t is None:
-            # if no timestamp, still count it (conservative)
-            bump(dest_counts, d)
-            bump(theme_counts, th)
+            bump(dest_counts, dest_key)
+            bump(theme_counts, theme_key)
             continue
-
         if t >= cutoff:
-            bump(dest_counts, d)
-            bump(theme_counts, th)
+            bump(dest_counts, dest_key)
+            bump(theme_counts, theme_key)
 
     return dest_counts, theme_counts
 
-
 def variety_score(count: int) -> float:
-    """
-    count=0 => 100 (fresh)
-    count=1 => 70
-    count=2 => 45
-    count>=3 => 25
-    """
     if count <= 0:
         return 100.0
     if count == 1:
@@ -288,7 +254,7 @@ def main() -> int:
     max_rows = env_int("MAX_ROWS_PER_RUN", 25)
     winners_per_run = env_int("WINNERS_PER_RUN", 1)
     lookback_hours = env_int("VARIETY_LOOKBACK_HOURS", 120)
-    dest_repeat_penalty = env_int("DEST_REPEAT_PENALTY", 80)  # applied in selection only
+    dest_repeat_penalty = env_int("DEST_REPEAT_PENALTY", 80)
 
     gc = get_client()
     sh = gc.open_by_key(spreadsheet_id)
@@ -300,19 +266,18 @@ def main() -> int:
         return 0
 
     headers = [h.strip() for h in values[0]]
+    # Self-heal scoring columns if missing
+    scoring_cols = ["deal_score", "dest_variety_score", "theme_variety_score", "scored_timestamp"]
+    headers = ensure_columns(ws, headers, scoring_cols)
+
+    # Re-read after header update to ensure column alignment
+    values = ws.get_all_values()
+    headers = [h.strip() for h in values[0]]
     rows = values[1:]
     h = {name: i for i, name in enumerate(headers)}
 
-    required = [
-        "status", "price_gbp", "outbound_date", "stops",
-        "destination_city", "destination_iata", "deal_theme",
-    ]
-    for c in required:
-        if c not in h:
-            raise RuntimeError(f"Missing required column in RAW_DEALS: {c}")
-
-    out_cols = ["deal_score", "dest_variety_score", "theme_variety_score", "scored_timestamp"]
-    for c in out_cols:
+    required_inputs = ["status", "price_gbp", "outbound_date", "stops", "destination_city", "destination_iata", "deal_theme"]
+    for c in required_inputs:
         if c not in h:
             raise RuntimeError(f"Missing required column in RAW_DEALS: {c}")
 
@@ -341,9 +306,8 @@ def main() -> int:
 
     log(f"Scoring {len(new_rownums)} NEW row(s)")
 
-    # Score and promote NEW -> SCORED
     batch_updates: List[Dict[str, Any]] = []
-    scored_candidates: List[Tuple[int, float]] = []  # (rownum, score)
+    scored_candidates: List[Tuple[int, float]] = []
 
     for rownum in new_rownums:
         r = rows[rownum - 2]
@@ -355,41 +319,35 @@ def main() -> int:
         stops = parse_int(r[h["stops"]] if h["stops"] < len(r) else "") or 0
         days_out = days_until(r[h["outbound_date"]] if h["outbound_date"] < len(r) else "") or 0
 
-        base_score = compute_deal_score(price, days_out, stops)
+        base = compute_deal_score(price, days_out, stops)
 
         dest_key = (r[h["destination_city"]] if h["destination_city"] < len(r) else "").strip().upper()
         if not dest_key:
             dest_key = (r[h["destination_iata"]] if h["destination_iata"] < len(r) else "").strip().upper()
-
         theme_key = (r[h["deal_theme"]] if h["deal_theme"] < len(r) else "").strip().upper()
 
         dv = variety_score(dest_counts.get(dest_key, 0))
         tv = variety_score(theme_counts.get(theme_key, 0))
 
-        # Deal score includes a small variety lift (not huge)
-        final = clamp(base_score * 0.85 + dv * 0.10 + tv * 0.05, 0.0, 100.0)
+        final = clamp(base * 0.85 + dv * 0.10 + tv * 0.05, 0.0, 100.0)
 
-        # Write scores + timestamp
         batch_updates.append({"range": a1(rownum, h["deal_score"]), "values": [[f"{final:.1f}"]]})
         batch_updates.append({"range": a1(rownum, h["dest_variety_score"]), "values": [[f"{dv:.1f}"]]})
         batch_updates.append({"range": a1(rownum, h["theme_variety_score"]), "values": [[f"{tv:.1f}"]]})
         batch_updates.append({"range": a1(rownum, h["scored_timestamp"]), "values": [[ts()]]})
-
-        # Promote status
         batch_updates.append({"range": a1(rownum, h["status"]), "values": [["SCORED"]]})
 
         scored_candidates.append((rownum, final))
 
     if batch_updates:
         ws.batch_update(batch_updates)
+
     log(f"✅ Promoted {len(scored_candidates)} row(s) NEW -> SCORED")
 
     if not scored_candidates:
         log("No scorable NEW rows found.")
         return 0
 
-    # Select winners: highest score, but penalise repeated destinations in recent history
-    # (simple + deterministic)
     def selection_score(rownum: int, score: float) -> float:
         r = rows[rownum - 2]
         dest_key = (r[h["destination_city"]] if h["destination_city"] < len(r) else "").strip().upper()
@@ -402,13 +360,12 @@ def main() -> int:
     ranked = sorted(scored_candidates, key=lambda x: selection_score(x[0], x[1]), reverse=True)
     winners = ranked[:max(1, winners_per_run)]
 
-    winner_updates: List[Dict[str, Any]] = []
-    for (rownum, sc) in winners:
-        winner_updates.append({"range": a1(rownum, h["status"]), "values": [["READY_TO_POST"]]})
+    win_updates: List[Dict[str, Any]] = []
+    for (rownum, _) in winners:
+        win_updates.append({"range": a1(rownum, h["status"]), "values": [["READY_TO_POST"]]})
 
-    ws.batch_update(winner_updates)
+    ws.batch_update(win_updates)
     log(f"🏁 Winner(s) promoted SCORED -> READY_TO_POST: {[w[0] for w in winners]}")
-
     return 0
 
 

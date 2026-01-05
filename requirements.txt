@@ -1,12 +1,14 @@
 # Google Sheets & Auth
-gspread==6.1.0
-google-auth==2.29.0
+gspread==6.1.4
+google-auth==2.33.0
 
 # API & Networking
-requests==2.31.0
+requests==2.32.3
 
 # Optional: OpenAI (The script checks if this is available)
 openai==1.14.3
+
+python-dateutil==2.9.0.post0
 
 # Standard processing (usually pre-installed, but good for safety)
 typing-extensions

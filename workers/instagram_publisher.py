@@ -1,52 +1,41 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — telegram_publisher.py
+TravelTxter V4.5x — instagram_publisher.py
 
 Purpose:
-- Deterministic Telegram publishing with status gating.
-- VIP-first (AM slot), Free-later (PM slot).
+- Post ONE deal to Instagram from RAW_DEALS
+- Only consumes status == READY_TO_PUBLISH
+- Requires graphic_url
+- Caption is LOCKED template (flags only)
+- Robust: polls container status and retries publish on "not ready"
 
-Status rules (LOCKED):
-AM run (RUN_SLOT=AM):
-  consumes: status == POSTED_INSTAGRAM
-  writes:   posted_telegram_vip_at
-  promotes: POSTED_INSTAGRAM -> POSTED_TELEGRAM_VIP
-
-PM run (RUN_SLOT=PM):
-  consumes: status == POSTED_TELEGRAM_VIP
-  writes:   posted_telegram_free_at
-  promotes: POSTED_TELEGRAM_VIP -> POSTED_ALL
-
-Templates:
-- VIP message: deal block + booking link, NO upsell banner
-- FREE message: same deal block + upsell block + Stripe links
+Writes (if columns exist):
+- posted_instagram_at
+- status -> POSTED_INSTAGRAM
+(optional) ig_media_id
 
 Env required:
 - SPREADSHEET_ID
 - GCP_SA_JSON_ONE_LINE
 - RAW_DEALS_TAB (default RAW_DEALS)
-
-Telegram env required:
-- TELEGRAM_BOT_TOKEN_VIP
-- TELEGRAM_CHANNEL_VIP
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHANNEL
-
-Monetisation env required (for FREE upsell):
+- IG_ACCESS_TOKEN
+- IG_USER_ID
 - STRIPE_MONTHLY_LINK
 - STRIPE_YEARLY_LINK
 
-Control env:
-- RUN_SLOT (AM or PM)  [set by workflow]
-- MAX_POSTS_PER_RUN (default 1)
+Env optional:
+- IG_CONTAINER_MAX_WAIT_SECONDS (default 120)
+- IG_CONTAINER_POLL_SECONDS (default 4)
+- IG_PUBLISH_RETRIES (default 6)
 """
 
 from __future__ import annotations
 
 import os
 import json
+import time
 import datetime as dt
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 import gspread
@@ -116,8 +105,21 @@ def a1(rownum: int, col0: int) -> str:
 
 
 # ============================================================
-# Message builders (no reinvention)
+# Locked caption template
 # ============================================================
+
+COUNTRY_FLAG = {
+    "SPAIN": "🇪🇸",
+    "ICELAND": "🇮🇸",
+    "PORTUGAL": "🇵🇹",
+    "FRANCE": "🇫🇷",
+    "ITALY": "🇮🇹",
+    "GREECE": "🇬🇷",
+    "THAILAND": "🇹🇭",
+    "JAPAN": "🇯🇵",
+    "MEXICO": "🇲🇽",
+    "MONTENEGRO": "🇲🇪",
+}
 
 def money_2dp(x: Any) -> str:
     try:
@@ -128,7 +130,7 @@ def money_2dp(x: Any) -> str:
             return s
         return ""
 
-def build_deal_block(row: Dict[str, str]) -> str:
+def build_locked_caption(row: Dict[str, str], monthly: str, yearly: str) -> str:
     country = (row.get("destination_country") or "").strip()
     to_city = (row.get("destination_city") or row.get("destination_iata") or "").strip()
     from_city = (row.get("origin_city") or row.get("origin_iata") or "").strip()
@@ -136,25 +138,17 @@ def build_deal_block(row: Dict[str, str]) -> str:
     back_iso = (row.get("return_date") or "").strip()
     price = money_2dp(row.get("price_gbp") or "")
 
-    # Telegram: keep clean, no weird formatting
+    flag = COUNTRY_FLAG.get(country.upper(), "")
+    headline = f"{price} to {country.title()}" if country else f"{price} to {to_city}"
+    if flag:
+        headline = f"{headline} {flag}"  # flags only
+
     lines = [
-        f"{price} to {country.title()}" if country else f"{price} to {to_city}",
+        headline,
         f"TO: {(to_city or '').upper()}",
         f"FROM: {from_city}",
         f"OUT: {out_iso}",
         f"BACK: {back_iso}",
-        "",
-    ]
-    return "\n".join(lines)
-
-def build_vip_message(row: Dict[str, str], link: str) -> str:
-    # VIP: no upsell
-    return (build_deal_block(row) + f"Book: {link}").strip()
-
-def build_free_message(row: Dict[str, str], link: str, monthly: str, yearly: str) -> str:
-    lines = [
-        build_deal_block(row).strip(),
-        f"Book: {link}",
         "",
         "Heads up:",
         "• VIP members saw this 24 hours ago",
@@ -170,29 +164,79 @@ def build_free_message(row: Dict[str, str], link: str, monthly: str, yearly: str
         "• Cancel anytime",
         "",
     ]
+
     if monthly:
         lines.append(f"Upgrade now (Monthly): {monthly}")
     if yearly:
         lines.append(f"Upgrade now (Yearly): {yearly}")
+
     return "\n".join(lines).strip()
 
 
 # ============================================================
-# Telegram API
+# Instagram Graph API helpers
 # ============================================================
 
-def tg_send(bot_token: str, chat_id: str, text: str) -> Dict[str, Any]:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": False,
-    }
-    r = requests.post(url, json=payload, timeout=45)
+def ig_get(url: str, params: Dict[str, str], timeout: int = 60) -> Dict[str, Any]:
+    r = requests.get(url, params=params, timeout=timeout)
     try:
         return r.json()
     except Exception:
-        return {"ok": False, "_raw": r.text, "_status": r.status_code}
+        return {"_raw": r.text, "_status": r.status_code}
+
+def ig_post(url: str, data: Dict[str, str], timeout: int = 60) -> Dict[str, Any]:
+    r = requests.post(url, data=data, timeout=timeout)
+    try:
+        return r.json()
+    except Exception:
+        return {"_raw": r.text, "_status": r.status_code}
+
+def wait_for_container_ready(creation_id: str, access_token: str, max_wait: int, poll: int) -> None:
+    url = f"https://graph.facebook.com/v20.0/{creation_id}"
+    deadline = time.time() + max_wait
+    last = None
+
+    while time.time() < deadline:
+        j = ig_get(url, params={"fields": "status_code", "access_token": access_token})
+        last = j
+        status = str(j.get("status_code", "")).upper()
+        if status == "FINISHED":
+            return
+        if status == "ERROR":
+            raise RuntimeError(f"IG container ERROR: {j}")
+        time.sleep(poll)
+
+    raise RuntimeError(f"IG container not ready after {max_wait}s: {last}")
+
+def publish_with_retry(ig_user: str, creation_id: str, access_token: str, retries: int) -> str:
+    url = f"https://graph.facebook.com/v20.0/{ig_user}/media_publish"
+    last = None
+
+    for attempt in range(1, retries + 1):
+        j = ig_post(url, data={"creation_id": creation_id, "access_token": access_token})
+        last = j
+        if "id" in j:
+            return str(j["id"])
+
+        err = j.get("error") or {}
+        code = err.get("code")
+        sub = err.get("error_subcode")
+        msg = (err.get("message") or "").lower()
+
+        not_ready = (
+            code == 9007 or sub == 2207027 or
+            "not ready" in msg or "media id is not available" in msg
+        )
+
+        if not_ready and attempt < retries:
+            sleep_s = min(15, 2 * attempt)
+            log(f"⏳ IG not ready (attempt {attempt}/{retries}) — sleep {sleep_s}s")
+            time.sleep(sleep_s)
+            continue
+
+        raise RuntimeError(f"IG publish failed: {j}")
+
+    raise RuntimeError(f"IG publish failed after retries: {last}")
 
 
 # ============================================================
@@ -202,22 +246,17 @@ def tg_send(bot_token: str, chat_id: str, text: str) -> Dict[str, Any]:
 def main() -> int:
     spreadsheet_id = env_str("SPREADSHEET_ID")
     tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-    run_slot = env_str("RUN_SLOT", "AM").upper()
-    max_posts = env_int("MAX_POSTS_PER_RUN", 1)
-
-    if not spreadsheet_id:
-        raise RuntimeError("Missing SPREADSHEET_ID")
-
-    vip_token = env_str("TELEGRAM_BOT_TOKEN_VIP")
-    vip_chat = env_str("TELEGRAM_CHANNEL_VIP")
-    free_token = env_str("TELEGRAM_BOT_TOKEN")
-    free_chat = env_str("TELEGRAM_CHANNEL")
-
-    if not (vip_token and vip_chat and free_token and free_chat):
-        raise RuntimeError("Missing Telegram env: TELEGRAM_BOT_TOKEN_VIP, TELEGRAM_CHANNEL_VIP, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL")
-
+    ig_token = env_str("IG_ACCESS_TOKEN")
+    ig_user = env_str("IG_USER_ID")
     monthly = clean_url(env_str("STRIPE_MONTHLY_LINK"))
     yearly = clean_url(env_str("STRIPE_YEARLY_LINK"))
+
+    if not (spreadsheet_id and ig_token and ig_user):
+        raise RuntimeError("Missing one of: SPREADSHEET_ID, IG_ACCESS_TOKEN, IG_USER_ID")
+
+    max_wait = env_int("IG_CONTAINER_MAX_WAIT_SECONDS", 120)
+    poll = env_int("IG_CONTAINER_POLL_SECONDS", 4)
+    retries = env_int("IG_PUBLISH_RETRIES", 6)
 
     gc = get_client()
     sh = gc.open_by_key(spreadsheet_id)
@@ -232,77 +271,66 @@ def main() -> int:
     rows = values[1:]
     h = {name: i for i, name in enumerate(headers)}
 
-    # Required columns
-    need = [
-        "status", "price_gbp", "origin_city", "destination_city", "destination_country",
-        "outbound_date", "return_date",
-        "affiliate_url", "booking_link_vip",
-        "posted_telegram_vip_at", "posted_telegram_free_at",
-    ]
-    for c in need:
+    required = ["status", "graphic_url", "origin_city", "destination_city", "destination_country", "outbound_date", "return_date", "price_gbp"]
+    for c in required:
         if c not in h:
             raise RuntimeError(f"Missing required column in RAW_DEALS: {c}")
 
-    # Determine mode
-    if run_slot == "AM":
-        consume_status = "POSTED_INSTAGRAM"
-        promote_status = "POSTED_TELEGRAM_VIP"
-        ts_col = "posted_telegram_vip_at"
-        token = vip_token
-        chat = vip_chat
-        mode = "VIP"
-    else:
-        consume_status = "POSTED_TELEGRAM_VIP"
-        promote_status = "POSTED_ALL"
-        ts_col = "posted_telegram_free_at"
-        token = free_token
-        chat = free_chat
-        mode = "FREE"
+    # Optional columns
+    posted_col = h.get("posted_instagram_at")
+    igid_col = h.get("ig_media_id")
 
-    posted = 0
-
+    # Find first READY_TO_PUBLISH with graphic_url
+    target_rownum: Optional[int] = None
     for rownum, r in enumerate(rows, start=2):
         status = (r[h["status"]] if h["status"] < len(r) else "").strip().upper()
-        if status != consume_status:
+        if status != "READY_TO_PUBLISH":
             continue
-
-        rowdict: Dict[str, str] = {name: (r[idx] if idx < len(r) else "") for name, idx in h.items()}
-
-        link = (rowdict.get("booking_link_vip") or "").strip()
-        if not link:
-            link = (rowdict.get("affiliate_url") or "").strip()
-
-        if not link:
-            # Don’t post a deal without a link; leave status for router to fix
-            log(f"⏭️  Skip row {rownum}: no booking_link_vip or affiliate_url")
-            continue
-
-        if mode == "VIP":
-            text = build_vip_message(rowdict, link=link)
-        else:
-            text = build_free_message(rowdict, link=link, monthly=monthly, yearly=yearly)
-
-        log(f"✈️  Telegram {mode} post row {rownum}")
-        resp = tg_send(token, chat, text)
-
-        if not resp.get("ok"):
-            raise RuntimeError(f"Telegram send failed: {resp}")
-
-        # Update sheet: timestamp + status
-        updates: List[Dict[str, Any]] = [
-            {"range": a1(rownum, h[ts_col]), "values": [[ts()]]},
-            {"range": a1(rownum, h["status"]), "values": [[promote_status]]},
-        ]
-        ws.batch_update(updates)
-
-        posted += 1
-        log(f"✅ Telegram {mode} posted row {rownum} -> {promote_status}")
-
-        if posted >= max_posts:
+        g = (r[h["graphic_url"]] if h["graphic_url"] < len(r) else "").strip()
+        if g and "no_id.png" not in g.lower():
+            target_rownum = rownum
             break
 
-    if posted == 0:
-        log(f"No rows in status {consume_status} to post for RUN_SLOT={run_slot}")
+    if not target_rownum:
+        log("No READY_TO_PUBLISH rows with valid graphic_url found.")
+        return 0
+
+    r = rows[target_rownum - 2]
+    rowdict: Dict[str, str] = {name: (r[idx] if idx < len(r) else "") for name, idx in h.items()}
+
+    image_url = rowdict.get("graphic_url", "").strip()
+    caption = build_locked_caption(rowdict, monthly=monthly, yearly=yearly)
+
+    log(f"📸 Posting IG for row {target_rownum}")
+
+    # 1) Create media container
+    create_url = f"https://graph.facebook.com/v20.0/{ig_user}/media"
+    j1 = ig_post(create_url, data={
+        "image_url": image_url,
+        "caption": caption,
+        "access_token": ig_token,
+    })
+
+    if "id" not in j1:
+        raise RuntimeError(f"IG container create failed: {j1}")
+
+    creation_id = str(j1["id"])
+
+    # 2) Wait until container finished
+    wait_for_container_ready(creation_id, ig_token, max_wait=max_wait, poll=poll)
+
+    # 3) Publish (retry)
+    media_id = publish_with_retry(ig_user, creation_id, ig_token, retries=retries)
+
+    # 4) Update sheet: POSTED_INSTAGRAM + timestamp (+ media id if column exists)
+    updates: List[Dict[str, Any]] = [{"range": a1(target_rownum, h["status"]), "values": [["POSTED_INSTAGRAM"]]}]
+    if posted_col is not None:
+        updates.append({"range": a1(target_rownum, posted_col), "values": [[ts()]]})
+    if igid_col is not None:
+        updates.append({"range": a1(target_rownum, igid_col), "values": [[media_id]]})
+
+    ws.batch_update(updates)
+    log(f"✅ IG posted row {target_rownum} -> media_id={media_id}")
     return 0
 
 

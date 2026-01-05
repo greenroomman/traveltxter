@@ -1,29 +1,70 @@
-from PIL import Image, ImageDraw, ImageFont
+#!/usr/bin/env python3
 
-WIDTH, HEIGHT = 1080, 1080
+import os
+import json
+import math
+import requests
+import gspread
+from datetime import datetime
+from google.oauth2.service_account import Credentials
 
-def generate_deal_image(data, output_path):
-    try:
-        img = Image.new("RGB", (WIDTH, HEIGHT), "#F5F5F5")
-        draw = ImageDraw.Draw(img)
 
-        try:
-            title = ImageFont.truetype("Montserrat-Bold.ttf", 72)
-            body = ImageFont.truetype("Montserrat-Regular.ttf", 48)
-            price_font = ImageFont.truetype("Montserrat-ExtraBold.ttf", 110)
-        except:
-            title = body = price_font = ImageFont.load_default()
+def ddmmyy(date_iso: str) -> str:
+    # YYYY-MM-DD → ddmmyy
+    y, m, d = date_iso.split("-")
+    return f"{d}{m}{y[-2:]}"
 
-        draw.text((100, 120), f"TO: {data['TO']}", fill="#111", font=title)
-        draw.text((100, 220), f"FROM: {data['FROM']}", fill="#333", font=body)
-        draw.text((100, 360), f"OUT: {data['OUT']}", fill="#333", font=body)
-        draw.text((100, 440), f"IN: {data['IN']}", fill="#333", font=body)
-        draw.text((100, 600), data["PRICE"], fill="#000", font=price_font)
 
-        draw.text((100, 960), "TravelTxter", fill="#999", font=body)
+def main():
+    render_url = os.getenv("RENDER_URL")
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    sa_json = os.getenv("GCP_SA_JSON_ONE_LINE")
 
-        img.save(output_path, "PNG", optimize=True)
-        return True
-    except Exception as e:
-        print(e)
-        return False
+    if not all([render_url, spreadsheet_id, sa_json]):
+        raise RuntimeError("Missing RENDER_URL / SPREADSHEET_ID / GCP_SA_JSON_ONE_LINE")
+
+    gc = gspread.authorize(
+        Credentials.from_service_account_info(
+            json.loads(sa_json),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+    )
+
+    ws = gc.open_by_key(spreadsheet_id).worksheet("RAW_DEALS")
+    rows = ws.get_all_values()
+    headers = rows[0]
+    h = {name: idx for idx, name in enumerate(headers)}
+
+    for row_idx, row in enumerate(rows[1:], start=2):
+        if row[h["status"]] != "READY_TO_POST":
+            continue
+
+        payload = {
+            "TO": row[h["destination_city"]],
+            "FROM": row[h["origin_city"]],
+            "OUT": ddmmyy(row[h["outbound_date"]]),
+            "IN": ddmmyy(row[h["return_date"]]),
+            "PRICE": f"£{math.ceil(float(row[h['price_gbp']]))}",
+        }
+
+        print(f"🎨 Rendering row {row_idx} → {payload}", flush=True)
+
+        r = requests.post(render_url, json=payload, timeout=60)
+        if r.status_code != 200:
+            print(f"❌ Render failed {r.status_code}: {r.text[:200]}")
+            return
+
+        image_url = r.json().get("image_url")
+        if not image_url:
+            print("❌ Render returned no image_url")
+            return
+
+        ws.update_cell(row_idx, h["image_url"] + 1, image_url)
+        ws.update_cell(row_idx, h["status"] + 1, "READY_TO_PUBLISH")
+
+        print(f"✅ Rendered row {row_idx}: {image_url}")
+        break  # ONE render per run
+
+
+if __name__ == "__main__":
+    main()

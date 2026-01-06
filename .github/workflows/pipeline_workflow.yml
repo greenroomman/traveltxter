@@ -108,6 +108,10 @@ jobs:
           RENDER_URL: ${{ secrets.RENDER_URL }}
           RENDER_MAX_ROWS: ${{ vars.RENDER_MAX_ROWS }}
 
+      - name: Cooldown before Instagram
+        if: env.RUN_SLOT == 'AM'
+        run: sleep 20
+
       - name: Instagram publish
         if: env.RUN_SLOT == 'AM'
         run: python workers/instagram_publisher.py

@@ -192,6 +192,23 @@ def read_table(ws: Optional[gspread.Worksheet]) -> Tuple[List[str], List[List[st
 def as_bool(s: str) -> bool:
     return (s or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
+def as_bool_default_true(s: str) -> bool:
+    """Treat blank/empty as TRUE (sheet-friendly)."""
+    if (s or "").strip() == "":
+        return True
+    return as_bool(s)
+
+def norm_theme(s: str) -> str:
+    """Normalise theme strings so CITY BREAK / City-Break / city_break => CITY_BREAK."""
+    s = (s or "").strip().upper()
+    if not s:
+        return ""
+    s = s.replace("-", " ")
+    s = "_".join([p for p in s.split() if p])
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s
+
 
 # ============================================================
 # Config loading (flexible headers)
@@ -202,9 +219,9 @@ def load_signals_map(sh: gspread.Spreadsheet) -> Tuple[Dict[str, str], Dict[str,
     Returns:
       city_by_iata, country_by_iata
     Accepts flexible header names:
-      iata / IATA
-      city / city_name
-      country / country_name
+      iata / IATA / destination_iata / iata_hint
+      city / city_name / destination_city
+      country / country_name / destination_country
     """
     ws = get_ws_optional(sh, "CONFIG_SIGNALS")
     h, rows = read_table(ws)
@@ -215,12 +232,12 @@ def load_signals_map(sh: gspread.Spreadsheet) -> Tuple[Dict[str, str], Dict[str,
 
     def find(*names: str) -> Optional[int]:
         for n in names:
-            for k, v in idx.items():
+            for k, _v in idx.items():
                 if k.lower() == n.lower():
-                    return v
+                    return idx[k]
         return None
 
-    i_iata = find("iata", "IATA", "destination_iata")
+    i_iata = find("iata", "IATA", "destination_iata", "iata_hint")
     i_city = find("city", "city_name", "destination_city")
     i_country = find("country", "country_name", "destination_country")
 
@@ -243,7 +260,7 @@ def load_signals_map(sh: gspread.Spreadsheet) -> Tuple[Dict[str, str], Dict[str,
 def pick_theme(sh: gspread.Spreadsheet) -> str:
     override = env_str("THEME")
     if override:
-        return override
+        return norm_theme(override) or override
 
     ws = get_ws_optional(sh, "THEMES")
     h, rows = read_table(ws)
@@ -261,14 +278,14 @@ def pick_theme(sh: gspread.Spreadsheet) -> str:
         if not name:
             continue
         if i_active is not None:
-            if not as_bool(safe_get(r, i_active)):
+            # Blank active/enabled means TRUE (sheet-friendly)
+            if not as_bool_default_true(safe_get(r, i_active)):
                 continue
-        themes.append(name.strip())
+        themes.append(norm_theme(name.strip()) or name.strip())
 
     if not themes:
         return "CITY_BREAK"
 
-    # deterministic-ish day rotation
     day = int(utcnow().strftime("%j"))
     return themes[day % len(themes)]
 
@@ -278,8 +295,8 @@ def load_routes(sh: gspread.Spreadsheet, theme: str) -> List[Tuple[str, str]]:
     Prefer CONFIG routes if present. Flexible headers:
       origin_iata / origin
       destination_iata / destination / dest
-      active / enabled
-      theme / deal_theme (optional)
+      active / enabled (blank treated as TRUE)
+      theme / deal_theme (optional; blanks treated as "all themes")
     """
     ws = get_ws_optional(sh, "CONFIG")
     h, rows = read_table(ws)
@@ -299,13 +316,15 @@ def load_routes(sh: gspread.Spreadsheet, theme: str) -> List[Tuple[str, str]]:
     i_active = col("active", "enabled", "is_active")
     i_theme = col("theme", "deal_theme")
 
+    theme_n = norm_theme(theme)
     routes: List[Tuple[str, str]] = []
     for r in rows:
-        if i_active is not None and not as_bool(safe_get(r, i_active)):
+        if i_active is not None and not as_bool_default_true(safe_get(r, i_active)):
             continue
         if i_theme is not None:
-            t = safe_get(r, i_theme).strip()
-            if t and t.lower() != theme.lower():
+            t_raw = safe_get(r, i_theme).strip()
+            t = norm_theme(t_raw)
+            if t and t != theme_n:
                 continue
 
         o = safe_get(r, i_origin).strip().upper() if i_origin is not None else ""
@@ -320,7 +339,7 @@ def load_origin_pool(sh: gspread.Spreadsheet) -> List[str]:
     """
     Flexible headers:
       origin_iata / iata / origin
-      active / enabled
+      active / enabled (blank treated as TRUE)
     """
     ws = get_ws_optional(sh, "CONFIG_ORIGIN_POOLS")
     h, rows = read_table(ws)
@@ -333,7 +352,7 @@ def load_origin_pool(sh: gspread.Spreadsheet) -> List[str]:
 
     out: List[str] = []
     for r in rows:
-        if i_active is not None and not as_bool(safe_get(r, i_active)):
+        if i_active is not None and not as_bool_default_true(safe_get(r, i_active)):
             continue
         iata = safe_get(r, i_iata).strip().upper() if i_iata is not None else ""
         if iata:
@@ -395,10 +414,6 @@ def duffel_search_return(
 
 
 def offer_price_gbp(offer: Dict[str, Any]) -> Optional[float]:
-    """
-    Duffel returns total_amount and total_currency.
-    We only accept GBP offers (or treat as unknown).
-    """
     try:
         amt = float(offer.get("total_amount", ""))
         cur = str(offer.get("total_currency", "")).upper()
@@ -410,9 +425,6 @@ def offer_price_gbp(offer: Dict[str, Any]) -> Optional[float]:
 
 
 def offer_stops(offer: Dict[str, Any]) -> int:
-    """
-    Simple proxy: outbound segments - 1 (min 0)
-    """
     try:
         slices = offer.get("slices", [])
         if not slices:
@@ -428,11 +440,6 @@ def offer_stops(offer: Dict[str, Any]) -> int:
 # ============================================================
 
 def pick_dates() -> Tuple[str, str]:
-    """
-    Simple deterministic window:
-    out_date  = today + 21..50 days
-    ret_date  = out_date + 3..7 days
-    """
     base = utcnow().date()
     out = base + dt.timedelta(days=random.randint(21, 50))
     ret = out + dt.timedelta(days=random.randint(3, 7))
@@ -461,7 +468,6 @@ def main() -> int:
     sh = open_sheet_with_backoff(gc, spreadsheet_id)
     raw_ws = sh.worksheet(raw_tab)
 
-    # Ensure RAW_DEALS schema exists
     raw_vals = raw_ws.get_all_values()
     headers = [h.strip() for h in raw_vals[0]] if raw_vals else []
 
@@ -494,7 +500,6 @@ def main() -> int:
     ]
 
     if not headers:
-        # create header row
         raw_ws.update([required_cols], "A1")
         headers = required_cols[:]
         log("🛠️  Created RAW_DEALS header row")
@@ -503,28 +508,36 @@ def main() -> int:
 
     h = {name: i for i, name in enumerate(headers)}
 
-    # Load config
     theme = pick_theme(sh)
     origins = load_origin_pool(sh)
     city_by_iata, country_by_iata = load_signals_map(sh)
 
     routes = load_routes(sh, theme)
 
-    # If CONFIG has no routes, synthesize simple routes from origin pool + a handful of signal destinations
+    # NEVER starve: if CONFIG routes are filtered out, synthesize from origins + signals.
     if not routes:
-        # use a small set of known destination keys from CONFIG_SIGNALS if available
-        dests = list(city_by_iata.keys())
+        if not origins:
+            origins = ["LON", "MAN", "BRS", "EDI", "GLA"]
+
+        dests = [d for d in list(city_by_iata.keys()) if len(d) == 3]
         random.shuffle(dests)
-        dests = dests[: max(10, ROUTES_PER_RUN * 3)]
+
+        if not dests:
+            dests = ["BCN", "AGP", "FCO", "LIS", "AMS", "CDG", "DUB", "PRG", "BUD", "KRK"]
+
+        dests = dests[: max(10, ROUTES_PER_RUN * 4)]
+
         for o in origins:
             for d in dests:
                 if o != d:
                     routes.append((o, d))
         random.shuffle(routes)
 
-    # rotate and cap routes
     random.shuffle(routes)
     routes = routes[: max(1, ROUTES_PER_RUN)]
+
+    if not routes:
+        routes = [("LON", "BCN")]
 
     log(f"🎯 Theme selected: {theme}")
     log(f"🧭 Routes this run: {len(routes)} (cap {ROUTES_PER_RUN})")
@@ -555,7 +568,6 @@ def main() -> int:
             log(f"❌ Duffel error: {e}")
             continue
 
-        # choose best GBP offer
         best_offer = None
         best_price = None
         for off in offers:
@@ -578,7 +590,6 @@ def main() -> int:
 
         stops = offer_stops(best_offer)
 
-        # Skyscanner-style affiliate fallback link (safe default)
         affiliate_url = f"https://www.skyscanner.net/transport/flights/{origin}/{dest}/{out_date.replace('-','')}/{ret_date.replace('-','')}/"
 
         row = [""] * len(headers)
@@ -595,7 +606,6 @@ def main() -> int:
         row[h["stops"]] = str(stops)
         row[h["deal_theme"]] = theme
 
-        # leave scores/media/publish timestamps blank (filled by later workers)
         row[h["affiliate_url"]] = affiliate_url
         row[h["affiliate_source"]] = "skyscanner_fallback"
 

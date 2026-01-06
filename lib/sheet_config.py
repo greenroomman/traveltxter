@@ -176,21 +176,29 @@ def theme_destinations(themes_rows: List[Dict[str, str]], theme: str, limit: int
 
 def iata_signal_maps(signals_rows: List[Dict[str, str]]) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Builds iata -> city / country maps from CONFIG_SIGNALS using:
-      iata_hint, destination_city, destination_country
+    Builds stable iata -> city / country maps from CONFIG_SIGNALS.
+    First valid entry wins; duplicates are ignored.
     """
     city: Dict[str, str] = {}
     country: Dict[str, str] = {}
+
     for r in signals_rows:
         code = _upper(r.get("iata_hint", ""))
         if len(code) != 3:
             continue
+
+        # Do NOT overwrite an existing mapping
+        if code in city or code in country:
+            continue
+
         c = _norm(r.get("destination_city", ""))
         k = _norm(r.get("destination_country", ""))
+
         if c:
             city[code] = c
         if k:
             country[code] = k
+
     return city, country
 
 

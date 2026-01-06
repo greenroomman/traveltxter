@@ -1,40 +1,57 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — ai_scorer.py (SCORING + WINNER SELECTION, SELF-HEALING HEADERS)
+TravelTxter V4.5x — pipeline_worker.py (FEEDER, config-driven)
 
-Fixes:
-- If scoring columns are missing in RAW_DEALS, this script APPENDS them to the header row automatically:
-    deal_score, dest_variety_score, theme_variety_score, scored_timestamp
-- Header-mapped only. No column numbers.
-- No creative captions.
+Reads control plane tabs:
+- CONFIG
+- CONFIG_ORIGIN_POOLS
+- THEMES
+- CONFIG_SIGNALS
+- CONFIG_CARRIER_BIAS
+- MVP_RULES
+Writes:
+- RAW_DEALS (append NEW rows)
+- DUFFEL_SEARCH_LOG (append one row per Duffel search)
 
-Purpose:
-- Score NEW -> promote to SCORED
-- Promote exactly ONE winner SCORED -> READY_TO_POST
+Does NOT score, render, publish.
 
 Env required:
 - SPREADSHEET_ID
 - GCP_SA_JSON_ONE_LINE (or GCP_SA_JSON)
 - RAW_DEALS_TAB (default RAW_DEALS)
+- DUFFEL_API_KEY
 
 Env optional:
-- MAX_ROWS_PER_RUN (default 25)
-- WINNERS_PER_RUN (default 1)
-- VARIETY_LOOKBACK_HOURS (default 120)
-- DEST_REPEAT_PENALTY (default 80)
+- RUN_SLOT (AM/PM)   (used only for logging)
+- DUFFEL_ROUTES_PER_RUN (default 3)
+- DUFFEL_MAX_SEARCHES_PER_RUN (default 4)
+- DUFFEL_MAX_INSERTS (default 3)
+- THEME (override theme rotation)
 """
 
 from __future__ import annotations
 
 import os
 import json
+import time
 import math
+import hashlib
 import datetime as dt
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
+import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
+from lib.sheet_config import (
+    load_config_bundle,
+    pick_theme_for_today,
+    active_config_routes,
+    origins_for_today,
+    theme_destinations,
+    iata_signal_maps,
+    mvp_hard_limits,
+)
 
 # ============================================================
 # Logging
@@ -49,7 +66,6 @@ def ts() -> str:
 def log(msg: str) -> None:
     print(f"{ts()} | {msg}", flush=True)
 
-
 # ============================================================
 # Env
 # ============================================================
@@ -63,12 +79,11 @@ def env_int(k: str, default: int) -> int:
     except Exception:
         return default
 
-
 # ============================================================
-# Sheets
+# Sheets auth
 # ============================================================
 
-def get_client() -> gspread.Client:
+def get_gspread_client() -> gspread.Client:
     sa = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
     if not sa:
         raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE (recommended) or GCP_SA_JSON")
@@ -77,168 +92,104 @@ def get_client() -> gspread.Client:
     except json.JSONDecodeError:
         info = json.loads(sa.replace("\\n", "\n"))
 
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
-def col_letter(n1: int) -> str:
-    s = ""
-    n = n1
-    while n:
-        n, rr = divmod(n - 1, 26)
-        s = chr(65 + rr) + s
-    return s
-
-def a1(rownum: int, col0: int) -> str:
-    return f"{col_letter(col0 + 1)}{rownum}"
-
-
 def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
-    """
-    Appends any missing required columns to the header row and writes back to the sheet.
-    Returns the updated headers list.
-    """
     missing = [c for c in required if c not in headers]
     if not missing:
         return headers
-
     new_headers = headers + missing
-    # gspread v6 safe: ws.update(values, range_name)
     ws.update([new_headers], "A1")
     log(f"🛠️  Added missing columns to header: {missing}")
     return new_headers
 
-
 # ============================================================
-# Scoring helpers (deterministic + explainable)
-# ============================================================
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def parse_float(s: Any) -> Optional[float]:
-    try:
-        if s is None:
-            return None
-        return float(str(s).replace("£", "").strip())
-    except Exception:
-        return None
-
-def parse_int(s: Any) -> Optional[int]:
-    try:
-        if s is None:
-            return None
-        return int(float(str(s).strip()))
-    except Exception:
-        return None
-
-def parse_iso_date(s: str) -> Optional[dt.date]:
-    s = (s or "").strip()
-    try:
-        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
-            return dt.date.fromisoformat(s[:10])
-        return None
-    except Exception:
-        return None
-
-def days_until(date_str: str) -> Optional[int]:
-    d = parse_iso_date(date_str)
-    if not d:
-        return None
-    return (d - utcnow().date()).days
-
-
-def score_price(price_gbp: float) -> float:
-    if price_gbp <= 40:
-        return 100.0
-    if price_gbp <= 120:
-        return 100.0 - ((price_gbp - 40.0) * (60.0 / 80.0))
-    if price_gbp <= 250:
-        return 40.0 - ((price_gbp - 120.0) * (30.0 / 130.0))
-    return 10.0
-
-def score_timing(days_out: int) -> float:
-    if days_out < 0:
-        return 0.0
-    if 20 <= days_out <= 60:
-        return 100.0
-    if days_out < 20:
-        return clamp(40.0 + (days_out * 3.0), 40.0, 95.0)
-    return clamp(100.0 - ((days_out - 60) * (60.0 / 120.0)), 40.0, 100.0)
-
-def score_stops(stops: int) -> float:
-    if stops <= 0:
-        return 100.0
-    if stops == 1:
-        return 70.0
-    if stops == 2:
-        return 40.0
-    return 20.0
-
-def compute_deal_score(price_gbp: float, days_out: int, stops: int) -> float:
-    p = score_price(price_gbp)
-    t = score_timing(days_out)
-    s = score_stops(stops)
-    return (0.55 * p) + (0.30 * t) + (0.15 * s)
-
-
-# ============================================================
-# Variety scoring
+# Duffel
 # ============================================================
 
-def parse_iso_ts(s: str) -> Optional[dt.datetime]:
-    s = (s or "").strip()
+DUFFEL_OFFER_REQUESTS_URL = "https://api.duffel.com/air/offer_requests"
+
+def duffel_offer_request(duffel_key: str, origin: str, dest: str, out_date: str, ret_date: str, max_connections: int = 1) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {duffel_key}",
+        "Content-Type": "application/json",
+        "Duffel-Version": "v2",
+    }
+    body = {
+        "data": {
+            "slices": [
+                {"origin": origin, "destination": dest, "departure_date": out_date},
+                {"origin": dest, "destination": origin, "departure_date": ret_date},
+            ],
+            "passengers": [{"type": "adult"}],
+            "cabin_class": "economy",
+            "max_connections": max_connections,
+        }
+    }
+    r = requests.post(DUFFEL_OFFER_REQUESTS_URL, headers=headers, json=body, timeout=45)
     try:
-        if s.endswith("Z"):
-            return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
-        return dt.datetime.fromisoformat(s)
+        j = r.json()
     except Exception:
-        return None
+        j = {"_raw": r.text}
+    if r.status_code >= 400:
+        raise RuntimeError(f"Duffel error {r.status_code}: {j}")
+    return j
 
-def recent_counts(rows: List[Dict[str, str]], lookback_hours: int) -> Tuple[Dict[str, int], Dict[str, int]]:
-    cutoff = utcnow() - dt.timedelta(hours=lookback_hours)
-    dest_counts: Dict[str, int] = {}
-    theme_counts: Dict[str, int] = {}
+def offer_stops(offer: Dict[str, Any]) -> int:
+    try:
+        slices = offer.get("slices") or []
+        segs = (slices[0].get("segments") or []) if slices else []
+        return max(0, len(segs) - 1)
+    except Exception:
+        return 0
 
-    def bump(d: Dict[str, int], k: str) -> None:
-        if not k:
-            return
-        d[k] = d.get(k, 0) + 1
+def offer_primary_carrier(offer: Dict[str, Any]) -> str:
+    """
+    Best-effort: returns marketing carrier IATA code for first segment of first slice.
+    """
+    try:
+        slices = offer.get("slices") or []
+        segs = (slices[0].get("segments") or []) if slices else []
+        if not segs:
+            return ""
+        carrier = (segs[0].get("marketing_carrier") or segs[0].get("operating_carrier") or {})
+        return str(carrier.get("iata_code") or "").strip().upper()
+    except Exception:
+        return ""
 
-    for r in rows:
-        dest_key = (r.get("destination_city") or r.get("destination_iata") or "").strip().upper()
-        theme_key = (r.get("deal_theme") or "").strip().upper()
+def offer_city_country(offer: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Best-effort: destination city + country from Duffel objects if present.
+    """
+    try:
+        sl = (offer.get("slices") or [{}])[0]
+        dest = sl.get("destination") or {}
+        city = str(dest.get("city_name") or dest.get("city") or "").strip()
+        country = str(dest.get("country_name") or dest.get("country") or "").strip()
+        return city, country
+    except Exception:
+        return "", ""
 
-        ts_s = (
-            r.get("posted_instagram_at")
-            or r.get("rendered_timestamp")
-            or r.get("scored_timestamp")
-            or r.get("created_at")
-            or r.get("scanned_at")
-            or ""
-        )
-        t = parse_iso_ts(ts_s)
-        if t is None:
-            bump(dest_counts, dest_key)
-            bump(theme_counts, theme_key)
-            continue
-        if t >= cutoff:
-            bump(dest_counts, dest_key)
-            bump(theme_counts, theme_key)
+def pick_best_offers(offers: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    def price(o: Dict[str, Any]) -> float:
+        try:
+            return float(o.get("total_amount") or 1e9)
+        except Exception:
+            return 1e9
+    return sorted(offers, key=price)[:limit]
 
-    return dest_counts, theme_counts
+# ============================================================
+# Dedupe key
+# ============================================================
 
-def variety_score(count: int) -> float:
-    if count <= 0:
-        return 100.0
-    if count == 1:
-        return 70.0
-    if count == 2:
-        return 45.0
-    return 25.0
-
+def deal_hash(origin: str, dest: str, out_date: str, ret_date: str, price_gbp: str) -> str:
+    raw = f"{origin}|{dest}|{out_date}|{ret_date}|{price_gbp}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:12]
 
 # ============================================================
 # Main
@@ -247,125 +198,234 @@ def variety_score(count: int) -> float:
 def main() -> int:
     spreadsheet_id = env_str("SPREADSHEET_ID")
     tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
+    duffel_key = env_str("DUFFEL_API_KEY")
+    run_slot = env_str("RUN_SLOT", "AM").upper()
 
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
+    if not duffel_key:
+        raise RuntimeError("Missing DUFFEL_API_KEY")
 
-    max_rows = env_int("MAX_ROWS_PER_RUN", 25)
-    winners_per_run = env_int("WINNERS_PER_RUN", 1)
-    lookback_hours = env_int("VARIETY_LOOKBACK_HOURS", 120)
-    dest_repeat_penalty = env_int("DEST_REPEAT_PENALTY", 80)
+    routes_per_run = env_int("DUFFEL_ROUTES_PER_RUN", 3)
+    max_searches = env_int("DUFFEL_MAX_SEARCHES_PER_RUN", 4)
+    max_inserts = env_int("DUFFEL_MAX_INSERTS", 3)
+    theme_override = env_str("THEME", "")
 
-    gc = get_client()
+    gc = get_gspread_client()
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(tab)
 
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
-        log("Sheet empty. Nothing to score.")
-        return 0
+    # Load control plane
+    cfg = load_config_bundle(sh)
+    theme = pick_theme_for_today(cfg.themes, override=theme_override)
+    limits = mvp_hard_limits(cfg.mvp_rules)
+    sig_city, sig_country = iata_signal_maps(cfg.signals)
 
-    headers = [h.strip() for h in values[0]]
-    # Self-heal scoring columns if missing
-    scoring_cols = ["deal_score", "dest_variety_score", "theme_variety_score", "scored_timestamp"]
-    headers = ensure_columns(ws, headers, scoring_cols)
+    # Get worksheets
+    ws_raw = sh.worksheet(tab)
 
-    # Re-read after header update to ensure column alignment
-    values = ws.get_all_values()
-    headers = [h.strip() for h in values[0]]
-    rows = values[1:]
+    # Ensure RAW_DEALS has required columns
+    raw_values = ws_raw.get_all_values()
+    if not raw_values:
+        raise RuntimeError("RAW_DEALS must have a header row.")
+
+    headers = [h.strip() for h in raw_values[0]]
+    required_cols = [
+        "status", "deal_id", "price_gbp",
+        "origin_iata", "destination_iata",
+        "origin_city", "destination_city", "destination_country",
+        "outbound_date", "return_date", "stops",
+        "deal_theme",
+        "affiliate_url", "booking_link_vip", "affiliate_source",
+        "created_utc",
+    ]
+    headers = ensure_columns(ws_raw, headers, required_cols)
+
+    # Re-read after header update
+    raw_values = ws_raw.get_all_values()
+    headers = [h.strip() for h in raw_values[0]]
     h = {name: i for i, name in enumerate(headers)}
 
-    required_inputs = ["status", "price_gbp", "outbound_date", "stops", "destination_city", "destination_iata", "deal_theme"]
-    for c in required_inputs:
-        if c not in h:
-            raise RuntimeError(f"Missing required column in RAW_DEALS: {c}")
+    # Search log tab (must exist in sheet)
+    try:
+        ws_log = sh.worksheet("DUFFEL_SEARCH_LOG")
+    except Exception:
+        ws_log = None
 
-    # Build dict rows for variety lookback
-    all_row_dicts: List[Dict[str, str]] = []
-    for r in rows:
-        d: Dict[str, str] = {}
-        for name, idx in h.items():
-            d[name] = (r[idx] if idx < len(r) else "")
-        all_row_dicts.append(d)
+    # Build route list: prefer CONFIG routes for theme, else build from THEMES + ORIGIN_POOLS
+    config_routes = active_config_routes(cfg.config_routes, theme)
+    routes: List[Dict[str, Any]] = []
 
-    dest_counts, theme_counts = recent_counts(all_row_dicts, lookback_hours)
+    if config_routes:
+        routes = config_routes[: max(1, routes_per_run)]
+        log(f"🎛️  Using CONFIG routes for theme={theme} count={len(routes)} (RUN_SLOT={run_slot})")
+    else:
+        origins = origins_for_today(cfg.origin_pools) or ["LGW", "LHR", "MAN", "BRS"]
+        dests = theme_destinations(cfg.themes, theme, limit=25)
+        if not dests:
+            dests = ["TFS", "ACE", "LPA"]  # safe fallback
+        # Create small grid
+        for o in origins[:3]:
+            for d in dests[:10]:
+                routes.append({
+                    "enabled": "TRUE",
+                    "priority": "1",
+                    "theme": theme,
+                    "origin_iata": o,
+                    "destination_iata": d,
+                    "days_ahead_min": "30",
+                    "days_ahead_max": "45",
+                    "trip_length_days": "5",
+                    "max_connections": "1",
+                    "included_airlines": "",
+                    "cabin_class": "economy",
+                })
+        routes = routes[: max(1, routes_per_run)]
+        log(f"🧩 Built routes from THEMES+ORIGIN_POOLS for theme={theme} count={len(routes)} (RUN_SLOT={run_slot})")
 
-    # Find NEW rows
-    new_rownums: List[int] = []
-    for idx, r in enumerate(rows, start=2):
-        status = (r[h["status"]] if h["status"] < len(r) else "").strip().upper()
-        if status == "NEW":
-            new_rownums.append(idx)
-            if len(new_rownums) >= max_rows:
-                break
+    searches = 0
+    inserted = 0
 
-    if not new_rownums:
-        log("No NEW rows found. Nothing to score.")
-        return 0
+    for rconf in routes:
+        if searches >= max_searches or inserted >= max_inserts:
+            break
 
-    log(f"Scoring {len(new_rownums)} NEW row(s)")
-
-    batch_updates: List[Dict[str, Any]] = []
-    scored_candidates: List[Tuple[int, float]] = []
-
-    for rownum in new_rownums:
-        r = rows[rownum - 2]
-
-        price = parse_float(r[h["price_gbp"]] if h["price_gbp"] < len(r) else "")
-        if price is None:
+        origin = str(rconf.get("origin_iata","")).strip().upper()
+        dest = str(rconf.get("destination_iata","")).strip().upper()
+        if len(origin) != 3 or len(dest) != 3:
             continue
 
-        stops = parse_int(r[h["stops"]] if h["stops"] < len(r) else "") or 0
-        days_out = days_until(r[h["outbound_date"]] if h["outbound_date"] < len(r) else "") or 0
+        days_min = int(float(rconf.get("days_ahead_min","30") or 30))
+        days_max = int(float(rconf.get("days_ahead_max","45") or 45))
+        trip_len = int(float(rconf.get("trip_length_days","5") or 5))
+        max_conn = int(float(rconf.get("max_connections","1") or 1))
 
-        base = compute_deal_score(price, days_out, stops)
+        # Deterministic date pick: min bound (keeps it simple)
+        out_date = (utcnow().date() + dt.timedelta(days=days_min)).isoformat()
+        ret_date = (utcnow().date() + dt.timedelta(days=days_min + trip_len)).isoformat()
 
-        dest_key = (r[h["destination_city"]] if h["destination_city"] < len(r) else "").strip().upper()
-        if not dest_key:
-            dest_key = (r[h["destination_iata"]] if h["destination_iata"] < len(r) else "").strip().upper()
-        theme_key = (r[h["deal_theme"]] if h["deal_theme"] < len(r) else "").strip().upper()
+        dedupe_key = f"{origin}-{dest}-{out_date}-{ret_date}-{theme}"
 
-        dv = variety_score(dest_counts.get(dest_key, 0))
-        tv = variety_score(theme_counts.get(theme_key, 0))
+        searches += 1
+        log(f"🔎 Duffel search {searches}/{max_searches}: {origin}->{dest} {out_date}/{ret_date} theme={theme}")
 
-        final = clamp(base * 0.85 + dv * 0.10 + tv * 0.05, 0.0, 100.0)
+        offers_count = 0
+        search_ok = False
 
-        batch_updates.append({"range": a1(rownum, h["deal_score"]), "values": [[f"{final:.1f}"]]})
-        batch_updates.append({"range": a1(rownum, h["dest_variety_score"]), "values": [[f"{dv:.1f}"]]})
-        batch_updates.append({"range": a1(rownum, h["theme_variety_score"]), "values": [[f"{tv:.1f}"]]})
-        batch_updates.append({"range": a1(rownum, h["scored_timestamp"]), "values": [[ts()]]})
-        batch_updates.append({"range": a1(rownum, h["status"]), "values": [["SCORED"]]})
+        try:
+            j = duffel_offer_request(duffel_key, origin, dest, out_date, ret_date, max_connections=max_conn)
+            offers = (((j or {}).get("data") or {}).get("offers") or [])
+            offers_count = len(offers)
+            search_ok = True
+        except Exception as e:
+            offers = []
+            log(f"❌ Duffel error: {e}")
 
-        scored_candidates.append((rownum, final))
+        # Log search (accounting)
+        if ws_log is not None:
+            # Ensure header exists
+            vals = ws_log.get_all_values()
+            if vals:
+                log_headers = [x.strip() for x in vals[0]]
+                needed = ["ts_utc","origin","dest","outbound_date","return_date","theme","dedupe_key","skipped_dedupe","search_ok","offers_count"]
+                missing = [c for c in needed if c not in log_headers]
+                if missing:
+                    ws_log.update([log_headers + missing], "A1")
+                row = ["" for _ in range(len(log_headers) + len(missing))]
+                # rebuild header map after potential expansion
+                vals2 = ws_log.get_all_values()
+                log_headers2 = [x.strip() for x in vals2[0]]
+                lh = {name:i for i,name in enumerate(log_headers2)}
+                def setv(col, v):
+                    i = lh[col]
+                    row[i] = str(v)
+                setv("ts_utc", ts())
+                setv("origin", origin)
+                setv("dest", dest)
+                setv("outbound_date", out_date)
+                setv("return_date", ret_date)
+                setv("theme", theme)
+                setv("dedupe_key", dedupe_key)
+                setv("skipped_dedupe", "FALSE")
+                setv("search_ok", "TRUE" if search_ok else "FALSE")
+                setv("offers_count", str(offers_count))
+                ws_log.append_row(row, value_input_option="USER_ENTERED")
 
-    if batch_updates:
-        ws.batch_update(batch_updates)
+        if not offers:
+            continue
 
-    log(f"✅ Promoted {len(scored_candidates)} row(s) NEW -> SCORED")
+        remaining = max(0, max_inserts - inserted)
+        chosen = pick_best_offers(offers, limit=min(remaining, 3))
 
-    if not scored_candidates:
-        log("No scorable NEW rows found.")
-        return 0
+        for offer in chosen:
+            if inserted >= max_inserts:
+                break
 
-    def selection_score(rownum: int, score: float) -> float:
-        r = rows[rownum - 2]
-        dest_key = (r[h["destination_city"]] if h["destination_city"] < len(r) else "").strip().upper()
-        if not dest_key:
-            dest_key = (r[h["destination_iata"]] if h["destination_iata"] < len(r) else "").strip().upper()
-        repeats = dest_counts.get(dest_key, 0)
-        penalty = dest_repeat_penalty if repeats >= 1 else 0
-        return score - penalty
+            cur = str(offer.get("total_currency") or "").upper()
+            if cur and cur != "GBP":
+                continue
 
-    ranked = sorted(scored_candidates, key=lambda x: selection_score(x[0], x[1]), reverse=True)
-    winners = ranked[:max(1, winners_per_run)]
+            try:
+                price = float(offer.get("total_amount"))
+            except Exception:
+                continue
 
-    win_updates: List[Dict[str, Any]] = []
-    for (rownum, _) in winners:
-        win_updates.append({"range": a1(rownum, h["status"]), "values": [["READY_TO_POST"]]})
+            stops = offer_stops(offer)
 
-    ws.batch_update(win_updates)
-    log(f"🏁 Winner(s) promoted SCORED -> READY_TO_POST: {[w[0] for w in winners]}")
+            # MVP hard rules (enforced here, at ingestion)
+            if price < float(limits["min_price_gbp"]) or price > float(limits["max_price_gbp"]):
+                continue
+            if stops > int(limits["max_stops"]):
+                continue
+
+            price_gbp = f"{price:.2f}"
+            deal_id = deal_hash(origin, dest, out_date, ret_date, price_gbp)
+
+            # City/country enrichment: Duffel first, then CONFIG_SIGNALS fallback
+            dest_city, dest_country = offer_city_country(offer)
+            if not dest_city:
+                dest_city = sig_city.get(dest, dest)
+            if not dest_country:
+                dest_country = sig_country.get(dest, "")
+
+            origin_city = origin  # safe default
+            # If we have a signal city for origin (rare), use it. Otherwise keep IATA (you can add origin map later)
+            origin_city = sig_city.get(origin, origin_city)
+
+            # Link (Duffel deep_link if present)
+            deep_link = str(offer.get("deep_link") or "").strip()
+
+            row_out = [""] * len(headers)
+            def setc(col: str, val: str):
+                if col not in h:
+                    return
+                i = h[col]
+                if i >= len(row_out):
+                    row_out.extend([""] * (i - len(row_out) + 1))
+                row_out[i] = val
+
+            setc("status", "NEW")
+            setc("deal_id", deal_id)
+            setc("price_gbp", price_gbp)
+            setc("origin_iata", origin)
+            setc("destination_iata", dest)
+            setc("origin_city", origin_city)
+            setc("destination_city", dest_city)
+            setc("destination_country", dest_country)
+            setc("outbound_date", out_date)
+            setc("return_date", ret_date)
+            setc("stops", str(stops))
+            setc("deal_theme", theme)
+            setc("affiliate_url", deep_link)
+            setc("booking_link_vip", "")
+            setc("affiliate_source", "skyscanner")
+            setc("created_utc", ts())
+
+            ws_raw.append_row(row_out, value_input_option="USER_ENTERED")
+            inserted += 1
+            log(f"✅ Inserted NEW: {deal_id} {origin}->{dest} £{price_gbp} stops={stops} theme={theme} (inserted={inserted})")
+            time.sleep(0.35)
+
+    log(f"Done. theme={theme} searches={searches} inserted={inserted}")
     return 0
 
 

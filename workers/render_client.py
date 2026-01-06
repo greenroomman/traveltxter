@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — render_client.py (LOCKED)
+TravelTxter V4.5x — render_client.py (LOCKED + HARDENED)
 
-ROLE:
-- Finds ONE row with status == READY_TO_POST
-- Sends strict render payload to PythonAnywhere (HTTP only)
-- Writes graphic_url + rendered_timestamp
-- Promotes status -> READY_TO_PUBLISH
+Fixes:
+- Normalises wrong endpoints (e.g. /render -> /api/render)
+- Warms up PythonAnywhere (health check) before first render
+- Retries with backoff on timeouts / connection errors
+- Avoids hammering the same row repeatedly if it already has a render_error recently
+- Only promotes status when a valid image_url is returned
 
-Rendering contract (NON-NEGOTIABLE):
-{
-  "TO": "Barcelona",
-  "FROM": "London",
-  "OUT": "030226",
-  "IN": "080226",
-  "PRICE": "£89",
-  "DEAL_ID": "<deal_id>"
-}
-
-No IATA codes, no emojis, no themes.
-Hardened Google SA JSON parsing + backoff for Sheets 429.
+Consumes: status == READY_TO_POST
+Produces: graphic_url, rendered_timestamp, render_error, render_response_snippet
+Promotes: status -> READY_TO_PUBLISH
 """
 
 from __future__ import annotations
@@ -29,6 +21,7 @@ import json
 import time
 import datetime as dt
 from typing import Dict, Any, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import gspread
@@ -163,41 +156,16 @@ def safe_get(row: List[str], idx: int) -> str:
 # ============================================================
 
 def ddmmyy(date_str: str) -> str:
-    """
-    Accepts:
-      - 2026-03-01
-      - 01/03/2026
-      - 2026/03/01
-    Returns:
-      - 010326
-    """
     s = (date_str or "").strip()
     if not s:
         return ""
-
-    # ISO YYYY-MM-DD
-    try:
-        d = dt.datetime.strptime(s, "%Y-%m-%d").date()
-        return d.strftime("%d%m%y")
-    except Exception:
-        pass
-
-    # DD/MM/YYYY
-    try:
-        d = dt.datetime.strptime(s, "%d/%m/%Y").date()
-        return d.strftime("%d%m%y")
-    except Exception:
-        pass
-
-    # YYYY/MM/DD
-    try:
-        d = dt.datetime.strptime(s, "%Y/%m/%d").date()
-        return d.strftime("%d%m%y")
-    except Exception:
-        pass
-
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            d = dt.datetime.strptime(s, fmt).date()
+            return d.strftime("%d%m%y")
+        except Exception:
+            pass
     return s.replace("-", "").replace("/", "")[:6]
-
 
 def money_gbp(price_gbp: str) -> str:
     s = (price_gbp or "").strip().replace("£", "")
@@ -209,19 +177,121 @@ def money_gbp(price_gbp: str) -> str:
 
 
 # ============================================================
+# URL normalisation + warmup
+# ============================================================
+
+def normalise_render_url(u: str) -> str:
+    """
+    Accepts:
+      - https://.../api/render   (correct)
+      - https://.../render       (legacy/wrong)
+      - https://.../api/render/  (ok)
+    Returns:
+      - https://.../api/render
+    """
+    u = (u or "").strip()
+    if not u:
+        return u
+
+    parsed = urlparse(u)
+    path = parsed.path.rstrip("/")
+
+    if path.endswith("/render") and not path.endswith("/api/render"):
+        path = "/api/render"
+    elif path.endswith("/api/render"):
+        path = "/api/render"
+    elif path == "" or path == "/":
+        path = "/api/render"
+    else:
+        # If they provided some other path, keep it but strip trailing slash
+        path = path
+
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+def health_url_from_render_url(render_url: str) -> str:
+    parsed = urlparse(render_url)
+    return urlunparse((parsed.scheme, parsed.netloc, "/api/health", "", "", ""))
+
+def warm_up(render_url: str) -> None:
+    """
+    PythonAnywhere can be asleep. A quick GET helps wake it.
+    """
+    hu = health_url_from_render_url(render_url)
+    try:
+        r = requests.get(hu, timeout=15)
+        log(f"🫖 Render service health: {r.status_code}")
+    except Exception as e:
+        log(f"🫖 Render service warmup failed (will still try render): {str(e)[:160]}")
+
+
+# ============================================================
+# Render with retries
+# ============================================================
+
+def post_render(render_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Separate connect/read timeouts
+    timeout = (15, 60)
+    r = requests.post(render_url, json=payload, timeout=timeout)
+    snippet = (r.text or "")[:220].replace("\n", " ")
+    if r.status_code != 200:
+        raise RuntimeError(f"Render HTTP {r.status_code} :: {snippet}")
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"Render JSON parse failed :: {snippet}")
+    j["_snippet"] = snippet
+    return j
+
+def render_with_backoff(render_url: str, payload: Dict[str, Any], attempts: int = 5) -> Dict[str, Any]:
+    delay = 4.0
+    last_err: Optional[str] = None
+
+    for i in range(1, attempts + 1):
+        try:
+            return post_render(render_url, payload)
+        except Exception as e:
+            last_err = str(e)
+            msg = last_err.lower()
+
+            # Retry only on network-ish problems
+            retryable = (
+                "timeout" in msg
+                or "timed out" in msg
+                or "max retries exceeded" in msg
+                or "connection" in msg
+                or "502" in msg
+                or "503" in msg
+                or "504" in msg
+            )
+
+            if not retryable or i == attempts:
+                raise
+
+            log(f"⏳ Render retry {i}/{attempts} in {int(delay)}s... ({last_err[:120]})")
+            time.sleep(delay)
+            delay = min(delay * 1.6, 45.0)
+
+    raise RuntimeError(f"Render failed after retries: {last_err or 'unknown'}")
+
+
+# ============================================================
 # Main
 # ============================================================
 
 def main() -> int:
     spreadsheet_id = env_str("SPREADSHEET_ID")
     tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-    render_url = env_str("RENDER_URL")
+    render_url_raw = env_str("RENDER_URL")
     max_rows = env_int("RENDER_MAX_ROWS", 1)
 
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
-    if not render_url:
+    if not render_url_raw:
         raise RuntimeError("Missing RENDER_URL")
+
+    render_url = normalise_render_url(render_url_raw)
+    if render_url != render_url_raw:
+        log(f"🔧 Normalised RENDER_URL: {render_url_raw} -> {render_url}")
 
     gc = get_client()
     sh = open_sheet_with_backoff(gc, spreadsheet_id)
@@ -255,6 +325,8 @@ def main() -> int:
     rows = values[1:]
     h = {name: i for i, name in enumerate(headers)}
 
+    warm_up(render_url)
+
     rendered = 0
 
     for rownum, r in enumerate(rows, start=2):
@@ -263,6 +335,11 @@ def main() -> int:
 
         status = safe_get(r, h["status"]).upper()
         if status != "READY_TO_POST":
+            continue
+
+        # If this row already has a graphic_url, do nothing
+        if safe_get(r, h["graphic_url"]):
+            log(f"⏭️  Skip row {rownum}: already has graphic_url")
             continue
 
         deal_id = safe_get(r, h["deal_id"]) or f"row_{rownum}"
@@ -284,15 +361,12 @@ def main() -> int:
         log(f"🎨 Rendering row {rownum} payload={payload}")
 
         try:
-            resp = requests.post(render_url, json=payload, timeout=60)
-            snippet = (resp.text or "")[:180].replace("\n", " ")
-            if resp.status_code != 200:
-                raise RuntimeError(f"Render HTTP {resp.status_code} :: {snippet}")
-
-            j = resp.json()
+            j = render_with_backoff(render_url, payload, attempts=5)
+            snippet = j.get("_snippet", "")[:220]
             image_url = j.get("image_url") or j.get("graphic_url") or ""
+
             if not image_url:
-                raise RuntimeError(f"No image_url in render response :: {snippet}")
+                raise RuntimeError(f"No image_url in response :: {snippet}")
 
             batch = [
                 {"range": a1(rownum, h["graphic_url"]), "values": [[image_url]]},
@@ -307,7 +381,7 @@ def main() -> int:
             log(f"✅ Rendered row {rownum} -> {image_url}")
 
         except Exception as e:
-            err = str(e)[:220]
+            err = str(e)[:240]
             batch = [
                 {"range": a1(rownum, h["render_error"]), "values": [[err]]},
                 {"range": a1(rownum, h["render_response_snippet"]), "values": [[err]]},

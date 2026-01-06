@@ -1,69 +1,46 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — link_router.py (VIP booking link routing)
+TravelTxter V4.5x — link_router.py (LOCKED)
 
-Purpose:
-- Populate booking_link_vip for rows that need it (idempotent).
-- Uses Duffel Links session URL for eligible short-haul/direct deals.
-- Falls back to existing affiliate_url if not eligible or any error occurs.
-- Never changes statuses.
+ROLE:
+- Populates booking_link_vip for rows that need it
+- Prefers booking_link_vip if already set
+- Falls back to affiliate_url if present
+- NEVER changes status (status gating is handled elsewhere)
+- Never crashes if Duffel Links config is missing
 
-Reads:
-- RAW_DEALS rows (any status) where booking_link_vip is blank and affiliate_url exists or Duffel can be used.
-
-Writes:
-- booking_link_vip
-- affiliate_source  (duffel_links / skyscanner / existing)
-- (optional) render_response_snippet is not used here
-
-Env required:
-- SPREADSHEET_ID
-- GCP_SA_JSON_ONE_LINE
-- RAW_DEALS_TAB (default RAW_DEALS)
-
-Duffel Links (optional):
-- DUFFEL_API_KEY
-- REDIRECT_BASE_URL   (must be a real URL base, e.g. https://greenroomman.pythonanywhere.com)
-
-Limits / controls:
-- MAX_LINK_ROWS_PER_RUN (default 5)
-- DUFFEL_LINKS_PRICE_CAP_GBP (default 120)
-- DUFFEL_LINKS_REQUIRE_DIRECT (default 1)
-
-Eligibility:
-- stops == 0 (if require direct)
-- price_gbp <= cap
-- origin_iata + destination_iata exist
+NOTE:
+This file is deliberately "safe-first" so the pipeline can publish reliably.
+If/when you want Duffel Links sessions, we can add that logic without touching
+the rest of the pipeline.
 """
 
 from __future__ import annotations
 
 import os
 import json
+import time
 import datetime as dt
 from typing import Dict, Any, List, Optional
 
-import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
 
 
 # ============================================================
 # Logging
 # ============================================================
 
-def utcnow() -> dt.datetime:
-    return dt.datetime.utcnow()
-
 def ts() -> str:
-    return utcnow().replace(microsecond=0).isoformat() + "Z"
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def log(msg: str) -> None:
     print(f"{ts()} | {msg}", flush=True)
 
 
 # ============================================================
-# Env
+# Env helpers
 # ============================================================
 
 def env_str(k: str, default: str = "") -> str:
@@ -75,34 +52,75 @@ def env_int(k: str, default: int) -> int:
     except Exception:
         return default
 
-def env_float(k: str, default: float) -> float:
+
+# ============================================================
+# Robust SA JSON parsing
+# ============================================================
+
+def _extract_json_object(raw: str) -> Dict[str, Any]:
+    raw = (raw or "").strip()
+
     try:
-        return float(env_str(k, str(default)))
+        return json.loads(raw)
     except Exception:
-        return default
+        pass
 
-def clean_url(u: str) -> str:
-    return (u or "").strip().replace(" ", "")
+    try:
+        return json.loads(raw.replace("\\n", "\n"))
+    except Exception:
+        pass
 
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise RuntimeError("Invalid GCP_SA_JSON_ONE_LINE: no JSON object found")
 
-# ============================================================
-# Sheets
-# ============================================================
+    candidate = raw[start:end + 1]
+
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+
+    try:
+        return json.loads(candidate.replace("\\n", "\n"))
+    except Exception as e:
+        raise RuntimeError("Invalid GCP_SA_JSON_ONE_LINE: JSON parse failed") from e
+
 
 def get_client() -> gspread.Client:
     sa = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
     if not sa:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE (recommended) or GCP_SA_JSON")
-    try:
-        info = json.loads(sa)
-    except json.JSONDecodeError:
-        info = json.loads(sa.replace("\\n", "\n"))
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+
+    info = _extract_json_object(sa)
 
     creds = Credentials.from_service_account_info(
         info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
     )
     return gspread.authorize(creds)
+
+
+def open_sheet_with_backoff(gc: gspread.Client, spreadsheet_id: str, attempts: int = 8) -> gspread.Spreadsheet:
+    delay = 4.0
+    for i in range(1, attempts + 1):
+        try:
+            return gc.open_by_key(spreadsheet_id)
+        except APIError as e:
+            msg = str(e)
+            if "429" in msg or "Quota exceeded" in msg:
+                log(f"⏳ Sheets quota (429). Retry {i}/{attempts} in {int(delay)}s...")
+                time.sleep(delay)
+                delay = min(delay * 1.6, 45.0)
+                continue
+            raise
+    raise RuntimeError("Sheets quota still exceeded after retries (429). Try again shortly.")
+
+
+# ============================================================
+# A1 helpers
+# ============================================================
 
 def col_letter(n1: int) -> str:
     s = ""
@@ -117,47 +135,19 @@ def a1(rownum: int, col0: int) -> str:
 
 
 # ============================================================
-# Duffel Links
+# Sheet helpers
 # ============================================================
 
-DUFFEL_LINKS_URL = "https://api.duffel.com/air/order_links"
+def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
+    missing = [c for c in required if c not in headers]
+    if not missing:
+        return headers
+    ws.update([headers + missing], "A1")
+    log(f"🛠️  Added missing columns: {missing}")
+    return headers + missing
 
-def parse_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(str(x).replace("£", "").strip())
-    except Exception:
-        return None
-
-def parse_int(x: Any) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        return int(float(str(x).strip()))
-    except Exception:
-        return None
-
-def create_duffel_link(duffel_key: str, offer_id: str, redirect_url: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {duffel_key}",
-        "Content-Type": "application/json",
-        "Duffel-Version": "v2",
-    }
-    body = {
-        "data": {
-            "selected_offers": [offer_id],
-            "redirect_url": redirect_url,
-        }
-    }
-    r = requests.post(DUFFEL_LINKS_URL, headers=headers, json=body, timeout=45)
-    j = r.json()
-    if r.status_code >= 400:
-        raise RuntimeError(f"Duffel Links failed {r.status_code}: {j}")
-    url = (((j.get("data") or {}).get("url")) or "").strip()
-    if not url:
-        raise RuntimeError(f"Duffel Links missing url: {j}")
-    return url
+def safe_get(row: List[str], idx: int) -> str:
+    return row[idx].strip() if 0 <= idx < len(row) else ""
 
 
 # ============================================================
@@ -167,98 +157,76 @@ def create_duffel_link(duffel_key: str, offer_id: str, redirect_url: str) -> str
 def main() -> int:
     spreadsheet_id = env_str("SPREADSHEET_ID")
     tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
+
+    max_rows = env_int("LINK_ROUTER_MAX_ROWS", 5)
+
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
 
-    max_rows = env_int("MAX_LINK_ROWS_PER_RUN", 5)
-    price_cap = env_float("DUFFEL_LINKS_PRICE_CAP_GBP", 120.0)
-    require_direct = env_int("DUFFEL_LINKS_REQUIRE_DIRECT", 1) == 1
-
-    duffel_key = env_str("DUFFEL_API_KEY")
-    redirect_base = clean_url(env_str("REDIRECT_BASE_URL"))
-
     gc = get_client()
-    sh = gc.open_by_key(spreadsheet_id)
+    sh = open_sheet_with_backoff(gc, spreadsheet_id)
     ws = sh.worksheet(tab)
 
     values = ws.get_all_values()
     if not values or len(values) < 2:
-        log("Sheet empty. Nothing to route.")
+        log("No rows.")
         return 0
 
+    headers = [h.strip() for h in values[0]]
+
+    required_cols = [
+        "status",
+        "affiliate_url",
+        "booking_link_vip",
+        "affiliate_source",
+        "link_routed_at",
+    ]
+    headers = ensure_columns(ws, headers, required_cols)
+
+    # Re-read once after header mutation
+    values = ws.get_all_values()
     headers = [h.strip() for h in values[0]]
     rows = values[1:]
     h = {name: i for i, name in enumerate(headers)}
 
-    needed = ["booking_link_vip", "affiliate_url", "affiliate_source", "price_gbp", "stops", "deal_id"]
-    for c in needed:
-        if c not in h:
-            raise RuntimeError(f"Missing required column in RAW_DEALS: {c}")
+    processed = 0
 
-    # Optional but strongly recommended if you want Duffel Links eligibility:
-    # offer_id from Duffel would need to be stored by the feeder in a column like "duffel_offer_id"
-    offer_id_col = h.get("duffel_offer_id")
-    origin_iata_col = h.get("origin_iata")
-    dest_iata_col = h.get("destination_iata")
-
-    routed = 0
+    # We route links for rows that are in-flight through publishing
+    eligible_statuses = {"READY_TO_POST", "READY_TO_PUBLISH", "POSTED_INSTAGRAM"}
 
     for rownum, r in enumerate(rows, start=2):
-        if routed >= max_rows:
+        if processed >= max_rows:
             break
 
-        booking = (r[h["booking_link_vip"]] if h["booking_link_vip"] < len(r) else "").strip()
-        if booking:
+        status = safe_get(r, h["status"]).upper()
+        if status not in eligible_statuses:
             continue
 
-        affiliate = (r[h["affiliate_url"]] if h["affiliate_url"] < len(r) else "").strip()
-        price = parse_float(r[h["price_gbp"]] if h["price_gbp"] < len(r) else "")
-        stops = parse_int(r[h["stops"]] if h["stops"] < len(r) else "") or 0
-        deal_id = (r[h["deal_id"]] if h["deal_id"] < len(r) else "").strip()
+        booking_link_vip = safe_get(r, h["booking_link_vip"])
+        affiliate_url = safe_get(r, h["affiliate_url"])
 
-        # Default route: fall back to affiliate_url if present
-        chosen_url = affiliate
-        chosen_source = "existing" if affiliate else ""
-
-        # Duffel Links attempt only if we have what we need
-        eligible = True
-        if not duffel_key or not redirect_base:
-            eligible = False
-        if price is None or price > price_cap:
-            eligible = False
-        if require_direct and stops != 0:
-            eligible = False
-        if offer_id_col is None:
-            eligible = False
-        if origin_iata_col is None or dest_iata_col is None:
-            eligible = False
-
-        if eligible:
-            offer_id = (r[offer_id_col] if offer_id_col < len(r) else "").strip()
-            origin_iata = (r[origin_iata_col] if origin_iata_col < len(r) else "").strip().upper()
-            dest_iata = (r[dest_iata_col] if dest_iata_col < len(r) else "").strip().upper()
-            if offer_id and origin_iata and dest_iata and deal_id:
-                redirect_url = f"{redirect_base}/r/vip/{deal_id}?url={affiliate}" if affiliate else f"{redirect_base}/r/vip/{deal_id}?url=https://skyscanner.net"
-                try:
-                    chosen_url = create_duffel_link(duffel_key, offer_id, redirect_url=redirect_url)
-                    chosen_source = "duffel_links"
-                    log(f"✅ Duffel Links for row {rownum} deal_id={deal_id}")
-                except Exception as e:
-                    # Soft-fail to affiliate
-                    log(f"⚠️  Duffel Links failed row {rownum}: {e}")
-
-        # If we still have no URL, skip
-        if not chosen_url:
-            log(f"⏭️  Skip row {rownum}: no link available")
+        # If we already have a VIP link, keep it.
+        if booking_link_vip:
             continue
 
-        ws.batch_update([
-            {"range": a1(rownum, h["booking_link_vip"]), "values": [[chosen_url]]},
-            {"range": a1(rownum, h["affiliate_source"]), "values": [[chosen_source or "skyscanner"]]},
-        ])
-        routed += 1
+        # Safe fallback: use affiliate_url if present
+        if not affiliate_url:
+            log(f"⏭️  Skip row {rownum}: no affiliate_url to use as fallback")
+            continue
 
-    log(f"Done. routed={routed}")
+        batch = [
+            {"range": a1(rownum, h["booking_link_vip"]), "values": [[affiliate_url]]},
+            {"range": a1(rownum, h["affiliate_source"]), "values": [["affiliate_fallback"]]},
+            {"range": a1(rownum, h["link_routed_at"]), "values": [[ts()]]},
+        ]
+        ws.batch_update(batch, value_input_option="USER_ENTERED")
+
+        processed += 1
+        log(f"🔗 Routed row {rownum}: booking_link_vip set from affiliate_url")
+
+        time.sleep(1)
+
+    log(f"Done. Routed {processed} link(s).")
     return 0
 
 

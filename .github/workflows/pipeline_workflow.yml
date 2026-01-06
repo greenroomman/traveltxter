@@ -1,4 +1,4 @@
-name: Traveltxter V4.5x Pipeline
+name: TravelTxter V4.5x Pipeline
 
 on:
   workflow_dispatch:
@@ -20,10 +20,13 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
-      # ✅ CRITICAL: make repo root importable (fixes: ModuleNotFoundError: lib)
       PYTHONPATH: ${{ github.workspace }}
 
     steps:
+      # --------------------------------------------------
+      # Checkout & Python
+      # --------------------------------------------------
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -32,10 +35,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # --------------------------------------------------
+      # Resolve RUN_SLOT
+      # --------------------------------------------------
 
       - name: Resolve RUN_SLOT
         id: slot
@@ -44,7 +51,6 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             SLOT="${{ inputs.run_slot }}"
           else
-            # schedule event: 07:30 UTC => AM, 16:30 UTC => PM
             if [ "${{ github.event.schedule }}" = "30 7 * * *" ]; then
               SLOT="AM"
             else
@@ -52,103 +58,99 @@ jobs:
             fi
           fi
           echo "RUN_SLOT=$SLOT" >> $GITHUB_ENV
-          echo "run_slot=$SLOT" >> $GITHUB_OUTPUT
           echo "Resolved RUN_SLOT=$SLOT"
 
-      # =========================
-      # AM RUN: Feeder → Scorer → Render → IG → Telegram VIP
-      # =========================
+      # ==================================================
+      # AM RUN — FEEDER → SCORER → LINK → RENDER → IG → VIP
+      # ==================================================
 
-      - name: Feeder (Duffel) -> write NEW rows
+      - name: Feeder (Duffel → NEW)
         if: env.RUN_SLOT == 'AM'
         run: python workers/pipeline_worker.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ vars.RAW_DEALS_TAB }}
+          RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
-          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
           DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
+          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
 
-      - name: Score + pick winner -> READY_TO_POST
+      - name: Score (NEW → READY_TO_POST)
         if: env.RUN_SLOT == 'AM'
         run: python workers/ai_scorer.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ vars.RAW_DEALS_TAB }}
+          RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
-          DEST_REPEAT_PENALTY: ${{ vars.DEST_REPEAT_PENALTY }}
-          WINNERS_PER_RUN: ${{ vars.WINNERS_PER_RUN }}
 
-      - name: Link Router (Duffel Links / Skyscanner)
+          WINNERS_PER_RUN: ${{ vars.WINNERS_PER_RUN }}
+          DEST_REPEAT_PENALTY: ${{ vars.DEST_REPEAT_PENALTY }}
+          VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
+
+      - name: Link Router (booking links)
         if: env.RUN_SLOT == 'AM'
         run: python workers/link_router.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ vars.RAW_DEALS_TAB }}
+          RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
 
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
 
-          DUFFEL_LINKS_PRICE_CAP_GBP: ${{ vars.DUFFEL_LINKS_PRICE_CAP_GBP }}
-          DUFFEL_LINKS_DIRECT_ONLY: ${{ vars.DUFFEL_LINKS_DIRECT_ONLY }}
-
-      - name: Render (PythonAnywhere) -> write graphic_url
+      - name: Render (PythonAnywhere)
         if: env.RUN_SLOT == 'AM'
         run: python workers/render_client.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ vars.RAW_DEALS_TAB }}
+          RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+
           RENDER_URL: ${{ secrets.RENDER_URL }}
-          RENDER_MAX_ROWS: ${{ vars.RENDER_MAX_ROWS }}
+          RENDER_MAX_ROWS: 1
 
       - name: Cooldown before Instagram
         if: env.RUN_SLOT == 'AM'
         run: sleep 20
 
-      - name: Instagram publish
+      - name: Instagram Publish
         if: env.RUN_SLOT == 'AM'
         run: python workers/instagram_publisher.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ vars.RAW_DEALS_TAB }}
+          RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
 
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+
           STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
           STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
 
-      - name: Telegram publish (VIP)
+      - name: Telegram Publish (VIP)
         if: env.RUN_SLOT == 'AM'
         run: python workers/telegram_publisher.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ vars.RAW_DEALS_TAB }}
+          RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+
           TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
           TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
-
           RUN_SLOT: AM
 
-      # =========================
-      # PM RUN: Telegram FREE
-      # =========================
+      # ==================================================
+      # PM RUN — TELEGRAM FREE ONLY
+      # ==================================================
 
-      - name: Telegram publish (FREE)
+      - name: Telegram Publish (FREE)
         if: env.RUN_SLOT == 'PM'
         run: python workers/telegram_publisher.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ vars.RAW_DEALS_TAB }}
+          RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
 
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -156,5 +158,4 @@ jobs:
 
           STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
           STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
-
           RUN_SLOT: PM

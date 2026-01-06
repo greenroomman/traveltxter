@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — render_client.py (LOCKED + HARDENED)
+TravelTxter V4.5x — render_client.py (LOCKED, FAIL-LOUD)
 
-Fixes:
-- Normalises wrong endpoints (e.g. /render -> /api/render)
-- Warms up PythonAnywhere (health check) before first render
-- Retries with backoff on timeouts / connection errors
-- Avoids hammering the same row repeatedly if it already has a render_error recently
-- Only promotes status when a valid image_url is returned
+Consumes:
+- status == READY_TO_POST
+- graphic_url blank
 
-Consumes: status == READY_TO_POST
-Produces: graphic_url, rendered_timestamp, render_error, render_response_snippet
-Promotes: status -> READY_TO_PUBLISH
+Produces:
+- graphic_url
+- rendered_timestamp
+- render_error
+- render_response_snippet
+
+Promotes:
+- READY_TO_POST -> READY_TO_PUBLISH (only after successful render)
+
+Key behavior:
+- Never "silently skips": logs skip reasons.
+- Warm-up hit to /api/health before first render.
+- Normalises wrong endpoint (/render -> /api/render).
+- Retries with backoff on timeouts and connection errors.
 """
 
 from __future__ import annotations
@@ -29,9 +37,9 @@ from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
 
-# ============================================================
+# -----------------------------
 # Logging
-# ============================================================
+# -----------------------------
 
 def ts() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -40,9 +48,9 @@ def log(msg: str) -> None:
     print(f"{ts()} | {msg}", flush=True)
 
 
-# ============================================================
+# -----------------------------
 # Env helpers
-# ============================================================
+# -----------------------------
 
 def env_str(k: str, default: str = "") -> str:
     return os.environ.get(k, default).strip()
@@ -54,9 +62,9 @@ def env_int(k: str, default: int) -> int:
         return default
 
 
-# ============================================================
+# -----------------------------
 # Robust SA JSON parsing
-# ============================================================
+# -----------------------------
 
 def _extract_json_object(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
@@ -119,9 +127,9 @@ def open_sheet_with_backoff(gc: gspread.Client, spreadsheet_id: str, attempts: i
     raise RuntimeError("Sheets quota still exceeded after retries (429). Try again shortly.")
 
 
-# ============================================================
+# -----------------------------
 # A1 helpers
-# ============================================================
+# -----------------------------
 
 def col_letter(n1: int) -> str:
     s = ""
@@ -135,9 +143,9 @@ def a1(rownum: int, col0: int) -> str:
     return f"{col_letter(col0 + 1)}{rownum}"
 
 
-# ============================================================
+# -----------------------------
 # Sheet helpers
-# ============================================================
+# -----------------------------
 
 def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
     missing = [c for c in required if c not in headers]
@@ -151,9 +159,9 @@ def safe_get(row: List[str], idx: int) -> str:
     return row[idx].strip() if 0 <= idx < len(row) else ""
 
 
-# ============================================================
+# -----------------------------
 # Formatting helpers
-# ============================================================
+# -----------------------------
 
 def ddmmyy(date_str: str) -> str:
     s = (date_str or "").strip()
@@ -171,40 +179,29 @@ def money_gbp(price_gbp: str) -> str:
     s = (price_gbp or "").strip().replace("£", "")
     try:
         v = float(s)
-        return f"£{int(v + 0.999)}"  # round up
+        return f"£{int(v + 0.999)}"
     except Exception:
         return f"£{s}" if s else "£0"
 
 
-# ============================================================
+# -----------------------------
 # URL normalisation + warmup
-# ============================================================
+# -----------------------------
 
 def normalise_render_url(u: str) -> str:
-    """
-    Accepts:
-      - https://.../api/render   (correct)
-      - https://.../render       (legacy/wrong)
-      - https://.../api/render/  (ok)
-    Returns:
-      - https://.../api/render
-    """
     u = (u or "").strip()
     if not u:
         return u
-
     parsed = urlparse(u)
     path = parsed.path.rstrip("/")
 
+    # Force canonical /api/render
     if path.endswith("/render") and not path.endswith("/api/render"):
         path = "/api/render"
     elif path.endswith("/api/render"):
         path = "/api/render"
     elif path == "" or path == "/":
         path = "/api/render"
-    else:
-        # If they provided some other path, keep it but strip trailing slash
-        path = path
 
     return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
@@ -213,26 +210,21 @@ def health_url_from_render_url(render_url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, "/api/health", "", "", ""))
 
 def warm_up(render_url: str) -> None:
-    """
-    PythonAnywhere can be asleep. A quick GET helps wake it.
-    """
     hu = health_url_from_render_url(render_url)
     try:
         r = requests.get(hu, timeout=15)
-        log(f"🫖 Render service health: {r.status_code}")
+        log(f"🫖 Render health: {r.status_code}")
     except Exception as e:
-        log(f"🫖 Render service warmup failed (will still try render): {str(e)[:160]}")
+        log(f"🫖 Warmup failed (will still try render): {str(e)[:160]}")
 
 
-# ============================================================
+# -----------------------------
 # Render with retries
-# ============================================================
+# -----------------------------
 
 def post_render(render_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Separate connect/read timeouts
-    timeout = (15, 60)
-    r = requests.post(render_url, json=payload, timeout=timeout)
-    snippet = (r.text or "")[:220].replace("\n", " ")
+    r = requests.post(render_url, json=payload, timeout=(15, 75))
+    snippet = (r.text or "")[:240].replace("\n", " ")
     if r.status_code != 200:
         raise RuntimeError(f"Render HTTP {r.status_code} :: {snippet}")
     try:
@@ -245,38 +237,27 @@ def post_render(render_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 def render_with_backoff(render_url: str, payload: Dict[str, Any], attempts: int = 5) -> Dict[str, Any]:
     delay = 4.0
     last_err: Optional[str] = None
-
     for i in range(1, attempts + 1):
         try:
             return post_render(render_url, payload)
         except Exception as e:
             last_err = str(e)
             msg = last_err.lower()
-
-            # Retry only on network-ish problems
-            retryable = (
-                "timeout" in msg
-                or "timed out" in msg
-                or "max retries exceeded" in msg
-                or "connection" in msg
-                or "502" in msg
-                or "503" in msg
-                or "504" in msg
-            )
-
+            retryable = any(x in msg for x in [
+                "timeout", "timed out", "max retries exceeded", "connection",
+                "502", "503", "504"
+            ])
             if not retryable or i == attempts:
                 raise
-
             log(f"⏳ Render retry {i}/{attempts} in {int(delay)}s... ({last_err[:120]})")
             time.sleep(delay)
             delay = min(delay * 1.6, 45.0)
-
     raise RuntimeError(f"Render failed after retries: {last_err or 'unknown'}")
 
 
-# ============================================================
+# -----------------------------
 # Main
-# ============================================================
+# -----------------------------
 
 def main() -> int:
     spreadsheet_id = env_str("SPREADSHEET_ID")
@@ -319,7 +300,7 @@ def main() -> int:
     ]
     headers = ensure_columns(ws, headers, required_cols)
 
-    # Re-read once after header mutation
+    # Re-read after potential header update
     values = ws.get_all_values()
     headers = [h.strip() for h in values[0]]
     rows = values[1:]
@@ -328,6 +309,7 @@ def main() -> int:
     warm_up(render_url)
 
     rendered = 0
+    seen_renderables = 0
 
     for rownum, r in enumerate(rows, start=2):
         if rendered >= max_rows:
@@ -337,9 +319,11 @@ def main() -> int:
         if status != "READY_TO_POST":
             continue
 
-        # If this row already has a graphic_url, do nothing
-        if safe_get(r, h["graphic_url"]):
-            log(f"⏭️  Skip row {rownum}: already has graphic_url")
+        seen_renderables += 1
+
+        graphic = safe_get(r, h["graphic_url"])
+        if graphic:
+            log(f"⏭️  Row {rownum} READY_TO_POST but already has graphic_url (skip)")
             continue
 
         deal_id = safe_get(r, h["deal_id"]) or f"row_{rownum}"
@@ -348,6 +332,23 @@ def main() -> int:
         out_date = ddmmyy(safe_get(r, h["outbound_date"]))
         in_date = ddmmyy(safe_get(r, h["return_date"]))
         price = money_gbp(safe_get(r, h["price_gbp"]))
+
+        # Fail-loud validation
+        missing_bits = []
+        if not to_city: missing_bits.append("destination_city")
+        if not from_city: missing_bits.append("origin_city")
+        if not out_date: missing_bits.append("outbound_date")
+        if not in_date: missing_bits.append("return_date")
+        if not price: missing_bits.append("price_gbp")
+
+        if missing_bits:
+            err = f"Missing fields for render: {', '.join(missing_bits)}"
+            ws.batch_update([
+                {"range": a1(rownum, h["render_error"]), "values": [[err]]},
+                {"range": a1(rownum, h["render_response_snippet"]), "values": [[err]]},
+            ], value_input_option="USER_ENTERED")
+            log(f"❌ Row {rownum} cannot render: {err}")
+            continue
 
         payload = {
             "TO": to_city,
@@ -362,32 +363,33 @@ def main() -> int:
 
         try:
             j = render_with_backoff(render_url, payload, attempts=5)
-            snippet = j.get("_snippet", "")[:220]
+            snippet = j.get("_snippet", "")[:240]
             image_url = j.get("image_url") or j.get("graphic_url") or ""
 
             if not image_url:
                 raise RuntimeError(f"No image_url in response :: {snippet}")
 
-            batch = [
+            ws.batch_update([
                 {"range": a1(rownum, h["graphic_url"]), "values": [[image_url]]},
                 {"range": a1(rownum, h["rendered_timestamp"]), "values": [[ts()]]},
                 {"range": a1(rownum, h["render_error"]), "values": [[""]]},
                 {"range": a1(rownum, h["render_response_snippet"]), "values": [[snippet]]},
                 {"range": a1(rownum, h["status"]), "values": [["READY_TO_PUBLISH"]]},
-            ]
-            ws.batch_update(batch, value_input_option="USER_ENTERED")
+            ], value_input_option="USER_ENTERED")
 
             rendered += 1
             log(f"✅ Rendered row {rownum} -> {image_url}")
 
         except Exception as e:
-            err = str(e)[:240]
-            batch = [
+            err = str(e)[:260]
+            ws.batch_update([
                 {"range": a1(rownum, h["render_error"]), "values": [[err]]},
                 {"range": a1(rownum, h["render_response_snippet"]), "values": [[err]]},
-            ]
-            ws.batch_update(batch, value_input_option="USER_ENTERED")
+            ], value_input_option="USER_ENTERED")
             log(f"❌ Render failed row {rownum}: {err}")
+
+    if seen_renderables == 0:
+        log("⚠️  No rows found with status == READY_TO_POST (nothing to render).")
 
     log(f"Done. Rendered {rendered}.")
     return 0

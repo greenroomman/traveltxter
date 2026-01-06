@@ -40,11 +40,30 @@ def log(msg: str):
 # ============================================================
 
 def get_gspread_client():
-    raw = os.environ["GCP_SA_JSON_ONE_LINE"]
-    info = json.loads(raw.replace("\\n", "\n"))
+    import json
+    import os
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    raw = os.environ.get("GCP_SA_JSON_ONE_LINE", "")
+    if not raw:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE")
+
+    # Robust parsing: handle escaped, unescaped, or mixed formats
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            info = json.loads(raw.replace("\\n", "\n"))
+        except json.JSONDecodeError as e:
+            raise RuntimeError("GCP_SA_JSON_ONE_LINE is not valid JSON") from e
+
     creds = Credentials.from_service_account_info(
         info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     return gspread.authorize(creds)
 

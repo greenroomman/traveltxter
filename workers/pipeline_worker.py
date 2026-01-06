@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — pipeline_worker.py (FEEDER, config-driven)
+TravelTxter V4.5x — telegram_publisher.py (LOCKED)
 
-Reads control plane tabs:
-- CONFIG
-- CONFIG_ORIGIN_POOLS
-- THEMES
-- CONFIG_SIGNALS
-- CONFIG_CARRIER_BIAS
-- MVP_RULES
-Writes:
-- RAW_DEALS (append NEW rows)
-- DUFFEL_SEARCH_LOG (append one row per Duffel search)
+AM run (RUN_SLOT=AM):
+- Finds rows with status == POSTED_INSTAGRAM and posted_telegram_vip_at empty
+- Posts to VIP channel (no upsell block)
+- Writes posted_telegram_vip_at
+- status -> POSTED_TELEGRAM_VIP
 
-Does NOT score, render, publish.
+PM run (RUN_SLOT=PM):
+- Finds rows with status == POSTED_TELEGRAM_VIP and posted_telegram_free_at empty
+- Enforces VIP_DELAY_HOURS since posted_telegram_vip_at
+- Posts to FREE channel (includes upsell block)
+- Writes posted_telegram_free_at
+- status -> POSTED_ALL
+
+Hard rules:
+- Sheets are the state machine
+- No AI creativity
+- Only flag emojis allowed
+- Deterministic template
 
 Env required:
 - SPREADSHEET_ID
 - GCP_SA_JSON_ONE_LINE (or GCP_SA_JSON)
 - RAW_DEALS_TAB (default RAW_DEALS)
-- DUFFEL_API_KEY
-
-Env optional:
-- RUN_SLOT (AM/PM)   (used only for logging)
-- DUFFEL_ROUTES_PER_RUN (default 3)
-- DUFFEL_MAX_SEARCHES_PER_RUN (default 4)
-- DUFFEL_MAX_INSERTS (default 3)
-- THEME (override theme rotation)
+- RUN_SLOT = AM or PM
+- TELEGRAM_BOT_TOKEN_VIP + TELEGRAM_CHANNEL_VIP
+- TELEGRAM_BOT_TOKEN + TELEGRAM_CHANNEL
+Optional:
+- VIP_DELAY_HOURS (default 24)
+- STRIPE_MONTHLY_LINK / STRIPE_YEARLY_LINK (used in FREE upsell)
 """
 
 from __future__ import annotations
@@ -34,40 +38,28 @@ from __future__ import annotations
 import os
 import json
 import time
-import math
-import hashlib
 import datetime as dt
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Optional
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
 
-from lib.sheet_config import (
-    load_config_bundle,
-    pick_theme_for_today,
-    active_config_routes,
-    origins_for_today,
-    theme_destinations,
-    iata_signal_maps,
-    mvp_hard_limits,
-)
 
 # ============================================================
 # Logging
 # ============================================================
 
-def utcnow() -> dt.datetime:
-    return dt.datetime.utcnow()
-
 def ts() -> str:
-    return utcnow().replace(microsecond=0).isoformat() + "Z"
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def log(msg: str) -> None:
     print(f"{ts()} | {msg}", flush=True)
 
+
 # ============================================================
-# Env
+# Env helpers
 # ============================================================
 
 def env_str(k: str, default: str = "") -> str:
@@ -79,117 +71,200 @@ def env_int(k: str, default: int) -> int:
     except Exception:
         return default
 
+
 # ============================================================
-# Sheets auth
+# Robust JSON extraction (for GCP_SA_JSON_ONE_LINE)
 # ============================================================
 
-def get_gspread_client() -> gspread.Client:
+def _extract_json_object(raw: str) -> Dict[str, Any]:
+    raw = (raw or "").strip()
+
+    # Fast path
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # Replace escaped newlines
+    try:
+        return json.loads(raw.replace("\\n", "\n"))
+    except Exception:
+        pass
+
+    # Extract first {...}
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise RuntimeError("Invalid GCP_SA_JSON_ONE_LINE: no JSON object found")
+
+    candidate = raw[start:end + 1]
+
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+
+    try:
+        return json.loads(candidate.replace("\\n", "\n"))
+    except Exception as e:
+        raise RuntimeError("Invalid GCP_SA_JSON_ONE_LINE: JSON parse failed") from e
+
+
+def get_client() -> gspread.Client:
     sa = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
     if not sa:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE (recommended) or GCP_SA_JSON")
-    try:
-        info = json.loads(sa)
-    except json.JSONDecodeError:
-        info = json.loads(sa.replace("\\n", "\n"))
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+    info = _extract_json_object(sa)
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+    )
     return gspread.authorize(creds)
+
+
+def open_sheet_with_backoff(gc: gspread.Client, spreadsheet_id: str, attempts: int = 8) -> gspread.Spreadsheet:
+    delay = 4.0
+    for i in range(1, attempts + 1):
+        try:
+            return gc.open_by_key(spreadsheet_id)
+        except APIError as e:
+            msg = str(e)
+            if "429" in msg or "Quota exceeded" in msg:
+                log(f"⏳ Sheets quota (429). Retry {i}/{attempts} in {int(delay)}s...")
+                time.sleep(delay)
+                delay = min(delay * 1.6, 45.0)
+                continue
+            raise
+    raise RuntimeError("Sheets quota still exceeded after retries (429).")
+
+
+# ============================================================
+# A1 helpers
+# ============================================================
+
+def col_letter(n1: int) -> str:
+    s = ""
+    n = n1
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def a1(rownum: int, col0: int) -> str:
+    return f"{col_letter(col0 + 1)}{rownum}"
+
+
+# ============================================================
+# Sheet helpers
+# ============================================================
 
 def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
     missing = [c for c in required if c not in headers]
     if not missing:
         return headers
-    new_headers = headers + missing
-    ws.update([new_headers], "A1")
-    log(f"🛠️  Added missing columns to header: {missing}")
-    return new_headers
+    ws.update([headers + missing], "A1")
+    log(f"🛠️  Added missing columns: {missing}")
+    return headers + missing
+
+def safe_get(row: List[str], idx: int) -> str:
+    return row[idx].strip() if 0 <= idx < len(row) else ""
+
+def parse_iso(s: str) -> Optional[dt.datetime]:
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", ""))
+    except Exception:
+        return None
+
 
 # ============================================================
-# Duffel
+# Locked caption template helpers
 # ============================================================
 
-DUFFEL_OFFER_REQUESTS_URL = "https://api.duffel.com/air/offer_requests"
+FLAG_MAP = {
+    "ICELAND": "🇮🇸",
+    "SPAIN": "🇪🇸",
+    "PORTUGAL": "🇵🇹",
+    "FRANCE": "🇫🇷",
+    "ITALY": "🇮🇹",
+    "GREECE": "🇬🇷",
+    "MOROCCO": "🇲🇦",
+    "TURKEY": "🇹🇷",
+    "THAILAND": "🇹🇭",
+    "JAPAN": "🇯🇵",
+    "USA": "🇺🇸",
+    "UNITED STATES": "🇺🇸",
+}
 
-def duffel_offer_request(duffel_key: str, origin: str, dest: str, out_date: str, ret_date: str, max_connections: int = 1) -> Dict[str, Any]:
-    headers = {
-        "Authorization": f"Bearer {duffel_key}",
-        "Content-Type": "application/json",
-        "Duffel-Version": "v2",
-    }
-    body = {
-        "data": {
-            "slices": [
-                {"origin": origin, "destination": dest, "departure_date": out_date},
-                {"origin": dest, "destination": origin, "departure_date": ret_date},
-            ],
-            "passengers": [{"type": "adult"}],
-            "cabin_class": "economy",
-            "max_connections": max_connections,
-        }
-    }
-    r = requests.post(DUFFEL_OFFER_REQUESTS_URL, headers=headers, json=body, timeout=45)
-    try:
-        j = r.json()
-    except Exception:
-        j = {"_raw": r.text}
-    if r.status_code >= 400:
-        raise RuntimeError(f"Duffel error {r.status_code}: {j}")
-    return j
+def country_flag(country: str) -> str:
+    c = (country or "").strip().upper()
+    return FLAG_MAP.get(c, "")
 
-def offer_stops(offer: Dict[str, Any]) -> int:
-    try:
-        slices = offer.get("slices") or []
-        segs = (slices[0].get("segments") or []) if slices else []
-        return max(0, len(segs) - 1)
-    except Exception:
-        return 0
+def build_core_lines(price_gbp: str, destination_country: str, destination_city: str, origin_city: str,
+                     outbound_date: str, return_date: str) -> List[str]:
+    flag = country_flag(destination_country)
+    dest_upper = (destination_city or "").strip().upper()
+    header = f"£{price_gbp} to {destination_country}{(' ' + flag) if flag else ''}".strip()
+    return [
+        header,
+        f"TO: {dest_upper}",
+        f"FROM: {origin_city}",
+        f"OUT: {outbound_date}",
+        f"BACK: {return_date}",
+        "",
+        "Heads up:",
+        "• VIP members saw this 24 hours ago",
+        "• Availability is running low",
+        "• Best deals go to VIPs first",
+        "",
+    ]
 
-def offer_primary_carrier(offer: Dict[str, Any]) -> str:
-    """
-    Best-effort: returns marketing carrier IATA code for first segment of first slice.
-    """
-    try:
-        slices = offer.get("slices") or []
-        segs = (slices[0].get("segments") or []) if slices else []
-        if not segs:
-            return ""
-        carrier = (segs[0].get("marketing_carrier") or segs[0].get("operating_carrier") or {})
-        return str(carrier.get("iata_code") or "").strip().upper()
-    except Exception:
-        return ""
+def build_vip_message(core: List[str], booking_link: str) -> str:
+    lines = core + [
+        booking_link.strip(),
+    ]
+    return "\n".join([l for l in lines if l is not None]).strip() + "\n"
 
-def offer_city_country(offer: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Best-effort: destination city + country from Duffel objects if present.
-    """
-    try:
-        sl = (offer.get("slices") or [{}])[0]
-        dest = sl.get("destination") or {}
-        city = str(dest.get("city_name") or dest.get("city") or "").strip()
-        country = str(dest.get("country_name") or dest.get("country") or "").strip()
-        return city, country
-    except Exception:
-        return "", ""
+def build_free_message(core: List[str], booking_link: str, stripe_monthly: str, stripe_yearly: str) -> str:
+    lines = core + [
+        "Want instant access?",
+        "Join TravelTxter Nomad for £7.99 / month:",
+        "",
+        "• Deals 24 hours early",
+        "• Direct booking links",
+        "• Exclusive mistake fares",
+        "• Cancel anytime",
+        "",
+        f"Upgrade now (Monthly): {stripe_monthly}".strip(),
+        f"Upgrade now (Yearly): {stripe_yearly}".strip(),
+        "",
+        booking_link.strip(),
+    ]
+    # remove empty upgrade lines if links missing
+    out = []
+    for ln in lines:
+        if "Upgrade now" in ln and ln.endswith(":"):
+            continue
+        out.append(ln)
+    return "\n".join(out).strip() + "\n"
 
-def pick_best_offers(offers: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-    def price(o: Dict[str, Any]) -> float:
-        try:
-            return float(o.get("total_amount") or 1e9)
-        except Exception:
-            return 1e9
-    return sorted(offers, key=price)[:limit]
 
 # ============================================================
-# Dedupe key
+# Telegram API
 # ============================================================
 
-def deal_hash(origin: str, dest: str, out_date: str, ret_date: str, price_gbp: str) -> str:
-    raw = f"{origin}|{dest}|{out_date}|{ret_date}|{price_gbp}".encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()[:12]
+def tg_send(bot_token: str, chat_id: str, text: str) -> None:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    r = requests.post(url, data={
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": False,
+    }, timeout=45)
+    j = r.json()
+    if not r.ok or not j.get("ok"):
+        raise RuntimeError(f"Telegram send failed: {j}")
+
 
 # ============================================================
 # Main
@@ -198,234 +273,137 @@ def deal_hash(origin: str, dest: str, out_date: str, ret_date: str, price_gbp: s
 def main() -> int:
     spreadsheet_id = env_str("SPREADSHEET_ID")
     tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-    duffel_key = env_str("DUFFEL_API_KEY")
     run_slot = env_str("RUN_SLOT", "AM").upper()
 
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
-    if not duffel_key:
-        raise RuntimeError("Missing DUFFEL_API_KEY")
+    if run_slot not in ("AM", "PM"):
+        raise RuntimeError("RUN_SLOT must be AM or PM")
 
-    routes_per_run = env_int("DUFFEL_ROUTES_PER_RUN", 3)
-    max_searches = env_int("DUFFEL_MAX_SEARCHES_PER_RUN", 4)
-    max_inserts = env_int("DUFFEL_MAX_INSERTS", 3)
-    theme_override = env_str("THEME", "")
+    bot_vip = env_str("TELEGRAM_BOT_TOKEN_VIP")
+    chan_vip = env_str("TELEGRAM_CHANNEL_VIP")
+    bot_free = env_str("TELEGRAM_BOT_TOKEN")
+    chan_free = env_str("TELEGRAM_CHANNEL")
 
-    gc = get_gspread_client()
-    sh = gc.open_by_key(spreadsheet_id)
+    # Require all 4 always (simplifies workflow wiring)
+    if not bot_vip or not chan_vip or not bot_free or not chan_free:
+        raise RuntimeError("Missing Telegram env: TELEGRAM_BOT_TOKEN_VIP, TELEGRAM_CHANNEL_VIP, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL")
 
-    # Load control plane
-    cfg = load_config_bundle(sh)
-    theme = pick_theme_for_today(cfg.themes, override=theme_override)
-    limits = mvp_hard_limits(cfg.mvp_rules)
-    sig_city, sig_country = iata_signal_maps(cfg.signals)
+    vip_delay_hours = env_int("VIP_DELAY_HOURS", 24)
+    stripe_monthly = env_str("STRIPE_MONTHLY_LINK")
+    stripe_yearly = env_str("STRIPE_YEARLY_LINK")
 
-    # Get worksheets
-    ws_raw = sh.worksheet(tab)
+    gc = get_client()
+    sh = open_sheet_with_backoff(gc, spreadsheet_id)
+    ws = sh.worksheet(tab)
 
-    # Ensure RAW_DEALS has required columns
-    raw_values = ws_raw.get_all_values()
-    if not raw_values:
-        raise RuntimeError("RAW_DEALS must have a header row.")
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        log("No rows.")
+        return 0
 
-    headers = [h.strip() for h in raw_values[0]]
+    headers = [h.strip() for h in values[0]]
+
     required_cols = [
-        "status", "deal_id", "price_gbp",
-        "origin_iata", "destination_iata",
-        "origin_city", "destination_city", "destination_country",
-        "outbound_date", "return_date", "stops",
-        "deal_theme",
-        "affiliate_url", "booking_link_vip", "affiliate_source",
-        "created_utc",
+        "status",
+        "price_gbp",
+        "destination_country",
+        "destination_city",
+        "origin_city",
+        "outbound_date",
+        "return_date",
+        "booking_link_vip",
+        "affiliate_url",
+        "posted_instagram_at",
+        "posted_telegram_vip_at",
+        "posted_telegram_free_at",
     ]
-    headers = ensure_columns(ws_raw, headers, required_cols)
+    headers = ensure_columns(ws, headers, required_cols)
 
-    # Re-read after header update
-    raw_values = ws_raw.get_all_values()
-    headers = [h.strip() for h in raw_values[0]]
+    values = ws.get_all_values()
+    headers = [h.strip() for h in values[0]]
+    rows = values[1:]
     h = {name: i for i, name in enumerate(headers)}
 
-    # Search log tab (must exist in sheet)
-    try:
-        ws_log = sh.worksheet("DUFFEL_SEARCH_LOG")
-    except Exception:
-        ws_log = None
+    posted = 0
 
-    # Build route list: prefer CONFIG routes for theme, else build from THEMES + ORIGIN_POOLS
-    config_routes = active_config_routes(cfg.config_routes, theme)
-    routes: List[Dict[str, Any]] = []
+    for rownum, r in enumerate(rows, start=2):
+        status = safe_get(r, h["status"]).upper()
 
-    if config_routes:
-        routes = config_routes[: max(1, routes_per_run)]
-        log(f"🎛️  Using CONFIG routes for theme={theme} count={len(routes)} (RUN_SLOT={run_slot})")
-    else:
-        origins = origins_for_today(cfg.origin_pools) or ["LGW", "LHR", "MAN", "BRS"]
-        dests = theme_destinations(cfg.themes, theme, limit=25)
-        if not dests:
-            dests = ["TFS", "ACE", "LPA"]  # safe fallback
-        # Create small grid
-        for o in origins[:3]:
-            for d in dests[:10]:
-                routes.append({
-                    "enabled": "TRUE",
-                    "priority": "1",
-                    "theme": theme,
-                    "origin_iata": o,
-                    "destination_iata": d,
-                    "days_ahead_min": "30",
-                    "days_ahead_max": "45",
-                    "trip_length_days": "5",
-                    "max_connections": "1",
-                    "included_airlines": "",
-                    "cabin_class": "economy",
-                })
-        routes = routes[: max(1, routes_per_run)]
-        log(f"🧩 Built routes from THEMES+ORIGIN_POOLS for theme={theme} count={len(routes)} (RUN_SLOT={run_slot})")
+        price_gbp = safe_get(r, h["price_gbp"])
+        destination_country = safe_get(r, h["destination_country"])
+        destination_city = safe_get(r, h["destination_city"])
+        origin_city = safe_get(r, h["origin_city"])
+        outbound_date = safe_get(r, h["outbound_date"])
+        return_date = safe_get(r, h["return_date"])
 
-    searches = 0
-    inserted = 0
+        booking_link = safe_get(r, h["booking_link_vip"]) or safe_get(r, h["affiliate_url"])
 
-    for rconf in routes:
-        if searches >= max_searches or inserted >= max_inserts:
-            break
+        posted_ig = safe_get(r, h["posted_instagram_at"])
+        posted_vip = safe_get(r, h["posted_telegram_vip_at"])
+        posted_free = safe_get(r, h["posted_telegram_free_at"])
 
-        origin = str(rconf.get("origin_iata","")).strip().upper()
-        dest = str(rconf.get("destination_iata","")).strip().upper()
-        if len(origin) != 3 or len(dest) != 3:
-            continue
-
-        days_min = int(float(rconf.get("days_ahead_min","30") or 30))
-        days_max = int(float(rconf.get("days_ahead_max","45") or 45))
-        trip_len = int(float(rconf.get("trip_length_days","5") or 5))
-        max_conn = int(float(rconf.get("max_connections","1") or 1))
-
-        # Deterministic date pick: min bound (keeps it simple)
-        out_date = (utcnow().date() + dt.timedelta(days=days_min)).isoformat()
-        ret_date = (utcnow().date() + dt.timedelta(days=days_min + trip_len)).isoformat()
-
-        dedupe_key = f"{origin}-{dest}-{out_date}-{ret_date}-{theme}"
-
-        searches += 1
-        log(f"🔎 Duffel search {searches}/{max_searches}: {origin}->{dest} {out_date}/{ret_date} theme={theme}")
-
-        offers_count = 0
-        search_ok = False
-
-        try:
-            j = duffel_offer_request(duffel_key, origin, dest, out_date, ret_date, max_connections=max_conn)
-            offers = (((j or {}).get("data") or {}).get("offers") or [])
-            offers_count = len(offers)
-            search_ok = True
-        except Exception as e:
-            offers = []
-            log(f"❌ Duffel error: {e}")
-
-        # Log search (accounting)
-        if ws_log is not None:
-            # Ensure header exists
-            vals = ws_log.get_all_values()
-            if vals:
-                log_headers = [x.strip() for x in vals[0]]
-                needed = ["ts_utc","origin","dest","outbound_date","return_date","theme","dedupe_key","skipped_dedupe","search_ok","offers_count"]
-                missing = [c for c in needed if c not in log_headers]
-                if missing:
-                    ws_log.update([log_headers + missing], "A1")
-                row = ["" for _ in range(len(log_headers) + len(missing))]
-                # rebuild header map after potential expansion
-                vals2 = ws_log.get_all_values()
-                log_headers2 = [x.strip() for x in vals2[0]]
-                lh = {name:i for i,name in enumerate(log_headers2)}
-                def setv(col, v):
-                    i = lh[col]
-                    row[i] = str(v)
-                setv("ts_utc", ts())
-                setv("origin", origin)
-                setv("dest", dest)
-                setv("outbound_date", out_date)
-                setv("return_date", ret_date)
-                setv("theme", theme)
-                setv("dedupe_key", dedupe_key)
-                setv("skipped_dedupe", "FALSE")
-                setv("search_ok", "TRUE" if search_ok else "FALSE")
-                setv("offers_count", str(offers_count))
-                ws_log.append_row(row, value_input_option="USER_ENTERED")
-
-        if not offers:
-            continue
-
-        remaining = max(0, max_inserts - inserted)
-        chosen = pick_best_offers(offers, limit=min(remaining, 3))
-
-        for offer in chosen:
-            if inserted >= max_inserts:
-                break
-
-            cur = str(offer.get("total_currency") or "").upper()
-            if cur and cur != "GBP":
+        # ---------------- AM: VIP ----------------
+        if run_slot == "AM":
+            if status != "POSTED_INSTAGRAM":
+                continue
+            if posted_vip:
+                continue
+            if not booking_link:
+                log(f"⏭️  Skip row {rownum}: no booking_link_vip/affiliate_url")
                 continue
 
-            try:
-                price = float(offer.get("total_amount"))
-            except Exception:
+            core = build_core_lines(price_gbp, destination_country, destination_city, origin_city, outbound_date, return_date)
+            msg = build_vip_message(core, booking_link)
+
+            log(f"📣 Telegram VIP posting row {rownum}")
+            tg_send(bot_vip, chan_vip, msg)
+
+            updates = [
+                {"range": a1(rownum, h["posted_telegram_vip_at"]), "values": [[ts()]]},
+                {"range": a1(rownum, h["status"]), "values": [["POSTED_TELEGRAM_VIP"]]},
+            ]
+            ws.batch_update(updates, value_input_option="USER_ENTERED")
+            posted += 1
+            log(f"✅ Telegram VIP posted row {rownum}")
+            break  # one per run
+
+        # ---------------- PM: FREE ----------------
+        if run_slot == "PM":
+            if status != "POSTED_TELEGRAM_VIP":
+                continue
+            if posted_free:
+                continue
+            if not booking_link:
+                log(f"⏭️  Skip row {rownum}: no booking_link_vip/affiliate_url")
                 continue
 
-            stops = offer_stops(offer)
-
-            # MVP hard rules (enforced here, at ingestion)
-            if price < float(limits["min_price_gbp"]) or price > float(limits["max_price_gbp"]):
-                continue
-            if stops > int(limits["max_stops"]):
+            vip_time = parse_iso(posted_vip)
+            if not vip_time:
+                # If missing, enforce by skipping (don’t cheat delay)
+                log(f"⏭️  Skip row {rownum}: missing posted_telegram_vip_at (delay enforcement)")
                 continue
 
-            price_gbp = f"{price:.2f}"
-            deal_id = deal_hash(origin, dest, out_date, ret_date, price_gbp)
+            if (dt.datetime.utcnow() - vip_time) < dt.timedelta(hours=vip_delay_hours):
+                log(f"⏭️  Skip row {rownum}: VIP delay not met")
+                continue
 
-            # City/country enrichment: Duffel first, then CONFIG_SIGNALS fallback
-            dest_city, dest_country = offer_city_country(offer)
-            if not dest_city:
-                dest_city = sig_city.get(dest, dest)
-            if not dest_country:
-                dest_country = sig_country.get(dest, "")
+            core = build_core_lines(price_gbp, destination_country, destination_city, origin_city, outbound_date, return_date)
+            msg = build_free_message(core, booking_link, stripe_monthly, stripe_yearly)
 
-            origin_city = origin  # safe default
-            # If we have a signal city for origin (rare), use it. Otherwise keep IATA (you can add origin map later)
-            origin_city = sig_city.get(origin, origin_city)
+            log(f"📣 Telegram FREE posting row {rownum}")
+            tg_send(bot_free, chan_free, msg)
 
-            # Link (Duffel deep_link if present)
-            deep_link = str(offer.get("deep_link") or "").strip()
+            updates = [
+                {"range": a1(rownum, h["posted_telegram_free_at"]), "values": [[ts()]]},
+                {"range": a1(rownum, h["status"]), "values": [["POSTED_ALL"]]},
+            ]
+            ws.batch_update(updates, value_input_option="USER_ENTERED")
+            posted += 1
+            log(f"✅ Telegram FREE posted row {rownum}")
+            break  # one per run
 
-            row_out = [""] * len(headers)
-            def setc(col: str, val: str):
-                if col not in h:
-                    return
-                i = h[col]
-                if i >= len(row_out):
-                    row_out.extend([""] * (i - len(row_out) + 1))
-                row_out[i] = val
-
-            setc("status", "NEW")
-            setc("deal_id", deal_id)
-            setc("price_gbp", price_gbp)
-            setc("origin_iata", origin)
-            setc("destination_iata", dest)
-            setc("origin_city", origin_city)
-            setc("destination_city", dest_city)
-            setc("destination_country", dest_country)
-            setc("outbound_date", out_date)
-            setc("return_date", ret_date)
-            setc("stops", str(stops))
-            setc("deal_theme", theme)
-            setc("affiliate_url", deep_link)
-            setc("booking_link_vip", "")
-            setc("affiliate_source", "skyscanner")
-            setc("created_utc", ts())
-
-            ws_raw.append_row(row_out, value_input_option="USER_ENTERED")
-            inserted += 1
-            log(f"✅ Inserted NEW: {deal_id} {origin}->{dest} £{price_gbp} stops={stops} theme={theme} (inserted={inserted})")
-            time.sleep(0.35)
-
-    log(f"Done. theme={theme} searches={searches} inserted={inserted}")
+    log(f"Done. Telegram posted {posted}.")
     return 0
 
 

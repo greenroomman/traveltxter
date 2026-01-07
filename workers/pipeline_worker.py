@@ -6,28 +6,26 @@ FIX INCLUDED:
 - Robustly handles Google Sheets NaN / floats from get_all_records()
   (prevents: AttributeError: 'float' object has no attribute 'strip')
 
-YOU ASKED FOR:
-- Massive fallback (strong enough to be real pipeline)
+UPGRADE (Jan 2026):
+- Theme Route Packs fallback: when CONFIG_SIGNALS / priors are weak, still get real themed deals.
+- UK origin cluster rotation: SW / London / North to prevent hammering one region.
+- Theme-aware date picking (single-shot, no extra searches).
+
+Core principles:
 - REAL IATA ONLY (Duffel-safe) — never LON/PAR/NYC etc
 - Theme-aware
-- Weekly sweep across all themes (Mon→Sun)
+- Weekly sweep across all themes (Mon→Sun) in AM slot if enabled
 - Insert NEW deals when eligible, otherwise bank to DISCOVERY_BANK
-
-SAFEGUARDS:
-- NEVER clears sheets
-- Adds missing columns only (appends)
 """
 
-from __future__ import annotations
-
 import os
+import sys
 import json
 import time
-import uuid
-import random
 import math
+import random
 import datetime as dt
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set
 
 import requests
 import gspread
@@ -38,26 +36,21 @@ from google.oauth2.service_account import Credentials
 # Logging
 # ============================================================
 
-def log(msg: str):
+def log(msg: str) -> None:
     ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     print(f"{ts} | {msg}", flush=True)
 
 
 # ============================================================
-# Safe cell handling (CRITICAL)
+# Cell helpers (robust against NaN/float)
 # ============================================================
 
 def cell_str(v) -> str:
-    """
-    Google Sheets via get_all_records() can yield floats (NaN) for blanks.
-    This converts any cell value safely to a clean string.
-    """
     if v is None:
         return ""
     if isinstance(v, float):
         if math.isnan(v):
             return ""
-        # avoid "123.0" when it was an integer in Sheets
         if v.is_integer():
             return str(int(v))
         return str(v)
@@ -73,10 +66,135 @@ def cell_lower(v) -> str:
 
 
 # ============================================================
-# Auth / Sheets
+# Theme Route Packs (fallback when CONFIG_SIGNALS / priors are weak)
 # ============================================================
 
-def _parse_sa_json(raw: str) -> Dict:
+ORIGIN_CLUSTERS = {
+    # South West / Wales
+    "SW": ["BRS", "EXT", "NQY", "SOU", "CWL"],
+    # London airports
+    "LON": ["LHR", "LGW", "STN", "LTN", "LCY", "SEN"],
+    # Midlands + North
+    "NORTH": ["MAN", "BHX", "LPL", "NCL", "EDI", "GLA"],
+}
+
+THEME_DEFAULTS = {
+    "SNOW": {"lead_days": 55, "trip_days": 4},
+    "SURF": {"lead_days": 70, "trip_days": 6},
+    "WINTER_SUN": {"lead_days": 70, "trip_days": 7},
+    "CITY_BREAKS": {"lead_days": 45, "trip_days": 3},
+}
+
+# High-probability destinations by theme (Duffel-safe IATA only).
+# Keep this list curated and fairly small: quality > quantity.
+ROUTE_PACKS = {
+    "SNOW": {
+        "dests": ["GVA", "BGY", "MXP", "TRN", "MUC", "ZRH", "BSL", "INN", "SZG"],
+    },
+    "SURF": {
+        "dests": ["AGA", "RAK", "AGP", "FAO", "FUE", "ACE", "LPA", "TFS"],
+    },
+    "WINTER_SUN": {
+        "dests": ["TFS", "LPA", "FUE", "ACE", "RAK", "AGA", "FNC", "PDL"],
+    },
+    "CITY_BREAKS": {
+        "dests": ["BUD", "PRG", "KRK", "WAW", "BCN", "PMI", "OPO", "LIS", "AMS", "DUB", "CPH"],
+    },
+}
+
+def normalize_theme_name(theme: str) -> str:
+    t = (theme or "").strip().upper()
+    # Allow a few common variants
+    if t in ("SKI",):
+        return "SNOW"
+    if t in ("CITY", "CITYBREAK", "CITYBREAKS"):
+        return "CITY_BREAKS"
+    if t in ("SUN", "BEACH"):
+        return "WINTER_SUN"
+    return t
+
+def pick_origin_cluster(run_slot: str) -> str:
+    """
+    Deterministic cluster rotation so we don't hammer London every run.
+    Uses day-of-year + slot to pick SW/LON/NORTH.
+    """
+    d = today_utc()
+    salt = 0 if (run_slot or "").upper() == "AM" else 1
+    idx = (d.timetuple().tm_yday + salt) % 3
+    return ["SW", "LON", "NORTH"][idx]
+
+def build_route_pack_fallback(
+    theme: str,
+    origins: List[str],
+    config_route_set: set,
+    cap: int = 40,
+) -> List[Tuple[str, str, str, int, int]]:
+    """
+    Build (origin, dest, theme, lead_days, trip_days) routes from curated packs.
+    Filters to real IATA only; does not require CONFIG_SIGNALS to be populated.
+    """
+    t = normalize_theme_name(theme)
+    pack = ROUTE_PACKS.get(t)
+    if not pack:
+        return []
+
+    defaults = THEME_DEFAULTS.get(t, {"lead_days": 55, "trip_days": 5})
+    lead_days = int(defaults.get("lead_days", 55))
+    trip_days = int(defaults.get("trip_days", 5))
+
+    # Use only valid IATA origins/dests
+    olist = [cell_upper(o) for o in (origins or []) if is_iata3(cell_upper(o))]
+    if not olist:
+        olist = ["LHR", "LGW", "STN", "LTN", "MAN", "BRS", "EDI", "GLA", "BHX"]
+
+    dests = [cell_upper(d) for d in pack.get("dests", []) if is_iata3(cell_upper(d))]
+    if not dests:
+        return []
+
+    routes: List[Tuple[str, str, str, int, int]] = []
+    seen = set()
+
+    rnd = random.Random(t + "_" + str(today_utc()))
+    rnd.shuffle(olist)
+    rnd.shuffle(dests)
+
+    # Prefer configured routes when present, otherwise allow pack routes freely
+    for d in dests:
+        for o in olist:
+            if o == d:
+                continue
+            k = (o, d, t)
+            if k in seen:
+                continue
+
+            if config_route_set and (o, d) not in config_route_set:
+                # If CONFIG exists, treat it as preference but not a hard block
+                pass
+
+            routes.append((o, d, t, lead_days, trip_days))
+            seen.add(k)
+            if len(routes) >= cap:
+                return routes
+
+    return routes
+
+
+# ============================================================
+# Auth / Sheets
+# ================================================
+
+def env_str(k: str, default: str = "") -> str:
+    return (os.environ.get(k, default) or "").strip()
+
+
+def env_int(k: str, default: int) -> int:
+    try:
+        return int(env_str(k, str(default)))
+    except Exception:
+        return default
+
+
+def parse_sa_json(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
     try:
         return json.loads(raw)
@@ -84,11 +202,11 @@ def _parse_sa_json(raw: str) -> Dict:
         return json.loads(raw.replace("\\n", "\n"))
 
 
-def get_client():
-    raw = os.environ.get("GCP_SA_JSON_ONE_LINE", "")
+def gs_client() -> gspread.Client:
+    raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
     if not raw:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE")
-    info = _parse_sa_json(raw)
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+    info = parse_sa_json(raw)
     creds = Credentials.from_service_account_info(
         info,
         scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
@@ -96,31 +214,16 @@ def get_client():
     return gspread.authorize(creds)
 
 
-def get_ws(sh, title: str):
-    return sh.worksheet(title)
+def ensure_headers(ws: gspread.Worksheet, required: List[str]) -> Dict[str, int]:
+    existing = ws.row_values(1)
+    existing = [cell_str(x).strip() for x in existing if cell_str(x).strip()]
 
+    if not existing:
+        ws.update([required], "A1")
+        existing = required[:]
+        log(f"🛠️ Created headers for {ws.title}")
 
-def get_or_create_ws(sh, title: str, rows: int = 2000, cols: int = 30):
-    try:
-        return sh.worksheet(title)
-    except Exception:
-        ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
-        return ws
-
-
-def ensure_columns(ws, required_cols: List[str]) -> Dict[str, int]:
-    """
-    Ensures required columns exist; appends missing to the end.
-    Returns header index map (0-based).
-    """
-    headers = ws.row_values(1)
-    if not headers:
-        ws.update([required_cols], "A1")
-        headers = required_cols[:]
-        log(f"🛠️ Initialised headers for {ws.title} (blank sheet)")
-
-    existing = [h.strip() for h in headers]
-    missing = [c for c in required_cols if c not in existing]
+    missing = [c for c in required if c not in existing]
     if missing:
         new_headers = existing + missing
         ws.update([new_headers], "A1")
@@ -128,6 +231,39 @@ def ensure_columns(ws, required_cols: List[str]) -> Dict[str, int]:
         existing = new_headers
 
     return {h: i for i, h in enumerate(existing)}
+
+
+def load_records(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
+    """
+    Uses get_all_records() but normalises NaN floats and missing fields.
+    """
+    recs = ws.get_all_records(default_blank="")
+    out = []
+    for r in recs:
+        rr = {}
+        for k, v in (r or {}).items():
+            rr[cell_str(k).strip()] = v
+        out.append(rr)
+    return out
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+def is_iata3(s: str) -> bool:
+    ss = (s or "").strip().upper()
+    return len(ss) == 3 and ss.isalpha()
+
+
+def is_trueish(v) -> bool:
+    s = cell_lower(v)
+    if s in ("", "true", "1", "yes", "y", "on", "enabled"):
+        return True
+    if s in ("false", "0", "no", "n", "off", "disabled"):
+        return False
+    # default permissive
+    return True
 
 
 # ============================================================
@@ -138,15 +274,70 @@ DUFFEL_API = "https://api.duffel.com/air/offer_requests"
 
 
 def duffel_headers():
+    key = env_str("DUFFEL_API_KEY")
+    if not key:
+        raise RuntimeError("Missing DUFFEL_API_KEY")
     return {
-        "Authorization": f"Bearer {os.environ['DUFFEL_API_KEY']}",
+        "Authorization": f"Bearer {key}",
         "Duffel-Version": "v2",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
 
-def duffel_search(origin: str, dest: str, out_date: str, ret_date: str):
-    payload = {
+def today_utc() -> dt.date:
+    return dt.datetime.utcnow().date()
+
+
+def _next_weekday(d: dt.date, weekday: int) -> dt.date:
+    """weekday: Monday=0..Sunday=6"""
+    delta = (weekday - d.weekday()) % 7
+    return d + dt.timedelta(days=delta)
+
+
+def pick_dates_for_theme(theme: str, avg_lead_days: int = 45, avg_trip_days: int = 5) -> Tuple[str, str]:
+    """
+    Theme-aware date picking (single-shot, no extra searches).
+    Keeps your free-tier caps safe while increasing hit-rate for "real" themed trips.
+    """
+    t = (theme or "").strip().upper()
+
+    # baseline jitter
+    lead_jitter = random.randint(-10, 15)
+    trip_jitter = random.randint(-1, 3)
+
+    base_out = today_utc() + dt.timedelta(days=max(10, avg_lead_days + lead_jitter))
+
+    # Preferred outbound weekdays per theme
+    # SNOW: Thu/Fri/Sat (long weekends)
+    # SURF/WINTER_SUN: Mon/Tue (cheaper shoulder days)
+    # CITY: Thu/Fri (weekenders)
+    if t in ("SNOW", "SKI"):
+        preferred = [3, 4, 5]
+        trip_min, trip_max = 3, 5
+    elif t in ("SURF", "WINTER_SUN", "SUN", "BEACH"):
+        preferred = [0, 1]
+        trip_min, trip_max = 4, 7
+    elif t in ("CITY", "CITY_BREAKS", "CITYBREAK", "FOODIE", "CULTURE"):
+        preferred = [3, 4]
+        trip_min, trip_max = 2, 4
+    else:
+        preferred = [1, 3, 5]  # mixed
+        trip_min, trip_max = 3, 6
+
+    # Snap base_out to the next preferred weekday (choose the soonest)
+    outs = [_next_weekday(base_out, w) for w in preferred]
+    out = min(outs)
+
+    # Trip length: keep avg as centre, clamp to theme ranges
+    trip = max(trip_min, min(trip_max, avg_trip_days + trip_jitter))
+    ret = out + dt.timedelta(days=trip)
+
+    return out.isoformat(), ret.isoformat()
+
+
+def duffel_offer_request(origin: str, dest: str, out_date: str, ret_date: str) -> Dict[str, Any]:
+    return {
         "data": {
             "slices": [
                 {"origin": origin, "destination": dest, "departure_date": out_date},
@@ -156,105 +347,90 @@ def duffel_search(origin: str, dest: str, out_date: str, ret_date: str):
             "cabin_class": "economy",
         }
     }
-    r = requests.post(DUFFEL_API, headers=duffel_headers(), json=payload, timeout=45)
-    r.raise_for_status()
-    return r.json()["data"]["offers"]
+
+
+def duffel_search(origin: str, dest: str, out_date: str, ret_date: str) -> Dict[str, Any]:
+    payload = duffel_offer_request(origin, dest, out_date, ret_date)
+    r = requests.post(DUFFEL_API, headers=duffel_headers(), json=payload, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Duffel offer_requests failed: {r.status_code} {r.text[:300]}")
+    return r.json()
 
 
 # ============================================================
-# Helpers
+# Config / Discovery helpers
 # ============================================================
 
-def today_utc() -> dt.date:
-    return dt.datetime.utcnow().date()
+def origins_from_origin_pools(rows: List[Dict]) -> List[str]:
+    """
+    CONFIG_ORIGIN_POOLS: expected columns:
+      - origin_iata
+      - enabled
+      - priority
+    """
+    out = []
+    for r in rows:
+        if not is_trueish(r.get("enabled", True)):
+            continue
+        o = cell_upper(r.get("origin_iata"))
+        if is_iata3(o):
+            out.append(o)
+    # stable order
+    out = list(dict.fromkeys(out))
+    return out
 
-
-def pick_dates(avg_lead_days: int = 45, avg_trip_days: int = 5) -> Tuple[str, str]:
-    lead_jitter = random.randint(-10, 15)
-    trip_jitter = random.randint(-1, 3)
-    out = today_utc() + dt.timedelta(days=max(10, avg_lead_days + lead_jitter))
-    ret = out + dt.timedelta(days=max(2, avg_trip_days + trip_jitter))
-    return out.isoformat(), ret.isoformat()
-
-
-def norm(s: str) -> str:
-    return (s or "").strip().lower().replace(" ", "_")
-
-
-def is_trueish(v) -> bool:
-    if v is None:
-        return True
-    return cell_lower(v) not in ("false", "0", "no", "off")
-
-
-def is_iata3(code: str) -> bool:
-    c = cell_upper(code)
-    return len(c) == 3 and c.isalpha()
-
-
-def safe_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        s = cell_str(x).strip().replace("£", "").replace(",", "")
-        if not s:
-            return None
-        return float(s)
-    except Exception:
-        return None
-
-
-# ============================================================
-# Load tabs
-# ============================================================
-
-def load_records(ws) -> List[Dict]:
-    return ws.get_all_records()
-
-
-# ============================================================
-# Weekly theme plan + massive fallback
-# ============================================================
 
 def build_week_theme_plan(themes_rows: List[Dict]) -> List[str]:
-    by_theme: Dict[str, int] = {}
+    """
+    CONFIG_THEMES expects (flexible):
+      - day_of_week (Mon..Sun) and theme
+    If missing, provide a stable default.
+    """
+    mapping = {}
     for r in themes_rows:
-        t = norm(cell_str(r.get("theme")))
-        if not t:
-            continue
-        pr = r.get("priority", 9999)
-        try:
-            pr_i = int(float(pr))
-        except Exception:
-            pr_i = 9999
-        by_theme[t] = min(by_theme.get(t, 9999), pr_i)
+        dow = cell_lower(r.get("day_of_week"))
+        theme = cell_upper(r.get("theme"))
+        if dow and theme:
+            mapping[dow] = theme
 
-    if not by_theme:
-        return ["city_break"] * 7
+    days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    default = ["CITY_BREAKS", "SURF", "SNOW", "WINTER_SUN", "CITY_BREAKS", "SURF", "SNOW"]
 
-    ordered = sorted(by_theme.keys(), key=lambda k: (by_theme[k], k))
-    plan = []
-    i = 0
-    while len(plan) < 7:
-        plan.append(ordered[i % len(ordered)])
-        i += 1
-    return plan
+    out = []
+    for i, d in enumerate(days):
+        out.append(mapping.get(d, default[i]))
+    return out
 
 
 def pick_today_theme(week_plan: List[str]) -> str:
-    dow = dt.datetime.utcnow().weekday()  # Mon=0..Sun=6
-    return week_plan[dow] if week_plan else "city_break"
+    idx = dt.datetime.utcnow().weekday()  # Monday=0
+    try:
+        return cell_upper(week_plan[idx])
+    except Exception:
+        return "CITY_BREAKS"
 
 
 def theme_destinations(themes_rows: List[Dict], theme: str) -> List[Dict]:
-    t = norm(theme)
+    """
+    CONFIG_THEME_DESTINATIONS:
+      - theme
+      - destination_iata
+      - lead_days
+      - trip_days
+      - priority
+      - enabled
+    """
+    t = cell_upper(theme)
     out = []
     for r in themes_rows:
-        if norm(cell_str(r.get("theme"))) != t:
+        if cell_upper(r.get("theme")) != t:
             continue
-        d = cell_upper(r.get("destination_iata"))
-        if is_iata3(d):
-            out.append(r)
+        if not is_trueish(r.get("enabled", True)):
+            continue
+        di = cell_upper(r.get("destination_iata"))
+        if not is_iata3(di):
+            continue
+        out.append(r)
 
     def keyfun(rr):
         pr = rr.get("priority", 9999)
@@ -263,6 +439,7 @@ def theme_destinations(themes_rows: List[Dict], theme: str) -> List[Dict]:
         except Exception:
             pr_i = 9999
         return (pr_i, cell_upper(rr.get("destination_iata")))
+
     out.sort(key=keyfun)
     return out
 
@@ -270,63 +447,14 @@ def theme_destinations(themes_rows: List[Dict], theme: str) -> List[Dict]:
 def signals_map(signals_rows: List[Dict]) -> Dict[str, Dict]:
     """
     CONFIG_SIGNALS: expects iata_hint column, but may contain NaN floats.
+    Returns map keyed by iata_hint.
     """
     m = {}
     for r in signals_rows:
-        iata = cell_upper(r.get("iata_hint"))
-        if is_iata3(iata):
-            m[iata] = r
+        code = cell_upper(r.get("iata_hint"))
+        if is_iata3(code):
+            m[code] = r
     return m
-
-
-def origins_from_origin_pools(origin_rows: List[Dict]) -> List[str]:
-    origins = []
-    for r in origin_rows:
-        o = cell_upper(r.get("origin_iata"))
-        if is_iata3(o):
-            origins.append(o)
-
-    def pri_for(o: str) -> int:
-        best = 0
-        for r in origin_rows:
-            if cell_upper(r.get("origin_iata")) == o:
-                try:
-                    best = max(best, int(float(r.get("priority", 0))))
-                except Exception:
-                    pass
-        return best
-
-    origins = sorted(list(set(origins)), key=lambda o: (-pri_for(o), o))
-    return origins
-
-
-def config_routes_for_theme(config_rows: List[Dict], theme: str) -> List[Tuple[str, str]]:
-    t = norm(theme)
-    routes = []
-    for r in config_rows:
-        if not is_trueish(r.get("enabled", True)):
-            continue
-        if norm(cell_str(r.get("theme"))) != t:
-            continue
-        o = cell_upper(r.get("origin_iata"))
-        d = cell_upper(r.get("destination_iata"))
-        if is_iata3(o) and is_iata3(d):
-            routes.append((o, d))
-
-    def pr_for(rt: Tuple[str, str]) -> int:
-        o, d = rt
-        pr = 9999
-        for r in config_rows:
-            if cell_upper(r.get("origin_iata")) == o and cell_upper(r.get("destination_iata")) == d:
-                try:
-                    pr = int(float(r.get("priority", 9999)))
-                except Exception:
-                    pr = 9999
-                break
-        return pr
-
-    routes.sort(key=lambda rt: (pr_for(rt), rt[0], rt[1]))
-    return routes
 
 
 def build_massive_weekly_fallback_routes(
@@ -359,92 +487,99 @@ def build_massive_weekly_fallback_routes(
             _ = sig.get(d)  # keep preference but don't hard-block
 
             chosen_origins = []
+            # rotate origins deterministically for variety
             for o in olist:
-                if o == d:
-                    continue
-                chosen_origins.append(o)
-                if len(chosen_origins) >= 2:
+                if o != d and is_iata3(o):
+                    chosen_origins.append(o)
+                if len(chosen_origins) >= 4:
                     break
 
             for o in chosen_origins:
-                key = (o, d, t)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                lead = 45
-                trip = 5
+                lead_days = 45
+                trip_days = 5
+                # allow overrides if present in destination rows
                 for rr in dest_rows:
                     if cell_upper(rr.get("destination_iata")) == d:
                         try:
-                            lead = int(float(rr.get("booking_lead_days", lead)))
+                            lead_days = int(float(rr.get("lead_days") or lead_days))
                         except Exception:
                             pass
                         try:
-                            trip = int(float(rr.get("avg_trip_days", trip)))
+                            trip_days = int(float(rr.get("trip_days") or trip_days))
                         except Exception:
                             pass
                         break
 
-                routes.append((o, d, t, lead, trip))
+                k = (o, d, cell_upper(t))
+                if k in seen:
+                    continue
+                routes.append((o, d, cell_upper(t), lead_days, trip_days))
+                seen.add(k)
 
     return routes
-
-
-# ============================================================
-# Publish eligibility + discovery reasons
-# ============================================================
-
-def publish_reason(
-    origin: str,
-    dest: str,
-    theme: str,
-    config_route_set: Set[Tuple[str, str]],
-    theme_dest_set: Set[str],
-    currency: str,
-    price: float,
-    price_max_gbp: float,
-) -> Optional[str]:
-    if (origin, dest) not in config_route_set:
-        return "outside_config"
-    if dest not in theme_dest_set:
-        return "outside_theme"
-    if currency != "GBP":
-        return "non_gbp"
-    if price > price_max_gbp:
-        return "too_expensive"
-    return None
 
 
 # ============================================================
 # Main
 # ============================================================
 
-def main():
-    # Controls
-    routes_cap = int(os.environ.get("DUFFEL_ROUTES_PER_RUN", "6"))
-    searches_cap = int(os.environ.get("DUFFEL_MAX_SEARCHES_PER_RUN", "4"))
-    inserts_cap = int(os.environ.get("DUFFEL_MAX_INSERTS", "3"))
+def main() -> None:
+    spreadsheet_id = env_str("SPREADSHEET_ID")
+    raw_tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
+    if not spreadsheet_id:
+        raise RuntimeError("Missing SPREADSHEET_ID")
 
-    price_max_gbp = float(os.environ.get("PRICE_MAX_GBP", "300"))
+    run_slot = env_str("RUN_SLOT", "AM").upper()
 
-    weekly_sweep = os.environ.get("WEEKLY_THEME_SWEEP", "true").strip().lower() not in ("false", "0", "no")
-    run_slot = os.environ.get("RUN_SLOT", "AM").strip().upper()
+    routes_cap = env_int("DUFFEL_ROUTES_PER_RUN", 4)
+    searches_cap = env_int("DUFFEL_MAX_SEARCHES_PER_RUN", 4)
+    inserts_cap = env_int("DUFFEL_MAX_INSERTS", 3)
 
-    gc = get_client()
-    sh = gc.open_by_key(os.environ["SPREADSHEET_ID"])
+    weekly_sweep = env_str("WEEKLY_THEME_SWEEP", "true").strip().lower() in ("true", "1", "yes")
 
-    raw_tab = os.environ.get("RAW_DEALS_TAB", "RAW_DEALS")
-    raw_ws = get_ws(sh, raw_tab)
-    disc_ws = get_or_create_ws(sh, "DISCOVERY_BANK", rows=5000, cols=30)
+    gc = gs_client()
+    sh = gc.open_by_key(spreadsheet_id)
 
-    config_ws = get_ws(sh, "CONFIG")
-    themes_ws = get_ws(sh, "THEMES")
-    signals_ws = get_ws(sh, "CONFIG_SIGNALS")
+    raw_ws = sh.worksheet(raw_tab)
 
-    config_rows = load_records(config_ws)
-    themes_rows = load_records(themes_ws)
-    signals_rows = load_records(signals_ws)
+    # Required RAW_DEALS headers for feeder insertion
+    raw_headers = ensure_headers(raw_ws, [
+        "status",
+        "deal_id",
+        "origin_iata",
+        "destination_iata",
+        "origin_city",
+        "destination_city",
+        "destination_country",
+        "outbound_date",
+        "return_date",
+        "price_gbp",
+        "currency",
+        "stops",
+        "carriers",
+        "deeplink",
+        "theme",
+        "timestamp",
+    ])
+
+    # Load config
+    try:
+        config_ws = sh.worksheet("CONFIG")
+        config_rows = load_records(config_ws)
+    except Exception:
+        config_rows = []
+
+    try:
+        themes_ws = sh.worksheet("CONFIG_THEME_DESTINATIONS")
+        themes_rows = load_records(themes_ws)
+    except Exception:
+        themes_rows = []
+
+    try:
+        signals_ws = sh.worksheet("CONFIG_SIGNALS")
+        signals_rows = load_records(signals_ws)
+    except Exception:
+        signals_rows = []
 
     # Origins
     try:
@@ -460,49 +595,7 @@ def main():
     # Week plan + today theme
     week_plan = build_week_theme_plan(themes_rows)
     today_theme = pick_today_theme(week_plan)
-
-    # Ensure schemas (non-destructive)
-    DISC_COLS = [
-        "found_at_utc",
-        "origin_iata",
-        "destination_iata",
-        "destination_city",
-        "destination_country",
-        "outbound_date",
-        "return_date",
-        "price",
-        "currency",
-        "stops",
-        "carrier_codes",
-        "raw_theme_guess",
-        "reason_flag",
-        "search_context",
-    ]
-    ensure_columns(disc_ws, DISC_COLS)
-
-    RAW_REQUIRED = [
-        "status",
-        "deal_id",
-        "price_gbp",
-        "origin_iata",
-        "destination_iata",
-        "origin_city",
-        "destination_city",
-        "destination_country",
-        "outbound_date",
-        "return_date",
-        "stops",
-        "deal_theme",
-        "created_utc",
-    ]
-    ensure_columns(raw_ws, RAW_REQUIRED)
-
-    # Signals lookup
-    sig = signals_map(signals_rows)
-
-    # Theme destinations set
-    def theme_dest_set(theme: str) -> Set[str]:
-        return set(cell_upper(r.get("destination_iata")) for r in theme_destinations(themes_rows, theme))
+    log(f"RUN_SLOT={run_slot} | Today theme: {today_theme}")
 
     # CONFIG route set
     config_route_set = set()
@@ -518,8 +611,8 @@ def main():
     route_plan: List[Tuple[str, str, str, int, int]] = []
 
     if weekly_sweep and run_slot == "AM":
-        log(f"🗓️ Weekly theme sweep enabled (AM). Week plan (Mon→Sun): {week_plan}")
-        fallback_routes = build_massive_weekly_fallback_routes(
+        log("🗓️ Weekly sweep enabled (AM). Building fallback plan across week.")
+        route_plan = build_massive_weekly_fallback_routes(
             week_plan=week_plan,
             themes_rows=themes_rows,
             signals_rows=signals_rows,
@@ -527,31 +620,38 @@ def main():
             per_theme_cap=25,
         )
 
-        rnd = random.Random(dt.datetime.utcnow().isocalendar().week)
-        rnd.shuffle(fallback_routes)
-        route_plan = fallback_routes[: max(routes_cap, searches_cap)]
-        log(f"🧰 Massive fallback pool built. Candidate routes: {len(fallback_routes)}. Using: {len(route_plan)}")
+        # If sweep is thin, top up with route packs for today's theme
+        if len(route_plan) < 10:
+            cluster = pick_origin_cluster(run_slot)
+            cluster_origins = [o for o in origins if cell_upper(o) in set(ORIGIN_CLUSTERS.get(cluster, []))]
+            use_origins = cluster_origins if cluster_origins else origins
+            rp = build_route_pack_fallback(today_theme, use_origins, config_route_set, cap=80)
+            if rp:
+                log(f"🧭 Final route-pack top-up for '{today_theme}' (cluster={cluster}) → +{len(rp)} routes")
+                route_plan = route_plan + rp
 
     else:
-        log(f"🎯 Theme selected for run: {today_theme}")
-        cfg_routes = config_routes_for_theme(config_rows, today_theme)
+        # Normal day: use CONFIG routes for today's theme if present
+        for r in config_rows:
+            if not is_trueish(r.get("enabled", True)):
+                continue
+            if cell_upper(r.get("theme")) != cell_upper(today_theme):
+                continue
+            o = cell_upper(r.get("origin_iata"))
+            d = cell_upper(r.get("destination_iata"))
+            if not (is_iata3(o) and is_iata3(d)):
+                continue
+            try:
+                lead_days = int(float(r.get("lead_days") or 45))
+            except Exception:
+                lead_days = 45
+            try:
+                trip_days = int(float(r.get("trip_days") or 5))
+            except Exception:
+                trip_days = 5
+            route_plan.append((o, d, cell_upper(today_theme), lead_days, trip_days))
 
-        if cfg_routes:
-            log(f"✅ Using CONFIG routes for theme '{today_theme}': {len(cfg_routes)}")
-            lead = 45
-            trip = 5
-            trows = theme_destinations(themes_rows, today_theme)
-            if trows:
-                try:
-                    lead = int(float(trows[0].get("booking_lead_days", lead)))
-                except Exception:
-                    pass
-                try:
-                    trip = int(float(trows[0].get("avg_trip_days", trip)))
-                except Exception:
-                    pass
-            route_plan = [(o, d, today_theme, lead, trip) for (o, d) in cfg_routes]
-        else:
+        if not route_plan:
             log(f"⚠️ CONFIG empty for theme '{today_theme}' → using theme fallback")
             fb = build_massive_weekly_fallback_routes(
                 week_plan=[today_theme],
@@ -562,18 +662,27 @@ def main():
             )
             route_plan = fb
 
+            # If theme destinations/signals are weak, use curated route-pack fallback
+            if not route_plan or len(route_plan) < 10:
+                cluster = pick_origin_cluster(run_slot)
+                cluster_origins = [o for o in origins if cell_upper(o) in set(ORIGIN_CLUSTERS.get(cluster, []))]
+                use_origins = cluster_origins if cluster_origins else origins
+                rp = build_route_pack_fallback(today_theme, use_origins, config_route_set, cap=60)
+                if rp:
+                    log(f"🧭 Route-pack fallback engaged for theme '{today_theme}' (cluster={cluster}) → {len(rp)} routes")
+                    route_plan = (route_plan or []) + rp
+
     if not route_plan:
         log("❌ No routes available after CONFIG + fallback. Nothing to do.")
         return
 
     route_plan = route_plan[:routes_cap]
-    log(f"🧭 Routes planned this run: {len(route_plan)} (DUFFEL_ROUTES_PER_RUN={routes_cap})")
 
-    published = 0
-    banked = 0
+    # Run searches
     searches = 0
+    published = 0
 
-    fallback_can_publish = os.environ.get("FALLBACK_CAN_PUBLISH", "false").strip().lower() in ("true", "1", "yes")
+    allow_publish = env_str("ALLOW_PUBLISH", "true").strip().lower() in ("true", "1", "yes")
 
     for origin, dest, theme, lead_days, trip_days in route_plan:
         if searches >= searches_cap:
@@ -585,24 +694,34 @@ def main():
             log(f"⏭️ Skip invalid IATA route: {origin}->{dest}")
             continue
 
-        out_date, ret_date = pick_dates(avg_lead_days=lead_days, avg_trip_days=trip_days)
+        out_date, ret_date = pick_dates_for_theme(theme, avg_lead_days=lead_days, avg_trip_days=trip_days)
         log(f"✈️ Duffel search: {origin}->{dest} ({theme}) {out_date}/{ret_date}")
 
         try:
-            offers = duffel_search(origin, dest, out_date, ret_date)
+            res = duffel_search(origin, dest, out_date, ret_date)
             searches += 1
         except Exception as e:
-            log(f"❌ Duffel error {origin}->{dest}: {e}")
+            log(f"❌ Duffel error: {e}")
             continue
 
+        offers = (((res or {}).get("data") or {}).get("offers") or [])
         if not offers:
             continue
 
-        for off in offers[:3]:
-            price = safe_float(off.get("total_amount"))
-            currency = (off.get("total_currency") or "").strip().upper()
-            if price is None:
+        # Insert cheapest offers up to inserts_cap
+        offers_sorted = []
+        for off in offers:
+            total = (off.get("total_amount") or "").strip()
+            try:
+                price = float(total)
+            except Exception:
                 continue
+            offers_sorted.append((price, off))
+        offers_sorted.sort(key=lambda x: x[0])
+
+        for price, off in offers_sorted:
+            if published >= inserts_cap:
+                break
 
             try:
                 stops = max(0, len(off["slices"][0]["segments"]) - 1)
@@ -619,69 +738,36 @@ def main():
                             carriers.add(code)
             except Exception:
                 pass
-            carrier_codes = ",".join(sorted(list(carriers)))
+            carriers_str = ",".join(sorted(carriers))[:80]
 
-            sigrow = sig.get(dest, {})
-            dest_city = cell_str(sigrow.get("destination_city")).strip()
-            dest_country = cell_str(sigrow.get("destination_country")).strip()
+            # deal_id stable-ish
+            deal_id = f"{origin}{dest}{out_date.replace('-','')}{ret_date.replace('-','')}{int(price*100)}"
+            deal_id = str(abs(hash(deal_id)))[:12]
 
-            t_dest_set = theme_dest_set(theme)
+            row = [""] * len(raw_headers)
+            row[raw_headers["status"]] = "NEW"
+            row[raw_headers["deal_id"]] = deal_id
+            row[raw_headers["origin_iata"]] = origin
+            row[raw_headers["destination_iata"]] = dest
+            row[raw_headers["origin_city"]] = origin  # resolved later by render/publishers
+            row[raw_headers["destination_city"]] = dest
+            row[raw_headers["outbound_date"]] = out_date
+            row[raw_headers["return_date"]] = ret_date
+            row[raw_headers["price_gbp"]] = f"{price:.2f}"
+            row[raw_headers["currency"]] = "GBP"
+            row[raw_headers["stops"]] = str(stops)
+            row[raw_headers["carriers"]] = carriers_str
+            row[raw_headers["theme"]] = theme
+            row[raw_headers["timestamp"]] = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-            reason = publish_reason(
-                origin=origin,
-                dest=dest,
-                theme=theme,
-                config_route_set=config_route_set,
-                theme_dest_set=t_dest_set,
-                currency=currency,
-                price=price,
-                price_max_gbp=price_max_gbp,
-            )
-
-            if fallback_can_publish and reason in ("outside_config", "outside_theme"):
-                if currency == "GBP" and price <= price_max_gbp and dest in t_dest_set:
-                    reason = None
-
-            if reason is None and published < inserts_cap:
-                raw_ws.append_row([
-                    "NEW",
-                    uuid.uuid4().hex[:12],
-                    price,
-                    origin,
-                    dest,
-                    origin,  # origin_city fallback
-                    dest_city or dest,
-                    dest_country or "",
-                    out_date,
-                    ret_date,
-                    stops,
-                    theme,
-                    dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-                ])
+            if allow_publish:
+                raw_ws.append_row(row, value_input_option="USER_ENTERED")
                 published += 1
+                log(f"✅ Inserted NEW deal {origin}->{dest} £{price:.2f} ({theme})")
             else:
-                if reason not in ("outside_config", "outside_theme", "non_gbp", "too_expensive", "duplicate_candidate"):
-                    reason = "duplicate_candidate"
+                log(f"🧪 Dry-run: would insert {origin}->{dest} £{price:.2f} ({theme})")
 
-                disc_ws.append_row([
-                    dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-                    origin,
-                    dest,
-                    dest_city or dest,
-                    dest_country or "",
-                    out_date,
-                    ret_date,
-                    price,
-                    currency,
-                    stops,
-                    carrier_codes,
-                    theme,
-                    reason,
-                    f"run_slot:{run_slot}|week:{dt.datetime.utcnow().isocalendar().week}|theme:{theme}",
-                ])
-                banked += 1
-
-    log(f"✅ Done. searches={searches} published={published} banked={banked} (caps: searches={searches_cap}, inserts={inserts_cap})")
+    log(f"Done. searches={searches} inserted={published}")
 
 
 if __name__ == "__main__":

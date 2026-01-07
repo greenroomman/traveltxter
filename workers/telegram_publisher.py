@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — telegram_publisher.py (LOCKED OUTPUT TEMPLATES)
+TravelTxter V4.5x — telegram_publisher.py (DEFINITIVE COMM TEMPLATES)
 
 AM (RUN_SLOT=AM):
   consumes: status == POSTED_INSTAGRAM
@@ -20,7 +20,8 @@ from __future__ import annotations
 import os
 import json
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+import hashlib
+from typing import Any, Dict, List, Optional
 
 import requests
 import gspread
@@ -125,7 +126,7 @@ def tg_send(bot_token: str, chat_id: str, text_html: str) -> None:
         timeout=30,
     )
     if r.status_code >= 400:
-        raise RuntimeError(f"Telegram send failed HTTP {r.status_code}: {r.text[:200]}")
+        raise RuntimeError(f"Telegram send failed HTTP {r.status_code}: {r.text[:250]}")
 
 
 # -----------------------------
@@ -148,20 +149,14 @@ FLAG_MAP = {
 }
 
 def country_flag(country: str) -> str:
-    c = (country or "").strip().upper()
-    return FLAG_MAP.get(c, "")
+    return FLAG_MAP.get((country or "").strip().upper(), "")
 
 def fmt_price_gbp(x: str) -> str:
-    """
-    Keep £103.35 style when possible.
-    """
-    s = (x or "").strip().replace(",", "")
+    s = (x or "").strip().replace(",", "").replace("£", "")
     if not s:
         return ""
-    s = s.replace("£", "")
     try:
         v = float(s)
-        # preserve two decimals when not an integer
         if v.is_integer():
             return f"£{int(v)}"
         return f"£{v:.2f}"
@@ -169,10 +164,6 @@ def fmt_price_gbp(x: str) -> str:
         return f"£{s}"
 
 def normalize_origin_city(x: str) -> str:
-    """
-    Telegram wants: 'London' not 'LHR' if it slips through.
-    Keep it conservative: only map common UK airport codes.
-    """
     s = (x or "").strip()
     u = s.upper()
     UK_AIRPORT_CITY_FALLBACK = {
@@ -194,27 +185,18 @@ def normalize_origin_city(x: str) -> str:
 
 
 # -----------------------------
-# Phrase bank loader (safe/optional)
+# PHRASE_BANK loader (matches your CSV schema)
+# Columns expected:
+# theme, category, phrase, approved, channel_hint, max_per_month, notes
 # -----------------------------
 
-def _pick_header(headers: List[str], candidates: List[str]) -> Optional[int]:
-    h = [x.strip() for x in headers]
-    for c in candidates:
-        if c in h:
-            return h.index(c)
-    # try case-insensitive match
-    upper = {x.strip().upper(): i for i, x in enumerate(headers)}
-    for c in candidates:
-        i = upper.get(c.upper())
-        if i is not None:
-            return i
-    return None
+def _truthy(x: str) -> bool:
+    v = (x or "").strip().lower()
+    return v in ("true", "yes", "1", "y", "on", "enabled")
 
 def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
     """
-    Reads PHRASE_BANK tab if present.
-    Supports flexible headers:
-      phrase/text, channel, theme, enabled, priority
+    Reads PHRASE_BANK tab if present and returns row dicts by header.
     """
     try:
         ws = sh.worksheet("PHRASE_BANK")
@@ -225,76 +207,39 @@ def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
     if not values or len(values) < 2:
         return []
 
-    headers = values[0]
-    i_phrase = _pick_header(headers, ["phrase", "text", "copy"])
-    if i_phrase is None:
-        return []
-
-    i_channel = _pick_header(headers, ["channel"])
-    i_theme = _pick_header(headers, ["theme"])
-    i_enabled = _pick_header(headers, ["enabled", "active"])
-    i_priority = _pick_header(headers, ["priority", "rank"])
-
+    headers = [h.strip() for h in values[0]]
     out: List[Dict[str, str]] = []
     for r in values[1:]:
-        phrase = (r[i_phrase] if i_phrase < len(r) else "").strip()
-        if not phrase:
-            continue
-
-        channel = (r[i_channel] if (i_channel is not None and i_channel < len(r)) else "").strip()
-        theme = (r[i_theme] if (i_theme is not None and i_theme < len(r)) else "").strip()
-        enabled = (r[i_enabled] if (i_enabled is not None and i_enabled < len(r)) else "").strip()
-        priority = (r[i_priority] if (i_priority is not None and i_priority < len(r)) else "").strip()
-
-        out.append({
-            "phrase": phrase,
-            "channel": channel,
-            "theme": theme,
-            "enabled": enabled,
-            "priority": priority,
-        })
-
+        d: Dict[str, str] = {}
+        for i, h in enumerate(headers):
+            d[h] = (r[i] if i < len(r) else "").strip()
+        if any(d.values()):
+            out.append(d)
     return out
 
-def pick_phrase(rows: List[Dict[str, str]], channel: str, theme: str) -> str:
+def pick_theme_phrase(phrase_rows: List[Dict[str, str]], deal_theme: str, deal_id: str) -> str:
     """
-    Deterministic:
-    - filter enabled
-    - filter channel match (channel or all/blank)
-    - filter theme match (theme or all/blank)
-    - sort by priority (desc), then phrase (asc)
-    - return first
+    Picks one approved phrase for the given theme.
+    Deterministic via deal_id hash so it doesn't jump between runs.
     """
-    ch = (channel or "").strip().lower()
-    th = (theme or "").strip().lower()
+    th = (deal_theme or "").strip().upper()
 
-    def enabled_ok(v: str) -> bool:
-        vv = (v or "").strip().lower()
-        return vv in ("", "true", "yes", "1", "on", "enabled")
+    approved = [
+        r for r in phrase_rows
+        if _truthy(r.get("approved", "")) and (r.get("phrase", "").strip() != "")
+    ]
 
-    pool = []
-    for r in rows:
-        if not enabled_ok(r.get("enabled", "")):
-            continue
-        rch = (r.get("channel", "") or "").strip().lower()
-        rth = (r.get("theme", "") or "").strip().lower()
-
-        ch_ok = (rch in ("", "all", ch))
-        th_ok = (rth in ("", "all", th))
-        if ch_ok and th_ok:
-            pool.append(r)
-
-    if not pool:
+    if not approved:
         return ""
 
-    def prio(x: str) -> int:
-        try:
-            return int(float((x or "").strip()))
-        except Exception:
-            return 0
+    themed = [r for r in approved if (r.get("theme", "").strip().upper() == th)] if th else []
+    pool = themed if themed else approved
 
-    pool.sort(key=lambda r: (-prio(r.get("priority", "")), r.get("phrase", "")))
-    return pool[0].get("phrase", "").strip()
+    # stable selection
+    key = (deal_id or "no_deal_id").encode("utf-8")
+    h = hashlib.md5(key).hexdigest()
+    idx = int(h[:8], 16) % len(pool)
+    return (pool[idx].get("phrase", "") or "").strip()
 
 
 # -----------------------------
@@ -303,12 +248,19 @@ def pick_phrase(rows: List[Dict[str, str]], channel: str, theme: str) -> str:
 
 DIVIDER = "_______________________________________________"
 
+def pick_booking_link(row: Dict[str, str]) -> str:
+    vip = (row.get("booking_link_vip", "") or "").strip()
+    aff = (row.get("affiliate_url", "") or "").strip()
+    return clean_url(vip or aff)
+
 def build_telegram_free(row: Dict[str, str], phrase: str, monthly_link: str, yearly_link: str) -> str:
     price = fmt_price_gbp(row.get("price_gbp", ""))
     country = (row.get("destination_country", "") or "").strip()
     flag = country_flag(country)
+
     dest_city = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
     origin_city = normalize_origin_city((row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip())
+
     out_d = (row.get("outbound_date", "") or "").strip()
     back_d = (row.get("return_date", "") or "").strip()
 
@@ -324,7 +276,7 @@ def build_telegram_free(row: Dict[str, str], phrase: str, monthly_link: str, yea
     ]
 
     if phrase:
-        lines.append(html_escape(phrase.strip()))
+        lines.append(html_escape(phrase))
         lines.append("")
 
     lines += [
@@ -355,8 +307,10 @@ def build_telegram_vip(row: Dict[str, str], phrase: str, booking_url: str) -> st
     price = fmt_price_gbp(row.get("price_gbp", ""))
     country = (row.get("destination_country", "") or "").strip()
     flag = country_flag(country)
+
     dest_city = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
     origin_city = normalize_origin_city((row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip())
+
     out_d = (row.get("outbound_date", "") or "").strip()
     back_d = (row.get("return_date", "") or "").strip()
 
@@ -372,22 +326,16 @@ def build_telegram_vip(row: Dict[str, str], phrase: str, booking_url: str) -> st
     ]
 
     if phrase:
-        lines.append(html_escape(phrase.strip()))
+        lines.append(html_escape(phrase))
         lines.append("")
 
     if booking_url:
         lines.append(html_link(booking_url, "BOOKING LINK"))
     else:
-        # Still show label even if missing so it’s obvious in logs
         lines.append("BOOKING LINK: (missing)")
 
     lines += ["", DIVIDER]
     return "\n".join(lines).strip()
-
-def pick_booking_link(row: Dict[str, str]) -> str:
-    vip = (row.get("booking_link_vip", "") or "").strip()
-    aff = (row.get("affiliate_url", "") or "").strip()
-    return clean_url(vip or aff)
 
 
 # -----------------------------
@@ -408,9 +356,9 @@ def main() -> int:
     bot_free = env_str("TELEGRAM_BOT_TOKEN")
     chan_free = env_str("TELEGRAM_CHANNEL")
 
-    # Upsell links (used in FREE template)
-    stripe_monthly = env_str("STRIPE_MONTHLY_LINK")  # Adventurer £3/mo
-    stripe_yearly = env_str("STRIPE_YEARLY_LINK")    # Nomad £30/yr
+    # Upsell links (FREE template)
+    stripe_monthly = env_str("STRIPE_MONTHLY_LINK")  # £3/mo
+    stripe_yearly = env_str("STRIPE_YEARLY_LINK")    # £30/yr
 
     if run_slot == "AM" and (not bot_vip or not chan_vip):
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN_VIP or TELEGRAM_CHANNEL_VIP")
@@ -423,6 +371,7 @@ def main() -> int:
 
     required = [
         "status",
+        "deal_id",
         "price_gbp",
         "origin_iata",
         "destination_iata",
@@ -470,11 +419,9 @@ def main() -> int:
     for col, idx in h.items():
         row[col] = target_row_vals[idx] if idx < len(target_row_vals) else ""
 
-    # Load phrase bank once per run
-    pb_rows = load_phrase_bank(sh)
-    theme = (row.get("deal_theme", "") or "").strip()
-    phrase_channel = "telegram_vip" if run_slot == "AM" else "telegram_free"
-    phrase = pick_phrase(pb_rows, phrase_channel, theme)
+    # Phrase bank (theme phrases)
+    pb = load_phrase_bank(sh)
+    phrase = pick_theme_phrase(pb, row.get("deal_theme", ""), row.get("deal_id", ""))
 
     now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 

@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — instagram_publisher.py (LOCKED)
+TravelTxter V4.5x — instagram_publisher.py (DEFINITIVE IG CAPTION TEMPLATE)
 
-ROLE:
-- Consumes: status == READY_TO_PUBLISH
-- Requires: graphic_url (publicly accessible URL)
-- Creates IG media container + publishes
-- Writes: posted_instagram_at
-- Promotes status -> POSTED_INSTAGRAM
+CAPTION MUST BE EXACTLY:
+
+Thailand [country flag]
+To: Phuket
+From: London
+Price: £685
+Out: 2026-02-18
+Return: 2026-02-28
+
+“Quieter dates, usually easier on your wallet.”
+Link in bio…
 
 Rules:
-- Caption template is LOCKED (flags only, no other emojis)
-- No markdown lists
-- Robust retries for "Media not ready" (error code 9007/subcode 2207027)
-- Hardened Google SA JSON parsing + Sheets 429 backoff
+- Flags only (no other emojis)
+- Phrase is quoted in curly quotes “...”
+- Pulls PHRASE_BANK by your CSV schema (theme/phrase/approved/etc)
+- Phrase selection deterministic by deal_id
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import os
 import json
 import time
 import datetime as dt
+import hashlib
 from typing import Dict, Any, List, Optional
 
 import requests
@@ -153,7 +159,7 @@ def safe_get(row: List[str], idx: int) -> str:
 
 
 # ============================================================
-# Caption template (LOCKED)
+# Flags + formatting
 # ============================================================
 
 FLAG_MAP = {
@@ -172,56 +178,79 @@ FLAG_MAP = {
 }
 
 def country_flag(country: str) -> str:
-    c = (country or "").strip().upper()
-    return FLAG_MAP.get(c, "")
+    return FLAG_MAP.get((country or "").strip().upper(), "")
 
-def build_caption(
-    price_gbp: str,
-    destination_country: str,
-    destination_city: str,
-    origin_city: str,
-    outbound_date: str,
-    return_date: str,
-    stripe_monthly: str,
-    stripe_yearly: str,
-) -> str:
-    flag = country_flag(destination_country)
-    dest_upper = (destination_city or "").strip().upper()
+def fmt_price_gbp(x: str) -> str:
+    s = (x or "").strip().replace(",", "").replace("£", "")
+    if not s:
+        return ""
+    try:
+        v = float(s)
+        if v.is_integer():
+            return f"£{int(v)}"
+        return f"£{v:.2f}"
+    except Exception:
+        return f"£{s}"
 
-    lines = [
-        f"£{price_gbp} to {destination_country}{(' ' + flag) if flag else ''}".strip(),
-        f"TO: {dest_upper}",
-        f"FROM: {origin_city}",
-        f"OUT: {outbound_date}",
-        f"BACK: {return_date}",
-        "",
-        "Heads up:",
-        "• VIP members saw this 24 hours ago",
-        "• Availability is running low",
-        "• Best deals go to VIPs first",
-        "",
-        "Want instant access?",
-        "Join TravelTxter Nomad for £7.99 / month:",
-        "",
-        "• Deals 24 hours early",
-        "• Direct booking links",
-        "• Exclusive mistake fares",
-        "• Cancel anytime",
-        "",
-        f"Upgrade now (Monthly): {stripe_monthly}".strip(),
-        f"Upgrade now (Yearly): {stripe_yearly}".strip(),
+def quote_phrase(s: str) -> str:
+    """
+    Ensures phrase prints as: “...”
+    Strips any existing straight/curly quotes.
+    """
+    t = (s or "").strip()
+    if not t:
+        return ""
+    t = t.strip('"\''"“”‘’")
+    return f"“{t}”"
+
+
+# ============================================================
+# PHRASE_BANK loader (matches your CSV schema)
+# Columns expected:
+# theme, category, phrase, approved, channel_hint, max_per_month, notes
+# ============================================================
+
+def _truthy(x: str) -> bool:
+    v = (x or "").strip().lower()
+    return v in ("true", "yes", "1", "y", "on", "enabled")
+
+def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
+    try:
+        ws = sh.worksheet("PHRASE_BANK")
+    except Exception:
+        return []
+
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return []
+
+    headers = [h.strip() for h in values[0]]
+    out: List[Dict[str, str]] = []
+    for r in values[1:]:
+        d: Dict[str, str] = {}
+        for i, h in enumerate(headers):
+            d[h] = (r[i] if i < len(r) else "").strip()
+        if any(d.values()):
+            out.append(d)
+    return out
+
+def pick_theme_phrase(phrase_rows: List[Dict[str, str]], deal_theme: str, deal_id: str) -> str:
+    th = (deal_theme or "").strip().upper()
+
+    approved = [
+        r for r in phrase_rows
+        if _truthy(r.get("approved", "")) and (r.get("phrase", "").strip() != "")
     ]
+    if not approved:
+        return ""
 
-    # remove upgrade lines if links missing
-    out: List[str] = []
-    for ln in lines:
-        if ln.startswith("Upgrade now (Monthly):") and ln.endswith(":"):
-            continue
-        if ln.startswith("Upgrade now (Yearly):") and ln.endswith(":"):
-            continue
-        out.append(ln)
+    themed = [r for r in approved if (r.get("theme", "").strip().upper() == th)] if th else []
+    pool = themed if themed else approved
 
-    return "\n".join(out).strip()
+    key = (deal_id or "no_deal_id").encode("utf-8")
+    h = hashlib.md5(key).hexdigest()
+    idx = int(h[:8], 16) % len(pool)
+    return (pool[idx].get("phrase", "") or "").strip()
 
 
 # ============================================================
@@ -232,11 +261,7 @@ def ig_create_container(graph_version: str, ig_user_id: str, token: str, image_u
     url = f"https://graph.facebook.com/{graph_version}/{ig_user_id}/media"
     r = requests.post(
         url,
-        data={
-            "image_url": image_url,
-            "caption": caption,
-            "access_token": token,
-        },
+        data={"image_url": image_url, "caption": caption, "access_token": token},
         timeout=60,
     )
     j = r.json()
@@ -248,10 +273,7 @@ def ig_publish(graph_version: str, ig_user_id: str, token: str, creation_id: str
     url = f"https://graph.facebook.com/{graph_version}/{ig_user_id}/media_publish"
     r = requests.post(
         url,
-        data={
-            "creation_id": creation_id,
-            "access_token": token,
-        },
+        data={"creation_id": creation_id, "access_token": token},
         timeout=60,
     )
     j = r.json()
@@ -259,37 +281,60 @@ def ig_publish(graph_version: str, ig_user_id: str, token: str, creation_id: str
         raise RuntimeError(f"IG publish failed: {j}")
     return j["id"]
 
-
-def ig_publish_with_retries(
-    graph_version: str,
-    ig_user_id: str,
-    token: str,
-    creation_id: str,
-    attempts: int = 10,
-) -> str:
-    """
-    Handles "Media not ready" (9007 / 2207027).
-    """
+def ig_publish_with_retries(graph_version: str, ig_user_id: str, token: str, creation_id: str, attempts: int = 10) -> str:
     delay = 4.0
     last_err: Optional[str] = None
-
     for i in range(1, attempts + 1):
         try:
             return ig_publish(graph_version, ig_user_id, token, creation_id)
         except Exception as e:
             msg = str(e)
             last_err = msg
-
-            # Meta "not ready" signature
             if "2207027" in msg or "Media ID is not available" in msg or "not ready" in msg.lower():
                 log(f"⏳ IG media not ready. Retry {i}/{attempts} in {int(delay)}s...")
                 time.sleep(delay)
                 delay = min(delay * 1.6, 45.0)
                 continue
-
             raise
-
     raise RuntimeError(f"IG publish failed after retries: {last_err}")
+
+
+# ============================================================
+# Caption template (definitive IG)
+# ============================================================
+
+def build_caption_ig(
+    destination_country: str,
+    destination_city: str,
+    origin_city: str,
+    price_gbp: str,
+    outbound_date: str,
+    return_date: str,
+    phrase: str,
+) -> str:
+    country = (destination_country or "").strip()
+    city = (destination_city or "").strip()
+    origin = (origin_city or "").strip()
+
+    flag = country_flag(country)
+    first_line = f"{country}{(' ' + flag) if flag else ''}".strip() if country else (city or "TravelTxter deal")
+
+    lines: List[str] = [
+        first_line,
+        f"To: {city or country}",
+        f"From: {origin}",
+        f"Price: {fmt_price_gbp(price_gbp)}",
+        f"Out: {outbound_date}",
+        f"Return: {return_date}",
+        "",
+    ]
+
+    if phrase:
+        lines.append(quote_phrase(phrase))
+        lines.append("")
+
+    lines.append("Link in bio…")
+    return "\n".join(lines).strip()
 
 
 # ============================================================
@@ -303,10 +348,6 @@ def main() -> int:
     ig_token = env_str("IG_ACCESS_TOKEN")
     ig_user_id = env_str("IG_USER_ID")
     graph_version = env_str("GRAPH_API_VERSION", "v20.0")
-
-    stripe_monthly = env_str("STRIPE_MONTHLY_LINK")
-    stripe_yearly = env_str("STRIPE_YEARLY_LINK")
-
     max_rows = env_int("IG_MAX_ROWS", 1)
 
     if not spreadsheet_id:
@@ -324,28 +365,31 @@ def main() -> int:
         return 0
 
     headers = [h.strip() for h in values[0]]
-
     required_cols = [
         "status",
         "graphic_url",
+        "deal_id",
         "price_gbp",
         "destination_country",
         "destination_city",
         "origin_city",
         "outbound_date",
         "return_date",
+        "deal_theme",
         "posted_instagram_at",
     ]
     headers = ensure_columns(ws, headers, required_cols)
 
-    # Re-read once after header mutation
+    # Re-read after header mutation
     values = ws.get_all_values()
     headers = [h.strip() for h in values[0]]
     rows = values[1:]
     h = {name: i for i, name in enumerate(headers)}
 
-    posted = 0
+    # Phrase bank once per run
+    pb = load_phrase_bank(sh)
 
+    posted = 0
     for rownum, r in enumerate(rows, start=2):
         if posted >= max_rows:
             break
@@ -359,19 +403,21 @@ def main() -> int:
             log(f"⏭️  Skip row {rownum}: missing graphic_url")
             continue
 
-        caption = build_caption(
-            price_gbp=safe_get(r, h["price_gbp"]),
+        deal_id = safe_get(r, h["deal_id"])
+        deal_theme = safe_get(r, h["deal_theme"])
+        phrase = pick_theme_phrase(pb, deal_theme, deal_id)
+
+        caption = build_caption_ig(
             destination_country=safe_get(r, h["destination_country"]),
             destination_city=safe_get(r, h["destination_city"]),
             origin_city=safe_get(r, h["origin_city"]),
+            price_gbp=safe_get(r, h["price_gbp"]),
             outbound_date=safe_get(r, h["outbound_date"]),
             return_date=safe_get(r, h["return_date"]),
-            stripe_monthly=stripe_monthly,
-            stripe_yearly=stripe_yearly,
+            phrase=phrase,
         )
 
         log(f"📸 Posting IG for row {rownum}")
-
         creation_id = ig_create_container(graph_version, ig_user_id, ig_token, image_url, caption)
         media_id = ig_publish_with_retries(graph_version, ig_user_id, ig_token, creation_id)
 
@@ -383,7 +429,6 @@ def main() -> int:
 
         posted += 1
         log(f"✅ IG posted row {rownum} media_id={media_id}")
-
         time.sleep(2)
 
     log(f"Done. IG posted {posted}.")

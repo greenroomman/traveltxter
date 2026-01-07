@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — render_client.py (LOCKED, FAIL-LOUD)
+TravelTxter V4.5x — render_client.py (LOCKED)
 
 Consumes:
 - status == READY_TO_POST
@@ -15,11 +15,14 @@ Produces:
 Promotes:
 - READY_TO_POST -> READY_TO_PUBLISH (only after successful render)
 
-Key behavior:
-- Never "silently skips": logs skip reasons.
-- Warm-up hit to /api/health before first render.
-- Normalises wrong endpoint (/render -> /api/render).
-- Retries with backoff on timeouts and connection errors.
+Non-negotiable render payload:
+{
+  "TO": "City",
+  "FROM": "City",
+  "OUT": "DDMMYY",
+  "IN": "DDMMYY",
+  "PRICE": "£123",
+}
 """
 
 from __future__ import annotations
@@ -28,32 +31,29 @@ import os
 import json
 import time
 import datetime as dt
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
 
 
 # -----------------------------
 # Logging
 # -----------------------------
 
-def ts() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
 def log(msg: str) -> None:
-    print(f"{ts()} | {msg}", flush=True)
+    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    print(f"{ts} | {msg}", flush=True)
 
 
 # -----------------------------
-# Env helpers
+# Env
 # -----------------------------
 
 def env_str(k: str, default: str = "") -> str:
-    return os.environ.get(k, default).strip()
+    return (os.environ.get(k, default) or "").strip()
 
 def env_int(k: str, default: int) -> int:
     try:
@@ -63,47 +63,21 @@ def env_int(k: str, default: int) -> int:
 
 
 # -----------------------------
-# Robust SA JSON parsing
+# Sheets auth
 # -----------------------------
 
-def _extract_json_object(raw: str) -> Dict[str, Any]:
+def _parse_sa_json(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
-
     try:
         return json.loads(raw)
-    except Exception:
-        pass
-
-    try:
+    except json.JSONDecodeError:
         return json.loads(raw.replace("\\n", "\n"))
-    except Exception:
-        pass
 
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise RuntimeError("Invalid GCP_SA_JSON_ONE_LINE: no JSON object found")
-
-    candidate = raw[start:end + 1]
-
-    try:
-        return json.loads(candidate)
-    except Exception:
-        pass
-
-    try:
-        return json.loads(candidate.replace("\\n", "\n"))
-    except Exception as e:
-        raise RuntimeError("Invalid GCP_SA_JSON_ONE_LINE: JSON parse failed") from e
-
-
-def get_client() -> gspread.Client:
-    sa = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
-    if not sa:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-
-    info = _extract_json_object(sa)
-
+def gs_client():
+    raw = env_str("GCP_SA_JSON_ONE_LINE")
+    if not raw:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE")
+    info = _parse_sa_json(raw)
     creds = Credentials.from_service_account_info(
         info,
         scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
@@ -111,77 +85,20 @@ def get_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def open_sheet_with_backoff(gc: gspread.Client, spreadsheet_id: str, attempts: int = 8) -> gspread.Spreadsheet:
-    delay = 4.0
-    for i in range(1, attempts + 1):
-        try:
-            return gc.open_by_key(spreadsheet_id)
-        except APIError as e:
-            msg = str(e)
-            if "429" in msg or "Quota exceeded" in msg:
-                log(f"⏳ Sheets quota (429). Retry {i}/{attempts} in {int(delay)}s...")
-                time.sleep(delay)
-                delay = min(delay * 1.6, 45.0)
-                continue
-            raise
-    raise RuntimeError("Sheets quota still exceeded after retries (429). Try again shortly.")
+def ensure_columns(ws, required_cols: List[str]) -> Dict[str, int]:
+    headers = ws.row_values(1)
+    if not headers:
+        ws.update([required_cols], "A1")
+        headers = required_cols[:]
+        log(f"🛠️  Initialised headers for {ws.title}")
 
-
-# -----------------------------
-# A1 helpers
-# -----------------------------
-
-def col_letter(n1: int) -> str:
-    s = ""
-    n = n1
-    while n:
-        n, rr = divmod(n - 1, 26)
-        s = chr(65 + rr) + s
-    return s
-
-def a1(rownum: int, col0: int) -> str:
-    return f"{col_letter(col0 + 1)}{rownum}"
-
-
-# -----------------------------
-# Sheet helpers
-# -----------------------------
-
-def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
-    missing = [c for c in required if c not in headers]
-    if not missing:
-        return headers
-    ws.update([headers + missing], "A1")
-    log(f"🛠️  Added missing columns: {missing}")
-    return headers + missing
-
-def safe_get(row: List[str], idx: int) -> str:
-    return row[idx].strip() if 0 <= idx < len(row) else ""
-
-
-# -----------------------------
-# Formatting helpers
-# -----------------------------
-
-def ddmmyy(date_str: str) -> str:
-    s = (date_str or "").strip()
-    if not s:
-        return ""
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
-        try:
-            d = dt.datetime.strptime(s, fmt).date()
-            return d.strftime("%d%m%y")
-        except Exception:
-            pass
-    return s.replace("-", "").replace("/", "")[:6]
-
-def money_gbp(price_gbp: str) -> str:
-    s = (price_gbp or "").strip().replace("£", "")
-    try:
-        v = float(s)
-        return f"£{int(v + 0.999)}"
-    except Exception:
-        return f"£{s}" if s else "£0"
+    headers = [h.strip() for h in headers]
+    missing = [c for c in required_cols if c not in headers]
+    if missing:
+        headers = headers + missing
+        ws.update([headers], "A1")
+        log(f"🛠️  Added missing columns: {missing}")
+    return {h: i for i, h in enumerate(headers)}
 
 
 # -----------------------------
@@ -193,66 +110,97 @@ def normalise_render_url(u: str) -> str:
     if not u:
         return u
     parsed = urlparse(u)
-    path = parsed.path.rstrip("/")
-
-    # Force canonical /api/render
-    if path.endswith("/render") and not path.endswith("/api/render"):
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or parsed.path  # handle accidental "domain.com/api/render"
+    path = parsed.path if parsed.netloc else ""
+    if not path.endswith("/api/render"):
         path = "/api/render"
-    elif path.endswith("/api/render"):
-        path = "/api/render"
-    elif path == "" or path == "/":
-        path = "/api/render"
-
-    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+    return urlunparse((scheme, netloc, path, "", "", ""))
 
 def health_url_from_render_url(render_url: str) -> str:
+    """
+    PythonAnywhere app exposes GET /health (NOT /api/health)
+    """
     parsed = urlparse(render_url)
-    return urlunparse((parsed.scheme, parsed.netloc, "/api/health", "", "", ""))
+    return urlunparse((parsed.scheme, parsed.netloc, "/health", "", "", ""))
 
 def warm_up(render_url: str) -> None:
     hu = health_url_from_render_url(render_url)
     try:
-        r = requests.get(hu, timeout=15)
+        r = requests.get(hu, timeout=15, headers={"User-Agent": "traveltxter-render-client/1.0"})
         log(f"🫖 Render health: {r.status_code}")
     except Exception as e:
         log(f"🫖 Warmup failed (will still try render): {str(e)[:160]}")
 
 
 # -----------------------------
+# Formatting helpers
+# -----------------------------
+
+def ddmmyy(iso_yyyy_mm_dd: str) -> str:
+    s = (iso_yyyy_mm_dd or "").strip()
+    try:
+        d = dt.datetime.strptime(s[:10], "%Y-%m-%d").date()
+        return d.strftime("%d%m%y")
+    except Exception:
+        # allow already ddmmyy
+        s2 = "".join(ch for ch in s if ch.isdigit())
+        return s2[-6:] if len(s2) >= 6 else s2
+
+def money_gbp(price_gbp: Any) -> str:
+    s = str(price_gbp or "").strip().replace("£", "").replace(",", "")
+    try:
+        v = float(s)
+        # ceil-ish
+        return f"£{int(v + 0.999)}"
+    except Exception:
+        return f"£{s}" if s else "£0"
+
+
+def is_iata3(x: str) -> bool:
+    s = (x or "").strip().upper()
+    return len(s) == 3 and s.isalpha()
+
+
+UK_AIRPORT_CITY_FALLBACK = {
+    "LHR": "London",
+    "LGW": "London",
+    "STN": "London",
+    "LTN": "London",
+    "LCY": "London",
+    "SEN": "London",
+    "MAN": "Manchester",
+    "BRS": "Bristol",
+    "BHX": "Birmingham",
+    "EDI": "Edinburgh",
+    "GLA": "Glasgow",
+    "NCL": "Newcastle",
+    "LPL": "Liverpool",
+    "NQY": "Newquay",
+    "SOU": "Southampton",
+    "CWL": "Cardiff",
+    "EXT": "Exeter",
+}
+
+
+# -----------------------------
 # Render with retries
 # -----------------------------
 
-def post_render(render_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.post(render_url, json=payload, timeout=(15, 75))
-    snippet = (r.text or "")[:240].replace("\n", " ")
-    if r.status_code != 200:
-        raise RuntimeError(f"Render HTTP {r.status_code} :: {snippet}")
+def post_render(render_url: str, payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], str, int]:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "traveltxter-render-client/1.0",
+    }
+    r = requests.post(render_url, json=payload, timeout=(15, 90), headers=headers)
+    snippet = (r.text or "")[:320].replace("\n", " ")
+    if r.status_code >= 400:
+        return False, {}, snippet, r.status_code
     try:
-        j = r.json()
+        return True, r.json(), snippet, r.status_code
     except Exception:
-        raise RuntimeError(f"Render JSON parse failed :: {snippet}")
-    j["_snippet"] = snippet
-    return j
-
-def render_with_backoff(render_url: str, payload: Dict[str, Any], attempts: int = 5) -> Dict[str, Any]:
-    delay = 4.0
-    last_err: Optional[str] = None
-    for i in range(1, attempts + 1):
-        try:
-            return post_render(render_url, payload)
-        except Exception as e:
-            last_err = str(e)
-            msg = last_err.lower()
-            retryable = any(x in msg for x in [
-                "timeout", "timed out", "max retries exceeded", "connection",
-                "502", "503", "504"
-            ])
-            if not retryable or i == attempts:
-                raise
-            log(f"⏳ Render retry {i}/{attempts} in {int(delay)}s... ({last_err[:120]})")
-            time.sleep(delay)
-            delay = min(delay * 1.6, 45.0)
-    raise RuntimeError(f"Render failed after retries: {last_err or 'unknown'}")
+        return False, {}, snippet, r.status_code
 
 
 # -----------------------------
@@ -263,7 +211,7 @@ def main() -> int:
     spreadsheet_id = env_str("SPREADSHEET_ID")
     tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
     render_url_raw = env_str("RENDER_URL")
-    max_rows = env_int("RENDER_MAX_ROWS", 1)
+    render_max = env_int("RENDER_MAX_ROWS", 1)
 
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
@@ -274,20 +222,15 @@ def main() -> int:
     if render_url != render_url_raw:
         log(f"🔧 Normalised RENDER_URL: {render_url_raw} -> {render_url}")
 
-    gc = get_client()
-    sh = open_sheet_with_backoff(gc, spreadsheet_id)
+    gc = gs_client()
+    sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(tab)
 
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
-        log("No rows.")
-        return 0
-
-    headers = [h.strip() for h in values[0]]
-
-    required_cols = [
+    need_cols = [
         "status",
         "deal_id",
+        "origin_iata",
+        "destination_iata",
         "origin_city",
         "destination_city",
         "outbound_date",
@@ -298,98 +241,102 @@ def main() -> int:
         "render_error",
         "render_response_snippet",
     ]
-    headers = ensure_columns(ws, headers, required_cols)
-
-    # Re-read after potential header update
-    values = ws.get_all_values()
-    headers = [h.strip() for h in values[0]]
-    rows = values[1:]
-    h = {name: i for i, name in enumerate(headers)}
+    h = ensure_columns(ws, need_cols)
 
     warm_up(render_url)
 
-    rendered = 0
-    seen_renderables = 0
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        log("No rows in RAW_DEALS.")
+        return 0
 
-    for rownum, r in enumerate(rows, start=2):
-        if rendered >= max_rows:
+    rendered = 0
+
+    for i in range(2, len(rows) + 1):  # 1-indexed in Sheets, skip header
+        if rendered >= render_max:
             break
 
-        status = safe_get(r, h["status"]).upper()
+        row = rows[i - 1]
+        def get(col: str) -> str:
+            idx = h[col]
+            return row[idx] if idx < len(row) else ""
+
+        status = (get("status") or "").strip()
+        graphic_url = (get("graphic_url") or "").strip()
+
         if status != "READY_TO_POST":
             continue
-
-        seen_renderables += 1
-
-        graphic = safe_get(r, h["graphic_url"])
-        if graphic:
-            log(f"⏭️  Row {rownum} READY_TO_POST but already has graphic_url (skip)")
+        if graphic_url:
             continue
 
-        deal_id = safe_get(r, h["deal_id"]) or f"row_{rownum}"
-        to_city = safe_get(r, h["destination_city"])
-        from_city = safe_get(r, h["origin_city"])
-        out_date = ddmmyy(safe_get(r, h["outbound_date"]))
-        in_date = ddmmyy(safe_get(r, h["return_date"]))
-        price = money_gbp(safe_get(r, h["price_gbp"]))
+        deal_id = (get("deal_id") or "").strip() or f"row{i}"
+        to_city = (get("destination_city") or "").strip()
+        from_city = (get("origin_city") or "").strip()
 
-        # Fail-loud validation
-        missing_bits = []
-        if not to_city: missing_bits.append("destination_city")
-        if not from_city: missing_bits.append("origin_city")
-        if not out_date: missing_bits.append("outbound_date")
-        if not in_date: missing_bits.append("return_date")
-        if not price: missing_bits.append("price_gbp")
+        # Hard fallback: if sheet only has IATA
+        if not to_city:
+            to_city = (get("destination_iata") or "").strip()
+        if not from_city:
+            from_city = (get("origin_iata") or "").strip()
 
-        if missing_bits:
-            err = f"Missing fields for render: {', '.join(missing_bits)}"
-            ws.batch_update([
-                {"range": a1(rownum, h["render_error"]), "values": [[err]]},
-                {"range": a1(rownum, h["render_response_snippet"]), "values": [[err]]},
-            ], value_input_option="USER_ENTERED")
-            log(f"❌ Row {rownum} cannot render: {err}")
-            continue
+        # If still IATA, translate UK origins so images look human
+        if is_iata3(from_city):
+            from_city = UK_AIRPORT_CITY_FALLBACK.get(from_city.upper(), from_city)
 
-        payload = {
-            "TO": to_city,
-            "FROM": from_city,
-            "OUT": out_date,
-            "IN": in_date,
-            "PRICE": price,
-            "DEAL_ID": deal_id,
-        }
+        out_date = ddmmyy(get("outbound_date"))
+        in_date = ddmmyy(get("return_date"))
+        price = money_gbp(get("price_gbp"))
 
-        log(f"🎨 Rendering row {rownum} payload={payload}")
+        payload = {"TO": to_city, "FROM": from_city, "OUT": out_date, "IN": in_date, "PRICE": price, "DEAL_ID": deal_id}
+        log(f"🎨 Rendering row {i} payload={payload}")
 
-        try:
-            j = render_with_backoff(render_url, payload, attempts=5)
-            snippet = j.get("_snippet", "")[:240]
-            image_url = j.get("image_url") or j.get("graphic_url") or ""
+        ok = False
+        last_snip = ""
+        last_code = 0
+        last_json: Dict[str, Any] = {}
 
-            if not image_url:
-                raise RuntimeError(f"No image_url in response :: {snippet}")
+        for attempt in range(1, 6):
+            ok, data, snip, code = post_render(render_url, payload)
+            last_snip, last_code, last_json = snip, code, data
 
-            ws.batch_update([
-                {"range": a1(rownum, h["graphic_url"]), "values": [[image_url]]},
-                {"range": a1(rownum, h["rendered_timestamp"]), "values": [[ts()]]},
-                {"range": a1(rownum, h["render_error"]), "values": [[""]]},
-                {"range": a1(rownum, h["render_response_snippet"]), "values": [[snippet]]},
-                {"range": a1(rownum, h["status"]), "values": [["READY_TO_PUBLISH"]]},
-            ], value_input_option="USER_ENTERED")
+            if ok and isinstance(data, dict) and (data.get("image_url") or data.get("graphic_url")):
+                break
 
-            rendered += 1
-            log(f"✅ Rendered row {rownum} -> {image_url}")
+            sleep_s = [0, 4, 6, 10, 16, 24][attempt]
+            log(f"⏳ Render retry {attempt}/5 in {sleep_s}s... (Render HTTP {code} :: {snip[:160]})")
+            time.sleep(sleep_s)
 
-        except Exception as e:
-            err = str(e)[:260]
-            ws.batch_update([
-                {"range": a1(rownum, h["render_error"]), "values": [[err]]},
-                {"range": a1(rownum, h["render_response_snippet"]), "values": [[err]]},
-            ], value_input_option="USER_ENTERED")
-            log(f"❌ Render failed row {rownum}: {err}")
+        # Prepare updates
+        now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        updates = {}
+        if ok:
+            image_url = (last_json.get("image_url") or last_json.get("graphic_url") or "").strip()
+            if image_url and image_url.startswith("/"):
+                image_url = f"{urlparse(render_url).scheme}://{urlparse(render_url).netloc}{image_url}"
 
-    if seen_renderables == 0:
-        log("⚠️  No rows found with status == READY_TO_POST (nothing to render).")
+            if image_url:
+                updates["graphic_url"] = image_url
+                updates["rendered_timestamp"] = now
+                updates["render_error"] = ""
+                updates["render_response_snippet"] = ""
+                updates["status"] = "READY_TO_PUBLISH"
+                rendered += 1
+            else:
+                updates["render_error"] = f"Render OK but no image_url/graphic_url in JSON (HTTP {last_code})"
+                updates["render_response_snippet"] = (json.dumps(last_json)[:300] if last_json else last_snip[:300])
+        else:
+            updates["render_error"] = f"Render HTTP {last_code}"
+            updates["render_response_snippet"] = last_snip[:300]
+
+        # Write updates (single row, multiple cells)
+        for col, val in updates.items():
+            cidx = h[col] + 1
+            ws.update_cell(i, cidx, val)
+
+        if not ok or "graphic_url" not in updates:
+            log(f"❌ Render failed row {i}: {updates.get('render_error','unknown')} :: {updates.get('render_response_snippet','')[:140]}")
+        else:
+            log(f"✅ Rendered row {i} -> READY_TO_PUBLISH")
 
     log(f"Done. Rendered {rendered}.")
     return 0

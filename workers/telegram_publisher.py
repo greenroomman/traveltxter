@@ -8,27 +8,22 @@ AM (RUN_SLOT=AM):
   promotes: POSTED_INSTAGRAM -> POSTED_TELEGRAM_VIP
 
 PM (RUN_SLOT=PM):
-  consumes: status == POSTED_TELEGRAM_VIP
-  posts FREE only if posted_telegram_vip_at <= now - 24h
+  consumes: status == POSTED_TELEGRAM_VIP AND posted_telegram_vip_at <= now-24h
   writes:   posted_telegram_free_at
   promotes: POSTED_TELEGRAM_VIP -> POSTED_ALL
 
-Key fixes:
-- Template matches your definitive formats (VIP + FREE)
-- No trailing separator line
-- TO is UPPERCASE; FROM is Title Case
-- Uses HTML hyperlinks (parse_mode=HTML)
-- Picks "latest & greatest" (by deal_score then recency), not top row
+Key rules:
+- NO weird trailing line: disable_web_page_preview=True
+- Headline destination is Title Case (Budapest), but TO: stays UPPER (BUDAPEST)
+- Uses Telegram HTML hyperlinks for booking + upgrades
 """
 
 from __future__ import annotations
 
 import os
 import json
-import re
-import time
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 import gspread
@@ -51,20 +46,8 @@ def log(msg: str) -> None:
 def env_str(k: str, default: str = "") -> str:
     return (os.environ.get(k, default) or "").strip()
 
-def env_int(k: str, default: int) -> int:
-    try:
-        return int(env_str(k, str(default)))
-    except Exception:
-        return default
-
 def clean_url(u: str) -> str:
     return (u or "").strip().replace(" ", "")
-
-def utcnow() -> dt.datetime:
-    return dt.datetime.utcnow()
-
-def iso_now() -> str:
-    return utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 # -----------------------------
@@ -79,9 +62,9 @@ def _parse_sa_json(raw: str) -> Dict[str, Any]:
         return json.loads(raw.replace("\\n", "\n"))
 
 def gs_client():
-    raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
+    raw = env_str("GCP_SA_JSON_ONE_LINE")
     if not raw:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE")
     info = _parse_sa_json(raw)
     creds = Credentials.from_service_account_info(
         info,
@@ -117,144 +100,110 @@ def tg_send(bot_token: str, chat_id: str, html_text: str) -> None:
             "chat_id": chat_id,
             "text": html_text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": False,
+            "disable_web_page_preview": True,   # <- kills the weird preview line
         },
         timeout=30,
     )
     if r.status_code >= 400:
-        raise RuntimeError(f"Telegram send failed HTTP {r.status_code}: {r.text[:400]}")
+        raise RuntimeError(f"Telegram send failed HTTP {r.status_code}: {r.text[:200]}")
 
-def html_escape(s: str) -> str:
-    s = s or ""
-    return (s.replace("&", "&amp;")
-             .replace("<", "&lt;")
-             .replace(">", "&gt;")
-             .replace('"', "&quot;"))
 
-def title_case_city(s: str) -> str:
-    s = (s or "").strip()
+# -----------------------------
+# Copy helpers
+# -----------------------------
+
+FLAG_MAP = {
+    "ICELAND": "🇮🇸",
+    "SPAIN": "🇪🇸",
+    "PORTUGAL": "🇵🇹",
+    "FRANCE": "🇫🇷",
+    "ITALY": "🇮🇹",
+    "GREECE": "🇬🇷",
+    "MOROCCO": "🇲🇦",
+    "TURKEY": "🇹🇷",
+    "THAILAND": "🇹🇭",
+    "JAPAN": "🇯🇵",
+    "USA": "🇺🇸",
+    "UNITED STATES": "🇺🇸",
+    "HUNGARY": "🇭🇺",
+    "CANADA": "🇨🇦",
+}
+
+def country_flag(country: str) -> str:
+    c = (country or "").strip().upper()
+    return FLAG_MAP.get(c, "")
+
+def title_case_city(x: str) -> str:
+    s = (x or "").strip()
     if not s:
         return ""
-    # Keep common airport-city words sane
-    return " ".join([w[:1].upper() + w[1:].lower() for w in s.split()])
-
-def upper_city(s: str) -> str:
-    return (s or "").strip().upper()
-
-def pick_flag(country: str) -> str:
-    # If you already have a flag column, use it; otherwise use the country name and a tiny mapping.
-    # Safe default: no emoji other than flags (you asked for that rule elsewhere).
-    c = (country or "").strip().lower()
-    flags = {
-        "iceland": "🇮🇸",
-        "thailand": "🇹🇭",
-        "hungary": "🇭🇺",
-        "spain": "🇪🇸",
-        "portugal": "🇵🇹",
-        "france": "🇫🇷",
-        "italy": "🇮🇹",
-        "greece": "🇬🇷",
-        "morocco": "🇲🇦",
-        "turkey": "🇹🇷",
-        "canada": "🇨🇦",
-        "united states": "🇺🇸",
-        "usa": "🇺🇸",
-        "mexico": "🇲🇽",
-        "japan": "🇯🇵",
-    }
-    return flags.get(c, "")
-
-def safe_float(s: str) -> Optional[float]:
-    try:
-        x = (s or "").strip().replace("£", "").replace(",", "")
-        return float(x) if x else None
-    except Exception:
-        return None
-
-def fmt_price_gbp(price_gbp: str) -> str:
-    # Your template shows £103.35 etc. Keep 2dp if present; otherwise format.
-    p = (price_gbp or "").strip()
-    if not p:
-        return ""
-    if p.startswith("£"):
-        return p
-    f = safe_float(p)
-    if f is None:
-        return p
-    return f"£{f:.2f}"
-
-def parse_iso(ts: str) -> Optional[dt.datetime]:
-    ts = (ts or "").strip()
-    if not ts:
-        return None
-    try:
-        return dt.datetime.fromisoformat(ts.replace("Z", ""))
-    except Exception:
-        return None
+    # Keep hyphens and accents reasonably intact
+    return " ".join([w[:1].upper() + w[1:].lower() if w else "" for w in s.split(" ")]).strip()
 
 
 def build_vip_message(row: Dict[str, str]) -> str:
-    price = fmt_price_gbp(row.get("price_gbp", ""))
-    country = row.get("destination_country", "").strip()
-    flag = pick_flag(country)
-    dest = upper_city(row.get("destination_city") or row.get("destination_iata") or "")
-    origin = title_case_city(row.get("origin_city") or row.get("origin_iata") or "")
-    out_d = (row.get("outbound_date") or "").strip()
-    ret_d = (row.get("return_date") or "").strip()
+    price = (row.get("price_gbp", "") or "").strip().replace("£", "")
+    country = (row.get("destination_country", "") or "").strip()
+    flag = country_flag(country)
 
-    phrase = (row.get("phrase") or row.get("why_good") or row.get("ai_notes") or "").strip()
+    dest_city_raw = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
+    origin_city_raw = (row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip()
 
-    booking = clean_url(row.get("booking_link_vip") or row.get("affiliate_url") or "")
-    booking_html = f'<a href="{html_escape(booking)}">Booking link</a>' if booking else ""
+    dest_headline = title_case_city(dest_city_raw)
+    dest_upper = dest_city_raw.upper()
+    origin_title = title_case_city(origin_city_raw)
 
+    out_d = (row.get("outbound_date", "") or "").strip()
+    ret_d = (row.get("return_date", "") or "").strip()
+
+    phrase = (row.get("phrase_bank", "") or "").strip()
+    booking = clean_url(row.get("booking_link_vip", "") or row.get("affiliate_url", "") or "")
+
+    # VIP template (your spec)
     lines = []
-    head = f"{html_escape(price)} to {html_escape(country)} {flag}".strip()
-    lines.append(head)
-    lines.append(f"TO: {html_escape(dest)}")
-    lines.append(f"FROM: {html_escape(origin)}")
-    lines.append(f"OUT: {html_escape(out_d)}")
-    lines.append(f"BACK: {html_escape(ret_d)}")
-
+    lines.append(f"£{price} to {country}{(' ' + flag) if flag else ''}".strip())
+    lines.append(f"TO: {dest_upper}")
+    lines.append(f"FROM: {origin_title}")
+    lines.append(f"OUT:  {out_d}")
+    lines.append(f"BACK: {ret_d}")
+    lines.append("")
     if phrase:
+        lines.append(phrase)
         lines.append("")
-        lines.append(html_escape(phrase))
-
-    if booking_html:
-        lines.append("")
-        lines.append(booking_html)
-
-    return "\n".join([l for l in lines if l is not None])
+    if booking:
+        lines.append(f'<a href="{booking}">BOOKING LINK</a>')
+    return "\n".join([ln for ln in lines if ln is not None]).strip()
 
 
 def build_free_message(row: Dict[str, str], stripe_monthly: str, stripe_yearly: str) -> str:
-    price = fmt_price_gbp(row.get("price_gbp", ""))
-    country = row.get("destination_country", "").strip()
-    flag = pick_flag(country)
-    dest = upper_city(row.get("destination_city") or row.get("destination_iata") or "")
-    origin = title_case_city(row.get("origin_city") or row.get("origin_iata") or "")
-    out_d = (row.get("outbound_date") or "").strip()
-    ret_d = (row.get("return_date") or "").strip()
+    price = (row.get("price_gbp", "") or "").strip().replace("£", "")
+    country = (row.get("destination_country", "") or "").strip()
+    flag = country_flag(country)
 
-    phrase = (row.get("phrase") or row.get("why_good") or row.get("ai_notes") or "").strip()
+    dest_city_raw = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
+    origin_city_raw = (row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip()
+
+    dest_upper = dest_city_raw.upper()
+    origin_title = title_case_city(origin_city_raw)
+
+    out_d = (row.get("outbound_date", "") or "").strip()
+    ret_d = (row.get("return_date", "") or "").strip()
+
+    phrase = (row.get("phrase_bank", "") or "").strip()
 
     m = clean_url(stripe_monthly)
     y = clean_url(stripe_yearly)
-    monthly_link = f'<a href="{html_escape(m)}">Upgrade now (Monthly)</a>' if m else ""
-    yearly_link = f'<a href="{html_escape(y)}">Upgrade now (Annual)</a>' if y else ""
 
     lines = []
-    head = f"{html_escape(price)} to {html_escape(country)} {flag}".strip()
-    lines.append(head)
-    lines.append(f"TO: {html_escape(dest)}")
-    lines.append(f"FROM: {html_escape(origin)}")
-    lines.append(f"OUT: {html_escape(out_d)}")
-    lines.append(f"BACK: {html_escape(ret_d)}")
-
-    if phrase:
-        lines.append("")
-        lines.append(html_escape(phrase))
-
+    lines.append(f"£{price} to {country}{(' ' + flag) if flag else ''}".strip())
+    lines.append(f"TO: {dest_upper}")
+    lines.append(f"FROM: {origin_title}")
+    lines.append(f"OUT:  {out_d}")
+    lines.append(f"BACK: {ret_d}")
     lines.append("")
+    if phrase:
+        lines.append(phrase)
+        lines.append("")
     lines.append("Want instant access?")
     lines.append("Join TravelTxter for early access")
     lines.append("")
@@ -264,177 +213,146 @@ def build_free_message(row: Dict[str, str], stripe_monthly: str, stripe_yearly: 
     lines.append("• Exclusive mistake fares")
     lines.append("• £3 p/m or £30 p/a")
     lines.append("• Cancel anytime")
-
-    if monthly_link or yearly_link:
-        lines.append("")
-        if monthly_link:
-            lines.append(monthly_link)
-        if yearly_link:
-            lines.append(yearly_link)
-
-    return "\n".join(lines)
+    lines.append("")
+    # Hyperlinks (only include if present)
+    if m:
+        lines.append(f'<a href="{m}">Upgrade now (Monthly)</a>')
+    if y:
+        lines.append(f'<a href="{y}">Upgrade now (Yearly)</a>')
+    return "\n".join(lines).strip()
 
 
-def row_to_dict(headers: List[str], r: List[str]) -> Dict[str, str]:
-    d: Dict[str, str] = {}
-    for i, h in enumerate(headers):
-        d[h] = (r[i] if i < len(r) else "") or ""
-    return d
+def parse_iso_z(s: str) -> Optional[dt.datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        # "2026-01-07T07:53:14Z" or without Z
+        if s.endswith("Z"):
+            s = s[:-1]
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 
-def choose_best_candidate(
-    candidates: List[Tuple[int, Dict[str, str]]],
-    run_slot: str,
-) -> Optional[Tuple[int, Dict[str, str]]]:
-    """
-    Pick "latest & greatest":
-    - Primary: deal_score desc
-    - Secondary: scored_timestamp desc
-    - Fallback: created_at desc
-    """
-    def score_key(item):
-        rownum, row = item
-        ds = safe_float(row.get("deal_score", "")) or 0.0
-        scored = parse_iso(row.get("scored_timestamp", "")) or dt.datetime(1970, 1, 1)
-        created = parse_iso(row.get("created_at", "")) or parse_iso(row.get("timestamp", "")) or dt.datetime(1970, 1, 1)
-        return (ds, scored, created, -rownum)
-
-    candidates_sorted = sorted(candidates, key=score_key, reverse=True)
-    return candidates_sorted[0] if candidates_sorted else None
-
+# -----------------------------
+# Main
+# -----------------------------
 
 def main() -> int:
     run_slot = env_str("RUN_SLOT", "AM").upper()
     spreadsheet_id = env_str("SPREADSHEET_ID")
-    raw_tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-
-    if not spreadsheet_id:
-        raise RuntimeError("Missing SPREADSHEET_ID")
-
-    # Routing based on slot
-    if run_slot == "AM":
-        bot_token = env_str("TELEGRAM_BOT_TOKEN_VIP")
-        chat_id = env_str("TELEGRAM_CHANNEL_VIP")
-        consume_status = "POSTED_INSTAGRAM"
-        promote_status = "POSTED_TELEGRAM_VIP"
-        is_vip = True
-    else:
-        bot_token = env_str("TELEGRAM_BOT_TOKEN")
-        chat_id = env_str("TELEGRAM_CHANNEL")
-        consume_status = "POSTED_TELEGRAM_VIP"
-        promote_status = "POSTED_ALL"
-        is_vip = False
-
-    if not bot_token or not chat_id:
-        raise RuntimeError(f"Missing Telegram creds for RUN_SLOT={run_slot}")
+    tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
 
     stripe_monthly = env_str("STRIPE_MONTHLY_LINK")
     stripe_yearly = env_str("STRIPE_YEARLY_LINK")
 
+    if not spreadsheet_id:
+        raise RuntimeError("Missing SPREADSHEET_ID")
+
+    # Tokens/channels
+    bot_vip = env_str("TELEGRAM_BOT_TOKEN_VIP")
+    chan_vip = env_str("TELEGRAM_CHANNEL_VIP")
+    bot_free = env_str("TELEGRAM_BOT_TOKEN")
+    chan_free = env_str("TELEGRAM_CHANNEL")
+
+    if run_slot == "AM" and (not bot_vip or not chan_vip):
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN_VIP or TELEGRAM_CHANNEL_VIP")
+    if run_slot == "PM" and (not bot_free or not chan_free):
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL")
+
     gc = gs_client()
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(raw_tab)
+    ws = sh.worksheet(tab)
 
-    required_cols = [
+    required = [
         "status",
-        "deal_id",
         "price_gbp",
-        "destination_country",
-        "destination_city",
+        "origin_iata",
         "destination_iata",
         "origin_city",
-        "origin_iata",
+        "destination_city",
+        "destination_country",
         "outbound_date",
         "return_date",
-        "deal_score",
-        "scored_timestamp",
-        "created_at",
-        "timestamp",
         "affiliate_url",
         "booking_link_vip",
+        "phrase_bank",
         "posted_instagram_at",
         "posted_telegram_vip_at",
         "posted_telegram_free_at",
-        "ai_notes",
-        "phrase",
-        "why_good",
     ]
-    ensure_columns(ws, required_cols)
+    h = ensure_columns(ws, required)
 
-    values = ws.get_all_values()
-    headers = [h.strip() for h in values[0]]
-    rows = values[1:]
-    h = {name: i for i, name in enumerate(headers)}
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        log("No rows.")
+        return 0
 
-    candidates: List[Tuple[int, Dict[str, str]]] = []
+    now_dt = dt.datetime.utcnow().replace(microsecond=0)
+    now_z = now_dt.isoformat() + "Z"
 
-    now = utcnow()
-    vip_age_hours_required = 24.0
+    if run_slot == "AM":
+        consume_status = "POSTED_INSTAGRAM"
+        promote_status = "POSTED_TELEGRAM_VIP"
+        ts_col = "posted_telegram_vip_at"
+    else:
+        consume_status = "POSTED_TELEGRAM_VIP"
+        promote_status = "POSTED_ALL"
+        ts_col = "posted_telegram_free_at"
 
-    for rownum, r in enumerate(rows, start=2):
-        status = (r[h["status"]] if h["status"] < len(r) else "").strip().upper()
-        if status != consume_status:
+    # Find first eligible row (deterministic)
+    target_row_idx = None
+    target_row_vals = None
+
+    for i in range(2, len(rows) + 1):
+        vals = rows[i - 1]
+        status = (vals[h["status"]] if h["status"] < len(vals) else "").strip()
+
+        # already posted in this slot?
+        ts_val = (vals[h[ts_col]] if h[ts_col] < len(vals) else "").strip()
+        if status != consume_status or ts_val:
             continue
 
-        row = row_to_dict(headers, r)
-
-        # PM rule: only release FREE if VIP is at least 24h old
-        if run_slot != "AM":
-            vip_ts = parse_iso(row.get("posted_telegram_vip_at", ""))
-            if not vip_ts:
+        # PM gate: VIP must be >= 24h ago
+        if run_slot == "PM":
+            vip_ts = (vals[h["posted_telegram_vip_at"]] if h["posted_telegram_vip_at"] < len(vals) else "").strip()
+            vip_dt = parse_iso_z(vip_ts)
+            if not vip_dt:
                 continue
-            age_hours = (now - vip_ts).total_seconds() / 3600.0
-            if age_hours < vip_age_hours_required:
+            if (now_dt - vip_dt) < dt.timedelta(hours=24):
                 continue
 
-        candidates.append((rownum, row))
+        target_row_idx = i
+        target_row_vals = vals
+        break
 
-    if not candidates:
-        log(f"⏭️  No eligible rows for RUN_SLOT={run_slot} (consume_status={consume_status}).")
+    if not target_row_idx:
+        if run_slot == "PM":
+            log("Done. Telegram posted 0. (No rows eligible for FREE: status=POSTED_TELEGRAM_VIP and VIP>= 24h ago)")
+        else:
+            log(f"Done. Telegram posted 0. (No rows with status={consume_status})")
         return 0
 
-    chosen = choose_best_candidate(candidates, run_slot)
-    if not chosen:
-        log("⏭️  No eligible candidate after ranking.")
-        return 0
+    # Build row dict
+    row: Dict[str, str] = {}
+    for col, idx in h.items():
+        row[col] = target_row_vals[idx] if idx < len(target_row_vals) else ""
 
-    rownum, row = chosen
-    deal_id = (row.get("deal_id") or "").strip()
-
-    if is_vip:
+    # Send
+    if run_slot == "AM":
         msg = build_vip_message(row)
+        tg_send(bot_vip, chan_vip, msg)
     else:
         msg = build_free_message(row, stripe_monthly=stripe_monthly, stripe_yearly=stripe_yearly)
+        tg_send(bot_free, chan_free, msg)
 
-    log(f"📨 Telegram posting {('VIP' if is_vip else 'FREE')} row {rownum} deal_id={deal_id}")
-    tg_send(bot_token, chat_id, msg)
+    # Write back
+    ws.update_cell(target_row_idx, h[ts_col] + 1, now_z)
+    ws.update_cell(target_row_idx, h["status"] + 1, promote_status)
 
-    # Promote status + timestamps
-    batch = []
-    if is_vip:
-        if "posted_telegram_vip_at" in h:
-            batch.append({"range": a1(rownum, h["posted_telegram_vip_at"]), "values": [[iso_now()]]})
-    else:
-        if "posted_telegram_free_at" in h:
-            batch.append({"range": a1(rownum, h["posted_telegram_free_at"]), "values": [[iso_now()]]})
-
-    batch.append({"range": a1(rownum, h["status"]), "values": [[promote_status]]})
-
-    ws.batch_update(batch, value_input_option="USER_ENTERED")
-    log(f"✅ Telegram posted 1. Row {rownum} -> {promote_status}")
+    log(f"✅ Telegram posted 1. Row {target_row_idx} -> {promote_status}")
     return 0
-
-
-def col_letter(n1: int) -> str:
-    s = ""
-    n = n1
-    while n:
-        n, rr = divmod(n - 1, 26)
-        s = chr(65 + rr) + s
-    return s
-
-def a1(rownum: int, col0: int) -> str:
-    return f"{col_letter(col0 + 1)}{rownum}"
 
 
 if __name__ == "__main__":

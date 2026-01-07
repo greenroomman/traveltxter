@@ -2,23 +2,17 @@ name: TravelTxter V4.5x Pipeline
 
 on:
   workflow_dispatch:
-    inputs:
-      run_slot:
-        description: "AM or PM"
-        required: false
-        default: "AM"
   schedule:
     - cron: "30 7 * * *"
     - cron: "30 16 * * *"
 
 concurrency:
-  group: traveltxter-v45x
-  cancel-in-progress: true
+  group: v45x-pipeline
+  cancel-in-progress: false
 
 jobs:
   pipeline:
-    runs-on: ubuntu-24.04
-
+    runs-on: ubuntu-latest
     env:
       PYTHONPATH: ${{ github.workspace }}
 
@@ -39,16 +33,13 @@ jobs:
       - name: Resolve RUN_SLOT
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            SLOT="${{ inputs.run_slot }}"
+          HOUR=$(date -u +%H)
+          if [ "$HOUR" -lt "12" ]; then
+            echo "RUN_SLOT=AM" >> $GITHUB_ENV
           else
-            if [ "${{ github.event.schedule }}" = "30 7 * * *" ]; then
-              SLOT="AM"
-            else
-              SLOT="PM"
-            fi
+            echo "RUN_SLOT=PM" >> $GITHUB_ENV
           fi
-          echo "RUN_SLOT=$SLOT" >> $GITHUB_ENV
+          echo "Resolved RUN_SLOT=$RUN_SLOT"
 
       # ================= AM RUN =================
 
@@ -111,6 +102,17 @@ jobs:
           STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
           STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
 
+      - name: Promotion Logger (Instagram)
+        if: env.RUN_SLOT == 'AM'
+        run: python workers/promotion_logger.py
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          PROMOTION_QUEUE_TAB: PROMOTION_QUEUE
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          POSTED_CHANNEL: INSTAGRAM
+          PROMO_LOGGER_MAX_ROWS: 50
+
       - name: Telegram VIP
         if: env.RUN_SLOT == 'AM'
         run: python workers/telegram_publisher.py
@@ -123,6 +125,17 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           RUN_SLOT: AM
+
+      - name: Promotion Logger (Telegram VIP)
+        if: env.RUN_SLOT == 'AM'
+        run: python workers/promotion_logger.py
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          PROMOTION_QUEUE_TAB: PROMOTION_QUEUE
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          POSTED_CHANNEL: TELEGRAM_VIP
+          PROMO_LOGGER_MAX_ROWS: 50
 
       # ================= PM RUN =================
 
@@ -137,6 +150,17 @@ jobs:
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
           TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+          RUN_SLOT: PM
           STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
           STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
-          RUN_SLOT: PM
+
+      - name: Promotion Logger (Telegram FREE)
+        if: env.RUN_SLOT == 'PM'
+        run: python workers/promotion_logger.py
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          PROMOTION_QUEUE_TAB: PROMOTION_QUEUE
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          POSTED_CHANNEL: TELEGRAM_FREE
+          PROMO_LOGGER_MAX_ROWS: 50

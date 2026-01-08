@@ -1,176 +1,133 @@
-name: TravelTxter V4.5x Pipeline
+#!/usr/bin/env python3
+# TravelTxter – Feeder v1 (Theme-Adhered Broad Net)
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "30 7 * * *"
-    - cron: "30 16 * * *"
+import os, json, math, random, datetime as dt, requests, gspread
+from google.oauth2.service_account import Credentials
 
-concurrency:
-  group: v45x-pipeline
-  cancel-in-progress: false
+def log(m): print(f"{dt.datetime.utcnow().isoformat()}Z | {m}", flush=True)
 
-jobs:
-  pipeline:
-    runs-on: ubuntu-latest
-    env:
-      PYTHONPATH: ${{ github.workspace }}
+# ---------- ENV ----------
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY")
+RAW_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
+ROUTES_PER_RUN = int(os.getenv("DUFFEL_ROUTES_PER_RUN", "2"))
+SEARCHES_PER_RUN = int(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "2"))
+MAX_INSERTS = int(os.getenv("DUFFEL_MAX_INSERTS", "6"))
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+# ---------- AUTH ----------
+creds = Credentials.from_service_account_info(
+    json.loads(os.getenv("GCP_SA_JSON_ONE_LINE")),
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
+gc = gspread.authorize(creds)
+sh = gc.open_by_key(SPREADSHEET_ID)
+raw = sh.worksheet(RAW_TAB)
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+# ---------- HELPERS ----------
+def today_theme():
+    try:
+        ws = sh.worksheet("THEMES")
+        rows = ws.get_all_records()
+        dow = ["MON","TUE","WED","THU","FRI","SAT","SUN"][dt.datetime.utcnow().weekday()]
+        for r in rows:
+            if r.get("day") == dow:
+                return r.get("theme","CITY")
+    except: pass
+    return "CITY"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+THEME_DESTS = {
+    "SNOW": ["GVA","INN","SZG","MUC","ZRH","BGY"],
+    "SURF": ["FAO","AGA","FUE","ACE","TFS"],
+    "SUMMER": ["PMI","BCN","LIS","OPO","NAP"],
+    "CITY": ["BCN","PRG","BUD","KRK","AMS"],
+    "WINTER_SUN": ["TFS","LPA","RAK","AGA","FNC"]
+}
 
-      # ✅ FIXED: RUN_SLOT is set AND visible in this step AND exported for later steps
-      - name: Resolve RUN_SLOT
-        shell: bash
-        run: |
-          HOUR=$(date -u +%H)
+ORIGINS = ["BRS","LGW","STN","MAN","BHX"]
 
-          if [ "$HOUR" -lt "12" ]; then
-            RUN_SLOT="AM"
-          else
-            RUN_SLOT="PM"
-          fi
+def pick_dates():
+    out = dt.date.today() + dt.timedelta(days=random.randint(30,90))
+    ret = out + dt.timedelta(days=random.randint(3,7))
+    return out.isoformat(), ret.isoformat()
 
-          echo "RUN_SLOT=$RUN_SLOT" >> $GITHUB_ENV
-          echo "Resolved RUN_SLOT=$RUN_SLOT (UTC hour=$HOUR)"
+def duffel_search(o,d,od,rd):
+    r = requests.post(
+        "https://api.duffel.com/air/offer_requests",
+        headers={
+            "Authorization": f"Bearer {DUFFEL_API_KEY}",
+            "Duffel-Version": "v2",
+            "Content-Type": "application/json"
+        },
+        json={
+            "data":{
+                "slices":[
+                    {"origin":o,"destination":d,"departure_date":od},
+                    {"origin":d,"destination":o,"departure_date":rd}
+                ],
+                "passengers":[{"type":"adult"}],
+                "cabin_class":"economy"
+            }
+        },
+        timeout=30
+    )
+    r.raise_for_status()
+    return r.json().get("data",{}).get("offers",[])
 
-      # ✅ This makes it obvious which branch is active
-      - name: Show run mode
-        shell: bash
-        run: |
-          echo "RUN_SLOT from env is: $RUN_SLOT"
+# ---------- MAIN ----------
+theme = today_theme()
+log(f"Theme today: {theme}")
 
-      # ================= AM RUN =================
+dests = THEME_DESTS.get(theme, THEME_DESTS["CITY"])
+random.shuffle(dests)
+random.shuffle(ORIGINS)
 
-      - name: Feeder
-        if: env.RUN_SLOT == 'AM'
-        run: python workers/pipeline_worker.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
-          DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
-          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
+routes = []
+for o in ORIGINS:
+    for d in dests:
+        if o!=d:
+            routes.append((o,d))
+routes = routes[:ROUTES_PER_RUN]
 
-      - name: Scorer
-        if: env.RUN_SLOT == 'AM'
-        run: python workers/ai_scorer.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          WINNERS_PER_RUN: ${{ vars.WINNERS_PER_RUN }}
-          DEST_REPEAT_PENALTY: ${{ vars.DEST_REPEAT_PENALTY }}
-          VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
+inserted = 0
+searched = 0
 
-      - name: Link Router
-        if: env.RUN_SLOT == 'AM'
-        run: python workers/link_router.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
+for o,d in routes:
+    if searched >= SEARCHES_PER_RUN or inserted >= MAX_INSERTS:
+        break
 
-      - name: Render
-        if: env.RUN_SLOT == 'AM'
-        run: python workers/render_client.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          RENDER_URL: ${{ secrets.RENDER_URL }}
-          RENDER_MAX_ROWS: 1
+    od, rd = pick_dates()
+    log(f"Search {o}->{d} {od}/{rd}")
 
-      - name: Cooldown
-        if: env.RUN_SLOT == 'AM'
-        run: sleep 20
+    try:
+        offers = duffel_search(o,d,od,rd)
+        searched += 1
+    except Exception as e:
+        log(f"Duffel error {o}->{d}: {e}")
+        continue
 
-      - name: Instagram
-        if: env.RUN_SLOT == 'AM'
-        run: python workers/instagram_publisher.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
-          STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
+    if not offers:
+        log(f"No offers {o}->{d}")
+        continue
 
-      - name: Promotion Logger (Instagram)
-        if: env.RUN_SLOT == 'AM'
-        run: python workers/promotion_logger.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          PROMOTION_QUEUE_TAB: PROMOTION_QUEUE
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          POSTED_CHANNEL: INSTAGRAM
-          PROMO_LOGGER_MAX_ROWS: 50
+    offers = sorted(offers, key=lambda x: float(x["total_amount"]))[:3]
 
-      - name: Telegram VIP
-        if: env.RUN_SLOT == 'AM'
-        run: python workers/telegram_publisher.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          RUN_SLOT: AM
+    for off in offers:
+        if inserted >= MAX_INSERTS: break
+        price = off["total_amount"]
 
-      - name: Promotion Logger (Telegram VIP)
-        if: env.RUN_SLOT == 'AM'
-        run: python workers/promotion_logger.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          PROMOTION_QUEUE_TAB: PROMOTION_QUEUE
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          POSTED_CHANNEL: TELEGRAM_VIP
-          PROMO_LOGGER_MAX_ROWS: 50
+        raw.append_row([
+            "NEW",
+            str(abs(hash(f"{o}{d}{od}{price}"))),
+            o, d,
+            "", "", "",
+            od, rd,
+            price, "GBP",
+            len(off["slices"][0]["segments"])-1,
+            theme,
+            dt.datetime.utcnow().isoformat()+"Z"
+        ], value_input_option="USER_ENTERED")
 
-      # ================= PM RUN =================
+        inserted += 1
+        log(f"Inserted {o}->{d} £{price}")
 
-      - name: Telegram FREE
-        if: env.RUN_SLOT == 'PM'
-        run: python workers/telegram_publisher.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
-          RUN_SLOT: PM
-          STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
-          STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
-
-      - name: Promotion Logger (Telegram FREE)
-        if: env.RUN_SLOT == 'PM'
-        run: python workers/promotion_logger.py
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          PROMOTION_QUEUE_TAB: PROMOTION_QUEUE
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          POSTED_CHANNEL: TELEGRAM_FREE
-          PROMO_LOGGER_MAX_ROWS: 50
+log(f"DONE searches={searched} inserted={inserted}")

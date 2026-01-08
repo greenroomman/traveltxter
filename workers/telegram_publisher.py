@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — telegram_publisher.py (LOCKED + BEST PICK)
+TravelTxter V4.5x — telegram_publisher.py (BEST PICK + METADATA FIX)
+
+Fix:
+- If destination_city is IATA (e.g., FNC) or country blank, resolve using CONFIG_SIGNALS.
+- Do NOT shout in ALL CAPS for city names.
+- If still missing destination metadata, dead-letter the row (ERROR_HARD) so it can't loop.
 
 AM (RUN_SLOT=AM):
   consumes: status == POSTED_INSTAGRAM
@@ -11,13 +16,6 @@ PM (RUN_SLOT=PM):
   consumes: status == POSTED_TELEGRAM_VIP AND posted_telegram_vip_at <= now-24h
   writes:   posted_telegram_free_at
   promotes: POSTED_TELEGRAM_VIP -> POSTED_ALL
-
-Best selection:
-- Picks best eligible row by:
-  1) deal_score (desc)
-  2) scored_timestamp (desc)
-  3) created_at / timestamp (desc)
-  4) row number (desc)
 """
 
 from __future__ import annotations
@@ -25,307 +23,306 @@ from __future__ import annotations
 import os
 import json
 import datetime as dt
+import time
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
 
 
-# -----------------------------
-# Logging
-# -----------------------------
+IATA_RE = re.compile(r"^[A-Z]{3}$")
+
 
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     print(f"{ts} | {msg}", flush=True)
 
-
-# -----------------------------
-# Env
-# -----------------------------
+def ts() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def env_str(k: str, default: str = "") -> str:
     return (os.environ.get(k, default) or "").strip()
 
-def clean_url(u: str) -> str:
-    return (u or "").strip().replace(" ", "")
-
-def utcnow() -> dt.datetime:
-    return dt.datetime.utcnow()
-
-def iso_now() -> str:
-    return utcnow().replace(microsecond=0).isoformat() + "Z"
+def env_int(k: str, default: int) -> int:
+    try:
+        return int(env_str(k, str(default)))
+    except Exception:
+        return default
 
 
 # -----------------------------
 # Sheets auth
 # -----------------------------
 
-def _parse_sa_json(raw: str) -> Dict[str, Any]:
+def _extract_sa(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
+    except Exception:
         return json.loads(raw.replace("\\n", "\n"))
 
-def gs_client():
-    raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
-    if not raw:
+def get_client() -> gspread.Client:
+    sa_raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
+    if not sa_raw:
         raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-    info = _parse_sa_json(raw)
+    info = _extract_sa(sa_raw)
     creds = Credentials.from_service_account_info(
         info,
         scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
     )
     return gspread.authorize(creds)
 
-def ensure_columns(ws, required_cols: List[str]) -> Dict[str, int]:
-    headers = ws.row_values(1)
-    if not headers:
-        ws.update([required_cols], "A1")
-        headers = required_cols[:]
-        log(f"🛠️  Initialised headers for {ws.title}")
-
-    headers = [h.strip() for h in headers]
-    missing = [c for c in required_cols if c not in headers]
-    if missing:
-        headers = headers + missing
-        ws.update([headers], "A1")
-        log(f"🛠️  Added missing columns: {missing}")
-    return {h: i for i, h in enumerate(headers)}
-
-
-# -----------------------------
-# Telegram
-# -----------------------------
-
-def tg_send(bot_token: str, chat_id: str, html_text: str) -> None:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    r = requests.post(
-        url,
-        json={
-            "chat_id": chat_id,
-            "text": html_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,  # <- kills the “weird line”
-        },
-        timeout=30,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(f"Telegram send failed HTTP {r.status_code}: {r.text[:300]}")
+def open_sheet_with_backoff(gc: gspread.Client, spreadsheet_id: str, attempts: int = 8) -> gspread.Spreadsheet:
+    delay = 4.0
+    for i in range(1, attempts + 1):
+        try:
+            return gc.open_by_key(spreadsheet_id)
+        except APIError as e:
+            msg = str(e)
+            if "429" in msg or "Quota exceeded" in msg:
+                log(f"⏳ Sheets quota (429). Retry {i}/{attempts} in {int(delay)}s...")
+                time.sleep(delay)
+                delay = min(delay * 1.6, 45.0)
+                continue
+            raise
+    raise RuntimeError("Sheets quota still exceeded after retries (429). Try again shortly.")
 
 
 # -----------------------------
-# Formatting helpers
+# A1 helpers
 # -----------------------------
 
-FLAG_MAP = {
-    "ICELAND": "🇮🇸",
-    "SPAIN": "🇪🇸",
-    "PORTUGAL": "🇵🇹",
-    "FRANCE": "🇫🇷",
-    "ITALY": "🇮🇹",
-    "GREECE": "🇬🇷",
-    "MOROCCO": "🇲🇦",
-    "TURKEY": "🇹🇷",
-    "THAILAND": "🇹🇭",
-    "JAPAN": "🇯🇵",
-    "USA": "🇺🇸",
-    "UNITED STATES": "🇺🇸",
-    "HUNGARY": "🇭🇺",
-    "CANADA": "🇨🇦",
-    "MEXICO": "🇲🇽",
+def col_letter(n1: int) -> str:
+    s = ""
+    n = n1
+    while n:
+        n, rr = divmod(n - 1, 26)
+        s = chr(65 + rr) + s
+    return s
+
+def a1(rownum: int, col0: int) -> str:
+    return f"{col_letter(col0 + 1)}{rownum}"
+
+
+# -----------------------------
+# Sheet helpers
+# -----------------------------
+
+def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
+    missing = [c for c in required if c not in headers]
+    if not missing:
+        return headers
+    ws.update([headers + missing], "A1")
+    log(f"🛠️  Added missing columns: {missing}")
+    return headers + missing
+
+def safe_get(row: List[str], idx: int) -> str:
+    return row[idx].strip() if 0 <= idx < len(row) else ""
+
+
+# -----------------------------
+# Metadata enrichment (CONFIG_SIGNALS)
+# -----------------------------
+
+def is_iata3(s: str) -> bool:
+    return bool(IATA_RE.match((s or "").strip().upper()))
+
+UK_AIRPORT_CITY_FALLBACK = {
+    "LHR": "London", "LGW": "London", "STN": "London", "LTN": "London", "LCY": "London", "SEN": "London",
+    "MAN": "Manchester", "BRS": "Bristol", "BHX": "Birmingham", "EDI": "Edinburgh", "GLA": "Glasgow",
+    "NCL": "Newcastle", "LPL": "Liverpool", "NQY": "Newquay", "SOU": "Southampton", "CWL": "Cardiff", "EXT": "Exeter",
 }
 
-def country_flag(country: str) -> str:
-    c = (country or "").strip().upper()
-    return FLAG_MAP.get(c, "")
-
-def title_case_city(x: str) -> str:
-    s = (x or "").strip()
-    if not s:
-        return ""
-    return " ".join([w[:1].upper() + w[1:].lower() if w else "" for w in s.split(" ")]).strip()
-
-def safe_float(s: str) -> Optional[float]:
+def load_config_signals_maps(sh: gspread.Spreadsheet) -> Tuple[Dict[str, str], Dict[str, str]]:
     try:
-        x = (s or "").strip().replace("£", "").replace(",", "")
-        return float(x) if x else None
+        ws = sh.worksheet("CONFIG_SIGNALS")
     except Exception:
+        return {}, {}
+
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return {}, {}
+
+    headers = [h.strip() for h in values[0]]
+    idx = {h: i for i, h in enumerate(headers)}
+
+    def pick(*names: str) -> Optional[int]:
+        for n in names:
+            if n in idx:
+                return idx[n]
         return None
 
-def fmt_price_gbp(price_gbp: str) -> str:
-    p = (price_gbp or "").strip()
-    if not p:
+    i_iata = pick("iata_hint", "destination_iata", "iata", "airport_iata")
+    i_city = pick("destination_city", "city", "dest_city", "airport_city")
+    i_country = pick("destination_country", "country", "dest_country")
+
+    if i_iata is None:
+        return {}, {}
+
+    iata_to_city: Dict[str, str] = {}
+    iata_to_country: Dict[str, str] = {}
+
+    for r in values[1:]:
+        code = (r[i_iata] if i_iata < len(r) else "").strip().upper()
+        if not is_iata3(code):
+            continue
+        city = (r[i_city] if (i_city is not None and i_city < len(r)) else "").strip()
+        country = (r[i_country] if (i_country is not None and i_country < len(r)) else "").strip()
+        if city:
+            iata_to_city[code] = city
+        if country:
+            iata_to_country[code] = country
+
+    return iata_to_city, iata_to_country
+
+def resolve_city(maybe_city: str, maybe_iata: str, iata_to_city: Dict[str, str]) -> str:
+    c = (maybe_city or "").strip()
+    if c and not is_iata3(c):
+        return c
+    code = (maybe_iata or c or "").strip().upper()
+    if is_iata3(code):
+        return iata_to_city.get(code) or UK_AIRPORT_CITY_FALLBACK.get(code) or code
+    return c
+
+def resolve_country(maybe_country: str, dest_iata: str, iata_to_country: Dict[str, str]) -> str:
+    c = (maybe_country or "").strip()
+    if c:
+        return c
+    code = (dest_iata or "").strip().upper()
+    if is_iata3(code):
+        return iata_to_country.get(code, "")
+    return ""
+
+def nice_city(s: str) -> str:
+    t = (s or "").strip()
+    if not t:
         return ""
-    if p.startswith("£"):
-        p = p[1:]
-    f = safe_float(p)
-    if f is None:
-        return f"£{p}"
-    return f"£{f:.2f}"
-
-def parse_iso_z(s: str) -> Optional[dt.datetime]:
-    s = (s or "").strip()
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1]
-        return dt.datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-
-def build_vip_message(row: Dict[str, str]) -> str:
-    price = fmt_price_gbp(row.get("price_gbp", ""))
-    country = (row.get("destination_country", "") or "").strip()
-    flag = country_flag(country)
-
-    dest_city_raw = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
-    origin_city_raw = (row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip()
-
-    dest_upper = dest_city_raw.upper()
-    origin_title = title_case_city(origin_city_raw)
-
-    out_d = (row.get("outbound_date", "") or "").strip()
-    ret_d = (row.get("return_date", "") or "").strip()
-
-    phrase = (row.get("phrase_bank", "") or row.get("why_good", "") or row.get("ai_notes", "") or "").strip()
-
-    booking = clean_url(row.get("booking_link_vip", "") or row.get("affiliate_url", "") or "")
-
-    lines = []
-    lines.append(f"{price} to {country}{(' ' + flag) if flag else ''}".strip())
-    lines.append(f"TO: {dest_upper}")
-    lines.append(f"FROM: {origin_title}")
-    lines.append(f"OUT:  {out_d}")
-    lines.append(f"BACK: {ret_d}")
-
-    if phrase:
-        lines.append("")
-        lines.append(phrase)
-
-    if booking:
-        lines.append("")
-        lines.append(f'<a href="{booking}">BOOKING LINK</a>')
-
-    return "\n".join(lines).strip()
-
-
-def build_free_message(row: Dict[str, str], stripe_monthly: str, stripe_yearly: str) -> str:
-    price = fmt_price_gbp(row.get("price_gbp", ""))
-    country = (row.get("destination_country", "") or "").strip()
-    flag = country_flag(country)
-
-    dest_city_raw = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
-    origin_city_raw = (row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip()
-
-    dest_upper = dest_city_raw.upper()
-    origin_title = title_case_city(origin_city_raw)
-
-    out_d = (row.get("outbound_date", "") or "").strip()
-    ret_d = (row.get("return_date", "") or "").strip()
-
-    phrase = (row.get("phrase_bank", "") or row.get("why_good", "") or row.get("ai_notes", "") or "").strip()
-
-    m = clean_url(stripe_monthly)
-    y = clean_url(stripe_yearly)
-
-    lines = []
-    lines.append(f"{price} to {country}{(' ' + flag) if flag else ''}".strip())
-    lines.append(f"TO: {dest_upper}")
-    lines.append(f"FROM: {origin_title}")
-    lines.append(f"OUT:  {out_d}")
-    lines.append(f"BACK: {ret_d}")
-
-    if phrase:
-        lines.append("")
-        lines.append(phrase)
-
-    lines.append("")
-    lines.append("Want instant access?")
-    lines.append("Join TravelTxter for early access")
-    lines.append("")
-    lines.append("• VIP members saw this 24 hours ago")
-    lines.append("• Deals 24 hours early")
-    lines.append("• Direct booking links")
-    lines.append("• Exclusive mistake fares")
-    lines.append("• £3 p/m or £30 p/a")
-    lines.append("• Cancel anytime")
-
-    links = []
-    if m:
-        links.append(f'<a href="{m}">Upgrade now (Monthly)</a>')
-    if y:
-        links.append(f'<a href="{y}">Upgrade now (Annual)</a>')
-    if links:
-        lines.append("")
-        lines.extend(links)
-
-    return "\n".join(lines).strip()
+    if is_iata3(t):
+        return t
+    # Keep internal casing for things like "São Paulo"
+    return t
 
 
 # -----------------------------
-# Best row selection
+# Telegram sender
 # -----------------------------
 
-def row_dict(headers: List[str], vals: List[str]) -> Dict[str, str]:
-    d: Dict[str, str] = {}
-    for i, h in enumerate(headers):
-        d[h] = (vals[i] if i < len(vals) else "") or ""
-    return d
+def tg_send(bot_token: str, chat_id: str, text: str) -> None:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    r = requests.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True}, timeout=60)
+    j = r.json()
+    if not j.get("ok"):
+        raise RuntimeError(f"Telegram sendMessage failed: {j}")
 
-def rank_key(rownum: int, row: Dict[str, str]) -> Tuple[float, dt.datetime, dt.datetime, int]:
-    ds = safe_float(row.get("deal_score", "")) or 0.0
-    scored = parse_iso_z(row.get("scored_timestamp", "")) or dt.datetime(1970, 1, 1)
-    created = (
-        parse_iso_z(row.get("created_at", "")) or
-        parse_iso_z(row.get("timestamp", "")) or
-        dt.datetime(1970, 1, 1)
-    )
-    return (ds, scored, created, rownum)
 
-def pick_best_eligible(
-    headers: List[str],
-    rows: List[List[str]],
-    h: Dict[str, int],
-    run_slot: str,
-    consume_status: str,
-    ts_col: str,
-    free_delay_hours: int = 24,
-) -> Optional[Tuple[int, Dict[str, str]]]:
-    now = utcnow()
-    eligible: List[Tuple[int, Dict[str, str]]] = []
+# -----------------------------
+# Row selection
+# -----------------------------
 
-    for rownum in range(2, len(rows) + 2):
-        vals = rows[rownum - 2]
-        status = (vals[h["status"]] if h["status"] < len(vals) else "").strip().upper()
-        if status != consume_status:
-            continue
-
-        already = (vals[h[ts_col]] if h[ts_col] < len(vals) else "").strip()
-        if already:
-            continue
-
-        if run_slot == "PM":
-            vip_ts = (vals[h["posted_telegram_vip_at"]] if h["posted_telegram_vip_at"] < len(vals) else "").strip()
-            vip_dt = parse_iso_z(vip_ts)
-            if not vip_dt:
-                continue
-            if (now - vip_dt) < dt.timedelta(hours=free_delay_hours):
-                continue
-
-        rdict = row_dict(headers, vals)
-        eligible.append((rownum, rdict))
-
-    if not eligible:
+def parse_iso(s: str) -> Optional[dt.datetime]:
+    t = (s or "").strip()
+    if not t:
+        return None
+    try:
+        return dt.datetime.fromisoformat(t.replace("Z", ""))
+    except Exception:
         return None
 
-    # Highest deal_score, then newest scored_timestamp/created_at, then latest rownum
-    eligible.sort(key=lambda it: rank_key(it[0], it[1]), reverse=True)
-    return eligible[0]
+def parse_num(s: str) -> Optional[float]:
+    t = (s or "").strip().replace("£", "").replace(",", "")
+    if not t:
+        return None
+    try:
+        return float(t)
+    except Exception:
+        return None
+
+def pick_best(rows: List[List[str]], h: Dict[str, int], run_slot: str) -> Optional[Tuple[int, List[str]]]:
+    candidates: List[Tuple[int, List[str]]] = []
+    now = dt.datetime.utcnow()
+
+    for rownum, r in enumerate(rows, start=2):
+        status = safe_get(r, h["status"]).upper()
+
+        if run_slot == "AM":
+            if status != "POSTED_INSTAGRAM":
+                continue
+            if safe_get(r, h["posted_telegram_vip_at"]):
+                continue
+        else:
+            if status != "POSTED_TELEGRAM_VIP":
+                continue
+            vip_at = parse_iso(safe_get(r, h["posted_telegram_vip_at"]))
+            if not vip_at:
+                continue
+            if now - vip_at < dt.timedelta(hours=24):
+                continue
+            if safe_get(r, h["posted_telegram_free_at"]):
+                continue
+
+        candidates.append((rownum, r))
+
+    if not candidates:
+        return None
+
+    def key(item: Tuple[int, List[str]]):
+        rownum, r = item
+        score = parse_num(safe_get(r, h["deal_score"])) if "deal_score" in h else None
+        scored_ts = parse_iso(safe_get(r, h["scored_timestamp"])) if "scored_timestamp" in h else None
+        created_ts = parse_iso(safe_get(r, h["timestamp"])) if "timestamp" in h else None
+        if created_ts is None and "created_at" in h:
+            created_ts = parse_iso(safe_get(r, h["created_at"]))
+        return (
+            -(score if score is not None else -1e18),
+            -(scored_ts.timestamp() if scored_ts else -1e18),
+            -(created_ts.timestamp() if created_ts else -1e18),
+            -rownum,
+        )
+
+    candidates.sort(key=key)
+    return candidates[0]
+
+
+# -----------------------------
+# Message builders
+# -----------------------------
+
+def build_message(price_gbp: str, to_city: str, from_city: str, out_d: str, back_d: str, country: str, vip: bool) -> str:
+    line1 = f"£{price_gbp} to {to_city}"
+    if country:
+        line1 = f"£{price_gbp} to {to_city}, {country}"
+
+    lines = [
+        line1,
+        "",
+        f"TO: {to_city}",
+        f"FROM: {from_city}",
+        f"OUT: {out_d}",
+        f"BACK: {back_d}",
+        "",
+    ]
+
+    if vip:
+        lines += [
+            "Heads up:",
+            "• VIP members saw this 24 hours ago",
+            "",
+            "Want instant access?",
+            "Join TravelTxter VIP for £3/month:",
+            "• Deals 24 hours early",
+            "• Direct booking links",
+            "Upgrade now: " + env_str("STRIPE_LINK_VIP", env_str("STRIPE_LINK", "")),
+        ]
+    else:
+        lines += [
+            "Want deals 24 hours early?",
+            "Upgrade to VIP: " + env_str("STRIPE_LINK_VIP", env_str("STRIPE_LINK", "")),
+        ]
+
+    return "\n".join([x for x in lines if x is not None]).strip()
 
 
 # -----------------------------
@@ -333,111 +330,126 @@ def pick_best_eligible(
 # -----------------------------
 
 def main() -> int:
-    run_slot = env_str("RUN_SLOT", "AM").upper()
     spreadsheet_id = env_str("SPREADSHEET_ID")
     tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-
-    stripe_monthly = env_str("STRIPE_MONTHLY_LINK")
-    stripe_yearly = env_str("STRIPE_YEARLY_LINK")
+    run_slot = env_str("RUN_SLOT", "AM").upper()
 
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
 
-    bot_vip = env_str("TELEGRAM_BOT_TOKEN_VIP")
-    chan_vip = env_str("TELEGRAM_CHANNEL_VIP")
-    bot_free = env_str("TELEGRAM_BOT_TOKEN")
-    chan_free = env_str("TELEGRAM_CHANNEL")
-
+    # Tokens/Channels
     if run_slot == "AM":
-        if not bot_vip or not chan_vip:
-            raise RuntimeError("Missing TELEGRAM_BOT_TOKEN_VIP / TELEGRAM_CHANNEL_VIP")
-        bot_token, chat_id = bot_vip, chan_vip
-        consume_status = "POSTED_INSTAGRAM"
-        promote_status = "POSTED_TELEGRAM_VIP"
-        ts_col = "posted_telegram_vip_at"
+        bot_token = env_str("TELEGRAM_BOT_TOKEN_VIP") or env_str("TELEGRAM_BOT_TOKEN")
+        chat_id = env_str("TELEGRAM_CHANNEL_VIP") or env_str("TELEGRAM_CHANNEL")
+        vip_mode = True
     else:
-        if not bot_free or not chan_free:
-            raise RuntimeError("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL")
-        bot_token, chat_id = bot_free, chan_free
-        consume_status = "POSTED_TELEGRAM_VIP"
-        promote_status = "POSTED_ALL"
-        ts_col = "posted_telegram_free_at"
+        bot_token = env_str("TELEGRAM_BOT_TOKEN")
+        chat_id = env_str("TELEGRAM_CHANNEL")
+        vip_mode = False
 
-    gc = gs_client()
-    sh = gc.open_by_key(spreadsheet_id)
+    if not bot_token or not chat_id:
+        raise RuntimeError("Missing Telegram bot/channel env vars for this slot")
+
+    gc = get_client()
+    sh = open_sheet_with_backoff(gc, spreadsheet_id)
     ws = sh.worksheet(tab)
 
-    required = [
-        "status",
-        "deal_id",
-        "deal_theme",
-        "price_gbp",
-        "origin_city",
-        "destination_city",
-        "origin_iata",
-        "destination_iata",
-        "destination_country",
-        "outbound_date",
-        "return_date",
-        "affiliate_url",
-        "booking_link_vip",
-        "phrase_bank",
-        "ai_notes",
-        "why_good",
-        "deal_score",
-        "scored_timestamp",
-        "created_at",
-        "timestamp",
-        "posted_telegram_vip_at",
-        "posted_telegram_free_at",
-        "posted_instagram_at",
-    ]
-    ensure_columns(ws, required)
-
-    all_vals = ws.get_all_values()
-    if len(all_vals) < 2:
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
         log("No rows.")
         return 0
 
-    headers = [h.strip() for h in all_vals[0]]
-    rows = all_vals[1:]
+    headers = [h.strip() for h in values[0]]
+    required_cols = [
+        "status",
+        "deal_id",
+        "price_gbp",
+        "origin_iata",
+        "destination_iata",
+        "origin_city",
+        "destination_city",
+        "destination_country",
+        "outbound_date",
+        "return_date",
+        "deal_score",
+        "scored_timestamp",
+        "timestamp",
+        "created_at",
+        "posted_telegram_vip_at",
+        "posted_telegram_free_at",
+        # dead-letter fields (safe add)
+        "publish_error",
+        "publish_error_at",
+    ]
+    headers = ensure_columns(ws, headers, required_cols)
+
+    values = ws.get_all_values()
+    headers = [h.strip() for h in values[0]]
+    rows = values[1:]
     h = {name: i for i, name in enumerate(headers)}
 
-    picked = pick_best_eligible(headers, rows, h, run_slot, consume_status, ts_col, free_delay_hours=24)
-    if not picked:
-        if run_slot == "PM":
-            log("Done. Telegram posted 0. (No rows eligible for FREE: status=POSTED_TELEGRAM_VIP and VIP>= 24h ago)")
-        else:
-            log(f"Done. Telegram posted 0. (No rows with status={consume_status})")
+    iata_to_city, iata_to_country = load_config_signals_maps(sh)
+
+    best = pick_best(rows, h, run_slot)
+    if not best:
+        log("No eligible rows for this slot.")
         return 0
 
-    rownum, row = picked
-    deal_id = (row.get("deal_id") or "").strip()
-    log(f"📨 Telegram best-pick row {rownum} deal_id={deal_id} RUN_SLOT={run_slot}")
+    rownum, r = best
 
-    if run_slot == "AM":
-        msg = build_vip_message(row)
-    else:
-        msg = build_free_message(row, stripe_monthly, stripe_yearly)
+    # Resolve metadata
+    origin_city = resolve_city(safe_get(r, h["origin_city"]), safe_get(r, h["origin_iata"]), iata_to_city)
+    dest_city = resolve_city(safe_get(r, h["destination_city"]), safe_get(r, h["destination_iata"]), iata_to_city)
+    dest_country = resolve_country(safe_get(r, h["destination_country"]), safe_get(r, h["destination_iata"]), iata_to_country)
+
+    origin_city = nice_city(origin_city)
+    dest_city = nice_city(dest_city)
+
+    if (not dest_country) or (not dest_city) or is_iata3(dest_city):
+        ws.batch_update(
+            [
+                {"range": a1(rownum, h["status"]), "values": [["ERROR_HARD"]]},
+                {"range": a1(rownum, h["publish_error"]), "values": [["missing_destination_metadata"]]},
+                {"range": a1(rownum, h["publish_error_at"]), "values": [[ts()]]},
+            ],
+            value_input_option="USER_ENTERED",
+        )
+        log(f"🧯 Dead-lettered row {rownum} (missing destination metadata)")
+        return 0
+
+    msg = build_message(
+        price_gbp=safe_get(r, h["price_gbp"]),
+        to_city=dest_city,
+        from_city=origin_city,
+        out_d=safe_get(r, h["outbound_date"]),
+        back_d=safe_get(r, h["return_date"]),
+        country=dest_country,
+        vip=vip_mode,
+    )
 
     tg_send(bot_token, chat_id, msg)
 
-    # Write timestamp + promote status
-    now_z = iso_now()
-    ws.update([[now_z]], f"{_col_letter(h[ts_col] + 1)}{rownum}")
-    ws.update([[promote_status]], f"{_col_letter(h['status'] + 1)}{rownum}")
+    # Update sheet status/timestamps
+    if run_slot == "AM":
+        ws.batch_update(
+            [
+                {"range": a1(rownum, h["posted_telegram_vip_at"]), "values": [[ts()]]},
+                {"range": a1(rownum, h["status"]), "values": [["POSTED_TELEGRAM_VIP"]]},
+            ],
+            value_input_option="USER_ENTERED",
+        )
+        log(f"✅ Telegram VIP posted row {rownum}")
+    else:
+        ws.batch_update(
+            [
+                {"range": a1(rownum, h["posted_telegram_free_at"]), "values": [[ts()]]},
+                {"range": a1(rownum, h["status"]), "values": [["POSTED_ALL"]]},
+            ],
+            value_input_option="USER_ENTERED",
+        )
+        log(f"✅ Telegram FREE posted row {rownum}")
 
-    log(f"✅ Telegram posted 1. Row {rownum} -> {promote_status}")
     return 0
-
-
-def _col_letter(n1: int) -> str:
-    s = ""
-    n = n1
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
 
 
 if __name__ == "__main__":

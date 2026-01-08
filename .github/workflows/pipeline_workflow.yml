@@ -7,7 +7,7 @@ on:
     - cron: "30 16 * * *"
 
 concurrency:
-  group: v45x-pipeline
+  group: traveltxter-v45x
   cancel-in-progress: false
 
 jobs:
@@ -17,10 +17,10 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -30,28 +30,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # --------------------------------------------------
+      # RESOLVE RUN SLOT (AM / PM) — FIXED & RELIABLE
+      # --------------------------------------------------
       - name: Resolve RUN_SLOT
+        id: runslot
         shell: bash
         run: |
           HOUR=$(date -u +%H)
           if [ "$HOUR" -lt "12" ]; then
-            echo "RUN_SLOT=AM" >> $GITHUB_ENV
-            echo "Resolved RUN_SLOT=AM"
+            SLOT="AM"
           else
-            echo "RUN_SLOT=PM" >> $GITHUB_ENV
-            echo "Resolved RUN_SLOT=PM"
+            SLOT="PM"
           fi
+          echo "slot=$SLOT" >> $GITHUB_OUTPUT
+          echo "Resolved RUN_SLOT=$SLOT (UTC hour=$HOUR)"
 
-      - name: Normalise Spreadsheet env vars
-        shell: bash
-        run: |
-          echo "SPREADSHEET_ID=${{ secrets.SPREADSHEET_ID }}" >> $GITHUB_ENV
-          echo "SHEET_ID=${{ secrets.SPREADSHEET_ID }}" >> $GITHUB_ENV
+      - name: Confirm RUN_SLOT
+        run: echo "RUN_SLOT is ${{ steps.runslot.outputs.slot }}"
 
-      # ================= AM RUN =================
+      # ==================================================
+      # =================== AM RUN =======================
+      # ==================================================
 
-      - name: Feeder
-        if: env.RUN_SLOT == 'AM'
+      - name: Feeder (Duffel ingestion)
+        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/pipeline_worker.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -63,7 +66,7 @@ jobs:
           DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
 
       - name: Scorer
-        if: env.RUN_SLOT == 'AM'
+        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/ai_scorer.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -74,7 +77,7 @@ jobs:
           VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
 
       - name: Link Router
-        if: env.RUN_SLOT == 'AM'
+        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/link_router.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -83,8 +86,8 @@ jobs:
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
 
-      - name: Render
-        if: env.RUN_SLOT == 'AM'
+      - name: Render Instagram Image
+        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/render_client.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -93,12 +96,8 @@ jobs:
           RENDER_URL: ${{ secrets.RENDER_URL }}
           RENDER_MAX_ROWS: 1
 
-      - name: Cooldown
-        if: env.RUN_SLOT == 'AM'
-        run: sleep 20
-
-      - name: Instagram
-        if: env.RUN_SLOT == 'AM'
+      - name: Publish Instagram
+        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/instagram_publisher.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -109,8 +108,8 @@ jobs:
           STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
           STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
 
-      - name: Telegram VIP
-        if: env.RUN_SLOT == 'AM'
+      - name: Publish Telegram VIP
+        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/telegram_publisher.py
         env:
           RUN_SLOT: AM
@@ -122,10 +121,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
 
-      # ================= PM RUN =================
+      # ==================================================
+      # =================== PM RUN =======================
+      # ==================================================
 
-      - name: Telegram FREE
-        if: env.RUN_SLOT == 'PM'
+      - name: Publish Telegram FREE
+        if: steps.runslot.outputs.slot == 'PM'
         run: python workers/telegram_publisher.py
         env:
           RUN_SLOT: PM

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — telegram_publisher.py (BEST PICK + METADATA FIX)
+TravelTxter V4.5.x — Telegram Publisher (VIP-first then FREE after delay)
 
-Fix:
-- If destination_city is IATA (e.g., FNC) or country blank, resolve using CONFIG_SIGNALS.
-- Do NOT shout in ALL CAPS for city names.
-- If still missing destination metadata, dead-letter the row (ERROR_HARD) so it can't loop.
+WHAT THIS FIXES
+- No all-caps city names in output
+- Telegram hyperlinks (HTML parse_mode)
+- FREE message uses Monthly + Annual upgrade links as clickable hyperlinks
+- VIP message includes clickable booking link (Duffel/Skyscanner)
+- VIP message includes "why it's good" bullets from available sheet columns
 
+PIPELINE CONTRACT (unchanged)
 AM (RUN_SLOT=AM):
   consumes: status == POSTED_INSTAGRAM
   writes:   posted_telegram_vip_at
@@ -22,9 +25,10 @@ from __future__ import annotations
 
 import os
 import json
-import datetime as dt
 import time
+import datetime as dt
 import re
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -36,13 +40,19 @@ from gspread.exceptions import APIError
 IATA_RE = re.compile(r"^[A-Z]{3}$")
 
 
-def log(msg: str) -> None:
-    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    print(f"{ts} | {msg}", flush=True)
-
-def ts() -> str:
+# -----------------------------
+# Logging
+# -----------------------------
+def now_utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
+def log(msg: str) -> None:
+    print(f"{now_utc_iso()} | {msg}", flush=True)
+
+
+# -----------------------------
+# Env
+# -----------------------------
 def env_str(k: str, default: str = "") -> str:
     return (os.environ.get(k, default) or "").strip()
 
@@ -56,7 +66,6 @@ def env_int(k: str, default: int) -> int:
 # -----------------------------
 # Sheets auth
 # -----------------------------
-
 def _extract_sa(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
     try:
@@ -88,13 +97,12 @@ def open_sheet_with_backoff(gc: gspread.Client, spreadsheet_id: str, attempts: i
                 delay = min(delay * 1.6, 45.0)
                 continue
             raise
-    raise RuntimeError("Sheets quota still exceeded after retries (429). Try again shortly.")
+    raise RuntimeError("Sheets quota still exceeded after retries (429).")
 
 
 # -----------------------------
 # A1 helpers
 # -----------------------------
-
 def col_letter(n1: int) -> str:
     s = ""
     n = n1
@@ -110,13 +118,12 @@ def a1(rownum: int, col0: int) -> str:
 # -----------------------------
 # Sheet helpers
 # -----------------------------
-
 def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
     missing = [c for c in required if c not in headers]
     if not missing:
         return headers
     ws.update([headers + missing], "A1")
-    log(f"🛠️  Added missing columns: {missing}")
+    log(f"🛠️ Added missing columns: {missing}")
     return headers + missing
 
 def safe_get(row: List[str], idx: int) -> str:
@@ -124,9 +131,27 @@ def safe_get(row: List[str], idx: int) -> str:
 
 
 # -----------------------------
-# Metadata enrichment (CONFIG_SIGNALS)
+# HTML safety (Telegram parse_mode=HTML)
 # -----------------------------
+def html_escape(s: str) -> str:
+    s = s or ""
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+    )
 
+def html_link(url: str, text: str) -> str:
+    url = (url or "").strip()
+    text = (text or "").strip()
+    if not url or not text:
+        return html_escape(text or url)
+    return f'<a href="{html_escape(url)}">{html_escape(text)}</a>'
+
+
+# -----------------------------
+# Metadata helpers
+# -----------------------------
 def is_iata3(s: str) -> bool:
     return bool(IATA_RE.match((s or "").strip().upper()))
 
@@ -136,7 +161,30 @@ UK_AIRPORT_CITY_FALLBACK = {
     "NCL": "Newcastle", "LPL": "Liverpool", "NQY": "Newquay", "SOU": "Southampton", "CWL": "Cardiff", "EXT": "Exeter",
 }
 
+FLAG_MAP = {
+    "ICELAND": "🇮🇸",
+    "SPAIN": "🇪🇸",
+    "PORTUGAL": "🇵🇹",
+    "FRANCE": "🇫🇷",
+    "ITALY": "🇮🇹",
+    "GREECE": "🇬🇷",
+    "MOROCCO": "🇲🇦",
+    "TURKEY": "🇹🇷",
+    "THAILAND": "🇹🇭",
+    "JAPAN": "🇯🇵",
+    "USA": "🇺🇸",
+    "UNITED STATES": "🇺🇸",
+    "CANADA": "🇨🇦",
+}
+
+def country_flag(country: str) -> str:
+    c = (country or "").strip().upper()
+    return FLAG_MAP.get(c, "")
+
 def load_config_signals_maps(sh: gspread.Spreadsheet) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Returns (iata->city, iata->country) from CONFIG_SIGNALS with flexible headers.
+    """
     try:
         ws = sh.worksheet("CONFIG_SIGNALS")
     except Exception:
@@ -196,23 +244,58 @@ def resolve_country(maybe_country: str, dest_iata: str, iata_to_country: Dict[st
         return iata_to_country.get(code, "")
     return ""
 
-def nice_city(s: str) -> str:
-    t = (s or "").strip()
-    if not t:
+
+# -----------------------------
+# Phrase bank (optional)
+# -----------------------------
+def _truthy(x: str) -> bool:
+    v = (x or "").strip().lower()
+    return v in ("true", "yes", "1", "y", "on", "enabled")
+
+def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
+    try:
+        ws = sh.worksheet("PHRASE_BANK")
+    except Exception:
+        return []
+
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return []
+
+    headers = [h.strip() for h in values[0]]
+    out: List[Dict[str, str]] = []
+    for r in values[1:]:
+        d: Dict[str, str] = {}
+        for i, h in enumerate(headers):
+            d[h] = (r[i] if i < len(r) else "").strip()
+        if any(d.values()):
+            out.append(d)
+    return out
+
+def pick_phrase(phrases: List[Dict[str, str]], theme: str, deal_id: str) -> str:
+    th = (theme or "").strip().upper()
+    approved = [r for r in phrases if _truthy(r.get("approved", "")) and (r.get("phrase", "").strip() != "")]
+    if not approved:
         return ""
-    if is_iata3(t):
-        return t
-    # Keep internal casing for things like "São Paulo"
-    return t
+    themed = [r for r in approved if (r.get("theme", "").strip().upper() == th)] if th else []
+    pool = themed if themed else approved
+    h = hashlib.md5((deal_id or "noid").encode("utf-8")).hexdigest()
+    idx = int(h[:8], 16) % len(pool)
+    return (pool[idx].get("phrase", "") or "").strip()
 
 
 # -----------------------------
 # Telegram sender
 # -----------------------------
-
-def tg_send(bot_token: str, chat_id: str, text: str) -> None:
+def tg_send(bot_token: str, chat_id: str, text_html: str) -> None:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    r = requests.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True}, timeout=60)
+    payload = {
+        "chat_id": chat_id,
+        "text": text_html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, json=payload, timeout=60)
     j = r.json()
     if not j.get("ok"):
         raise RuntimeError(f"Telegram sendMessage failed: {j}")
@@ -221,7 +304,6 @@ def tg_send(bot_token: str, chat_id: str, text: str) -> None:
 # -----------------------------
 # Row selection
 # -----------------------------
-
 def parse_iso(s: str) -> Optional[dt.datetime]:
     t = (s or "").strip()
     if not t:
@@ -270,9 +352,9 @@ def pick_best(rows: List[List[str]], h: Dict[str, int], run_slot: str) -> Option
 
     def key(item: Tuple[int, List[str]]):
         rownum, r = item
-        score = parse_num(safe_get(r, h["deal_score"])) if "deal_score" in h else None
-        scored_ts = parse_iso(safe_get(r, h["scored_timestamp"])) if "scored_timestamp" in h else None
-        created_ts = parse_iso(safe_get(r, h["timestamp"])) if "timestamp" in h else None
+        score = parse_num(safe_get(r, h.get("deal_score", -1))) if "deal_score" in h else None
+        scored_ts = parse_iso(safe_get(r, h.get("scored_timestamp", -1))) if "scored_timestamp" in h else None
+        created_ts = parse_iso(safe_get(r, h.get("timestamp", -1))) if "timestamp" in h else None
         if created_ts is None and "created_at" in h:
             created_ts = parse_iso(safe_get(r, h["created_at"]))
         return (
@@ -289,46 +371,127 @@ def pick_best(rows: List[List[str]], h: Dict[str, int], run_slot: str) -> Option
 # -----------------------------
 # Message builders
 # -----------------------------
+def format_price(price_gbp: str) -> str:
+    p = (price_gbp or "").strip()
+    return p if p else "?"
 
-def build_message(price_gbp: str, to_city: str, from_city: str, out_d: str, back_d: str, country: str, vip: bool) -> str:
-    line1 = f"£{price_gbp} to {to_city}"
+def build_free_message(price: str, country: str, flag: str, to_city: str, from_city: str, out_d: str, back_d: str, phrase: str,
+                       monthly_url: str, annual_url: str) -> str:
+    header = f"£{price} to {to_city}"
     if country:
-        line1 = f"£{price_gbp} to {to_city}, {country}"
+        header = f"£{price} to {country} {flag}".strip()
 
-    lines = [
-        line1,
-        "",
-        f"TO: {to_city}",
-        f"FROM: {from_city}",
-        f"OUT: {out_d}",
-        f"BACK: {back_d}",
-        "",
-    ]
+    parts: List[str] = []
+    parts.append(f"<b>{html_escape(header)}</b>")
+    parts.append("")
+    parts.append(f"<b>TO:</b> {html_escape(to_city)}")
+    parts.append(f"<b>FROM:</b> {html_escape(from_city)}")
+    parts.append(f"<b>OUT:</b> {html_escape(out_d)}")
+    parts.append(f"<b>BACK:</b> {html_escape(back_d)}")
+    parts.append("")
 
-    if vip:
-        lines += [
-            "Heads up:",
-            "• VIP members saw this 24 hours ago",
-            "",
-            "Want instant access?",
-            "Join TravelTxter VIP for £3/month:",
-            "• Deals 24 hours early",
-            "• Direct booking links",
-            "Upgrade now: " + env_str("STRIPE_LINK_VIP", env_str("STRIPE_LINK", "")),
-        ]
+    if phrase:
+        parts.append(html_escape(phrase))
+        parts.append("")
+
+    parts.append("<b>Want instant access?</b>")
+    parts.append("Join TravelTxter for early access:")
+    parts.append("")
+    parts.append("• VIP members saw this 24 hours ago")
+    parts.append("• Deals 24 hours early")
+    parts.append("• Direct booking links")
+    parts.append("• Exclusive mistake fares")
+    parts.append("• £3 p/m or £30 p/a")
+    parts.append("• Cancel anytime")
+    parts.append("")
+    parts.append(f"👉 {html_link(monthly_url, 'Upgrade Monthly (£3)')}")
+    parts.append(f"👉 {html_link(annual_url, 'Upgrade Annual (£30)')}")
+    return "\n".join(parts).strip()
+
+def build_vip_message(price: str, country: str, flag: str, to_city: str, from_city: str, out_d: str, back_d: str,
+                      phrase: str, why_bullets: List[str], booking_url: str) -> str:
+    header = f"£{price} to {to_city}"
+    if country:
+        header = f"£{price} to {country} {flag}".strip()
+
+    parts: List[str] = []
+    parts.append(f"<b>{html_escape(header)}</b>")
+    parts.append("")
+    parts.append(f"<b>TO:</b> {html_escape(to_city)}")
+    parts.append(f"<b>FROM:</b> {html_escape(from_city)}")
+    parts.append(f"<b>OUT:</b> {html_escape(out_d)}")
+    parts.append(f"<b>BACK:</b> {html_escape(back_d)}")
+    parts.append("")
+
+    if phrase:
+        parts.append(html_escape(phrase))
+        parts.append("")
+
+    if why_bullets:
+        parts.append("<b>Why it’s good:</b>")
+        for b in why_bullets[:3]:
+            bb = (b or "").strip()
+            if bb:
+                parts.append(f"• {html_escape(bb)}")
+        parts.append("")
+
+    if booking_url:
+        parts.append(f"✅ {html_link(booking_url, 'Book this deal')}")
     else:
-        lines += [
-            "Want deals 24 hours early?",
-            "Upgrade to VIP: " + env_str("STRIPE_LINK_VIP", env_str("STRIPE_LINK", "")),
-        ]
+        parts.append("✅ Booking link coming soon")
+    return "\n".join(parts).strip()
 
-    return "\n".join([x for x in lines if x is not None]).strip()
+def extract_why_bullets(row: List[str], h: Dict[str, int]) -> List[str]:
+    """
+    Pulls benefit bullets from whichever columns exist.
+    We try, in order:
+      benefit_1/benefit_2/benefit_3
+      benefit_summary
+      ai_notes
+    """
+    bullets: List[str] = []
+
+    for k in ("benefit_1", "benefit_2", "benefit_3"):
+        if k in h:
+            v = safe_get(row, h[k])
+            if v:
+                bullets.append(v)
+
+    if not bullets and "benefit_summary" in h:
+        v = safe_get(row, h["benefit_summary"])
+        if v:
+            # split into bullets if user wrote multiple lines
+            bullets.extend([x.strip("• ").strip() for x in v.splitlines() if x.strip()])
+
+    if not bullets and "ai_notes" in h:
+        v = safe_get(row, h["ai_notes"])
+        if v:
+            bullets.extend([x.strip("• ").strip() for x in v.splitlines() if x.strip()])
+
+    # Last resort: try "ai_grading" (some builds use it)
+    if not bullets and "ai_grading" in h:
+        v = safe_get(row, h["ai_grading"])
+        if v:
+            bullets.append(v)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    out = []
+    for b in bullets:
+        bb = b.strip()
+        if not bb:
+            continue
+        key = bb.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(bb)
+    return out
 
 
 # -----------------------------
 # Main
 # -----------------------------
-
 def main() -> int:
     spreadsheet_id = env_str("SPREADSHEET_ID")
     tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
@@ -337,7 +500,7 @@ def main() -> int:
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID")
 
-    # Tokens/Channels
+    # Telegram routing by slot
     if run_slot == "AM":
         bot_token = env_str("TELEGRAM_BOT_TOKEN_VIP") or env_str("TELEGRAM_BOT_TOKEN")
         chat_id = env_str("TELEGRAM_CHANNEL_VIP") or env_str("TELEGRAM_CHANNEL")
@@ -350,6 +513,11 @@ def main() -> int:
     if not bot_token or not chat_id:
         raise RuntimeError("Missing Telegram bot/channel env vars for this slot")
 
+    # Upgrade links (hyperlinks)
+    # Prefer env vars, but include safe defaults matching your locked Stripe links.
+    monthly_url = env_str("STRIPE_LINK_MONTHLY", "https://buy.stripe.com/3cI14g3rU4KOdiUbWJe7m08")
+    annual_url  = env_str("STRIPE_LINK_ANNUAL",  "https://buy.stripe.com/9B67sE2nQa586Uw3qde7m07")
+
     gc = get_client()
     sh = open_sheet_with_backoff(gc, spreadsheet_id)
     ws = sh.worksheet(tab)
@@ -361,25 +529,19 @@ def main() -> int:
 
     headers = [h.strip() for h in values[0]]
     required_cols = [
-        "status",
-        "deal_id",
-        "price_gbp",
-        "origin_iata",
-        "destination_iata",
-        "origin_city",
-        "destination_city",
-        "destination_country",
-        "outbound_date",
-        "return_date",
-        "deal_score",
-        "scored_timestamp",
-        "timestamp",
-        "created_at",
-        "posted_telegram_vip_at",
-        "posted_telegram_free_at",
-        # dead-letter fields (safe add)
-        "publish_error",
-        "publish_error_at",
+        "status", "deal_id", "price_gbp",
+        "origin_iata", "destination_iata",
+        "origin_city", "destination_city", "destination_country",
+        "outbound_date", "return_date",
+        "deal_theme",
+        "deal_score", "scored_timestamp", "timestamp", "created_at",
+        "posted_telegram_vip_at", "posted_telegram_free_at",
+        # booking links (either may exist)
+        "booking_link_vip", "booking_link",
+        # error fields (safe)
+        "publish_error", "publish_error_at",
+        # optional benefits
+        "benefit_1", "benefit_2", "benefit_3", "benefit_summary", "ai_notes", "ai_grading",
     ]
     headers = ensure_columns(ws, headers, required_cols)
 
@@ -389,6 +551,7 @@ def main() -> int:
     h = {name: i for i, name in enumerate(headers)}
 
     iata_to_city, iata_to_country = load_config_signals_maps(sh)
+    phrases = load_phrase_bank(sh)
 
     best = pick_best(rows, h, run_slot)
     if not best:
@@ -397,35 +560,65 @@ def main() -> int:
 
     rownum, r = best
 
-    # Resolve metadata
+    deal_id = safe_get(r, h["deal_id"])
+    theme = safe_get(r, h.get("deal_theme", -1))
+    phrase = pick_phrase(phrases, theme, deal_id)
+
     origin_city = resolve_city(safe_get(r, h["origin_city"]), safe_get(r, h["origin_iata"]), iata_to_city)
     dest_city = resolve_city(safe_get(r, h["destination_city"]), safe_get(r, h["destination_iata"]), iata_to_city)
     dest_country = resolve_country(safe_get(r, h["destination_country"]), safe_get(r, h["destination_iata"]), iata_to_country)
 
-    origin_city = nice_city(origin_city)
-    dest_city = nice_city(dest_city)
-
+    # If missing metadata, dead-letter so it cannot loop spam
     if (not dest_country) or (not dest_city) or is_iata3(dest_city):
         ws.batch_update(
             [
                 {"range": a1(rownum, h["status"]), "values": [["ERROR_HARD"]]},
                 {"range": a1(rownum, h["publish_error"]), "values": [["missing_destination_metadata"]]},
-                {"range": a1(rownum, h["publish_error_at"]), "values": [[ts()]]},
+                {"range": a1(rownum, h["publish_error_at"]), "values": [[now_utc_iso()]]},
             ],
             value_input_option="USER_ENTERED",
         )
         log(f"🧯 Dead-lettered row {rownum} (missing destination metadata)")
         return 0
 
-    msg = build_message(
-        price_gbp=safe_get(r, h["price_gbp"]),
-        to_city=dest_city,
-        from_city=origin_city,
-        out_d=safe_get(r, h["outbound_date"]),
-        back_d=safe_get(r, h["return_date"]),
-        country=dest_country,
-        vip=vip_mode,
-    )
+    price = format_price(safe_get(r, h["price_gbp"]))
+    out_d = safe_get(r, h["outbound_date"])
+    back_d = safe_get(r, h["return_date"])
+
+    flag = country_flag(dest_country)
+    why_bullets = extract_why_bullets(r, h)
+
+    # Booking link: prefer booking_link_vip, fallback booking_link
+    booking_url = safe_get(r, h.get("booking_link_vip", -1)) if "booking_link_vip" in h else ""
+    if not booking_url and "booking_link" in h:
+        booking_url = safe_get(r, h["booking_link"])
+
+    if vip_mode:
+        msg = build_vip_message(
+            price=price,
+            country=dest_country,
+            flag=flag,
+            to_city=dest_city,
+            from_city=origin_city,
+            out_d=out_d,
+            back_d=back_d,
+            phrase=phrase,
+            why_bullets=why_bullets,
+            booking_url=booking_url,
+        )
+    else:
+        msg = build_free_message(
+            price=price,
+            country=dest_country,
+            flag=flag,
+            to_city=dest_city,
+            from_city=origin_city,
+            out_d=out_d,
+            back_d=back_d,
+            phrase=phrase,
+            monthly_url=monthly_url,
+            annual_url=annual_url,
+        )
 
     tg_send(bot_token, chat_id, msg)
 
@@ -433,7 +626,7 @@ def main() -> int:
     if run_slot == "AM":
         ws.batch_update(
             [
-                {"range": a1(rownum, h["posted_telegram_vip_at"]), "values": [[ts()]]},
+                {"range": a1(rownum, h["posted_telegram_vip_at"]), "values": [[now_utc_iso()]]},
                 {"range": a1(rownum, h["status"]), "values": [["POSTED_TELEGRAM_VIP"]]},
             ],
             value_input_option="USER_ENTERED",
@@ -442,7 +635,7 @@ def main() -> int:
     else:
         ws.batch_update(
             [
-                {"range": a1(rownum, h["posted_telegram_free_at"]), "values": [[ts()]]},
+                {"range": a1(rownum, h["posted_telegram_free_at"]), "values": [[now_utc_iso()]]},
                 {"range": a1(rownum, h["status"]), "values": [["POSTED_ALL"]]},
             ],
             value_input_option="USER_ENTERED",

@@ -42,6 +42,11 @@ jobs:
           echo "RUN_SLOT=$RUN_SLOT" >> $GITHUB_ENV
           echo "Resolved RUN_SLOT=$RUN_SLOT"
 
+      - name: Normalise spreadsheet env vars
+        run: |
+          echo "SPREADSHEET_ID=${{ secrets.SPREADSHEET_ID }}" >> $GITHUB_ENV
+          echo "SHEET_ID=${{ secrets.SPREADSHEET_ID }}" >> $GITHUB_ENV
+
       # ================= AM RUN =================
 
       - name: AM — Pipeline worker

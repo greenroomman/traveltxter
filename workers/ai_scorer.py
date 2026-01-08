@@ -1,301 +1,564 @@
 #!/usr/bin/env python3
 """
-TravelTxter — AI Scorer (Spreadsheet-Driven Worthiness)
+TravelTxter — AI Scorer (Deterministic) with ZONE × THEME Benchmarks
 
-LOCKED RULE:
-- Spreadsheet is the brain.
-- This worker does NOT compute quality.
-- It only PROMOTES based on RAW_DEALS.worthiness_verdict and worthiness_score.
+Reads:
+- RAW_DEALS where status == NEW
 
-Consumes:
-- RAW_DEALS rows with status == NEW
+Writes:
+- deal_score
+- dest_variety_score
+- theme_variety_score
+- scored_timestamp
+- why_good
+- ai_notes (optional)
+- status -> READY_TO_POST for winners, SCORED for non-winners
 
-Promotes:
-- If worthiness_verdict == "PUBLISH" and passes variety guard:
-    status -> READY_TO_POST
-    scored_timestamp -> now
+Brain:
+- ZONE_THEME_BENCHMARKS tab:
+  zone,theme,low_price,normal_price,high_price,notes
 
-Leaves alone:
-- HOLD / REJECT rows (status remains NEW by default; spreadsheet remains source of truth)
-
-Environment:
-- SPREADSHEET_ID (required; accepts SHEET_ID as fallback)
-- RAW_DEALS_TAB (default RAW_DEALS)
-- GCP_SA_JSON_ONE_LINE or GCP_SA_JSON (required)
-- WINNERS_PER_RUN (default 1)
-- VARIETY_LOOKBACK_HOURS (default 120)
+Principles:
+- Deterministic (no AI text generation)
+- Explainable ("why_good" is a short deterministic reason)
+- Safe (won't publish obvious non-deals)
 """
-
-from __future__ import annotations
 
 import os
 import json
-import time
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
 
 
-# ============================================================
+# =======================
 # Logging
-# ============================================================
-
-def now_utc() -> dt.datetime:
-    return dt.datetime.utcnow()
-
-def now_utc_iso() -> str:
-    return now_utc().replace(microsecond=0).isoformat() + "Z"
+# =======================
 
 def log(msg: str) -> None:
-    print(f"{now_utc_iso()} | {msg}", flush=True)
+    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    print(f"{ts} | {msg}", flush=True)
 
 
-# ============================================================
+# =======================
 # Env helpers
-# ============================================================
+# =======================
 
-def env_str(k: str, default: str = "") -> str:
-    return (os.environ.get(k, default) or "").strip()
+def env_str(key: str, default: Optional[str] = None) -> str:
+    v = os.getenv(key, default)
+    if v is None or str(v).strip() == "":
+        raise RuntimeError(f"Missing {key}")
+    return str(v)
 
-def env_any(keys: List[str], default: str = "") -> str:
-    for k in keys:
-        v = env_str(k, "")
-        if v:
-            return v
-    return default
+def env_int(key: str, default: int) -> int:
+    v = os.getenv(key)
+    if v is None or str(v).strip() == "":
+        return int(default)
+    return int(str(v).strip())
 
-def env_int(k: str, default: int) -> int:
-    try:
-        return int(env_str(k, str(default)))
-    except Exception:
-        return default
-
-def parse_iso_z(s: str) -> Optional[dt.datetime]:
-    s = (s or "").strip()
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1]
-        return dt.datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-def safe_float(s: str) -> float:
-    try:
-        x = (s or "").strip().replace("£", "").replace(",", "")
-        return float(x) if x else 0.0
-    except Exception:
-        return 0.0
+def env_float(key: str, default: float) -> float:
+    v = os.getenv(key)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    return float(str(v).strip())
 
 
-# ============================================================
-# Sheets auth
-# ============================================================
-
-def _extract_sa(raw: str) -> Dict[str, Any]:
-    raw = (raw or "").strip()
-    try:
-        return json.loads(raw)
-    except Exception:
-        return json.loads(raw.replace("\\n", "\n"))
-
-def get_client() -> gspread.Client:
-    sa_raw = env_any(["GCP_SA_JSON_ONE_LINE", "GCP_SA_JSON"])
-    if not sa_raw:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-    info = _extract_sa(sa_raw)
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
-    )
-    return gspread.authorize(creds)
-
-def open_sheet_with_backoff(gc: gspread.Client, spreadsheet_id: str, attempts: int = 8) -> gspread.Spreadsheet:
-    delay = 4.0
-    for i in range(1, attempts + 1):
-        try:
-            return gc.open_by_key(spreadsheet_id)
-        except APIError as e:
-            msg = str(e)
-            if "429" in msg or "Quota exceeded" in msg:
-                log(f"⏳ Sheets quota (429). Retry {i}/{attempts} in {int(delay)}s...")
-                time.sleep(delay)
-                delay = min(delay * 1.6, 45.0)
-                continue
-            raise
-    raise RuntimeError("Sheets quota still exceeded after retries (429).")
-
-
-# ============================================================
+# =======================
 # A1 helpers
-# ============================================================
+# =======================
 
-def col_letter(n1: int) -> str:
+def col_letter(col1: int) -> str:
     s = ""
-    n = n1
-    while n:
-        n, rr = divmod(n - 1, 26)
-        s = chr(65 + rr) + s
+    x = col1
+    while x:
+        x, r = divmod(x - 1, 26)
+        s = chr(65 + r) + s
     return s
 
-def a1(rownum: int, col0: int) -> str:
-    return f"{col_letter(col0 + 1)}{rownum}"
-
-def safe_get(row: List[str], idx: int) -> str:
-    return row[idx].strip() if 0 <= idx < len(row) else ""
-
-def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
-    missing = [c for c in required if c not in headers]
-    if not missing:
-        return headers
-    ws.update([headers + missing], "A1")
-    log(f"🛠️ Added missing columns: {missing}")
-    return headers + missing
+def a1(row: int, col0: int) -> str:
+    return f"{col_letter(col0 + 1)}{row}"
 
 
-# ============================================================
-# Variety guard
-# ============================================================
+# =======================
+# Parsing helpers
+# =======================
 
-POSTED_STATUSES = {
-    "POSTED_INSTAGRAM",
-    "POSTED_TELEGRAM_VIP",
-    "POSTED_TELEGRAM_FREE",
-    "POSTED_ALL",
-}
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip().replace("£", "").replace(",", "")
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
 
-def recently_posted_destinations(
-    headers: List[str],
-    rows: List[List[str]],
-    lookback_hours: int,
-) -> set:
-    """
-    Collect destinations posted within lookback window (by best available timestamp).
-    """
-    h = {name: i for i, name in enumerate(headers)}
-    now = now_utc()
-    cutoff = now - dt.timedelta(hours=lookback_hours)
-    recent = set()
+def safe_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not s:
+            return None
+        return int(float(s))
+    except Exception:
+        return None
 
-    ts_cols = []
-    for c in ["posted_all_at", "posted_instagram_at", "posted_telegram_free_at", "posted_telegram_vip_at"]:
-        if c in h:
-            ts_cols.append(c)
+def up(x: Any) -> str:
+    return str(x or "").strip().upper()
 
-    dest_key = "destination_city" if "destination_city" in h else ("destination_iata" if "destination_iata" in h else None)
-    if not dest_key:
-        return recent
-
-    for r in rows:
-        status = safe_get(r, h.get("status", -1)).upper()
-        if status not in POSTED_STATUSES:
-            continue
-
-        dt_found: Optional[dt.datetime] = None
-        for c in ts_cols:
-            t = parse_iso_z(safe_get(r, h[c]))
-            if t:
-                if dt_found is None or t > dt_found:
-                    dt_found = t
-
-        if dt_found and dt_found >= cutoff:
-            recent.add(safe_get(r, h[dest_key]).strip().upper())
-
-    return recent
+def low(x: Any) -> str:
+    return str(x or "").strip().lower()
 
 
-# ============================================================
-# Main
-# ============================================================
+# =======================
+# Sheets init
+# =======================
 
-def main() -> int:
-    spreadsheet_id = env_any(["SPREADSHEET_ID", "SHEET_ID"])
+def open_sheet() -> gspread.Spreadsheet:
+    spreadsheet_id = os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID")
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID (or SHEET_ID)")
 
-    tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-    winners = env_int("WINNERS_PER_RUN", 1)
-    lookback_hours = env_int("VARIETY_LOOKBACK_HOURS", 120)
+    gcp = os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
+    if not gcp:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE (or GCP_SA_JSON)")
 
-    gc = get_client()
-    sh = open_sheet_with_backoff(gc, spreadsheet_id)
-    ws = sh.worksheet(tab)
+    sa = json.loads(gcp)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(sa, scopes=scopes)
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(spreadsheet_id)
+
+
+# =======================
+# Load ZONE_THEME_BENCHMARKS
+# =======================
+
+def load_zone_theme_benchmarks(sh: gspread.Spreadsheet) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """
+    Returns dict keyed by (zone, theme):
+      { low_price, normal_price, high_price, notes }
+    """
+    tab = "ZONE_THEME_BENCHMARKS"
+    try:
+        ws = sh.worksheet(tab)
+    except Exception:
+        log("⚠️ ZONE_THEME_BENCHMARKS not found. Scoring will run WITHOUT zone/theme price intelligence.")
+        return {}
 
     values = ws.get_all_values()
-    if not values or len(values) < 2:
-        log("No rows to score.")
+    if len(values) < 2:
+        log("⚠️ ZONE_THEME_BENCHMARKS empty. Scoring will run WITHOUT zone/theme price intelligence.")
+        return {}
+
+    headers = [h.strip() for h in values[0]]
+    idx = {h: i for i, h in enumerate(headers)}
+    required = ["zone", "theme", "low_price", "normal_price", "high_price"]
+    missing = [c for c in required if c not in idx]
+    if missing:
+        log(f"⚠️ ZONE_THEME_BENCHMARKS missing columns {missing}. Scoring will run WITHOUT zone/theme price intelligence.")
+        return {}
+
+    bench: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in values[1:]:
+        z = low(r[idx["zone"]] if idx["zone"] < len(r) else "")
+        t = low(r[idx["theme"]] if idx["theme"] < len(r) else "")
+        if not z or not t:
+            continue
+        lp = safe_float(r[idx["low_price"]] if idx["low_price"] < len(r) else None)
+        np = safe_float(r[idx["normal_price"]] if idx["normal_price"] < len(r) else None)
+        hp = safe_float(r[idx["high_price"]] if idx["high_price"] < len(r) else None)
+        if lp is None or np is None or hp is None:
+            continue
+        bench[(z, t)] = {
+            "low_price": lp,
+            "normal_price": np,
+            "high_price": hp,
+            "notes": (r[idx["notes"]] if "notes" in idx and idx["notes"] < len(r) else "").strip()
+        }
+
+    log(f"✓ Loaded {len(bench)} ZONE×THEME benchmark rows")
+    return bench
+
+
+# =======================
+# Zone inference (v1 deterministic)
+# =======================
+
+CANARIES_MADEIRA_IATA = {
+    "TFS", "TFN", "ACE", "FUE", "LPA", "SPC", "FNC", "PXO", "PDL"
+}
+ICELAND_ARCTIC_IATA = {"KEF"}
+
+NORTH_AMERICA_WEST_IATA = {"LAX", "SFO", "SAN", "SEA", "PDX", "LAS", "PHX", "DEN", "SLC", "YVR", "YYC"}
+NORTH_AMERICA_EAST_IATA = {"JFK", "EWR", "BOS", "IAD", "DCA", "MIA", "ORD", "ATL", "DFW", "IAH", "YYZ", "YUL", "YOW"}
+
+EUROPE_COUNTRIES = {
+    "UNITED KINGDOM","IRELAND","FRANCE","SPAIN","PORTUGAL","ITALY","GERMANY","NETHERLANDS","BELGIUM","LUXEMBOURG",
+    "SWITZERLAND","AUSTRIA","CZECHIA","CZECH REPUBLIC","POLAND","HUNGARY","SLOVAKIA","SLOVENIA","CROATIA","BOSNIA",
+    "BOSNIA AND HERZEGOVINA","SERBIA","MONTENEGRO","ALBANIA","NORTH MACEDONIA","GREECE","BULGARIA","ROMANIA",
+    "ESTONIA","LATVIA","LITHUANIA","FINLAND","SWEDEN","NORWAY","DENMARK","ICELAND","MALTA","CYPRUS","TURKEY"
+}
+
+NORTH_AFRICA_COUNTRIES = {"MOROCCO","TUNISIA","ALGERIA","EGYPT"}
+MIDDLE_EAST_COUNTRIES = {"UNITED ARAB EMIRATES","UAE","QATAR","BAHRAIN","SAUDI ARABIA","OMAN","JORDAN","KUWAIT","LEBANON","ISRAEL","IRAQ"}
+
+AFRICA_SOUTH_COUNTRIES = {"SOUTH AFRICA","NAMIBIA","BOTSWANA","ZIMBABWE","MOZAMBIQUE","ZAMBIA"}
+AFRICA_EAST_COUNTRIES = {"KENYA","TANZANIA","UGANDA","RWANDA","ETHIOPIA","SEYCHELLES","MAURITIUS"}
+
+ASIA_EAST_COUNTRIES = {"JAPAN","SOUTH KOREA","KOREA","CHINA","HONG KONG","TAIWAN","MONGOLIA"}
+ASIA_SOUTHEAST_COUNTRIES = {"THAILAND","VIETNAM","INDONESIA","MALAYSIA","SINGAPORE","PHILIPPINES","CAMBODIA","LAOS","MYANMAR","BRUNEI"}
+ASIA_SOUTH_COUNTRIES = {"INDIA","SRI LANKA","NEPAL","PAKISTAN","BANGLADESH","MALDIVES","BHUTAN"}
+
+AUSTRALASIA_COUNTRIES = {"AUSTRALIA","NEW ZEALAND"}
+
+SOUTH_AMERICA_NORTH_COUNTRIES = {"COSTA RICA","PANAMA","COLOMBIA","ECUADOR","VENEZUELA"}
+SOUTH_AMERICA_SOUTH_COUNTRIES = {"PERU","CHILE","ARGENTINA","BRAZIL","BOLIVIA","URUGUAY","PARAGUAY"}
+
+NORTH_AMERICA_COUNTRIES = {"UNITED STATES","USA","CANADA","MEXICO"}
+
+
+def infer_zone(destination_iata: str, destination_country: str) -> str:
+    di = up(destination_iata)
+    dc = up(destination_country)
+
+    if di in ICELAND_ARCTIC_IATA or dc == "ICELAND":
+        return "iceland_arctic"
+
+    if di in CANARIES_MADEIRA_IATA:
+        return "canaries_madeira"
+
+    if dc in NORTH_AFRICA_COUNTRIES:
+        return "north_africa"
+
+    if dc in MIDDLE_EAST_COUNTRIES:
+        return "middle_east"
+
+    if dc in AFRICA_SOUTH_COUNTRIES:
+        return "africa_south"
+
+    if dc in AFRICA_EAST_COUNTRIES:
+        return "africa_east"
+
+    if dc in AUSTRALASIA_COUNTRIES:
+        return "australasia"
+
+    if dc in ASIA_EAST_COUNTRIES:
+        return "asia_east"
+
+    if dc in ASIA_SOUTHEAST_COUNTRIES:
+        return "asia_southeast"
+
+    if dc in ASIA_SOUTH_COUNTRIES:
+        return "asia_south"
+
+    if dc in SOUTH_AMERICA_NORTH_COUNTRIES:
+        return "south_america_north"
+
+    if dc in SOUTH_AMERICA_SOUTH_COUNTRIES:
+        return "south_america_south"
+
+    if dc in NORTH_AMERICA_COUNTRIES:
+        # split east/west by IATA hint
+        if di in NORTH_AMERICA_WEST_IATA:
+            return "north_america_west"
+        if di in NORTH_AMERICA_EAST_IATA:
+            return "north_america_east"
+        # default east (more common for UK)
+        return "north_america_east"
+
+    # Europe fallback
+    if dc in EUROPE_COUNTRIES or dc == "":
+        # If we can't tell, treat as shorthaul to be conservative
+        return "europe_shorthaul"
+
+    # Unknown fallback
+    return "europe_shorthaul"
+
+
+# =======================
+# Core scoring
+# =======================
+
+def compute_base_score(price: Optional[float], stops: Optional[int], days_ahead: Optional[int]) -> float:
+    """
+    Low-tech baseline: timing + stops + slight price presence.
+    This is NOT the price intelligence layer.
+    """
+    score = 0.0
+
+    # Price present?
+    if price is not None:
+        score += 5.0
+
+    # Stops
+    if stops is not None:
+        if stops == 0:
+            score += 12.0
+        elif stops == 1:
+            score += 6.0
+        else:
+            score -= 4.0 * max(0, stops - 1)
+
+    # Timing
+    if days_ahead is not None:
+        if 20 <= days_ahead <= 70:
+            score += 8.0
+        elif days_ahead < 10:
+            score -= 6.0
+        elif days_ahead > 120:
+            score -= 4.0
+
+    return score
+
+
+def compute_price_band_score(price: Optional[float], bench: Optional[Dict[str, Any]]) -> Tuple[float, str]:
+    """
+    Returns (score, band_label)
+      band_label in {PRIZE, GOOD, OK, BAD, UNKNOWN}
+    """
+    if price is None or not bench:
+        return 0.0, "UNKNOWN"
+
+    low_p = float(bench["low_price"])
+    norm_p = float(bench["normal_price"])
+    high_p = float(bench["high_price"])
+
+    if price <= low_p:
+        return 40.0, "PRIZE"
+    if price <= norm_p:
+        return 20.0, "GOOD"
+    if price <= high_p:
+        return 5.0, "OK"
+    return -30.0, "BAD"
+
+
+def why_good_text(band: str, zone: str, theme: str, price: Optional[float], bench: Optional[Dict[str, Any]]) -> str:
+    if price is None or not bench or band == "UNKNOWN":
+        return "Scored using timing/stops only (no benchmark match)."
+    lp = int(round(float(bench["low_price"])))
+    np = int(round(float(bench["normal_price"])))
+    hp = int(round(float(bench["high_price"])))
+    p = int(round(float(price)))
+    if band == "PRIZE":
+        return f"Prize fish for {theme} in {zone}: £{p} (<= low £{lp})."
+    if band == "GOOD":
+        return f"Strong value for {theme} in {zone}: £{p} (<= normal £{np})."
+    if band == "OK":
+        return f"Acceptable for {theme} in {zone}: £{p} (<= high £{hp})."
+    return f"Not a deal for {theme} in {zone}: £{p} (> high £{hp})."
+
+
+# =======================
+# Main
+# =======================
+
+def main() -> int:
+    raw_tab = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
+
+    WINNERS_PER_RUN = env_int("WINNERS_PER_RUN", 1)
+    VARIETY_LOOKBACK_HOURS = env_int("VARIETY_LOOKBACK_HOURS", 120)
+    DEST_REPEAT_PENALTY = env_float("DEST_REPEAT_PENALTY", 80.0)
+    THEME_REPEAT_PENALTY = env_float("THEME_REPEAT_PENALTY", 25.0)
+
+    # If TRUE, we will never promote "BAD" band deals even if nothing else exists.
+    HARD_BLOCK_BAD_DEALS = (os.getenv("HARD_BLOCK_BAD_DEALS", "true").strip().lower() == "true")
+
+    log("=" * 80)
+    log("TRAVELTXTER AI SCORER — ZONE×THEME BENCHMARKS")
+    log("=" * 80)
+    log(f"RAW_DEALS_TAB={raw_tab}")
+    log(f"WINNERS_PER_RUN={WINNERS_PER_RUN}")
+    log(f"VARIETY_LOOKBACK_HOURS={VARIETY_LOOKBACK_HOURS}, DEST_REPEAT_PENALTY={DEST_REPEAT_PENALTY}, THEME_REPEAT_PENALTY={THEME_REPEAT_PENALTY}")
+    log(f"HARD_BLOCK_BAD_DEALS={HARD_BLOCK_BAD_DEALS}")
+
+    sh = open_sheet()
+    ws = sh.worksheet(raw_tab)
+
+    # Load benchmark brain
+    benchmarks = load_zone_theme_benchmarks(sh)
+
+    values = ws.get_all_values()
+    if len(values) < 2:
+        log("Sheet empty. Nothing to score.")
         return 0
 
     headers = [h.strip() for h in values[0]]
-
-    required = [
-        "status",
-        "deal_id",
-        "worthiness_verdict",
-        "worthiness_score",
-        "destination_city",
-        "destination_iata",
-        "scored_timestamp",
-    ]
-    headers = ensure_columns(ws, headers, required)
-
-    values = ws.get_all_values()
-    headers = [h.strip() for h in values[0]]
-    rows = values[1:]
     h = {name: i for i, name in enumerate(headers)}
 
-    # Compute recent destinations to avoid repeats
-    recent_dests = recently_posted_destinations(headers, rows, lookback_hours)
-    if recent_dests:
-        log(f"🧠 Variety guard: {len(recent_dests)} recent destinations in last {lookback_hours}h")
+    # Required columns (LOCKED)
+    required = [
+        "status", "deal_id", "price_gbp",
+        "origin_city", "origin_iata",
+        "destination_city", "destination_iata", "destination_country",
+        "outbound_date", "return_date", "stops",
+        "deal_theme"
+    ]
+    missing = [c for c in required if c not in h]
+    if missing:
+        raise RuntimeError(f"RAW_DEALS missing required columns: {missing}")
 
-    # Collect candidates
-    candidates: List[Tuple[float, int, List[str]]] = []
-    for idx0, r in enumerate(rows):
-        rownum = idx0 + 2
+    # Columns we write (create if missing)
+    out_cols = ["deal_score", "dest_variety_score", "theme_variety_score", "scored_timestamp", "why_good"]
+    for c in out_cols:
+        if c not in h:
+            raise RuntimeError(f"RAW_DEALS missing required output column: {c}")
 
-        status = safe_get(r, h["status"]).upper()
-        if status != "NEW":
-            continue
+    # Optional write columns (only if present)
+    has_ai_notes = ("ai_notes" in h)
+    has_zone = ("zone" in h)  # optional if you add later
+    has_price_band = ("price_band" in h)  # optional if you add later
 
-        verdict = safe_get(r, h["worthiness_verdict"]).upper()
-        if verdict != "PUBLISH":
-            continue
+    # Gather NEW rows
+    new_rows: List[Tuple[int, List[str]]] = []
+    for i, row in enumerate(values[1:], start=2):  # sheet row number
+        status = (row[h["status"]] if h["status"] < len(row) else "").strip()
+        if status == "NEW":
+            new_rows.append((i, row))
 
-        score = safe_float(safe_get(r, h["worthiness_score"]))
-
-        dest_city = safe_get(r, h.get("destination_city", -1)).strip()
-        dest_iata = safe_get(r, h.get("destination_iata", -1)).strip()
-        dest_norm = (dest_city or dest_iata or "").strip().upper()
-
-        # Variety guard: skip if this destination was posted recently
-        if dest_norm and dest_norm in recent_dests:
-            continue
-
-        candidates.append((score, rownum, r))
-
-    if not candidates:
-        log("Done. Promoted 0 (no NEW rows with worthiness_verdict=PUBLISH passing variety guard).")
+    if not new_rows:
+        log("No NEW rows to score.")
         return 0
 
-    # Highest score first
-    candidates.sort(key=lambda t: t[0], reverse=True)
+    log(f"✓ Found NEW rows: {len(new_rows)}")
 
-    promote = candidates[:max(1, winners)]
-    updates = []
-    for score, rownum, r in promote:
-        deal_id = safe_get(r, h["deal_id"])
-        log(f"✅ Promote row {rownum} deal_id={deal_id} worthiness_score={score:.2f}")
+    # Recent destination + theme sets for variety penalties
+    lookback_cutoff = dt.datetime.utcnow() - dt.timedelta(hours=VARIETY_LOOKBACK_HOURS)
+    recent_dests: Set[str] = set()
+    recent_themes: Set[str] = set()
 
-        updates.append({"range": a1(rownum, h["status"]), "values": [["READY_TO_POST"]]})
-        updates.append({"range": a1(rownum, h["scored_timestamp"]), "values": [[now_utc_iso()]]})
+    if "scored_timestamp" in h and "destination_iata" in h and "deal_theme" in h:
+        ts_idx = h["scored_timestamp"]
+        dest_idx = h["destination_iata"]
+        theme_idx = h["deal_theme"]
 
-    ws.batch_update(updates, value_input_option="USER_ENTERED")
-    log(f"Done. Promoted {len(promote)} row(s) to READY_TO_POST.")
+        for row in values[1:]:
+            ts_val = row[ts_idx] if ts_idx < len(row) else ""
+            if not ts_val:
+                continue
+            try:
+                t = dt.datetime.fromisoformat(ts_val.replace("Z", ""))
+            except Exception:
+                continue
+            if t < lookback_cutoff:
+                continue
+
+            dest_val = row[dest_idx] if dest_idx < len(row) else ""
+            theme_val = row[theme_idx] if theme_idx < len(row) else ""
+            if dest_val:
+                recent_dests.add(up(dest_val))
+            if theme_val:
+                recent_themes.add(str(theme_val).strip().lower())
+
+    scored: List[Tuple[float, int, str]] = []  # (final_score, sheet_row, band)
+
+    updates: List[Tuple[str, Any]] = []
+
+    for sheet_row, row in new_rows:
+        dest_iata = up(row[h["destination_iata"]] if h["destination_iata"] < len(row) else "")
+        dest_country = (row[h["destination_country"]] if h["destination_country"] < len(row) else "").strip()
+        theme = low(row[h["deal_theme"]] if h["deal_theme"] < len(row) else "")
+
+        price = safe_float(row[h["price_gbp"]] if h["price_gbp"] < len(row) else None)
+        stops = safe_int(row[h["stops"]] if h["stops"] < len(row) else None)
+
+        # days ahead from outbound_date
+        days_ahead = None
+        od = row[h["outbound_date"]] if h["outbound_date"] < len(row) else ""
+        if od:
+            try:
+                d = dt.datetime.fromisoformat(str(od)[:10]).date()
+                days_ahead = (d - dt.datetime.utcnow().date()).days
+            except Exception:
+                days_ahead = None
+
+        # Zone & benchmark lookup
+        zone = infer_zone(dest_iata, dest_country)
+        bench = benchmarks.get((zone, theme))
+
+        # Price band score
+        band_score, band = compute_price_band_score(price, bench)
+
+        # Base score (timing/stops)
+        base_score = compute_base_score(price, stops, days_ahead)
+
+        # Variety penalties
+        dest_variety_score = 0.0
+        if dest_iata and dest_iata in recent_dests:
+            dest_variety_score = -float(DEST_REPEAT_PENALTY)
+
+        theme_variety_score = 0.0
+        if theme and theme in recent_themes:
+            theme_variety_score = -float(THEME_REPEAT_PENALTY)
+
+        final_score = base_score + band_score + dest_variety_score + theme_variety_score
+
+        # Deterministic rationale
+        why = why_good_text(band, zone, theme, price, bench)
+
+        note_bits = []
+        note_bits.append(f"zone={zone}")
+        note_bits.append(f"theme={theme}")
+        note_bits.append(f"band={band}")
+        if bench:
+            note_bits.append(f"bench=({bench['low_price']},{bench['normal_price']},{bench['high_price']})")
+        if dest_variety_score < 0:
+            note_bits.append("dest_repeat_penalty")
+        if theme_variety_score < 0:
+            note_bits.append("theme_repeat_penalty")
+        notes = "; ".join(note_bits)
+
+        # Write outputs
+        updates.append((a1(sheet_row, h["deal_score"]), round(final_score, 2)))
+        updates.append((a1(sheet_row, h["dest_variety_score"]), round(dest_variety_score, 2)))
+        updates.append((a1(sheet_row, h["theme_variety_score"]), round(theme_variety_score, 2)))
+        updates.append((a1(sheet_row, h["scored_timestamp"]), dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"))
+        updates.append((a1(sheet_row, h["why_good"]), why))
+        if has_ai_notes:
+            updates.append((a1(sheet_row, h["ai_notes"]), notes))
+        if has_zone:
+            updates.append((a1(sheet_row, h["zone"]), zone))
+        if has_price_band:
+            updates.append((a1(sheet_row, h["price_band"]), band))
+
+        scored.append((final_score, sheet_row, band))
+
+    # Batch write (single-cell updates but grouped)
+    log(f"Writing {len(updates)} cell updates...")
+    for cell, val in updates:
+        ws.update([[val]], cell)
+
+    # Rank: highest score first
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Winner selection with safety: optionally block BAD deals
+    winners: List[Tuple[float, int, str]] = []
+    for s, r, band in scored:
+        if HARD_BLOCK_BAD_DEALS and band == "BAD":
+            continue
+        winners.append((s, r, band))
+        if len(winners) >= max(1, WINNERS_PER_RUN):
+            break
+
+    if not winners:
+        log("⚠️ No eligible winners (all NEW deals were BAD vs benchmarks). Marking them SCORED; no publishing.")
+        winner_rows: Set[int] = set()
+    else:
+        winner_rows = {r for _s, r, _b in winners}
+
+    # Update statuses
+    for _s, sheet_row, _band in scored:
+        status_cell = a1(sheet_row, h["status"])
+        if sheet_row in winner_rows:
+            ws.update([["READY_TO_POST"]], status_cell)
+        else:
+            ws.update([["SCORED"]], status_cell)
+
+    log(f"✅ Winners promoted to READY_TO_POST: {len(winner_rows)} (WINNERS_PER_RUN={WINNERS_PER_RUN})")
     return 0
 
 

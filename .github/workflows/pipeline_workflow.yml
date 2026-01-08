@@ -1,13 +1,10 @@
-name: TravelTxter V4.5x Pipeline
+name: TravelTxter V4.5x Pipeline (TEST MODE)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "30 7 * * *"
-    - cron: "30 16 * * *"
 
 concurrency:
-  group: traveltxter-v45x
+  group: traveltxter-v45x-test
   cancel-in-progress: false
 
 jobs:
@@ -30,31 +27,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --------------------------------------------------
-      # RESOLVE RUN SLOT (AM / PM) — FIXED & RELIABLE
-      # --------------------------------------------------
-      - name: Resolve RUN_SLOT
-        id: runslot
-        shell: bash
-        run: |
-          HOUR=$(date -u +%H)
-          if [ "$HOUR" -lt "12" ]; then
-            SLOT="AM"
-          else
-            SLOT="PM"
-          fi
-          echo "slot=$SLOT" >> $GITHUB_OUTPUT
-          echo "Resolved RUN_SLOT=$SLOT (UTC hour=$HOUR)"
-
-      - name: Confirm RUN_SLOT
-        run: echo "RUN_SLOT is ${{ steps.runslot.outputs.slot }}"
-
       # ==================================================
-      # =================== AM RUN =======================
+      # FEEDER — MUST ALWAYS RUN
       # ==================================================
-
       - name: Feeder (Duffel ingestion)
-        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/pipeline_worker.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -65,8 +41,10 @@ jobs:
           DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
           DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
 
+      # ==================================================
+      # SCORER
+      # ==================================================
       - name: Scorer
-        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/ai_scorer.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -76,8 +54,10 @@ jobs:
           DEST_REPEAT_PENALTY: ${{ vars.DEST_REPEAT_PENALTY }}
           VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
 
+      # ==================================================
+      # LINK ROUTER
+      # ==================================================
       - name: Link Router
-        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/link_router.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -86,8 +66,10 @@ jobs:
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
 
+      # ==================================================
+      # RENDER
+      # ==================================================
       - name: Render Instagram Image
-        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/render_client.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -96,8 +78,10 @@ jobs:
           RENDER_URL: ${{ secrets.RENDER_URL }}
           RENDER_MAX_ROWS: 1
 
+      # ==================================================
+      # PUBLISH INSTAGRAM
+      # ==================================================
       - name: Publish Instagram
-        if: steps.runslot.outputs.slot == 'AM'
         run: python workers/instagram_publisher.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -108,11 +92,13 @@ jobs:
           STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
           STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
 
-      - name: Publish Telegram VIP
-        if: steps.runslot.outputs.slot == 'AM'
+      # ==================================================
+      # PUBLISH TELEGRAM (VIP + FREE FOR TESTING)
+      # ==================================================
+      - name: Publish Telegram
         run: python workers/telegram_publisher.py
         env:
-          RUN_SLOT: AM
+          RUN_SLOT: TEST
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
@@ -120,22 +106,5 @@ jobs:
           TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-
-      # ==================================================
-      # =================== PM RUN =======================
-      # ==================================================
-
-      - name: Publish Telegram FREE
-        if: steps.runslot.outputs.slot == 'PM'
-        run: python workers/telegram_publisher.py
-        env:
-          RUN_SLOT: PM
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
           STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
           STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}

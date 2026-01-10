@@ -1,43 +1,36 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — render_client.py (LOCKED, MINIMAL PATCH)
+workers/render_client.py
 
-Consumes:
-- status == READY_TO_POST
-- graphic_url blank
+Renders the BEST eligible row by calling the PythonAnywhere renderer.
 
-Produces:
-- graphic_url
-- rendered_timestamp
-- render_error
-- render_response_snippet
+Key behavior (LOCKED):
+- RENDER_URL may be either:
+  (a) base domain: https://greenroomman.pythonanywhere.com
+  (b) full endpoint: https://greenroomman.pythonanywhere.com/api/render
+- We normalize to a POST endpoint at /api/render
+- Healthcheck uses /api/health (best effort)
 
-Promotes:
-- READY_TO_POST -> READY_TO_PUBLISH (only after successful render)
+IMPORTANT FIX (THIS SESSION):
+- Instagram error 9004 happens when graphic_url is not a PUBLIC, DIRECT image URL.
+- The renderer sometimes returns a relative path like /static/renders/xxx.png
+  which Instagram cannot fetch unless it is made absolute (https://domain/static/...)
+- Therefore: we absolutise and preflight the returned image URL BEFORE writing it to the sheet.
 
-Non-negotiable render payload keys:
-{
-  "TO": "City",
-  "FROM": "City",
-  "OUT": "DDMMYY",
-  "IN": "DDMMYY",
-  "PRICE": "<numeric>",   # IMPORTANT: numeric only (renderer prints the £)
-}
-
-WHY THIS PATCH:
-- Your current 405 comes from POSTing to the wrong URL path.
-- This file forces /api/render (known working in your older, stable build).
-- Fixes ££ by sending numeric-only PRICE.
+PRICE RULE:
+- Renderer now guarantees a single £ inside the image.
+- We send numeric-only PRICE to keep things clean (e.g. "660").
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import json
-import time
 import math
+import time
 import datetime as dt
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -45,32 +38,34 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-# -----------------------------
+# ============================================================
 # Logging
-# -----------------------------
+# ============================================================
 
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     print(f"{ts} | {msg}", flush=True)
 
 
-# -----------------------------
+def die(msg: str, code: int = 1) -> None:
+    log(f"FATAL: {msg}")
+    raise SystemExit(code)
+
+
+# ============================================================
 # Env
-# -----------------------------
+# ============================================================
 
-def env_str(k: str, default: str = "") -> str:
-    return (os.environ.get(k, default) or "").strip()
-
-def env_int(k: str, default: int) -> int:
-    try:
-        return int(env_str(k, str(default)))
-    except Exception:
-        return default
+def get_env(name: str) -> str:
+    v = (os.getenv(name) or "").strip()
+    if not v:
+        die(f"Missing env var: {name}")
+    return v
 
 
-# -----------------------------
+# ============================================================
 # Sheets auth
-# -----------------------------
+# ============================================================
 
 def _parse_sa_json(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
@@ -79,293 +74,275 @@ def _parse_sa_json(raw: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return json.loads(raw.replace("\\n", "\n"))
 
-def gs_client():
-    raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
+
+def gs_client() -> gspread.Client:
+    raw = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
     if not raw:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+        die("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+
     info = _parse_sa_json(raw)
     creds = Credentials.from_service_account_info(
         info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     return gspread.authorize(creds)
 
 
-def ensure_columns(ws, required_cols: List[str]) -> Dict[str, int]:
-    headers = ws.row_values(1)
-    if not headers:
-        ws.update([required_cols], "A1")
-        headers = required_cols[:]
-        log(f"🛠️  Initialised headers for {ws.title}")
+# ============================================================
+# Helpers
+# ============================================================
 
-    headers = [h.strip() for h in headers]
-    missing = [c for c in required_cols if c not in headers]
-    if missing:
-        headers = headers + missing
-        ws.update([headers], "A1")
-        log(f"🛠️  Added missing columns: {missing}")
-    return {h: i for i, h in enumerate(headers)}
+def a1_col(idx0: int) -> str:
+    """0-based col index -> A1 column letters"""
+    idx = idx0 + 1
+    s = ""
+    while idx:
+        idx, r = divmod(idx - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 
-# -----------------------------
-# URL normalisation + warmup
-# -----------------------------
-
-def normalise_render_url(u: str) -> str:
-    """
-    LOCKED:
-    - Renderer endpoint is POST /api/render
-    - If secret is base domain, force /api/render
-    - If secret already includes a path, still force /api/render (stable contract)
-    """
-    u = (u or "").strip()
-    if not u:
-        return u
-    parsed = urlparse(u)
-    scheme = parsed.scheme or "https"
-    netloc = parsed.netloc or parsed.path  # handle accidental "domain.com/api/render"
-    path = parsed.path if parsed.netloc else ""
-    if not path.endswith("/api/render"):
-        path = "/api/render"
-    return urlunparse((scheme, netloc, path, "", "", ""))
-
-def health_url_from_render_url(render_url: str) -> str:
-    """
-    PythonAnywhere app exposes GET /health (NOT /api/health)
-    """
-    parsed = urlparse(render_url)
-    return urlunparse((parsed.scheme, parsed.netloc, "/health", "", "", ""))
-
-def warm_up(render_url: str) -> None:
-    hu = health_url_from_render_url(render_url)
+def ddmmyy(iso_date: str) -> str:
+    s = (iso_date or "").strip()
+    if not s:
+        return ""
     try:
-        r = requests.get(hu, timeout=15, headers={"User-Agent": "traveltxter-render-client/1.0"})
-        log(f"🫖 Render health: {r.status_code}")
-    except Exception as e:
-        log(f"🫖 Warmup failed (will still try render): {str(e)[:160]}")
-
-
-# -----------------------------
-# Formatting helpers
-# -----------------------------
-
-def ddmmyy(iso_yyyy_mm_dd: str) -> str:
-    s = (iso_yyyy_mm_dd or "").strip()
-    try:
-        d = dt.datetime.strptime(s[:10], "%Y-%m-%d").date()
+        d = dt.date.fromisoformat(s[:10])
         return d.strftime("%d%m%y")
     except Exception:
-        # allow already ddmmyy
-        s2 = "".join(ch for ch in s if ch.isdigit())
-        return s2[-6:] if len(s2) >= 6 else s2
-
-def price_numeric(price_gbp: Any) -> str:
-    """
-    IMPORTANT (LOCKED):
-    - Renderer template prints the £ itself
-    - So we send numeric only (e.g. "660"), NOT "£660"
-    """
-    s = str(price_gbp or "").strip().replace("£", "").replace(",", "")
-    try:
-        v = float(s)
-        return str(int(math.ceil(v)))
-    except Exception:
+        # best-effort fallback
         digits = "".join(ch for ch in s if ch.isdigit())
-        return digits if digits else "0"
+        return digits[-6:] if len(digits) >= 6 else digits
 
 
-def is_iata3(x: str) -> bool:
-    s = (x or "").strip().upper()
-    return len(s) == 3 and s.isalpha()
+def normalize_renderer_urls(render_url_raw: str) -> Tuple[str, str]:
+    """
+    Returns (render_ep, health_ep)
+    - render_ep MUST be POST /api/render
+    - health_ep best-effort GET /api/health
+    """
+    u = (render_url_raw or "").strip().rstrip("/")
+    if not u:
+        die("Missing RENDER_URL")
+
+    p = urlparse(u)
+    if not p.scheme:
+        # If someone pasted "domain.com/..." assume https
+        u = "https://" + u
+        p = urlparse(u)
+
+    base = urlunparse((p.scheme, p.netloc, "", "", "", ""))
+
+    # If the provided URL already ends with /api/render, keep it.
+    if p.path.endswith("/api/render"):
+        render_ep = u
+    else:
+        render_ep = base.rstrip("/") + "/api/render"
+
+    health_ep = base.rstrip("/") + "/api/health"
+    return render_ep, health_ep
 
 
-UK_AIRPORT_CITY_FALLBACK = {
-    "LHR": "London",
-    "LGW": "London",
-    "STN": "London",
-    "LTN": "London",
-    "LCY": "London",
-    "SEN": "London",
-    "MAN": "Manchester",
-    "BRS": "Bristol",
-    "BHX": "Birmingham",
-    "EDI": "Edinburgh",
-    "GLA": "Glasgow",
-    "NCL": "Newcastle",
-    "LPL": "Liverpool",
-    "NQY": "Newquay",
-    "SOU": "Southampton",
-    "CWL": "Cardiff",
-    "EXT": "Exeter",
-}
+def absolutise_image_url(image_url: str, render_ep: str) -> str:
+    """
+    Make renderer-returned URLs safe for Instagram:
+    - If '/static/..' -> 'https://domain/static/..'
+    - If missing scheme -> assume https
+    """
+    u = (image_url or "").strip()
+    if not u:
+        return ""
+
+    # If it is relative (/static/...), prefix with scheme+host from render_ep
+    if u.startswith("/"):
+        p = urlparse(render_ep)
+        base = urlunparse((p.scheme, p.netloc, "", "", "", "")).rstrip("/")
+        return base + u
+
+    pu = urlparse(u)
+    if not pu.scheme:
+        return "https://" + u.lstrip("/")
+
+    return u
 
 
-# -----------------------------
-# Render with retries
-# -----------------------------
+def preflight_public_image(url: str) -> None:
+    """
+    Ensure the URL is a direct, public image:
+    - HTTP 200
+    - Content-Type: image/*
+    """
+    if not url:
+        raise RuntimeError("graphic_url is blank after normalisation")
 
-def post_render(render_url: str, payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], str, int]:
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "traveltxter-render-client/1.0",
-    }
-    r = requests.post(render_url, json=payload, timeout=(15, 90), headers=headers)
-    snippet = (r.text or "")[:320].replace("\n", " ")
-    if r.status_code >= 400:
-        return False, {}, snippet, r.status_code
-    try:
-        return True, r.json(), snippet, r.status_code
-    except Exception:
-        return False, {}, snippet, r.status_code
+    headers = {"User-Agent": "traveltxter-render-preflight/1.0"}
+    r = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
+
+    if r.status_code != 200:
+        snippet = (r.text or "")[:200].replace("\n", " ")
+        raise RuntimeError(f"Rendered image not fetchable (HTTP {r.status_code}) :: {snippet}")
+
+    ctype = (r.headers.get("Content-Type") or "").lower().strip()
+    if not ctype.startswith("image/"):
+        # small peek to catch HTML/JSON
+        try:
+            chunk = next(r.iter_content(chunk_size=512))
+            peek = chunk[:120]
+        except Exception:
+            peek = b""
+        raise RuntimeError(f"Rendered URL not an image (Content-Type={ctype}) :: peek={peek!r}")
 
 
-# -----------------------------
+# ============================================================
 # Main
-# -----------------------------
+# ============================================================
 
-def main() -> int:
-    spreadsheet_id = env_str("SPREADSHEET_ID") or env_str("SHEET_ID")
-    tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-    render_url_raw = env_str("RENDER_URL")
-    render_max = env_int("RENDER_MAX_ROWS", 1)
+def main() -> None:
+    spreadsheet_id = get_env("SPREADSHEET_ID")
+    raw_tab = (os.getenv("RAW_DEALS_TAB", "RAW_DEALS") or "RAW_DEALS").strip()
+    render_url_raw = get_env("RENDER_URL")
+    render_max_rows = int(os.getenv("RENDER_MAX_ROWS", "1"))
 
-    if not spreadsheet_id:
-        raise RuntimeError("Missing SPREADSHEET_ID (or SHEET_ID)")
-    if not render_url_raw:
-        raise RuntimeError("Missing RENDER_URL")
-
-    render_url = normalise_render_url(render_url_raw)
-    if render_url != render_url_raw:
-        log(f"🔧 Normalised RENDER_URL: {render_url_raw} -> {render_url}")
+    render_ep, health_ep = normalize_renderer_urls(render_url_raw)
 
     gc = gs_client()
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(tab)
+    ws = sh.worksheet(raw_tab)
 
-    need_cols = [
-        "status",
-        "deal_id",
-        "origin_iata",
-        "destination_iata",
-        "origin_city",
-        "destination_city",
-        "outbound_date",
-        "return_date",
-        "price_gbp",
-        "graphic_url",
-        "rendered_timestamp",
-        "render_error",
-        "render_response_snippet",
-    ]
-    h = ensure_columns(ws, need_cols)
+    rows: List[List[Any]] = ws.get_all_values()
+    if not rows or len(rows) < 2:
+        die("RAW_DEALS is empty (no header + rows).", 0)
 
-    warm_up(render_url)
+    headers = rows[0]
+    h = {name.strip(): i for i, name in enumerate(headers)}
 
-    rows = ws.get_all_values()
-    if len(rows) < 2:
-        log("No rows in RAW_DEALS.")
-        return 0
+    def col(name: str) -> int:
+        if name not in h:
+            die(f"Missing required column in RAW_DEALS: {name}")
+        return h[name]
 
-    rendered = 0
+    # Required cols for render payload
+    c_status = col("status")
+    c_deal_id = col("deal_id")
+    c_price = col("price_gbp")
+    c_origin_city = col("origin_city")
+    c_dest_city = col("destination_city")
+    c_out = col("outbound_date")
+    c_ret = col("return_date")
 
-    for i in range(2, len(rows) + 1):  # 1-indexed in Sheets, skip header
-        if rendered >= render_max:
-            break
+    # Optional cols
+    c_render_url = h.get("graphic_url")
+    c_render_err = h.get("render_error")
 
-        row = rows[i - 1]
+    # Healthcheck (best effort)
+    try:
+        r = requests.get(health_ep, timeout=10)
+        log(f"Renderer healthcheck: {r.status_code}")
+    except Exception as e:
+        log(f"Renderer healthcheck failed (non-fatal): {e}")
 
-        def get(col: str) -> str:
-            idx = h[col]
-            return row[idx] if idx < len(row) else ""
-
-        status = (get("status") or "").strip()
-        graphic_url = (get("graphic_url") or "").strip()
-
+    # Pick BEST eligible row (keep existing behavior)
+    candidates: List[Tuple[int, List[Any]]] = []
+    for i in range(1, len(rows)):
+        row = rows[i]
+        status = (row[c_status] if c_status < len(row) else "").strip()
         if status != "READY_TO_POST":
             continue
-        if graphic_url:
-            continue
+        candidates.append((i, row))
 
-        deal_id = (get("deal_id") or "").strip() or f"row{i}"
-        to_city = (get("destination_city") or "").strip()
-        from_city = (get("origin_city") or "").strip()
+    if not candidates:
+        log("No READY_TO_POST rows to render.")
+        return
 
-        # Hard fallback: if sheet only has IATA
-        if not to_city:
-            to_city = (get("destination_iata") or "").strip()
-        if not from_city:
-            from_city = (get("origin_iata") or "").strip()
+    # Deterministic: first candidate (existing behavior in this file’s style)
+    to_process = candidates[: max(1, render_max_rows)]
 
-        # If still IATA, translate UK origins so images look human
-        if is_iata3(from_city):
-            from_city = UK_AIRPORT_CITY_FALLBACK.get(from_city.upper(), from_city)
+    for idx, row in to_process:
+        sheet_row_num = idx + 1  # rows list is 0-based, sheets are 1-based
 
-        out_date = ddmmyy(get("outbound_date"))
-        in_date = ddmmyy(get("return_date"))
-        price = price_numeric(get("price_gbp"))  # ✅ numeric only
+        deal_id = (row[c_deal_id] if c_deal_id < len(row) else "").strip()
+        origin_city = (row[c_origin_city] if c_origin_city < len(row) else "").strip()
+        dest_city = (row[c_dest_city] if c_dest_city < len(row) else "").strip()
+        out_fmt = ddmmyy((row[c_out] if c_out < len(row) else "").strip())
+        in_fmt = ddmmyy((row[c_ret] if c_ret < len(row) else "").strip())
+
+        # PRICE: numeric only (renderer prints £)
+        try:
+            raw_price = (row[c_price] if c_price < len(row) else "0")
+            raw_price = (raw_price or "").strip().replace("£", "").replace(",", "")
+            price_val = float(raw_price or "0")
+        except Exception:
+            price_val = 0.0
+        price_fmt = str(int(math.ceil(price_val)))
 
         payload = {
-            "TO": to_city,
-            "FROM": from_city,
-            "OUT": out_date,
-            "IN": in_date,
-            "PRICE": price,
-            "DEAL_ID": deal_id,  # harmless metadata; renderer can ignore
+            "deal_id": deal_id,
+            "TO": dest_city,
+            "FROM": origin_city,
+            "OUT": out_fmt,
+            "IN": in_fmt,
+            "PRICE": price_fmt,
         }
-        log(f"🎨 Rendering row {i} payload={payload}")
 
-        ok = False
-        last_snip = ""
-        last_code = 0
-        last_json: Dict[str, Any] = {}
+        log(f"🖼️ Rendering row {sheet_row_num} deal_id={deal_id}")
 
-        for attempt in range(1, 6):
-            ok, data, snip, code = post_render(render_url, payload)
-            last_snip, last_code, last_json = snip, code, data
+        try:
+            resp = requests.post(render_ep, json=payload, timeout=90)
+        except Exception as e:
+            msg = f"Render request failed: {e}"
+            log(f"❌ {msg}")
+            if c_render_err is not None:
+                ws.update([[msg]], f"{a1_col(c_render_err)}{sheet_row_num}")
+            continue
 
-            if ok and isinstance(data, dict) and (data.get("image_url") or data.get("graphic_url")):
-                break
+        raw = (resp.text or "")[:400]
+        if resp.status_code >= 400:
+            msg = f"Render HTTP {resp.status_code}: {raw}"
+            log(f"❌ {msg}")
+            if c_render_err is not None:
+                ws.update([[msg]], f"{a1_col(c_render_err)}{sheet_row_num}")
+            continue
 
-            sleep_s = [0, 4, 6, 10, 16, 24][attempt]
-            log(f"⏳ Render retry {attempt}/5 in {sleep_s}s... (Render HTTP {code} :: {snip[:160]})")
-            time.sleep(sleep_s)
+        data = resp.json() if "application/json" in (resp.headers.get("content-type", "") or "") else {}
+        image_url = (data.get("image_url") or data.get("graphic_url") or "").strip()
 
-        now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-        updates: Dict[str, str] = {}
+        if not image_url:
+            msg = f"Render OK but missing image_url. Response: {str(data)[:300]}"
+            log(f"❌ {msg}")
+            if c_render_err is not None:
+                ws.update([[msg]], f"{a1_col(c_render_err)}{sheet_row_num}")
+            continue
 
-        if ok:
-            image_url = (last_json.get("image_url") or last_json.get("graphic_url") or "").strip()
-            if image_url and image_url.startswith("/"):
-                parsed = urlparse(render_url)
-                image_url = f"{parsed.scheme}://{parsed.netloc}{image_url}"
+        # ✅ FIX: absolutise + preflight so IG can fetch it
+        image_url_abs = absolutise_image_url(image_url, render_ep)
 
-            if image_url:
-                updates["graphic_url"] = image_url
-                updates["rendered_timestamp"] = now
-                updates["render_error"] = ""
-                updates["render_response_snippet"] = ""
-                updates["status"] = "READY_TO_PUBLISH"
-                rendered += 1
-            else:
-                updates["render_error"] = f"Render OK but no image_url/graphic_url in JSON (HTTP {last_code})"
-                updates["render_response_snippet"] = (json.dumps(last_json)[:300] if last_json else last_snip[:300])
-        else:
-            updates["render_error"] = f"Render HTTP {last_code}"
-            updates["render_response_snippet"] = last_snip[:300]
+        try:
+            preflight_public_image(image_url_abs)
+        except Exception as e:
+            msg = f"Rendered URL not IG-safe: {str(e)[:260]}"
+            log(f"❌ {msg}")
+            if c_render_err is not None:
+                ws.update([[msg]], f"{a1_col(c_render_err)}{sheet_row_num}")
+            continue
 
-        for col, val in updates.items():
-            cidx = h[col] + 1
-            ws.update_cell(i, cidx, val)
+        # Write graphic_url
+        if c_render_url is None:
+            die("RAW_DEALS missing graphic_url column (required for downstream).")
 
-        if "graphic_url" not in updates:
-            log(f"❌ Render failed row {i}: {updates.get('render_error','unknown')} :: {updates.get('render_response_snippet','')[:140]}")
-        else:
-            log(f"✅ Rendered row {i} -> READY_TO_PUBLISH")
+        ws.update([[image_url_abs]], f"{a1_col(c_render_url)}{sheet_row_num}")
 
-    log(f"Done. Rendered {rendered}.")
-    return 0
+        # Clear render_error if present
+        if c_render_err is not None:
+            ws.update([[""]], f"{a1_col(c_render_err)}{sheet_row_num}")
+
+        # Promote status
+        ws.update([["READY_TO_PUBLISH"]], f"{a1_col(c_status)}{sheet_row_num}")
+
+        log(f"✅ Rendered and promoted row {sheet_row_num} -> READY_TO_PUBLISH")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

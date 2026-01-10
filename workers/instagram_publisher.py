@@ -6,12 +6,13 @@ LOCKED SYSTEM RULES:
 - Consume: status == READY_TO_PUBLISH
 - Require: graphic_url present
 - Produce: status -> POSTED_INSTAGRAM
-- Non-technical stability fixes only (no redesign).
 
-This patch fixes:
+This patch fixes TWO production blockers:
 1) Phrase missing: PHRASE_BANK.channel_hint is descriptive in this project, so we DO NOT filter on it.
-2) Price showing "££": normalise price to exactly one "£" prefix.
-3) Keep prior stability fixes (caption quoting + IG publish retries).
+2) IG error 9004 "media download has failed": graphic_url must be a PUBLIC, DIRECT image URL
+   that returns HTTP 200 with Content-Type image/* (not HTML/redirect/login). We now:
+   - normalise/absolutise the URL (handles relative /static/... and missing scheme)
+   - preflight GET the image and fail fast with a clear sheet error if not valid
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import time
 import datetime as dt
 import hashlib
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import gspread
@@ -122,32 +124,26 @@ def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str
 
 
 # =========================
-# Price normaliser (LOCKED)
+# Price normaliser (caption only)
 # =========================
 
 def normalise_gbp_price(raw: str) -> str:
     """
-    Ensure display is exactly '£123.45' (one £ only), if a number exists.
-    If value is empty or non-numeric, return as-is but without duplicate '££'.
+    Ensure caption display is exactly '£123.45' (one £ only), if numeric exists.
     """
     s = (raw or "").strip()
     if not s:
         return ""
 
-    # Remove all leading/trailing currency clutter then rebuild
     s2 = s.replace("£", "").strip()
-
-    # If it looks numeric, format with one £
     try:
         v = float(s2.replace(",", ""))
         return f"£{v:,.2f}"
     except Exception:
-        # Not numeric: just ensure no duplicate ££
-        if "££" in s:
-            s = s.replace("££", "£")
+        # Not numeric: just collapse duplicate £
+        s = s.replace("££", "£")
         if s.startswith("£"):
             return s
-        # If it had any £ originally, keep one
         if "£" in raw:
             return "£" + s2
         return s
@@ -192,11 +188,10 @@ def _pick_from_pool(pool: List[Dict[str, str]], deal_id: str) -> str:
 
 def pick_phrase_from_bank(bank: List[Dict[str, str]], theme: str, deal_id: str) -> str:
     """
-    IMPORTANT: In this project PHRASE_BANK.channel_hint is descriptive text,
-    so we DO NOT filter on it.
-
-    1) Try theme match (approved + theme exact match).
-    2) Fallback to any approved phrase (never blank).
+    IMPORTANT:
+    - PHRASE_BANK.channel_hint is descriptive text, so we DO NOT filter on it.
+    - 1) Try approved + theme match
+    - 2) Fallback to any approved phrase
     """
     theme_u = (theme or "").strip().upper()
 
@@ -224,12 +219,12 @@ def pick_phrase_from_bank(bank: List[Dict[str, str]], theme: str, deal_id: str) 
 
 def build_caption_ig(country: str, to_city: str, from_city: str, price: str, out_d: str, back_d: str, phrase: str) -> str:
     lines = [
-        country,
-        f"To: {to_city}",
-        f"From: {from_city}",
-        f"Price: {price}",
-        f"Out: {out_d}",
-        f"Return: {back_d}",
+        (country or "").strip(),
+        f"To: {(to_city or '').strip()}",
+        f"From: {(from_city or '').strip()}",
+        f"Price: {(price or '').strip()}",
+        f"Out: {(out_d or '').strip()}",
+        f"Return: {(back_d or '').strip()}",
         "",
     ]
 
@@ -240,7 +235,86 @@ def build_caption_ig(country: str, to_city: str, from_city: str, price: str, out
             lines.append("")
 
     lines.append("Link in bio…")
-    return "\n".join(lines).strip()
+    return "\n".join([x for x in lines if x is not None]).strip()
+
+
+# =========================
+# Image URL normalisation + preflight (FIXES IG 9004)
+# =========================
+
+def _base_from_render_url(render_url: str) -> Optional[str]:
+    """
+    Uses RENDER_URL to recover the scheme+host for relative graphic_url like /static/...
+    """
+    ru = (render_url or "").strip()
+    if not ru:
+        return None
+    p = urlparse(ru)
+    if not p.scheme or not p.netloc:
+        return None
+    return urlunparse((p.scheme, p.netloc, "", "", "", "")).rstrip("/")
+
+
+def absolutise_image_url(image_url: str) -> str:
+    """
+    IG must fetch this URL publicly.
+    - If url starts with /static/... -> prefix with scheme+host from RENDER_URL
+    - If url has no scheme -> prefix https://
+    """
+    u = (image_url or "").strip()
+    if not u:
+        return ""
+
+    if u.startswith("/"):
+        base = _base_from_render_url(env_str("RENDER_URL"))
+        if base:
+            return base + u
+        return u  # leave as-is (will fail preflight with clear error)
+
+    p = urlparse(u)
+    if not p.scheme:
+        return "https://" + u.lstrip("/")
+
+    return u
+
+
+def preflight_public_image(url: str) -> None:
+    """
+    Fail fast if the URL is not a direct public image.
+    IG typically fails with code 9004 when:
+    - 404/403
+    - HTML page returned instead of image/*
+    - redirects to login
+    """
+    if not url:
+        raise RuntimeError("graphic_url is blank after normalisation")
+
+    headers = {"User-Agent": "traveltxter-ig-preflight/1.0"}
+    r = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
+
+    if r.status_code != 200:
+        snippet = (r.text or "")[:200].replace("\n", " ")
+        raise RuntimeError(f"graphic_url not fetchable (HTTP {r.status_code}) :: {snippet}")
+
+    ctype = (r.headers.get("Content-Type") or "").lower().strip()
+    if not ctype.startswith("image/"):
+        # Read a tiny chunk to catch HTML/JSON
+        try:
+            chunk = next(r.iter_content(chunk_size=512))
+            peek = chunk[:200]
+        except Exception:
+            peek = b""
+        raise RuntimeError(f"graphic_url not an image (Content-Type={ctype}) :: peek={peek[:80]!r}")
+
+    # Optional sanity: ensure not enormous
+    clen = r.headers.get("Content-Length")
+    if clen:
+        try:
+            n = int(clen)
+            if n > 15_000_000:
+                raise RuntimeError(f"graphic_url too large for IG (Content-Length={n})")
+        except ValueError:
+            pass
 
 
 # =========================
@@ -308,9 +382,12 @@ def main() -> int:
         if safe_get(r, h["status"]) != "READY_TO_PUBLISH":
             continue
 
-        image_url = safe_get(r, h["graphic_url"])
-        if not image_url:
+        image_url_raw = safe_get(r, h["graphic_url"])
+        if not image_url_raw:
             continue
+
+        # ✅ Normalise to absolute public URL before IG sees it
+        image_url = absolutise_image_url(image_url_raw)
 
         deal_id = safe_get(r, h["deal_id"])
         theme = safe_get(r, h.get("deal_theme", -1)) or safe_get(r, h.get("theme", -1))
@@ -334,6 +411,9 @@ def main() -> int:
         )
 
         try:
+            # ✅ Preflight: if this isn't a direct image URL, IG will fail with 9004
+            preflight_public_image(image_url)
+
             ig_create_and_publish(
                 env_str("IG_ACCESS_TOKEN"),
                 env_str("IG_USER_ID"),

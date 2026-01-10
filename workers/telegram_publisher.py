@@ -12,16 +12,14 @@ FREE post (24h after VIP):
   - Writes:   posted_telegram_free_at
   - Promotes: POSTED_TELEGRAM_VIP -> POSTED_ALL
 
-RUN_SLOT support (for testing):
+RUN_SLOT support:
   - VIP:  RUN_SLOT in (VIP, AM, TEST)  -> VIP behaviour
   - FREE: RUN_SLOT in (FREE, PM)       -> FREE behaviour
 
 LOCKED OUTPUT RULE:
-- Telegram must display PHRASE BANK text.
+- Telegram must show phrase_bank.
 - If RAW_DEALS.phrase_bank is blank, this worker loads PHRASE_BANK and writes it into RAW_DEALS.phrase_bank.
-
-LOCKED PHRASE BANK RULE (IMPORTANT):
-- PHRASE_BANK.csv uses channel_hint as descriptive text (not TG/IG routing), so we DO NOT filter on it.
+- Flag emoji must use COUNTRY_FLAG_MAP (fallback 🌍 if unknown).
 """
 
 from __future__ import annotations
@@ -130,6 +128,273 @@ def tg_send(bot_token: str, chat_id: str, message_html: str) -> None:
 
 
 # -----------------------------
+# Flags (LOCKED)
+# -----------------------------
+
+# Complete country-to-flag emoji mapping (195 UN member states + common territories)
+COUNTRY_FLAG_MAP = {
+    # Europe
+    "albania": "🇦🇱",
+    "andorra": "🇦🇩",
+    "armenia": "🇦🇲",
+    "austria": "🇦🇹",
+    "azerbaijan": "🇦🇿",
+    "belarus": "🇧🇾",
+    "belgium": "🇧🇪",
+    "bosnia and herzegovina": "🇧🇦",
+    "bosnia": "🇧🇦",
+    "bulgaria": "🇧🇬",
+    "croatia": "🇭🇷",
+    "cyprus": "🇨🇾",
+    "czech republic": "🇨🇿",
+    "czechia": "🇨🇿",
+    "denmark": "🇩🇰",
+    "estonia": "🇪🇪",
+    "finland": "🇫🇮",
+    "france": "🇫🇷",
+    "georgia": "🇬🇪",
+    "germany": "🇩🇪",
+    "greece": "🇬🇷",
+    "hungary": "🇭🇺",
+    "iceland": "🇮🇸",
+    "ireland": "🇮🇪",
+    "italy": "🇮🇹",
+    "kosovo": "🇽🇰",
+    "latvia": "🇱🇻",
+    "liechtenstein": "🇱🇮",
+    "lithuania": "🇱🇹",
+    "luxembourg": "🇱🇺",
+    "malta": "🇲🇹",
+    "moldova": "🇲🇩",
+    "monaco": "🇲🇨",
+    "montenegro": "🇲🇪",
+    "netherlands": "🇳🇱",
+    "north macedonia": "🇲🇰",
+    "macedonia": "🇲🇰",
+    "norway": "🇳🇴",
+    "poland": "🇵🇱",
+    "portugal": "🇵🇹",
+    "romania": "🇷🇴",
+    "russia": "🇷🇺",
+    "russian federation": "🇷🇺",
+    "san marino": "🇸🇲",
+    "serbia": "🇷🇸",
+    "slovakia": "🇸🇰",
+    "slovenia": "🇸🇮",
+    "spain": "🇪🇸",
+    "sweden": "🇸🇪",
+    "switzerland": "🇨🇭",
+    "ukraine": "🇺🇦",
+    "united kingdom": "🇬🇧",
+    "uk": "🇬🇧",
+    "great britain": "🇬🇧",
+    "england": "🏴",
+    "scotland": "🏴",
+    "wales": "🏴",
+    "northern ireland": "🇬🇧",
+    "vatican city": "🇻🇦",
+
+    # Asia
+    "afghanistan": "🇦🇫",
+    "bahrain": "🇧🇭",
+    "bangladesh": "🇧🇩",
+    "bhutan": "🇧🇹",
+    "brunei": "🇧🇳",
+    "cambodia": "🇰🇭",
+    "china": "🇨🇳",
+    "india": "🇮🇳",
+    "indonesia": "🇮🇩",
+    "iran": "🇮🇷",
+    "iraq": "🇮🇶",
+    "israel": "🇮🇱",
+    "japan": "🇯🇵",
+    "jordan": "🇯🇴",
+    "kazakhstan": "🇰🇿",
+    "kuwait": "🇰🇼",
+    "kyrgyzstan": "🇰🇬",
+    "laos": "🇱🇦",
+    "lebanon": "🇱🇧",
+    "malaysia": "🇲🇾",
+    "maldives": "🇲🇻",
+    "mongolia": "🇲🇳",
+    "myanmar": "🇲🇲",
+    "burma": "🇲🇲",
+    "nepal": "🇳🇵",
+    "north korea": "🇰🇵",
+    "oman": "🇴🇲",
+    "pakistan": "🇵🇰",
+    "palestine": "🇵🇸",
+    "philippines": "🇵🇭",
+    "qatar": "🇶🇦",
+    "saudi arabia": "🇸🇦",
+    "singapore": "🇸🇬",
+    "south korea": "🇰🇷",
+    "korea": "🇰🇷",
+    "sri lanka": "🇱🇰",
+    "syria": "🇸🇾",
+    "taiwan": "🇹🇼",
+    "tajikistan": "🇹🇯",
+    "thailand": "🇹🇭",
+    "timor-leste": "🇹🇱",
+    "east timor": "🇹🇱",
+    "turkey": "🇹🇷",
+    "turkmenistan": "🇹🇲",
+    "united arab emirates": "🇦🇪",
+    "uae": "🇦🇪",
+    "uzbekistan": "🇺🇿",
+    "vietnam": "🇻🇳",
+    "yemen": "🇾🇪",
+
+    # Africa
+    "algeria": "🇩🇿",
+    "angola": "🇦🇴",
+    "benin": "🇧🇯",
+    "botswana": "🇧🇼",
+    "burkina faso": "🇧🇫",
+    "burundi": "🇧🇮",
+    "cameroon": "🇨🇲",
+    "cape verde": "🇨🇻",
+    "central african republic": "🇨🇫",
+    "chad": "🇹🇩",
+    "comoros": "🇰🇲",
+    "congo": "🇨🇬",
+    "democratic republic of the congo": "🇨🇩",
+    "drc": "🇨🇩",
+    "djibouti": "🇩🇯",
+    "egypt": "🇪🇬",
+    "equatorial guinea": "🇬🇶",
+    "eritrea": "🇪🇷",
+    "eswatini": "🇸🇿",
+    "swaziland": "🇸🇿",
+    "ethiopia": "🇪🇹",
+    "gabon": "🇬🇦",
+    "gambia": "🇬🇲",
+    "ghana": "🇬🇭",
+    "guinea": "🇬🇳",
+    "guinea-bissau": "🇬🇼",
+    "ivory coast": "🇨🇮",
+    "côte d'ivoire": "🇨🇮",
+    "kenya": "🇰🇪",
+    "lesotho": "🇱🇸",
+    "liberia": "🇱🇷",
+    "libya": "🇱🇾",
+    "madagascar": "🇲🇬",
+    "malawi": "🇲🇼",
+    "mali": "🇲🇱",
+    "mauritania": "🇲🇷",
+    "mauritius": "🇲🇺",
+    "morocco": "🇲🇦",
+    "mozambique": "🇲🇿",
+    "namibia": "🇳🇦",
+    "niger": "🇳🇪",
+    "nigeria": "🇳🇬",
+    "rwanda": "🇷🇼",
+    "sao tome and principe": "🇸🇹",
+    "senegal": "🇸🇳",
+    "seychelles": "🇸🇨",
+    "sierra leone": "🇸🇱",
+    "somalia": "🇸🇴",
+    "south africa": "🇿🇦",
+    "south sudan": "🇸🇸",
+    "sudan": "🇸🇩",
+    "tanzania": "🇹🇿",
+    "togo": "🇹🇬",
+    "tunisia": "🇹🇳",
+    "uganda": "🇺🇬",
+    "zambia": "🇿🇲",
+    "zimbabwe": "🇿🇼",
+
+    # North America
+    "antigua and barbuda": "🇦🇬",
+    "bahamas": "🇧🇸",
+    "barbados": "🇧🇧",
+    "belize": "🇧🇿",
+    "canada": "🇨🇦",
+    "costa rica": "🇨🇷",
+    "cuba": "🇨🇺",
+    "dominica": "🇩🇲",
+    "dominican republic": "🇩🇴",
+    "el salvador": "🇸🇻",
+    "grenada": "🇬🇩",
+    "guatemala": "🇬🇹",
+    "haiti": "🇭🇹",
+    "honduras": "🇭🇳",
+    "jamaica": "🇯🇲",
+    "mexico": "🇲🇽",
+    "nicaragua": "🇳🇮",
+    "panama": "🇵🇦",
+    "saint kitts and nevis": "🇰🇳",
+    "saint lucia": "🇱🇨",
+    "saint vincent and the grenadines": "🇻🇨",
+    "trinidad and tobago": "🇹🇹",
+    "united states": "🇺🇸",
+    "united states of america": "🇺🇸",
+    "usa": "🇺🇸",
+    "us": "🇺🇸",
+    "america": "🇺🇸",
+
+    # South America
+    "argentina": "🇦🇷",
+    "bolivia": "🇧🇴",
+    "brazil": "🇧🇷",
+    "chile": "🇨🇱",
+    "colombia": "🇨🇴",
+    "ecuador": "🇪🇨",
+    "guyana": "🇬🇾",
+    "paraguay": "🇵🇾",
+    "peru": "🇵🇪",
+    "suriname": "🇸🇷",
+    "uruguay": "🇺🇾",
+    "venezuela": "🇻🇪",
+
+    # Oceania
+    "australia": "🇦🇺",
+    "fiji": "🇫🇯",
+    "kiribati": "🇰🇮",
+    "marshall islands": "🇲🇭",
+    "micronesia": "🇫🇲",
+    "nauru": "🇳🇷",
+    "new zealand": "🇳🇿",
+    "palau": "🇵🇼",
+    "papua new guinea": "🇵🇬",
+    "samoa": "🇼🇸",
+    "solomon islands": "🇸🇧",
+    "tonga": "🇹🇴",
+    "tuvalu": "🇹🇻",
+    "vanuatu": "🇻🇺",
+
+    # Common territories / dependencies (non-UN members)
+    "hong kong": "🇭🇰",
+    "macau": "🇲🇴",
+    "puerto rico": "🇵🇷",
+    "greenland": "🇬🇱",
+    "faroe islands": "🇫🇴",
+    "bermuda": "🇧🇲",
+    "cayman islands": "🇰🇾",
+    "french polynesia": "🇵🇫",
+    "tahiti": "🇵🇫",
+    "guam": "🇬🇺",
+    "new caledonia": "🇳🇨",
+    "aruba": "🇦🇼",
+    "curaçao": "🇨🇼",
+    "gibraltar": "🇬🇮",
+    "isle of man": "🇮🇲",
+    "jersey": "🇯🇪",
+    "guernsey": "🇬🇬",
+}
+
+def get_country_flag(country_name: str) -> str:
+    if not country_name:
+        return ""
+    normalized = country_name.lower().strip()
+    return COUNTRY_FLAG_MAP.get(normalized, "")
+
+def get_country_flag_with_fallback(country_name: str, fallback: str = "🌍") -> str:
+    flag = get_country_flag(country_name)
+    return flag if flag else fallback
+
+
+# -----------------------------
 # Formatting helpers
 # -----------------------------
 
@@ -168,31 +433,6 @@ def fmt_price_gbp(p: str) -> str:
     except Exception:
         return p if p.startswith("£") else f"£{p}"
 
-def country_flag(country: str) -> str:
-    c = (country or "").strip().lower()
-    m = {
-        "iceland": "🇮🇸",
-        "spain": "🇪🇸",
-        "portugal": "🇵🇹",
-        "greece": "🇬🇷",
-        "malta": "🇲🇹",
-        "poland": "🇵🇱",
-        "croatia": "🇭🇷",
-        "italy": "🇮🇹",
-        "france": "🇫🇷",
-        "turkey": "🇹🇷",
-        "morocco": "🇲🇦",
-        "thailand": "🇹🇭",
-        "japan": "🇯🇵",
-        "usa": "🇺🇸",
-        "united states": "🇺🇸",
-        "united states of america": "🇺🇸",
-        "mexico": "🇲🇽",
-        "united arab emirates": "🇦🇪",
-        "uae": "🇦🇪",
-    }
-    return m.get(c, "")
-
 def pick_first_present(row: Dict[str, str], keys: List[str]) -> str:
     for k in keys:
         v = (row.get(k, "") or "").strip()
@@ -205,8 +445,12 @@ def pick_first_present(row: Dict[str, str], keys: List[str]) -> str:
 # PHRASE BANK loader + picker (LOCKED)
 # -----------------------------
 
-def _truthy(x: str) -> bool:
-    return (x or "").strip().lower() in ("true", "yes", "1", "y", "approved")
+def _truthy(x: Any) -> bool:
+    if x is True:
+        return True
+    if x is False or x is None:
+        return False
+    return str(x).strip().lower() in ("true", "yes", "1", "y", "approved")
 
 def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
     try:
@@ -228,19 +472,30 @@ def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
             out.append(d)
     return out
 
-def pick_phrase(bank: List[Dict[str, str]], theme: str, deal_id: str) -> str:
-    # IMPORTANT: channel_hint is descriptive text in your PHRASE_BANK, so we ignore it.
-    theme_u = (theme or "").strip().upper()
-    pool = [
-        r for r in bank
-        if (r.get("phrase") or "").strip()
-        and _truthy(r.get("approved", ""))
-        and (not (r.get("theme") or "").strip() or (r.get("theme") or "").strip().upper() == theme_u)
-    ]
+def _pick_from_pool(pool: List[Dict[str, str]], deal_id: str) -> str:
     if not pool:
         return ""
     h = hashlib.md5((deal_id or "x").encode()).hexdigest()
     return (pool[int(h[:8], 16) % len(pool)].get("phrase", "") or "").strip()
+
+def pick_phrase(bank: List[Dict[str, str]], theme: str, deal_id: str) -> str:
+    theme_u = (theme or "").strip().upper()
+    themed = [
+        r for r in bank
+        if (r.get("phrase") or "").strip()
+        and _truthy(r.get("approved", ""))
+        and (r.get("theme") or "").strip().upper() == theme_u
+    ]
+    chosen = _pick_from_pool(themed, deal_id)
+    if chosen:
+        return chosen
+
+    any_ok = [
+        r for r in bank
+        if (r.get("phrase") or "").strip()
+        and _truthy(r.get("approved", ""))
+    ]
+    return _pick_from_pool(any_ok, deal_id)
 
 
 # -----------------------------
@@ -250,7 +505,7 @@ def pick_phrase(bank: List[Dict[str, str]], theme: str, deal_id: str) -> str:
 def build_vip_message(row: Dict[str, str]) -> str:
     price = fmt_price_gbp(row.get("price_gbp", ""))
     country = (row.get("destination_country", "") or "").strip()
-    flag = country_flag(country)
+    flag = get_country_flag_with_fallback(country, fallback="🌍")
 
     dest_city_raw = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
     origin_city_raw = (row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip()
@@ -262,11 +517,10 @@ def build_vip_message(row: Dict[str, str]) -> str:
     ret_d = (row.get("return_date", "") or "").strip()
 
     phrase = (row.get("phrase_bank", "") or "").strip()
-
     booking = clean_url(pick_first_present(row, ["booking_link_vip", "deeplink", "affiliate_url"]))
 
     lines: List[str] = []
-    lines.append(f"{price} to {country}{(' ' + flag) if flag else ''}".strip())
+    lines.append(f"{price} to {country} {flag}".strip())
     lines.append(f"TO: {dest_upper}")
     lines.append(f"FROM: {origin_title}")
     lines.append(f"OUT:  {out_d}")
@@ -285,7 +539,7 @@ def build_vip_message(row: Dict[str, str]) -> str:
 def build_free_message(row: Dict[str, str], stripe_monthly: str, stripe_yearly: str) -> str:
     price = fmt_price_gbp(row.get("price_gbp", ""))
     country = (row.get("destination_country", "") or "").strip()
-    flag = country_flag(country)
+    flag = get_country_flag_with_fallback(country, fallback="🌍")
 
     dest_city_raw = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
     origin_city_raw = (row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip()
@@ -302,7 +556,7 @@ def build_free_message(row: Dict[str, str], stripe_monthly: str, stripe_yearly: 
     y = clean_url(stripe_yearly)
 
     lines: List[str] = []
-    lines.append(f"{price} to {country}{(' ' + flag) if flag else ''}".strip())
+    lines.append(f"{price} to {country} {flag}".strip())
     lines.append(f"TO: {dest_upper}")
     lines.append(f"FROM: {origin_title}")
     lines.append(f"OUT:  {out_d}")
@@ -395,7 +649,6 @@ def pick_best_eligible(
 
 def main() -> int:
     run_slot = env_str("RUN_SLOT", "VIP").upper().strip()
-
     mode = "FREE" if run_slot in ("FREE", "PM") else "VIP"
 
     spreadsheet_id = env_any(["SPREADSHEET_ID", "SHEET_ID"])
@@ -432,7 +685,7 @@ def main() -> int:
     ws = sh.worksheet(tab)
 
     required = [
-        "status","deal_id","deal_theme","price_gbp","origin_city","destination_city",
+        "status","deal_id","deal_theme","theme","price_gbp","origin_city","destination_city",
         "origin_iata","destination_iata","destination_country","outbound_date","return_date",
         "booking_link_vip","deeplink","affiliate_url","phrase_bank","deal_score","scored_timestamp",
         "timestamp","created_at","posted_telegram_vip_at","posted_telegram_free_at","posted_instagram_at",
@@ -455,9 +708,8 @@ def main() -> int:
 
     rownum, row = picked
     deal_id = (row.get("deal_id") or "").strip()
-    theme = (row.get("deal_theme") or "").strip()
+    theme = pick_first_present(row, ["deal_theme", "theme"])
 
-    # Fill phrase_bank if missing (long_haul included)
     phrase = (row.get("phrase_bank") or "").strip()
     if not phrase:
         bank = load_phrase_bank(sh)
@@ -465,7 +717,9 @@ def main() -> int:
         if chosen:
             ws.update([[chosen]], gspread.utils.rowcol_to_a1(rownum, h["phrase_bank"] + 1))
             row["phrase_bank"] = chosen
-            log(f"🧩 Filled phrase_bank for row {rownum} (theme={theme})")
+            log(f"🧩 Filled phrase_bank for row {rownum} (theme={theme or 'UNKNOWN'})")
+        else:
+            log(f"⚠️ No approved phrases found in PHRASE_BANK (theme={theme or 'UNKNOWN'})")
 
     log(f"📨 Telegram best-pick row {rownum} deal_id={deal_id} MODE={mode} RUN_SLOT={run_slot}")
 

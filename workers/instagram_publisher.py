@@ -9,8 +9,9 @@ LOCKED SYSTEM RULES:
 - Non-technical stability fixes only (no redesign).
 
 This patch fixes:
-1) SyntaxError in caption quoting (illegal backslash inside f-string expression).
-2) Instagram "media not ready" publish timing by adding retries.
+1) Phrase missing: PHRASE_BANK.channel_hint is descriptive in this project, so we DO NOT filter on it.
+2) Price showing "££": normalise price to exactly one "£" prefix.
+3) Keep prior stability fixes (caption quoting + IG publish retries).
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import json
 import time
 import datetime as dt
 import hashlib
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 import gspread
@@ -121,11 +122,47 @@ def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str
 
 
 # =========================
+# Price normaliser (LOCKED)
+# =========================
+
+def normalise_gbp_price(raw: str) -> str:
+    """
+    Ensure display is exactly '£123.45' (one £ only), if a number exists.
+    If value is empty or non-numeric, return as-is but without duplicate '££'.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+
+    # Remove all leading/trailing currency clutter then rebuild
+    s2 = s.replace("£", "").strip()
+
+    # If it looks numeric, format with one £
+    try:
+        v = float(s2.replace(",", ""))
+        return f"£{v:,.2f}"
+    except Exception:
+        # Not numeric: just ensure no duplicate ££
+        if "££" in s:
+            s = s.replace("££", "£")
+        if s.startswith("£"):
+            return s
+        # If it had any £ originally, keep one
+        if "£" in raw:
+            return "£" + s2
+        return s
+
+
+# =========================
 # Phrase Bank
 # =========================
 
-def _truthy(x: str) -> bool:
-    return (x or "").strip().lower() in ("true", "yes", "1", "y", "approved")
+def _truthy(x: Any) -> bool:
+    if x is True:
+        return True
+    if x is False or x is None:
+        return False
+    return str(x).strip().lower() in ("true", "yes", "1", "y", "approved")
 
 
 def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
@@ -146,22 +183,39 @@ def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
     return out
 
 
-def _channel_ok(hint: str) -> bool:
-    return not hint or hint.upper() in ("ALL", "IG", "INSTAGRAM")
-
-
-def pick_phrase_from_bank(bank: List[Dict[str, str]], theme: str, deal_id: str) -> str:
-    pool = [
-        r for r in bank
-        if r.get("phrase")
-        and _truthy(r.get("approved", ""))
-        and _channel_ok(r.get("channel_hint", ""))
-        and (not r.get("theme") or r.get("theme", "").upper() == (theme or "").upper())
-    ]
+def _pick_from_pool(pool: List[Dict[str, str]], deal_id: str) -> str:
     if not pool:
         return ""
     h = hashlib.md5((deal_id or "x").encode()).hexdigest()
     return (pool[int(h[:8], 16) % len(pool)].get("phrase", "") or "").strip()
+
+
+def pick_phrase_from_bank(bank: List[Dict[str, str]], theme: str, deal_id: str) -> str:
+    """
+    IMPORTANT: In this project PHRASE_BANK.channel_hint is descriptive text,
+    so we DO NOT filter on it.
+
+    1) Try theme match (approved + theme exact match).
+    2) Fallback to any approved phrase (never blank).
+    """
+    theme_u = (theme or "").strip().upper()
+
+    themed = [
+        r for r in bank
+        if (r.get("phrase") or "").strip()
+        and _truthy(r.get("approved", ""))
+        and (r.get("theme") or "").strip().upper() == theme_u
+    ]
+    chosen = _pick_from_pool(themed, deal_id)
+    if chosen:
+        return chosen
+
+    any_ok = [
+        r for r in bank
+        if (r.get("phrase") or "").strip()
+        and _truthy(r.get("approved", ""))
+    ]
+    return _pick_from_pool(any_ok, deal_id)
 
 
 # =========================
@@ -179,7 +233,6 @@ def build_caption_ig(country: str, to_city: str, from_city: str, price: str, out
         "",
     ]
 
-    # ✅ FIX: no backslashes inside f-string expressions
     if phrase:
         clean_phrase = (phrase or "").replace('"', "").strip()
         if clean_phrase:
@@ -206,12 +259,10 @@ def ig_create_and_publish(access_token: str, ig_user_id: str, image_url: str, ca
         raise RuntimeError(f"IG /media failed: {j1}")
 
     creation_id = j1["id"]
-
     publish_url = f"https://graph.facebook.com/v20.0/{ig_user_id}/media_publish"
 
-    # IG sometimes needs time to process the media container before it can be published.
     last = None
-    for attempt in range(1, 11):  # up to ~60 seconds total
+    for attempt in range(1, 11):
         time.sleep(6)
         r2 = requests.post(
             publish_url,
@@ -245,7 +296,7 @@ def main() -> int:
         [
             "status", "deal_id", "graphic_url",
             "price_gbp", "origin_city", "destination_city", "destination_country",
-            "outbound_date", "return_date", "deal_theme", "phrase_bank",
+            "outbound_date", "return_date", "deal_theme", "theme", "phrase_bank",
             "posted_instagram_at", "publish_error", "publish_error_at"
         ],
     )
@@ -262,7 +313,7 @@ def main() -> int:
             continue
 
         deal_id = safe_get(r, h["deal_id"])
-        theme = safe_get(r, h["deal_theme"])
+        theme = safe_get(r, h.get("deal_theme", -1)) or safe_get(r, h.get("theme", -1))
 
         phrase = safe_get(r, h["phrase_bank"])
         if not phrase:
@@ -270,11 +321,13 @@ def main() -> int:
             if phrase:
                 ws.update([[phrase]], a1(rownum, h["phrase_bank"]))
 
+        price_clean = normalise_gbp_price(safe_get(r, h["price_gbp"]))
+
         caption = build_caption_ig(
             safe_get(r, h["destination_country"]),
             safe_get(r, h["destination_city"]),
             safe_get(r, h["origin_city"]),
-            safe_get(r, h["price_gbp"]),
+            price_clean,
             safe_get(r, h["outbound_date"]),
             safe_get(r, h["return_date"]),
             phrase,

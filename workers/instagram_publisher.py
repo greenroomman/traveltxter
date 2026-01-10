@@ -7,12 +7,10 @@ LOCKED SYSTEM RULES:
 - Require: graphic_url present
 - Produce: status -> POSTED_INSTAGRAM
 
-This patch fixes TWO production blockers:
+THIS PATCH FIXES:
 1) Phrase missing: PHRASE_BANK.channel_hint is descriptive in this project, so we DO NOT filter on it.
-2) IG error 9004 "media download has failed": graphic_url must be a PUBLIC, DIRECT image URL
-   that returns HTTP 200 with Content-Type image/* (not HTML/redirect/login). We now:
-   - normalise/absolutise the URL (handles relative /static/... and missing scheme)
-   - preflight GET the image and fail fast with a clear sheet error if not valid
+2) IG failures from bad graphic_url: we preflight and AUTO-REPAIR common PythonAnywhere static URL variants.
+   If we find a working image URL, we WRITE IT BACK into graphic_url and proceed.
 """
 
 from __future__ import annotations
@@ -140,7 +138,6 @@ def normalise_gbp_price(raw: str) -> str:
         v = float(s2.replace(",", ""))
         return f"£{v:,.2f}"
     except Exception:
-        # Not numeric: just collapse duplicate £
         s = s.replace("££", "£")
         if s.startswith("£"):
             return s
@@ -239,13 +236,10 @@ def build_caption_ig(country: str, to_city: str, from_city: str, price: str, out
 
 
 # =========================
-# Image URL normalisation + preflight (FIXES IG 9004)
+# URL helpers (AUTO-REPAIR 404s)
 # =========================
 
 def _base_from_render_url(render_url: str) -> Optional[str]:
-    """
-    Uses RENDER_URL to recover the scheme+host for relative graphic_url like /static/...
-    """
     ru = (render_url or "").strip()
     if not ru:
         return None
@@ -269,7 +263,7 @@ def absolutise_image_url(image_url: str) -> str:
         base = _base_from_render_url(env_str("RENDER_URL"))
         if base:
             return base + u
-        return u  # leave as-is (will fail preflight with clear error)
+        return u
 
     p = urlparse(u)
     if not p.scheme:
@@ -278,43 +272,87 @@ def absolutise_image_url(image_url: str) -> str:
     return u
 
 
-def preflight_public_image(url: str) -> None:
+def _candidate_url_variants(url: str) -> List[str]:
     """
-    Fail fast if the URL is not a direct public image.
-    IG typically fails with code 9004 when:
-    - 404/403
-    - HTML page returned instead of image/*
-    - redirects to login
+    If the URL 404s, try common PythonAnywhere variants.
+    We do NOT guess random things; only these safe swaps:
+    - https <-> http
+    - /static/ <-> /staticfiles/
     """
-    if not url:
-        raise RuntimeError("graphic_url is blank after normalisation")
+    u = (url or "").strip()
+    if not u:
+        return []
 
+    out = [u]
+
+    # scheme swap
+    if u.startswith("https://"):
+        out.append("http://" + u[len("https://"):])
+    elif u.startswith("http://"):
+        out.append("https://" + u[len("http://"):])
+
+    # static path swap (on each scheme variant)
+    more = []
+    for x in out:
+        if "/static/" in x:
+            more.append(x.replace("/static/", "/staticfiles/"))
+        if "/staticfiles/" in x:
+            more.append(x.replace("/staticfiles/", "/static/"))
+    out.extend(more)
+
+    # de-dupe preserving order
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            uniq.append(x)
+            seen.add(x)
+    return uniq
+
+
+def _fetch_ok_image(url: str) -> bool:
     headers = {"User-Agent": "traveltxter-ig-preflight/1.0"}
     r = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
-
     if r.status_code != 200:
-        snippet = (r.text or "")[:200].replace("\n", " ")
-        raise RuntimeError(f"graphic_url not fetchable (HTTP {r.status_code}) :: {snippet}")
-
+        return False
     ctype = (r.headers.get("Content-Type") or "").lower().strip()
-    if not ctype.startswith("image/"):
-        # Read a tiny chunk to catch HTML/JSON
+    return ctype.startswith("image/")
+
+
+def preflight_and_repair_image_url(url: str) -> str:
+    """
+    Returns a working, public, direct image URL or raises with a clear error.
+    """
+    candidates = _candidate_url_variants(url)
+    if not candidates:
+        raise RuntimeError("graphic_url is blank after normalisation")
+
+    last_status = None
+    last_snippet = ""
+    for cand in candidates:
+        headers = {"User-Agent": "traveltxter-ig-preflight/1.0"}
+        r = requests.get(cand, stream=True, timeout=30, headers=headers, allow_redirects=True)
+        last_status = r.status_code
+        if r.status_code != 200:
+            try:
+                last_snippet = (r.text or "")[:180].replace("\n", " ")
+            except Exception:
+                last_snippet = ""
+            continue
+
+        ctype = (r.headers.get("Content-Type") or "").lower().strip()
+        if ctype.startswith("image/"):
+            return cand
+
+        # 200 but not image
         try:
             chunk = next(r.iter_content(chunk_size=512))
-            peek = chunk[:200]
+            peek = chunk[:120]
         except Exception:
             peek = b""
-        raise RuntimeError(f"graphic_url not an image (Content-Type={ctype}) :: peek={peek[:80]!r}")
+        raise RuntimeError(f"graphic_url not an image (Content-Type={ctype}) :: peek={peek!r}")
 
-    # Optional sanity: ensure not enormous
-    clen = r.headers.get("Content-Length")
-    if clen:
-        try:
-            n = int(clen)
-            if n > 15_000_000:
-                raise RuntimeError(f"graphic_url too large for IG (Content-Length={n})")
-        except ValueError:
-            pass
+    raise RuntimeError(f"graphic_url not fetchable (HTTP {last_status}) :: {last_snippet}")
 
 
 # =========================
@@ -382,22 +420,21 @@ def main() -> int:
         if safe_get(r, h["status"]) != "READY_TO_PUBLISH":
             continue
 
-        image_url_raw = safe_get(r, h["graphic_url"])
-        if not image_url_raw:
+        graphic_url_raw = safe_get(r, h["graphic_url"])
+        if not graphic_url_raw:
             continue
-
-        # ✅ Normalise to absolute public URL before IG sees it
-        image_url = absolutise_image_url(image_url_raw)
 
         deal_id = safe_get(r, h["deal_id"])
         theme = safe_get(r, h.get("deal_theme", -1)) or safe_get(r, h.get("theme", -1))
 
+        # Phrase
         phrase = safe_get(r, h["phrase_bank"])
         if not phrase:
             phrase = pick_phrase_from_bank(bank, theme, deal_id)
             if phrase:
                 ws.update([[phrase]], a1(rownum, h["phrase_bank"]))
 
+        # Caption price
         price_clean = normalise_gbp_price(safe_get(r, h["price_gbp"]))
 
         caption = build_caption_ig(
@@ -411,15 +448,24 @@ def main() -> int:
         )
 
         try:
-            # ✅ Preflight: if this isn't a direct image URL, IG will fail with 9004
-            preflight_public_image(image_url)
+            # 1) absolutise if /static/... etc
+            image_url = absolutise_image_url(graphic_url_raw)
 
+            # 2) repair if 404 by trying safe variants; returns working URL or raises
+            image_url_working = preflight_and_repair_image_url(image_url)
+
+            # 3) if repaired, write back to sheet so pipeline stays clean
+            if image_url_working != graphic_url_raw:
+                ws.update([[image_url_working]], a1(rownum, h["graphic_url"]))
+
+            # 4) publish
             ig_create_and_publish(
                 env_str("IG_ACCESS_TOKEN"),
                 env_str("IG_USER_ID"),
-                image_url,
+                image_url_working,
                 caption,
             )
+
         except Exception as e:
             ws.update([[str(e)[:300]]], a1(rownum, h["publish_error"]))
             ws.update([[now_utc_iso()]], a1(rownum, h["publish_error_at"]))

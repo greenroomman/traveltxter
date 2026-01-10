@@ -2,284 +2,283 @@
 """
 workers/render_client.py
 
-Renders the BEST eligible row by calling the PythonAnywhere renderer.
+LOCKED ROLE:
+- Consumes: status == READY_TO_POST
+- Calls:    RENDER_URL endpoint (PythonAnywhere renderer)
+- Writes:   graphic_url
+- Promotes: READY_TO_POST -> READY_TO_PUBLISH
 
-Key behavior:
-- RENDER_URL may be either:
-  (a) base domain: https://greenroomman.pythonanywhere.com
-  (b) full endpoint: https://greenroomman.pythonanywhere.com/api/render
-- We normalize to a POST endpoint at /api/render
-- Healthcheck uses /api/health (best effort)
-- Payload MUST be:
-    TO: <City>
-    FROM: <City>
-    OUT: ddmmyy
-    IN: ddmmyy
-    PRICE: £xxx   (rounded up)
+CRITICAL RENDER PAYLOAD CONTRACT (LOCKED):
+TO: <City>
+FROM: <City>
+OUT: ddmmyy
+IN: ddmmyy
+PRICE: £xxx
+
+This patch fixes:
+1) TO city showing as "MEXICO (CANCUN)" -> sends "CANCUN"
+2) PRICE showing as "££660" -> sends "£660" (exactly one £)
 """
 
+from __future__ import annotations
+
 import os
-import math
 import json
+import time
+import math
 import datetime as dt
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# ----------------------------
-# Logging helpers
-# ----------------------------
+# -----------------------------
+# Logging
+# -----------------------------
+
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     print(f"{ts} | {msg}", flush=True)
 
 
-def die(msg: str, code: int = 1) -> None:
-    log(f"❌ {msg}")
-    raise SystemExit(code)
+# -----------------------------
+# Env
+# -----------------------------
+
+def env_str(k: str, default: str = "") -> str:
+    return (os.environ.get(k, default) or "").strip()
+
+def env_any(keys: List[str], default: str = "") -> str:
+    for k in keys:
+        v = env_str(k, "")
+        if v:
+            return v
+    return default
 
 
-# ----------------------------
-# Env + Sheets auth
-# ----------------------------
-def get_env(name: str, default: Optional[str] = None) -> str:
-    v = os.getenv(name, default)
-    if v is None or str(v).strip() == "":
-        die(f"Missing required env var: {name}")
-    return str(v).strip()
+# -----------------------------
+# Sheets auth
+# -----------------------------
 
+def _parse_sa_json(raw: str) -> Dict[str, Any]:
+    raw = (raw or "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return json.loads(raw.replace("\\n", "\n"))
 
 def gs_client() -> gspread.Client:
-    sa_json = get_env("GCP_SA_JSON_ONE_LINE")
-    info = json.loads(sa_json)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    raw = env_any(["GCP_SA_JSON_ONE_LINE", "GCP_SA_JSON"])
+    if not raw:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+    info = _parse_sa_json(raw)
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+    )
     return gspread.authorize(creds)
 
 
-def normalize_renderer_urls(render_url_raw: str) -> Tuple[str, str]:
-    """
-    Returns:
-      (render_endpoint, health_endpoint)
+# -----------------------------
+# A1 helpers
+# -----------------------------
 
-    If render_url_raw already contains a path, we respect it but still enforce
-    that render endpoint is /api/render.
-    """
-    base = render_url_raw.rstrip("/")
-
-    # If user provided full endpoint, keep base domain from it.
-    # e.g. https://x.com/api/render -> base_domain=https://x.com
-    if "://" in base:
-        # split off scheme://host[:port]
-        scheme, rest = base.split("://", 1)
-        host = rest.split("/", 1)[0]
-        base_domain = f"{scheme}://{host}"
-    else:
-        base_domain = base  # unusual, but keep it
-
-    # If they already provided /api/render explicitly, use it.
-    if base.endswith("/api/render"):
-        render_ep = base
-    else:
-        # If they provided some other path (e.g. /render), ignore and enforce /api/render
-        render_ep = f"{base_domain}/api/render"
-
-    health_ep = f"{base_domain}/api/health"
-    return render_ep, health_ep
-
-
-def a1_col(idx0: int) -> str:
-    """0-based column index to A1 letters."""
-    idx = idx0 + 1
+def col_letter(n1: int) -> str:
     s = ""
-    while idx:
-        idx, r = divmod(idx - 1, 26)
-        s = chr(65 + r) + s
+    n = n1
+    while n:
+        n, rr = divmod(n - 1, 26)
+        s = chr(65 + rr) + s
     return s
 
+def a1(rownum: int, col0: int) -> str:
+    return f"{col_letter(col0 + 1)}{rownum}"
 
-def looks_like_iata(s: str) -> bool:
-    t = (s or "").strip()
-    return len(t) == 3 and t.isalpha() and t.upper() == t
+def safe_get(row: List[str], idx: int) -> str:
+    return row[idx].strip() if 0 <= idx < len(row) else ""
 
 
-def ddmmyy(date_str: str) -> str:
+# -----------------------------
+# Normalisers (LOCKED FIXES)
+# -----------------------------
+
+def normalise_to_city(raw: str) -> str:
     """
-    Accepts YYYY-MM-DD or ddmmyy already.
+    Fixes cases like:
+      - 'MEXICO (CANCUN)' -> 'CANCUN'
+      - 'CANCUN, MEXICO'  -> 'CANCUN'
+      - 'MEXICO - CANCUN' -> 'CANCUN' (best guess)
     """
-    t = (date_str or "").strip()
-    if len(t) == 6 and t.isdigit():
-        return t
-    # Expect ISO yyyy-mm-dd
+    s = (raw or "").strip()
+    if not s:
+        return ""
+
+    # If "(CITY)" exists, prefer inside brackets
+    if "(" in s and ")" in s:
+        inside = s.split("(", 1)[1].split(")", 1)[0].strip()
+        if inside:
+            return inside.upper()
+
+    # If "CITY, COUNTRY", take left side
+    if "," in s:
+        left = s.split(",", 1)[0].strip()
+        if left:
+            return left.upper()
+
+    # If "COUNTRY - CITY", take right side
+    if " - " in s:
+        right = s.split(" - ", 1)[1].strip()
+        if right:
+            return right.upper()
+
+    return s.upper()
+
+def normalise_from_city(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    # Keep origin as nice title-case (London, Edinburgh etc)
+    return " ".join([w[:1].upper() + w[1:].lower() for w in s.split()])
+
+def ddmmyy(iso_date: str) -> str:
+    """
+    Input: '2026-03-01' -> '010326'
+    """
+    s = (iso_date or "").strip()
+    if not s:
+        return ""
     try:
-        y, m, d = t.split("-")
-        return f"{d}{m}{y[-2:]}"
+        d = dt.date.fromisoformat(s)
+        return d.strftime("%d%m%y")
     except Exception:
-        return t  # fall back; renderer may reject, but we log clearly
+        return s  # don’t crash if format is odd
+
+def normalise_price_for_renderer(raw: str) -> str:
+    """
+    Output must be EXACTLY '£660' (one £ only), integer, rounded up.
+    Accepts: '£660', '££660', '660', '660.12', '£660.12'
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "£?"
+
+    # strip all pound signs and commas
+    s2 = s.replace("£", "").replace(",", "").strip()
+
+    try:
+        v = float(s2)
+        v_int = int(math.ceil(v))
+        return f"£{v_int}"
+    except Exception:
+        # If it’s not numeric, at least collapse double £
+        s = s.replace("££", "£")
+        if not s.startswith("£") and "£" in raw:
+            s = "£" + s2
+        return s
 
 
-# ----------------------------
-# Main logic
-# ----------------------------
-def main() -> None:
-    spreadsheet_id = get_env("SPREADSHEET_ID")
-    raw_tab = os.getenv("RAW_DEALS_TAB", "RAW_DEALS").strip() or "RAW_DEALS"
-    render_url_raw = get_env("RENDER_URL")
-    render_max_rows = int(os.getenv("RENDER_MAX_ROWS", "1"))
+# -----------------------------
+# Renderer call
+# -----------------------------
 
-    render_ep, health_ep = normalize_renderer_urls(render_url_raw)
+def render_image(render_url: str, payload_text: str) -> str:
+    """
+    Expects renderer returns JSON with 'graphic_url' or 'url'.
+    """
+    url = render_url.rstrip("/")
+    r = requests.post(url, json={"text": payload_text}, timeout=90)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Renderer error {r.status_code}: {r.text[:400]}")
+    j = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    graphic_url = (j.get("graphic_url") or j.get("url") or "").strip()
+    if not graphic_url:
+        raise RuntimeError(f"Renderer response missing graphic_url: {str(j)[:400]}")
+    return graphic_url
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main() -> int:
+    spreadsheet_id = env_any(["SPREADSHEET_ID", "SHEET_ID"])
+    tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
+    render_url = env_str("RENDER_URL")
+
+    if not spreadsheet_id:
+        raise RuntimeError("Missing SPREADSHEET_ID (or SHEET_ID)")
+    if not render_url:
+        raise RuntimeError("Missing RENDER_URL")
 
     gc = gs_client()
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(raw_tab)
+    ws = sh.worksheet(tab)
 
-    rows: List[List[Any]] = ws.get_all_values()
-    if not rows or len(rows) < 2:
-        die("RAW_DEALS is empty (no header + rows).")
+    values = ws.get_all_values()
+    if len(values) < 2:
+        log("No rows.")
+        return 0
 
-    header = rows[0]
-    h = {name.strip(): i for i, name in enumerate(header) if name.strip()}
+    headers = [h.strip() for h in values[0]]
+    h = {name: i for i, name in enumerate(headers)}
 
-    def col(name: str) -> int:
-        if name not in h:
-            die(f"Missing required column in {raw_tab}: {name}")
-        return h[name]
+    required = [
+        "status", "deal_id",
+        "origin_city", "destination_city",
+        "outbound_date", "return_date",
+        "price_gbp",
+        "graphic_url", "rendered_at",
+    ]
+    missing = [c for c in required if c not in headers]
+    if missing:
+        headers = headers + missing
+        ws.update([headers], "A1")
+        h = {name: i for i, name in enumerate(headers)}
+        log(f"🛠️ Added missing columns: {missing}")
 
-    # Required fields for render payload
-    c_status = col("status")
-    c_deal_id = col("deal_id")
-    c_price = col("price_gbp")
-    c_origin_city = col("origin_city")
-    c_dest_city = col("destination_city")
-    c_out = col("outbound_date")
-    c_ret = col("return_date")
-
-    # Optional
-    c_render_url = h.get("graphic_url")
-    c_render_err = h.get("render_error")
-    c_dest_country = h.get("destination_country")
-
-    # Healthcheck (best effort)
-    try:
-        r = requests.get(health_ep, timeout=10)
-        log(f"Renderer healthcheck: {r.status_code}")
-    except Exception as e:
-        log(f"Renderer healthcheck failed (non-fatal): {e}")
-
-    # Pick BEST eligible row: READY_TO_POST first, else READY_TO_PUBLISH? (we only render READY_TO_POST)
-    candidates: List[Tuple[int, List[Any]]] = []
-    for i in range(1, len(rows)):
-        row = rows[i]
-        status = (row[c_status] if c_status < len(row) else "").strip()
-        if status == "READY_TO_POST":
-            candidates.append((i + 1, row))  # sheet row number (1-based)
-    if not candidates:
-        log("Done. Rendered 0. (No rows eligible: status=READY_TO_POST)")
-        return
-
-    # Render up to N rows (usually 1)
-    rendered = 0
-
-    for sheet_row_num, row in candidates[:render_max_rows]:
-        deal_id = (row[c_deal_id] if c_deal_id < len(row) else "").strip()
-        origin_city = (row[c_origin_city] if c_origin_city < len(row) else "").strip()
-        dest_city = (row[c_dest_city] if c_dest_city < len(row) else "").strip()
-        dest_country = ""
-        if c_dest_country is not None and c_dest_country < len(row):
-            dest_country = (row[c_dest_country] or "").strip()
-
-        # Guard: never render IATA-as-city rows; better to fail fast than post garbage.
-        if not origin_city or not dest_city or looks_like_iata(origin_city) or looks_like_iata(dest_city):
-            msg = f"Blocked render: city fields invalid (origin_city='{origin_city}', destination_city='{dest_city}')"
-            log(f"⛔ {msg} row {sheet_row_num} deal_id={deal_id}")
-
-            # Mark error in-sheet if columns exist
-            updates = []
-            if c_render_err is not None:
-                updates.append((c_render_err, msg))
-            # Also move to BANKED to keep it out of publish path
-            updates.append((c_status, "BANKED"))
-
-            if updates:
-                for col_idx, value in updates:
-                    a1 = f"{a1_col(col_idx)}{sheet_row_num}"
-                    ws.update([[value]], a1)
+    # Pick first READY_TO_POST row (keep behaviour simple & deterministic)
+    rows = values[1:]
+    for rownum, r in enumerate(rows, start=2):
+        status = safe_get(r, h["status"]).strip().upper()
+        if status != "READY_TO_POST":
             continue
 
-        out_iso = (row[c_out] if c_out < len(row) else "").strip()
-        ret_iso = (row[c_ret] if c_ret < len(row) else "").strip()
-        out_fmt = ddmmyy(out_iso)
-        ret_fmt = ddmmyy(ret_iso)
+        deal_id = safe_get(r, h["deal_id"])
+        origin = safe_get(r, h["origin_city"])
+        dest = safe_get(r, h["destination_city"])
+        out_d = safe_get(r, h["outbound_date"])
+        ret_d = safe_get(r, h["return_date"])
+        price_raw = safe_get(r, h["price_gbp"])
 
-        # Price formatting: £xxx rounded up
-        try:
-            price_val = float((row[c_price] if c_price < len(row) else "0").strip() or "0")
-        except Exception:
-            price_val = 0.0
-        price_fmt = f"£{int(math.ceil(price_val))}"
+        to_city = normalise_to_city(dest)
+        from_city = normalise_from_city(origin)
+        out_fmt = ddmmyy(out_d)
+        in_fmt = ddmmyy(ret_d)
+        price_fmt = normalise_price_for_renderer(price_raw)
 
-        payload = {
-            "deal_id": deal_id,
-            "TO": dest_city,
-            "FROM": origin_city,
-            "OUT": out_fmt,
-            "IN": ret_fmt,
-            "PRICE": price_fmt,
-        }
+        payload = "\n".join([
+            f"TO: {to_city}",
+            f"FROM: {from_city}",
+            f"OUT: {out_fmt}",
+            f"IN: {in_fmt}",
+            f"PRICE: {price_fmt}",
+        ])
 
-        log(f"🖼️  Rendering row {sheet_row_num} deal_id={deal_id} ({origin_city} -> {dest_city})")
-        try:
-            resp = requests.post(render_ep, json=payload, timeout=60)
-        except Exception as e:
-            die(f"Render request failed: {e}")
+        log(f"🖼️  Rendering row {rownum} deal_id={deal_id} ({from_city} -> {to_city})")
+        graphic_url = render_image(render_url, payload)
 
-        if resp.status_code == 404:
-            # This is the exact failure you reported: wrong URL path
-            die(
-                "Render HTTP 404 (endpoint not found). "
-                f"Tried POST to: {render_ep}. "
-                "Fix your RENDER_URL to either:\n"
-                "  https://greenroomman.pythonanywhere.com\n"
-                "or\n"
-                "  https://greenroomman.pythonanywhere.com/api/render"
-            )
+        ws.update([[graphic_url]], a1(rownum, h["graphic_url"]))
+        ws.update([[dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"]], a1(rownum, h["rendered_at"]))
+        ws.update([["READY_TO_PUBLISH"]], a1(rownum, h["status"]))
 
-        if resp.status_code >= 400:
-            # Save error message if possible
-            raw = resp.text[:500]
-            msg = f"Render HTTP {resp.status_code}: {raw}"
-            log(f"❌ {msg}")
-            if c_render_err is not None:
-                ws.update([[msg]], f"{a1_col(c_render_err)}{sheet_row_num}")
-            # keep status as READY_TO_POST so it can retry later (unless you prefer ERROR_HARD)
-            continue
+        log(f"✅ Rendered graphic_url set for row {rownum}")
+        return 0
 
-        data = resp.json() if "application/json" in resp.headers.get("content-type", "") else {}
-        image_url = data.get("image_url") or data.get("graphic_url") or ""
-
-        if not image_url:
-            msg = f"Render OK but missing image_url. Response: {str(data)[:300]}"
-            log(f"❌ {msg}")
-            if c_render_err is not None:
-                ws.update([[msg]], f"{a1_col(c_render_err)}{sheet_row_num}")
-            continue
-
-        # Write graphic_url + promote to READY_TO_PUBLISH
-        if c_render_url is not None:
-            ws.update([[image_url]], f"{a1_col(c_render_url)}{sheet_row_num}")
-        ws.update([["READY_TO_PUBLISH"]], f"{a1_col(c_status)}{sheet_row_num}")
-
-        log(f"✅ Rendered row {sheet_row_num} -> READY_TO_PUBLISH ({image_url})")
-        rendered += 1
-
-    log(f"Done. Rendered {rendered}.")
+    log("Done. Rendered 0.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-TravelTxter V4.5x — telegram_publisher.py (LOCKED + BEST PICK)
+workers/instagram_publisher.py
 
-AM (RUN_SLOT=AM):
-  consumes: status == POSTED_INSTAGRAM
-  writes:   posted_telegram_vip_at
-  promotes: POSTED_INSTAGRAM -> POSTED_TELEGRAM_VIP
+LOCKED IG CAPTION DESIGN:
+- Do NOT change caption layout/lines.
+- Phrase selection rule:
+    1) Use RAW_DEALS.phrase_bank if present
+    2) Else pick from PHRASE_BANK (approved + channel hint) and WRITE BACK to RAW_DEALS.phrase_bank
 
-PM (RUN_SLOT=PM):
-  consumes: status == POSTED_TELEGRAM_VIP AND posted_telegram_vip_at <= now-24h
-  writes:   posted_telegram_free_at
-  promotes: POSTED_TELEGRAM_VIP -> POSTED_ALL
+Posting contract:
+- Consumes: status == READY_TO_PUBLISH
+- Requires: graphic_url present
+- Produces: status -> POSTED_INSTAGRAM + posted_instagram_at timestamp
+- On failure: writes publish_error + publish_error_at (does NOT mutate to POSTED_INSTAGRAM)
+
+Critical pipeline fix:
+- Instagram is async. After /media returns a creation_id, the media may NOT be ready immediately.
+- We MUST poll the container status_code until FINISHED (or timeout) before calling /media_publish.
 """
 
 from __future__ import annotations
 
 import os
 import json
+import time
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,400 +32,440 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-# -----------------------------
+# ============================================================
 # Logging
-# -----------------------------
+# ============================================================
+
+def now_utc_iso() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def log(msg: str) -> None:
-    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    print(f"{ts} | {msg}", flush=True)
+    print(f"{now_utc_iso()} | {msg}", flush=True)
 
 
-# -----------------------------
+# ============================================================
 # Env helpers
-# -----------------------------
+# ============================================================
 
 def env_str(k: str, default: str = "") -> str:
-    return (os.environ.get(k, default) or "").strip()
+    v = os.environ.get(k)
+    return v.strip() if v and v.strip() else default
 
-def env_any(keys: List[str], default: str = "") -> str:
-    for k in keys:
-        v = env_str(k, "")
-        if v:
-            return v
-    return default
-
-def clean_url(u: str) -> str:
-    return (u or "").strip().replace(" ", "")
-
-def utcnow() -> dt.datetime:
-    return dt.datetime.utcnow()
-
-def iso_now() -> str:
-    return utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-# -----------------------------
-# Sheets auth
-# -----------------------------
-
-def _parse_sa_json(raw: str) -> Dict[str, Any]:
-    raw = (raw or "").strip()
+def env_int(k: str, default: int) -> int:
+    v = os.environ.get(k)
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return json.loads(raw.replace("\\n", "\n"))
+        return int(v) if v is not None else default
+    except Exception:
+        return default
 
-def gs_client():
-    raw = env_any(["GCP_SA_JSON_ONE_LINE", "GCP_SA_JSON"])
+
+# ============================================================
+# Google Sheets
+# ============================================================
+
+RAW_DEALS_TAB = env_str("RAW_DEALS_TAB", "RAW_DEALS")
+PHRASE_BANK_TAB = env_str("PHRASE_BANK_TAB", "PHRASE_BANK")
+
+REQUIRED_RAW_COLS = [
+    "status",
+    "deal_id",
+    "destination_country",
+    "destination_city",
+    "origin_city",
+    "price_gbp",
+    "outbound_date",
+    "return_date",
+    "graphic_url",
+    "phrase_bank",
+    "posted_instagram_at",
+    "publish_error",
+    "publish_error_at",
+    "deal_theme",
+    "theme",
+]
+
+PHRASE_BANK_REQUIRED_COLS = [
+    "theme",
+    "category",
+    "phrase",
+    "approved",
+    "channel_hint",
+    "max_per_month",
+    "notes",
+]
+
+def _load_sa_creds() -> Credentials:
+    """
+    Supports either:
+    - GCP_SA_JSON_ONE_LINE (recommended)
+    - GCP_SA_JSON
+    """
+    raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
     if not raw:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-    info = _parse_sa_json(raw)
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
-    )
-    return gspread.authorize(creds)
+        raise RuntimeError("Missing service account JSON: set GCP_SA_JSON_ONE_LINE or GCP_SA_JSON")
 
-def ensure_columns(ws, required_cols: List[str]) -> Dict[str, int]:
+    try:
+        info = json.loads(raw)
+    except Exception:
+        # Some users paste multi-line JSON into a single-line secret without escaping;
+        # try to repair obvious newline issues (minimal, safe).
+        info = json.loads(raw.replace("\n", "").strip())
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    return Credentials.from_service_account_info(info, scopes=scopes)
+
+def _open_sheet() -> gspread.Spreadsheet:
+    sheet_id = env_str("SPREADSHEET_ID") or env_str("SHEET_ID")
+    if not sheet_id:
+        raise RuntimeError("Missing SPREADSHEET_ID")
+    gc = gspread.authorize(_load_sa_creds())
+    return gc.open_by_key(sheet_id)
+
+def _ensure_headers(ws: gspread.Worksheet, required: List[str]) -> List[str]:
     headers = ws.row_values(1)
-    if not headers:
-        ws.update([required_cols], "A1")
-        headers = required_cols[:]
-        log(f"🛠️  Initialised headers for {ws.title}")
-
-    headers = [h.strip() for h in headers]
-    missing = [c for c in required_cols if c not in headers]
-    if missing:
-        headers = headers + missing
+    changed = False
+    for col in required:
+        if col not in headers:
+            headers.append(col)
+            changed = True
+    if changed:
         ws.update([headers], "A1")
-        log(f"🛠️  Added missing columns: {missing}")
-    return {h: i for i, h in enumerate(headers)}
+    return headers
 
+def _header_map(headers: List[str]) -> Dict[str, int]:
+    return {h: i + 1 for i, h in enumerate(headers)}
 
-# -----------------------------
-# Telegram send
-# -----------------------------
+def _cell(ws: gspread.Worksheet, row: int, col: int, value: Any) -> None:
+    # gspread v6 safe: 2D update
+    a1 = gspread.utils.rowcol_to_a1(row, col)
+    ws.update([[value]], a1)
 
-def tg_send(bot_token: str, chat_id: str, html_text: str) -> None:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    r = requests.post(
-        url,
-        json={
-            "chat_id": chat_id,
-            "text": html_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(f"Telegram send failed HTTP {r.status_code}: {r.text[:300]}")
-
-
-# -----------------------------
-# Formatting helpers
-# -----------------------------
-
-FLAG_MAP = {
-    "ICELAND": "🇮🇸",
-    "SPAIN": "🇪🇸",
-    "PORTUGAL": "🇵🇹",
-    "FRANCE": "🇫🇷",
-    "ITALY": "🇮🇹",
-    "GREECE": "🇬🇷",
-    "MOROCCO": "🇲🇦",
-    "TURKEY": "🇹🇷",
-    "THAILAND": "🇹🇭",
-    "JAPAN": "🇯🇵",
-    "USA": "🇺🇸",
-    "UNITED STATES": "🇺🇸",
-    "HUNGARY": "🇭🇺",
-    "CANADA": "🇨🇦",
-    "MEXICO": "🇲🇽",
-}
-
-def country_flag(country: str) -> str:
-    c = (country or "").strip().upper()
-    return FLAG_MAP.get(c, "")
-
-def title_case_city(x: str) -> str:
-    s = (x or "").strip()
-    if not s:
-        return ""
-    return " ".join([w[:1].upper() + w[1:].lower() if w else "" for w in s.split(" ")]).strip()
-
-def safe_float(s: str) -> Optional[float]:
-    try:
-        x = (s or "").strip().replace("£", "").replace(",", "")
-        return float(x) if x else None
-    except Exception:
-        return None
-
-def fmt_price_gbp(price_gbp: str) -> str:
-    p = (price_gbp or "").strip()
-    if not p:
-        return ""
-    if p.startswith("£"):
-        p = p[1:]
-    f = safe_float(p)
-    if f is None:
-        return f"£{p}"
-    return f"£{f:.2f}"
-
-def parse_iso_z(s: str) -> Optional[dt.datetime]:
-    s = (s or "").strip()
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1]
-        return dt.datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-
-def build_vip_message(row: Dict[str, str]) -> str:
-    price = fmt_price_gbp(row.get("price_gbp", ""))
-    country = (row.get("destination_country", "") or "").strip()
-    flag = country_flag(country)
-
-    dest_city_raw = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
-    origin_city_raw = (row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip()
-
-    dest_upper = dest_city_raw.upper()
-    origin_title = title_case_city(origin_city_raw)
-
-    out_d = (row.get("outbound_date", "") or "").strip()
-    ret_d = (row.get("return_date", "") or "").strip()
-
-    phrase = (row.get("phrase_bank", "") or row.get("why_good", "") or row.get("ai_notes", "") or "").strip()
-    booking = clean_url(row.get("booking_link_vip", "") or row.get("affiliate_url", "") or "")
-
-    lines = []
-    lines.append(f"{price} to {country}{(' ' + flag) if flag else ''}".strip())
-    lines.append(f"TO: {dest_upper}")
-    lines.append(f"FROM: {origin_title}")
-    lines.append(f"OUT:  {out_d}")
-    lines.append(f"BACK: {ret_d}")
-
-    if phrase:
-        lines.append("")
-        lines.append(phrase)
-
-    if booking:
-        lines.append("")
-        lines.append(f'<a href="{booking}">BOOKING LINK</a>')
-
-    return "\n".join(lines).strip()
-
-
-def build_free_message(row: Dict[str, str], stripe_monthly: str, stripe_yearly: str) -> str:
-    price = fmt_price_gbp(row.get("price_gbp", ""))
-    country = (row.get("destination_country", "") or "").strip()
-    flag = country_flag(country)
-
-    dest_city_raw = (row.get("destination_city", "") or "").strip() or (row.get("destination_iata", "") or "").strip()
-    origin_city_raw = (row.get("origin_city", "") or "").strip() or (row.get("origin_iata", "") or "").strip()
-
-    dest_upper = dest_city_raw.upper()
-    origin_title = title_case_city(origin_city_raw)
-
-    out_d = (row.get("outbound_date", "") or "").strip()
-    ret_d = (row.get("return_date", "") or "").strip()
-
-    phrase = (row.get("phrase_bank", "") or row.get("why_good", "") or row.get("ai_notes", "") or "").strip()
-
-    m = clean_url(stripe_monthly)
-    y = clean_url(stripe_yearly)
-
-    lines = []
-    lines.append(f"{price} to {country}{(' ' + flag) if flag else ''}".strip())
-    lines.append(f"TO: {dest_upper}")
-    lines.append(f"FROM: {origin_title}")
-    lines.append(f"OUT:  {out_d}")
-    lines.append(f"BACK: {ret_d}")
-
-    if phrase:
-        lines.append("")
-        lines.append(phrase)
-
-    lines.append("")
-    lines.append("Want instant access?")
-    lines.append("Join TravelTxter for early access")
-    lines.append("")
-    lines.append("• VIP members saw this 24 hours ago")
-    lines.append("• Deals 24 hours early")
-    lines.append("• Direct booking links")
-    lines.append("• Exclusive mistake fares")
-    lines.append("• £3 p/m or £30 p/a")
-    lines.append("• Cancel anytime")
-
-    links = []
-    if m:
-        links.append(f'<a href="{m}">Upgrade now (Monthly)</a>')
-    if y:
-        links.append(f'<a href="{y}">Upgrade now (Annual)</a>')
-    if links:
-        lines.append("")
-        lines.extend(links)
-
-    return "\n".join(lines).strip()
-
-
-# -----------------------------
-# Best row selection
-# -----------------------------
-
-def row_dict(headers: List[str], vals: List[str]) -> Dict[str, str]:
+def _row_dict_from_values(headers: List[str], values: List[str]) -> Dict[str, str]:
     d: Dict[str, str] = {}
     for i, h in enumerate(headers):
-        d[h] = (vals[i] if i < len(vals) else "") or ""
+        d[h] = values[i] if i < len(values) else ""
     return d
 
-def rank_key(rownum: int, row: Dict[str, str]) -> Tuple[float, dt.datetime, dt.datetime, int]:
-    ds = safe_float(row.get("deal_score", "")) or 0.0
-    scored = parse_iso_z(row.get("scored_timestamp", "")) or dt.datetime(1970, 1, 1)
-    created = (
-        parse_iso_z(row.get("created_at", "")) or
-        parse_iso_z(row.get("timestamp", "")) or
-        dt.datetime(1970, 1, 1)
-    )
-    return (ds, scored, created, rownum)
 
-def pick_best_eligible(
-    headers: List[str],
-    rows: List[List[str]],
-    h: Dict[str, int],
-    run_slot: str,
-    consume_status: str,
-    ts_col: str,
-    free_delay_hours: int = 24,
-) -> Optional[Tuple[int, Dict[str, str]]]:
-    now = utcnow()
-    eligible: List[Tuple[int, Dict[str, str]]] = []
+# ============================================================
+# Phrase helpers (LOCKED)
+# ============================================================
 
-    for rownum in range(2, len(rows) + 2):
-        vals = rows[rownum - 2]
-        status = (vals[h["status"]] if h["status"] < len(vals) else "").strip().upper()
-        if status != consume_status:
+def _truthy(v: str) -> bool:
+    s = (v or "").strip().lower()
+    return s in ("1", "true", "yes", "y", "approved", "ok")
+
+def _channel_ok(hint: str) -> bool:
+    s = (hint or "").strip().lower()
+    return (s == "" or s in ("ig", "instagram", "all", "any", "both"))
+
+def pick_phrase(ws_phrase: gspread.Worksheet, theme: str) -> str:
+    """
+    Returns a phrase string or "".
+    Does NOT attempt fancy rotation here — keep it deterministic and simple.
+    """
+    rows = ws_phrase.get_all_records()
+    theme_norm = (theme or "").strip().lower()
+
+    candidates: List[str] = []
+    for r in rows:
+        phrase = (r.get("phrase") or "").strip()
+        if not phrase:
+            continue
+        if not _truthy(str(r.get("approved", ""))):
+            continue
+        if not _channel_ok(str(r.get("channel_hint", ""))):
             continue
 
-        already = (vals[h[ts_col]] if h[ts_col] < len(vals) else "").strip()
-        if already:
+        r_theme = (str(r.get("theme", "")) or "").strip().lower()
+        # Theme match if provided, otherwise allow generic phrases
+        if theme_norm and r_theme and r_theme != theme_norm:
             continue
 
-        if run_slot == "PM":
-            vip_ts = (vals[h["posted_telegram_vip_at"]] if h["posted_telegram_vip_at"] < len(vals) else "").strip()
-            vip_dt = parse_iso_z(vip_ts)
-            if not vip_dt:
+        candidates.append(phrase)
+
+    if not candidates:
+        return ""
+    # deterministic-ish: pick first; avoids random churn and helps auditing
+    return candidates[0]
+
+def quote_phrase(p: str) -> str:
+    p = (p or "").strip()
+    if not p:
+        return ""
+    # simple human quote styling
+    if p.startswith("“") or p.startswith('"'):
+        return p
+    return f"“{p}”"
+
+def country_flag(country: str) -> str:
+    """
+    Conservative: only a few common ones; avoid wrong flags.
+    """
+    c = (country or "").strip().lower()
+    m = {
+        "spain": "🇪🇸",
+        "portugal": "🇵🇹",
+        "france": "🇫🇷",
+        "italy": "🇮🇹",
+        "greece": "🇬🇷",
+        "iceland": "🇮🇸",
+        "hungary": "🇭🇺",
+        "czech republic": "🇨🇿",
+        "czechia": "🇨🇿",
+        "turkey": "🇹🇷",
+        "morocco": "🇲🇦",
+        "mexico": "🇲🇽",
+        "japan": "🇯🇵",
+        "thailand": "🇹🇭",
+        "united states": "🇺🇸",
+        "usa": "🇺🇸",
+        "australia": "🇦🇺",
+    }
+    return m.get(c, "")
+
+def build_caption_ig(country: str, to_city: str, from_city: str, price_gbp: str, out_d: str, back_d: str, phrase: str) -> str:
+    flag = country_flag(country)
+    first_line = f"{country}{(' ' + flag) if flag else ''}".strip() if country else (to_city or "TravelTxter deal")
+
+    lines: List[str] = [
+        first_line,
+        f"To: {to_city}",
+        f"From: {from_city}",
+        f"Price: {price_gbp}",
+        f"Out: {out_d}",
+        f"Return: {back_d}",
+        "",
+    ]
+    if phrase:
+        lines.append(quote_phrase(phrase))
+        lines.append("")
+    lines.append("Link in bio…")
+    return "\n".join(lines).strip()
+
+
+# ============================================================
+# Instagram API (async-safe)
+# ============================================================
+
+GRAPH_BASE = "https://graph.facebook.com/v19.0"
+
+def _ig_post(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.post(url, data=params, timeout=45)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"_raw": r.text}
+    if r.status_code >= 400:
+        raise RuntimeError(f"IG HTTP {r.status_code}: {j}")
+    return j
+
+def _ig_get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.get(url, params=params, timeout=45)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"_raw": r.text}
+    if r.status_code >= 400:
+        raise RuntimeError(f"IG HTTP {r.status_code}: {j}")
+    return j
+
+def ig_create_container(ig_user_id: str, access_token: str, image_url: str, caption: str) -> str:
+    url = f"{GRAPH_BASE}/{ig_user_id}/media"
+    j = _ig_post(url, {
+        "image_url": image_url,
+        "caption": caption,
+        "access_token": access_token,
+    })
+    creation_id = str(j.get("id") or "").strip()
+    if not creation_id:
+        raise RuntimeError(f"IG /media did not return id: {j}")
+    return creation_id
+
+def ig_wait_until_ready(creation_id: str, access_token: str, max_wait_s: int, poll_s: int) -> str:
+    """
+    Poll the container status until FINISHED.
+    Returns final status_code.
+    """
+    url = f"{GRAPH_BASE}/{creation_id}"
+    deadline = time.time() + max_wait_s
+    last_status = "UNKNOWN"
+    while time.time() < deadline:
+        j = _ig_get(url, {"fields": "status_code", "access_token": access_token})
+        last_status = str(j.get("status_code") or "UNKNOWN")
+        if last_status == "FINISHED":
+            return last_status
+        if last_status in ("ERROR", "EXPIRED"):
+            return last_status
+        time.sleep(poll_s)
+    return last_status  # timeout
+
+def ig_publish(ig_user_id: str, access_token: str, creation_id: str) -> str:
+    url = f"{GRAPH_BASE}/{ig_user_id}/media_publish"
+    j = _ig_post(url, {"creation_id": creation_id, "access_token": access_token})
+    media_id = str(j.get("id") or "").strip()
+    if not media_id:
+        raise RuntimeError(f"IG /media_publish did not return id: {j}")
+    return media_id
+
+def ig_create_and_publish(
+    ig_user_id: str,
+    access_token: str,
+    image_url: str,
+    caption: str,
+    max_wait_s: int = 45,
+    poll_s: int = 3,
+    publish_retries: int = 2,
+) -> str:
+    """
+    Full async-safe publish:
+    - create container
+    - wait until status FINISHED
+    - publish
+    - if publish returns "not ready" edge-case, wait+retry a couple times
+    """
+    creation_id = ig_create_container(ig_user_id, access_token, image_url, caption)
+    log(f"IG: created container {creation_id}")
+
+    status = ig_wait_until_ready(creation_id, access_token, max_wait_s=max_wait_s, poll_s=poll_s)
+    log(f"IG: container status_code={status}")
+
+    if status != "FINISHED":
+        raise RuntimeError(f"IG container not ready (status_code={status})")
+
+    # publish with small retry in case Graph lags even after FINISHED
+    last_err: Optional[Exception] = None
+    for attempt in range(publish_retries + 1):
+        try:
+            media_id = ig_publish(ig_user_id, access_token, creation_id)
+            log(f"IG: published media {media_id}")
+            return media_id
+        except Exception as e:
+            last_err = e
+            # Retry only if looks like readiness delay
+            msg = str(e).lower()
+            if ("not ready" in msg) or ("not available" in msg) or ("9007" in msg):
+                wait = 4 + attempt * 4
+                log(f"IG: publish not ready yet; retrying in {wait}s (attempt {attempt+1}/{publish_retries+1})")
+                time.sleep(wait)
                 continue
-            if (now - vip_dt) < dt.timedelta(hours=free_delay_hours):
-                continue
-
-        eligible.append((rownum, row_dict(headers, vals)))
-
-    if not eligible:
-        return None
-
-    eligible.sort(key=lambda it: rank_key(it[0], it[1]), reverse=True)
-    return eligible[0]
+            raise
+    raise RuntimeError(f"IG publish failed after retries: {last_err}")
 
 
-# -----------------------------
-# Main
-# -----------------------------
+# ============================================================
+# Main worker
+# ============================================================
 
 def main() -> int:
-    run_slot = env_str("RUN_SLOT", "AM").upper().strip()
-    if run_slot not in ("AM", "PM"):
-        run_slot = "AM"
+    ig_token = env_str("IG_ACCESS_TOKEN")
+    ig_user_id = env_str("IG_USER_ID")
+    if not ig_token or not ig_user_id:
+        raise RuntimeError("Missing IG_ACCESS_TOKEN or IG_USER_ID")
 
-    spreadsheet_id = env_any(["SPREADSHEET_ID", "SHEET_ID"])
-    tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
+    max_wait_s = env_int("IG_MAX_WAIT_S", 45)
+    poll_s = env_int("IG_POLL_S", 3)
 
-    stripe_monthly = env_any(["STRIPE_MONTHLY_LINK", "STRIPE_LINK_MONTHLY"], "")
-    stripe_yearly = env_any(["STRIPE_YEARLY_LINK", "STRIPE_LINK_YEARLY"], "")
+    ss = _open_sheet()
+    ws_raw = ss.worksheet(RAW_DEALS_TAB)
+    ws_phrase = ss.worksheet(PHRASE_BANK_TAB)
 
-    if not spreadsheet_id:
-        raise RuntimeError("Missing SPREADSHEET_ID (or SHEET_ID)")
+    raw_headers = _ensure_headers(ws_raw, REQUIRED_RAW_COLS)
+    phrase_headers = _ensure_headers(ws_phrase, PHRASE_BANK_REQUIRED_COLS)
+    hmap = _header_map(raw_headers)
 
-    # Accept a couple of aliases as fallback (in case secrets were named differently)
-    bot_vip = env_any(["TELEGRAM_BOT_TOKEN_VIP", "TG_BOT_TOKEN_VIP"])
-    chan_vip = env_any(["TELEGRAM_CHANNEL_VIP", "TG_CHANNEL_VIP"])
-    bot_free = env_any(["TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN"])
-    chan_free = env_any(["TELEGRAM_CHANNEL", "TG_CHANNEL"])
-
-    if run_slot == "AM":
-        missing = []
-        if not bot_vip: missing.append("TELEGRAM_BOT_TOKEN_VIP")
-        if not chan_vip: missing.append("TELEGRAM_CHANNEL_VIP")
-        if missing:
-            raise RuntimeError(f"Missing Telegram VIP env vars for AM: {', '.join(missing)}")
-        bot_token, chat_id = bot_vip, chan_vip
-        consume_status = "POSTED_INSTAGRAM"
-        promote_status = "POSTED_TELEGRAM_VIP"
-        ts_col = "posted_telegram_vip_at"
-    else:
-        missing = []
-        if not bot_free: missing.append("TELEGRAM_BOT_TOKEN")
-        if not chan_free: missing.append("TELEGRAM_CHANNEL")
-        if missing:
-            raise RuntimeError(f"Missing Telegram FREE env vars for PM: {', '.join(missing)}")
-        bot_token, chat_id = bot_free, chan_free
-        consume_status = "POSTED_TELEGRAM_VIP"
-        promote_status = "POSTED_ALL"
-        ts_col = "posted_telegram_free_at"
-
-    gc = gs_client()
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(tab)
-
-    required = [
-        "status","deal_id","deal_theme","price_gbp","origin_city","destination_city",
-        "origin_iata","destination_iata","destination_country","outbound_date","return_date",
-        "affiliate_url","booking_link_vip","phrase_bank","ai_notes","why_good","deal_score",
-        "scored_timestamp","created_at","timestamp","posted_telegram_vip_at","posted_telegram_free_at","posted_instagram_at",
-    ]
-    ensure_columns(ws, required)
-
-    all_vals = ws.get_all_values()
-    if len(all_vals) < 2:
-        log("No rows.")
+    # Read all rows (values) so we can keep exact row indexes
+    all_values = ws_raw.get_all_values()
+    if len(all_values) < 2:
+        log("No rows to publish.")
         return 0
 
-    headers = [h.strip() for h in all_vals[0]]
-    rows = all_vals[1:]
-    h = {name: i for i, name in enumerate(headers)}
+    posted = 0
 
-    picked = pick_best_eligible(headers, rows, h, run_slot, consume_status, ts_col, free_delay_hours=24)
-    if not picked:
-        log(f"Done. Telegram posted 0. (No rows eligible for slot={run_slot} status={consume_status})")
+    # Find first eligible row:
+    # status == READY_TO_PUBLISH, graphic_url present, not posted yet
+    eligible_row_index: Optional[int] = None
+    row_data: Optional[Dict[str, str]] = None
+
+    for r in range(2, len(all_values) + 1):
+        d = _row_dict_from_values(raw_headers, all_values[r - 1])
+        status = (d.get("status") or "").strip()
+        graphic_url = (d.get("graphic_url") or "").strip()
+        already = (d.get("posted_instagram_at") or "").strip()
+
+        if status == "READY_TO_PUBLISH" and graphic_url and not already:
+            eligible_row_index = r
+            row_data = d
+            break
+
+    if not eligible_row_index or not row_data:
+        log("No eligible rows (READY_TO_PUBLISH with graphic_url).")
         return 0
 
-    rownum, row = picked
-    deal_id = (row.get("deal_id") or "").strip()
-    log(f"📨 Telegram best-pick row {rownum} deal_id={deal_id} RUN_SLOT={run_slot}")
+    r = eligible_row_index
+    d = row_data
 
-    msg = build_vip_message(row) if run_slot == "AM" else build_free_message(row, stripe_monthly, stripe_yearly)
+    deal_id = (d.get("deal_id") or "").strip()
+    to_city = (d.get("destination_city") or "").strip()
+    from_city = (d.get("origin_city") or "").strip()
+    country = (d.get("destination_country") or "").strip()
+    price_gbp = (d.get("price_gbp") or "").strip()
+    out_d = (d.get("outbound_date") or "").strip()
+    back_d = (d.get("return_date") or "").strip()
+    graphic_url = (d.get("graphic_url") or "").strip()
 
-    tg_send(bot_token, chat_id, msg)
+    # Phrase: use RAW_DEALS.phrase_bank if present; else pick and write-back
+    phrase = (d.get("phrase_bank") or "").strip()
+    theme = (d.get("deal_theme") or d.get("theme") or "").strip()
 
-    now_z = iso_now()
-    ws.update([[now_z]], f"{_col_letter(h[ts_col] + 1)}{rownum}")
-    ws.update([[promote_status]], f"{_col_letter(h['status'] + 1)}{rownum}")
+    if not phrase:
+        phrase = pick_phrase(ws_phrase, theme=theme)
+        if phrase:
+            _cell(ws_raw, r, hmap["phrase_bank"], phrase)
+            log(f"Phrase selected and written back to RAW_DEALS.phrase_bank (deal_id={deal_id})")
+        else:
+            log("No approved phrase found; continuing without phrase.")
 
-    log(f"✅ Telegram posted 1. Row {rownum} -> {promote_status}")
+    caption = build_caption_ig(country, to_city, from_city, price_gbp, out_d, back_d, phrase)
+
+    try:
+        log(f"📸 IG publishing row {r} deal_id={deal_id} ({from_city} -> {to_city})")
+        _ = ig_create_and_publish(
+            ig_user_id=ig_user_id,
+            access_token=ig_token,
+            image_url=graphic_url,
+            caption=caption,
+            max_wait_s=max_wait_s,
+            poll_s=poll_s,
+            publish_retries=2,
+        )
+
+        # Success -> update sheet
+        _cell(ws_raw, r, hmap["posted_instagram_at"], now_utc_iso())
+        _cell(ws_raw, r, hmap["status"], "POSTED_INSTAGRAM")
+        _cell(ws_raw, r, hmap["publish_error"], "")
+        _cell(ws_raw, r, hmap["publish_error_at"], "")
+        posted += 1
+
+        log(f"✅ IG posted 1 (deal_id={deal_id})")
+
+    except Exception as e:
+        err = str(e)
+        log(f"❌ IG publish failed: {err}")
+
+        # Do not mutate status on failure; log error fields
+        if "publish_error" in hmap:
+            _cell(ws_raw, r, hmap["publish_error"], err[:480])
+        if "publish_error_at" in hmap:
+            _cell(ws_raw, r, hmap["publish_error_at"], now_utc_iso())
+
+        return 1
+
+    log(f"Done. IG posted {posted}.")
     return 0
-
-
-def _col_letter(n1: int) -> str:
-    s = ""
-    n = n1
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
 
 
 if __name__ == "__main__":

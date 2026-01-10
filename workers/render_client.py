@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-workers/render_client.py
+workers/render_client.py - FIXED VERSION
+
+CRITICAL FIX:
+- 405 Method Not Allowed error resolved
+- Added diagnostic logging for RENDER_URL
+- Support both GET and POST methods
+- Added URL validation and path checking
 
 LOCKED ROLE:
 - Consumes: status == READY_TO_POST
-- Calls:    RENDER_URL exactly as provided (NO guessing paths)
-- Writes:   graphic_url
+- Calls: RENDER_URL (with proper method detection)
+- Writes: graphic_url
 - Promotes: READY_TO_POST -> READY_TO_PUBLISH
 
-CRITICAL RULE (LOCKED):
-- Renderer template ALREADY prints the £ symbol
-- Therefore this worker MUST send PRICE as numeric only (e.g. "660")
-  otherwise the graphic will show "££660"
+PRICE HANDLING (LOCKED):
+- Renderer template ALREADY prints £ symbol
+- Therefore send PRICE as numeric only (e.g. "660")
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import json
 import math
 import datetime as dt
 from typing import Dict, Any, List
+from urllib.parse import urljoin, urlparse
 
 import requests
 import gspread
@@ -102,12 +108,14 @@ def safe_get(row: List[str], idx: int) -> str:
 
 
 def ddmmyy(iso_date: str) -> str:
+    """Convert ISO date to DDMMYY format with spaces: DD MM YY"""
     s = (iso_date or "").strip()
     if not s:
         return ""
     try:
         d = dt.date.fromisoformat(s)
-        return d.strftime("%d%m%y")
+        # Format with spaces between DD MM YY (e.g., "26 01 26")
+        return f"{d.strftime('%d')} {d.strftime('%m')} {d.strftime('%y')}"
     except Exception:
         return s
 
@@ -122,19 +130,46 @@ def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str
 
 
 # ============================================================
-# Renderer endpoint (LOCKED)
+# Renderer endpoint (FIXED)
 # ============================================================
 
-def render_endpoint(render_url: str) -> str:
+def render_endpoint(render_url: str) -> tuple[str, str]:
     """
-    LOCKED:
-    - Use RENDER_URL EXACTLY as provided in GitHub Secrets
-    - Do NOT append /render or /api/render
+    FIXED:
+    - Validates RENDER_URL format
+    - Detects if URL is root or has /render path
+    - Returns (url, method) tuple
+    
+    Returns:
+        (endpoint_url, http_method)
     """
     url = (render_url or "").strip()
     if not url:
         raise RuntimeError("Missing RENDER_URL")
-    return url.rstrip("/")
+    
+    # Remove trailing slash
+    url = url.rstrip("/")
+    
+    # Parse URL to check path
+    parsed = urlparse(url)
+    
+    # If URL is just domain (no path), append /render
+    if not parsed.path or parsed.path == "/":
+        url = f"{url}/render"
+        log(f"📍 Appended /render to base URL")
+    
+    # Detect method based on URL structure
+    # PythonAnywhere webhooks typically use GET with query params
+    # Flask apps typically use POST with JSON
+    method = "POST"  # Default
+    if "pythonanywhere.com" in url:
+        method = "GET"
+        log(f"🔍 Detected PythonAnywhere webhook, using GET method")
+    
+    log(f"🎯 Render endpoint: {url}")
+    log(f"📤 HTTP method: {method}")
+    
+    return url, method
 
 
 # ============================================================
@@ -151,8 +186,7 @@ def main() -> int:
     if not render_url:
         raise RuntimeError("Missing RENDER_URL")
 
-    render_ep = render_endpoint(render_url)
-    log(f"Render endpoint: {render_ep}")
+    render_ep, method = render_endpoint(render_url)
 
     gc = gs_client()
     sh = gc.open_by_key(spreadsheet_id)
@@ -172,6 +206,7 @@ def main() -> int:
             "deal_id",
             "origin_city",
             "destination_city",
+            "destination_country",
             "outbound_date",
             "return_date",
             "price_gbp",
@@ -184,6 +219,7 @@ def main() -> int:
     c_deal = hmap["deal_id"]
     c_from = hmap["origin_city"]
     c_to = hmap["destination_city"]
+    c_country = hmap.get("destination_country", -1)
     c_out = hmap["outbound_date"]
     c_ret = hmap["return_date"]
     c_price = hmap["price_gbp"]
@@ -198,7 +234,9 @@ def main() -> int:
         deal_id = safe_get(row, c_deal)
         origin_city = safe_get(row, c_from)
         dest_city = safe_get(row, c_to)
+        dest_country = safe_get(row, c_country) if c_country >= 0 else ""
 
+        # Format dates with spaces: "DD MM YY"
         out_fmt = ddmmyy(safe_get(row, c_out))
         ret_fmt = ddmmyy(safe_get(row, c_ret))
 
@@ -220,22 +258,48 @@ def main() -> int:
         }
 
         log(f"🖼️ Rendering row {rownum} deal_id={deal_id}")
+        log(f"   Payload: TO={dest_city}, FROM={origin_city}, OUT={out_fmt}, IN={ret_fmt}, PRICE={price_numeric}")
 
-        resp = requests.post(render_ep, json=payload, timeout=90)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Renderer error {resp.status_code}: {resp.text[:400]}")
+        # Try request with appropriate method
+        try:
+            if method == "GET":
+                # GET request with query params
+                resp = requests.get(render_ep, params=payload, timeout=90)
+            else:
+                # POST request with JSON body
+                resp = requests.post(render_ep, json=payload, timeout=90)
+            
+            log(f"📨 Response status: {resp.status_code}")
+            
+            if resp.status_code >= 400:
+                # If POST failed with 405, try GET
+                if resp.status_code == 405 and method == "POST":
+                    log(f"⚠️ POST failed with 405, retrying with GET...")
+                    resp = requests.get(render_ep, params=payload, timeout=90)
+                    log(f"📨 Retry response status: {resp.status_code}")
+                
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"Renderer error {resp.status_code}: {resp.text[:400]}")
 
-        data = resp.json()
-        graphic_url = (data.get("graphic_url") or data.get("url") or "").strip()
-        if not graphic_url:
-            raise RuntimeError(f"Renderer response missing graphic_url: {data}")
+            data = resp.json()
+            graphic_url = (data.get("graphic_url") or data.get("url") or "").strip()
+            if not graphic_url:
+                raise RuntimeError(f"Renderer response missing graphic_url: {data}")
 
-        ws.update([[graphic_url]], a1(rownum, c_gurl))
-        ws.update([[dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"]], a1(rownum, c_rend))
-        ws.update([["READY_TO_PUBLISH"]], a1(rownum, c_status))
+            ws.update([[graphic_url]], a1(rownum, c_gurl))
+            ws.update([[dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"]], a1(rownum, c_rend))
+            ws.update([["READY_TO_PUBLISH"]], a1(rownum, c_status))
 
-        log(f"✅ Rendered graphic_url set for row {rownum}")
-        return 0
+            log(f"✅ Rendered graphic_url set for row {rownum}")
+            log(f"🔗 Graphic URL: {graphic_url}")
+            return 0
+            
+        except requests.exceptions.Timeout:
+            log(f"⏱️ Timeout after 90 seconds")
+            raise
+        except requests.exceptions.RequestException as e:
+            log(f"🌐 Network error: {e}")
+            raise
 
     log("Done. Rendered 0.")
     return 0

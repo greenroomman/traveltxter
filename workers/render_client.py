@@ -8,10 +8,18 @@ LOCKED PURPOSE:
 - Writes graphic_url back to RAW_DEALS
 - Promotes status -> READY_TO_PUBLISH
 
-CRITICAL FIX (NO REINVENT):
-- If RAW_DEALS does not have 'graphic_url' column, create it.
-- Same for 'render_error' (optional but useful).
-- This stops the "PNG exists but no graphic_url appears" loop.
+"100% WORKS" HARDENING (NO REINVENTION):
+1) Always normalise RENDER_URL safely:
+   - If secret is base domain, we use /api/render automatically
+   - If secret already includes /api/render, we keep it
+2) Always ensure RAW_DEALS has columns:
+   - graphic_url
+   - render_error
+3) Never promote status unless:
+   - renderer returns a URL
+   - URL is ABSOLUTE https URL
+   - URL is publicly fetchable (HTTP 200) and Content-Type is image/*
+4) Logs clearly what happened.
 
 Does NOT change creative rendering.
 """
@@ -21,7 +29,6 @@ from __future__ import annotations
 import os
 import json
 import math
-import time
 import datetime as dt
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse, urlunparse
@@ -135,22 +142,30 @@ def normalize_renderer_urls(render_url_raw: str) -> Tuple[str, str, str]:
     """
     Returns (render_ep, health_ep, base_url)
 
-    render_ep is always POST {base}/api/render
-    health_ep is GET  {base}/api/health
+    Accepts:
+    - https://domain
+    - https://domain/
+    - https://domain/api/render
+    - https://domain/api/render/
     """
-    u = (render_url_raw or "").strip().rstrip("/")
+    u = (render_url_raw or "").strip()
     if not u:
         die("Missing RENDER_URL")
 
-    p = urlparse(u)
-    if not p.scheme:
+    # Ensure scheme
+    if not u.startswith("http://") and not u.startswith("https://"):
         u = "https://" + u
-        p = urlparse(u)
 
+    u = u.rstrip("/")
+    p = urlparse(u)
     base = urlunparse((p.scheme, p.netloc, "", "", "", "")).rstrip("/")
 
-    # If someone gave /api/render already, keep base anyway
-    render_ep = base + "/api/render"
+    # If user provided /api/render explicitly, keep it.
+    if p.path.endswith("/api/render"):
+        render_ep = u
+    else:
+        render_ep = base + "/api/render"
+
     health_ep = base + "/api/health"
     return render_ep, health_ep, base
 
@@ -173,8 +188,33 @@ def absolutise_image_url(image_url: str, base_url: str) -> str:
     return u
 
 
+def preflight_public_image(url: str) -> None:
+    """
+    Must be publicly fetchable:
+    - HTTP 200
+    - Content-Type: image/*
+    """
+    if not url:
+        raise RuntimeError("graphic_url is blank")
+
+    headers = {"User-Agent": "traveltxter-render-preflight/1.0"}
+    r = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
+
+    if r.status_code != 200:
+        snippet = ""
+        try:
+            snippet = (r.text or "")[:180].replace("\n", " ")
+        except Exception:
+            snippet = ""
+        raise RuntimeError(f"graphic_url not fetchable (HTTP {r.status_code}) :: {snippet}")
+
+    ctype = (r.headers.get("Content-Type") or "").lower().strip()
+    if not ctype.startswith("image/"):
+        raise RuntimeError(f"graphic_url not an image (Content-Type={ctype})")
+
+
 # -------------------------
-# Sheet header enforcement (THE FIX)
+# Sheet header enforcement
 # -------------------------
 
 def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
@@ -208,9 +248,8 @@ def main() -> None:
     if not values or len(values) < 2:
         die("RAW_DEALS is empty (no header + rows).", 0)
 
-    # ✅ Ensure we have columns to write into (this stops the loop)
+    # Ensure write columns exist
     headers = ensure_columns(ws, values[0], ["graphic_url", "render_error"])
-    # Refresh values after header change
     values = ws.get_all_values()
     headers = values[0]
 
@@ -221,6 +260,7 @@ def main() -> None:
             die(f"Missing required column in RAW_DEALS: {name}")
         return h[name]
 
+    # Required
     c_status = col("status")
     c_deal_id = col("deal_id")
     c_price = col("price_gbp")
@@ -228,6 +268,8 @@ def main() -> None:
     c_dest_city = col("destination_city")
     c_out = col("outbound_date")
     c_ret = col("return_date")
+
+    # Write cols
     c_graphic = col("graphic_url")
     c_render_err = col("render_error")
 
@@ -286,8 +328,15 @@ def main() -> None:
             ws.update([[f"Render OK but missing graphic_url: {str(data)[:300]}"]], a1_cell(c_render_err, sheet_row_num))
             continue
 
-        # ✅ Store an IG-safe absolute URL
+        # Store absolute URL
         image_url_abs = absolutise_image_url(image_url, base_url)
+
+        # ✅ HARD GUARANTEE: do not promote unless the URL is publicly fetchable as an image
+        try:
+            preflight_public_image(image_url_abs)
+        except Exception as e:
+            ws.update([[f"Rendered URL failed preflight: {str(e)[:250]}"]], a1_cell(c_render_err, sheet_row_num))
+            continue
 
         ws.update([[image_url_abs]], a1_cell(c_graphic, sheet_row_num))
         ws.update([[""]], a1_cell(c_render_err, sheet_row_num))

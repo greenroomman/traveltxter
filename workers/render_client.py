@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-workers/render_client.py
+workers/render_client.py  (PASTE-SAFE, HARDENED)
 
-LOCKED PURPOSE:
-- Finds status == READY_TO_POST
-- Calls PythonAnywhere renderer (POST /api/render)
-- Writes graphic_url back to RAW_DEALS
-- Promotes status -> READY_TO_PUBLISH
+LOCKED PURPOSE (NO REINVENTION):
+- Find RAW_DEALS rows where status == READY_TO_POST
+- Call PythonAnywhere renderer
+- Write graphic_url back to RAW_DEALS
+- Promote status -> READY_TO_PUBLISH
 
-"100% WORKS" HARDENING (NO REINVENTION):
-1) Always normalise RENDER_URL safely:
-   - If secret is base domain, we use /api/render automatically
-   - If secret already includes /api/render, we keep it
-2) Always ensure RAW_DEALS has columns:
+HARDENING (so it doesn't break again):
+1) Accepts RENDER_URL as either:
+   - https://domain
+   - https://domain/api/render
+   - https://domain/render  (legacy)
+   We auto-try sensible endpoints in order until one works.
+2) Ensures columns exist:
    - graphic_url
    - render_error
-3) Never promote status unless:
-   - renderer returns a URL
-   - URL is ABSOLUTE https URL
-   - URL is publicly fetchable (HTTP 200) and Content-Type is image/*
-4) Logs clearly what happened.
+3) Never promotes unless the returned image URL is publicly fetchable (HTTP 200 + Content-Type image/*)
+4) Always stores an absolute https URL in graphic_url
 
-Does NOT change creative rendering.
+Does NOT change your creative renderer in any way.
 """
 
 from __future__ import annotations
@@ -110,7 +109,7 @@ def a1_cell(col0: int, row1: int) -> str:
 
 
 # -------------------------
-# Date + price formatting
+# Formatting helpers
 # -------------------------
 
 def ddmmyy(iso_date: str) -> str:
@@ -135,49 +134,63 @@ def ceil_price_digits_only(raw: str) -> str:
 
 
 # -------------------------
-# Renderer URL normalisation
+# Renderer endpoint logic
 # -------------------------
 
-def normalize_renderer_urls(render_url_raw: str) -> Tuple[str, str, str]:
-    """
-    Returns (render_ep, health_ep, base_url)
+def _base_from_any_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if not u.startswith("http://") and not u.startswith("https://"):
+        u = "https://" + u
+    u = u.rstrip("/")
+    p = urlparse(u)
+    return urlunparse((p.scheme, p.netloc, "", "", "", "")).rstrip("/")
 
-    Accepts:
-    - https://domain
-    - https://domain/
-    - https://domain/api/render
-    - https://domain/api/render/
+
+def candidate_render_endpoints(render_url_raw: str) -> Tuple[List[str], str]:
+    """
+    Returns (candidates, base_url)
+    Candidates are tried in order until one works.
     """
     u = (render_url_raw or "").strip()
     if not u:
         die("Missing RENDER_URL")
 
-    # Ensure scheme
     if not u.startswith("http://") and not u.startswith("https://"):
         u = "https://" + u
-
     u = u.rstrip("/")
+
+    base = _base_from_any_url(u)
     p = urlparse(u)
-    base = urlunparse((p.scheme, p.netloc, "", "", "", "")).rstrip("/")
 
-    # If user provided /api/render explicitly, keep it.
-    if p.path.endswith("/api/render"):
-        render_ep = u
-    else:
-        render_ep = base + "/api/render"
+    candidates: List[str] = []
 
-    health_ep = base + "/api/health"
-    return render_ep, health_ep, base
+    # If user already provided a specific endpoint path, try it first
+    if p.path and p.path != "/":
+        candidates.append(u)
+
+    # Then try the two common ones we support
+    candidates.append(base + "/api/render")
+    candidates.append(base + "/render")  # legacy
+
+    # De-dupe while preserving order
+    seen = set()
+    out = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+
+    return out, base
 
 
-def absolutise_image_url(image_url: str, base_url: str) -> str:
-    """
-    Renderer may return:
-      - absolute https://...
-      - or /static/renders/...
-    We store absolute URLs in the sheet (IG-safe).
-    """
-    u = (image_url or "").strip()
+def candidate_health_endpoints(base_url: str) -> List[str]:
+    return [base_url + "/api/health", base_url + "/health"]
+
+
+def absolutise_url(maybe_url: str, base_url: str) -> str:
+    u = (maybe_url or "").strip()
     if not u:
         return ""
     if u.startswith("/"):
@@ -189,17 +202,8 @@ def absolutise_image_url(image_url: str, base_url: str) -> str:
 
 
 def preflight_public_image(url: str) -> None:
-    """
-    Must be publicly fetchable:
-    - HTTP 200
-    - Content-Type: image/*
-    """
-    if not url:
-        raise RuntimeError("graphic_url is blank")
-
     headers = {"User-Agent": "traveltxter-render-preflight/1.0"}
     r = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
-
     if r.status_code != 200:
         snippet = ""
         try:
@@ -207,10 +211,44 @@ def preflight_public_image(url: str) -> None:
         except Exception:
             snippet = ""
         raise RuntimeError(f"graphic_url not fetchable (HTTP {r.status_code}) :: {snippet}")
-
     ctype = (r.headers.get("Content-Type") or "").lower().strip()
     if not ctype.startswith("image/"):
         raise RuntimeError(f"graphic_url not an image (Content-Type={ctype})")
+
+
+def try_render(endpoints: List[str], payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any], int, str]:
+    """
+    Try POSTing to endpoints until we get a 2xx with a JSON graphic_url.
+    Returns: (used_endpoint, json_data, status_code, response_text_snippet)
+    Raises: RuntimeError if all attempts fail.
+    """
+    last_err = None
+    last_status = 0
+    last_snip = ""
+
+    for ep in endpoints:
+        try:
+            log(f"➡️  Render endpoint try: {ep}")
+            resp = requests.post(ep, json=payload, timeout=60)
+            last_status = resp.status_code
+            last_snip = (resp.text or "")[:300]
+            if resp.status_code >= 400:
+                last_err = RuntimeError(f"HTTP {resp.status_code}: {last_snip}")
+                continue
+
+            ctype = (resp.headers.get("content-type") or "")
+            if "application/json" not in ctype.lower():
+                last_err = RuntimeError(f"Expected JSON, got Content-Type={ctype} :: {last_snip}")
+                continue
+
+            data = resp.json()
+            return ep, data, resp.status_code, last_snip
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"All render endpoints failed. Last status={last_status} :: {last_snip} :: {last_err}")
 
 
 # -------------------------
@@ -221,7 +259,6 @@ def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str
     missing = [c for c in required if c not in headers]
     if not missing:
         return headers
-
     new_headers = headers + missing
     ws.update([new_headers], "A1")
     log(f"🛠️ Added missing columns: {missing}")
@@ -238,7 +275,20 @@ def main() -> None:
     render_url_raw = must_env("RENDER_URL")
     max_rows = int(env("RENDER_MAX_ROWS", "1"))
 
-    render_ep, health_ep, base_url = normalize_renderer_urls(render_url_raw)
+    endpoints, base_url = candidate_render_endpoints(render_url_raw)
+    health_eps = candidate_health_endpoints(base_url)
+
+    log(f"Renderer base_url: {base_url}")
+    log(f"Renderer endpoints (in order): {endpoints}")
+
+    # Best-effort healthcheck
+    for hep in health_eps:
+        try:
+            r = requests.get(hep, timeout=10)
+            log(f"Renderer healthcheck {hep}: {r.status_code}")
+            break
+        except Exception:
+            continue
 
     gc = gs_client()
     sh = gc.open_by_key(spreadsheet_id)
@@ -248,7 +298,7 @@ def main() -> None:
     if not values or len(values) < 2:
         die("RAW_DEALS is empty (no header + rows).", 0)
 
-    # Ensure write columns exist
+    # Ensure required write columns exist
     headers = ensure_columns(ws, values[0], ["graphic_url", "render_error"])
     values = ws.get_all_values()
     headers = values[0]
@@ -260,7 +310,7 @@ def main() -> None:
             die(f"Missing required column in RAW_DEALS: {name}")
         return h[name]
 
-    # Required
+    # Required columns (contract)
     c_status = col("status")
     c_deal_id = col("deal_id")
     c_price = col("price_gbp")
@@ -269,16 +319,9 @@ def main() -> None:
     c_out = col("outbound_date")
     c_ret = col("return_date")
 
-    # Write cols
+    # Write columns
     c_graphic = col("graphic_url")
     c_render_err = col("render_error")
-
-    # Healthcheck (best effort)
-    try:
-        r = requests.get(health_ep, timeout=10)
-        log(f"Renderer healthcheck: {r.status_code}")
-    except Exception as e:
-        log(f"Renderer healthcheck failed (non-fatal): {e}")
 
     rendered = 0
 
@@ -297,52 +340,58 @@ def main() -> None:
         ret_fmt = ddmmyy((row[c_ret] if c_ret < len(row) else "").strip())
         price_fmt = ceil_price_digits_only(row[c_price] if c_price < len(row) else "")
 
+        # Payload: include BOTH key styles to avoid future contract drift
         payload = {
+            # Identifiers
             "deal_id": deal_id,
+
+            # Uppercase contract (used in your current render_api support)
             "TO": dest_city,
             "FROM": origin_city,
             "OUT": out_fmt,
             "IN": ret_fmt,
             "PRICE": price_fmt,
+
+            # Lowercase contract (legacy-safe)
+            "to_city": dest_city,
+            "from_city": origin_city,
+            "out_date": out_fmt,
+            "in_date": ret_fmt,
+            "price": price_fmt,
         }
 
         log(f"🖼️  Rendering row {sheet_row_num} deal_id={deal_id} ({origin_city} -> {dest_city})")
 
         try:
-            resp = requests.post(render_ep, json=payload, timeout=60)
+            used_ep, data, _, _ = try_render(endpoints, payload)
         except Exception as e:
-            ws.update([[f"Render request failed: {e}"]], a1_cell(c_render_err, sheet_row_num))
+            ws.update([[f"Render failed: {str(e)[:280]}"]], a1_cell(c_render_err, sheet_row_num))
+            log(f"❌ Render failed row {sheet_row_num}: {e}")
             continue
 
-        raw = (resp.text or "")[:400]
-        if resp.status_code >= 400:
-            ws.update([[f"Render HTTP {resp.status_code}: {raw}"]], a1_cell(c_render_err, sheet_row_num))
+        # Accept either key name
+        img_url = (data.get("graphic_url") or data.get("image_url") or "").strip()
+        if not img_url:
+            ws.update([[f"Render OK but missing graphic_url in JSON: {str(data)[:260]}"]], a1_cell(c_render_err, sheet_row_num))
+            log(f"❌ Missing graphic_url row {sheet_row_num}")
             continue
 
-        # Parse JSON
-        ctype = (resp.headers.get("content-type") or "")
-        data = resp.json() if "application/json" in ctype else {}
-        image_url = (data.get("graphic_url") or data.get("image_url") or "").strip()
+        img_url_abs = absolutise_url(img_url, base_url)
 
-        if not image_url:
-            ws.update([[f"Render OK but missing graphic_url: {str(data)[:300]}"]], a1_cell(c_render_err, sheet_row_num))
-            continue
-
-        # Store absolute URL
-        image_url_abs = absolutise_image_url(image_url, base_url)
-
-        # ✅ HARD GUARANTEE: do not promote unless the URL is publicly fetchable as an image
+        # Preflight must pass before we promote
         try:
-            preflight_public_image(image_url_abs)
+            preflight_public_image(img_url_abs)
         except Exception as e:
-            ws.update([[f"Rendered URL failed preflight: {str(e)[:250]}"]], a1_cell(c_render_err, sheet_row_num))
+            ws.update([[f"Rendered URL failed preflight: {str(e)[:260]}"]], a1_cell(c_render_err, sheet_row_num))
+            log(f"❌ Preflight failed row {sheet_row_num}: {e}")
             continue
 
-        ws.update([[image_url_abs]], a1_cell(c_graphic, sheet_row_num))
+        # Write + promote
+        ws.update([[img_url_abs]], a1_cell(c_graphic, sheet_row_num))
         ws.update([[""]], a1_cell(c_render_err, sheet_row_num))
         ws.update([["READY_TO_PUBLISH"]], a1_cell(c_status, sheet_row_num))
 
-        log(f"✅ Rendered row {sheet_row_num} -> READY_TO_PUBLISH ({image_url_abs})")
+        log(f"✅ Rendered row {sheet_row_num} -> READY_TO_PUBLISH via {used_ep}")
         rendered += 1
 
         if rendered >= max_rows:

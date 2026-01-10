@@ -15,6 +15,13 @@ FREE post (24h after VIP):
 RUN_SLOT support (for testing):
   - VIP:  RUN_SLOT in (VIP, AM, TEST)  -> VIP behaviour
   - FREE: RUN_SLOT in (FREE, PM)       -> FREE behaviour
+
+LOCKED OUTPUT RULE:
+- Telegram must display PHRASE BANK text.
+- If RAW_DEALS.phrase_bank is blank, this worker loads PHRASE_BANK and writes it into RAW_DEALS.phrase_bank.
+
+LOCKED PHRASE BANK RULE (IMPORTANT):
+- PHRASE_BANK.csv uses channel_hint as descriptive text (not TG/IG routing), so we DO NOT filter on it.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ from __future__ import annotations
 import os
 import json
 import datetime as dt
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -73,7 +81,7 @@ def _parse_sa_json(raw: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return json.loads(raw.replace("\\n", "\n"))
 
-def gs_client():
+def gs_client() -> gspread.Client:
     raw = env_any(["GCP_SA_JSON_ONE_LINE", "GCP_SA_JSON"])
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
@@ -84,7 +92,7 @@ def gs_client():
     )
     return gspread.authorize(creds)
 
-def ensure_columns(ws, required_cols: List[str]) -> Dict[str, int]:
+def ensure_columns(ws: gspread.Worksheet, required_cols: List[str]) -> Dict[str, int]:
     headers = ws.row_values(1)
     if not headers:
         ws.update([required_cols], "A1")
@@ -146,7 +154,6 @@ def title_case_city(s: str) -> str:
     s = (s or "").strip()
     if not s:
         return ""
-    # keep common IATA-like uppercase as-is if it's 3 letters
     if len(s) == 3 and s.isalpha() and s.upper() == s:
         return s
     return " ".join([w[:1].upper() + w[1:].lower() for w in s.split()])
@@ -159,11 +166,9 @@ def fmt_price_gbp(p: str) -> str:
         v = float(p)
         return f"£{v:,.2f}"
     except Exception:
-        # if already includes £
         return p if p.startswith("£") else f"£{p}"
 
 def country_flag(country: str) -> str:
-    # Simple mapping (extend later if needed)
     c = (country or "").strip().lower()
     m = {
         "iceland": "🇮🇸",
@@ -182,6 +187,9 @@ def country_flag(country: str) -> str:
         "usa": "🇺🇸",
         "united states": "🇺🇸",
         "united states of america": "🇺🇸",
+        "mexico": "🇲🇽",
+        "united arab emirates": "🇦🇪",
+        "uae": "🇦🇪",
     }
     return m.get(c, "")
 
@@ -191,6 +199,48 @@ def pick_first_present(row: Dict[str, str], keys: List[str]) -> str:
         if v:
             return v
     return ""
+
+
+# -----------------------------
+# PHRASE BANK loader + picker (LOCKED)
+# -----------------------------
+
+def _truthy(x: str) -> bool:
+    return (x or "").strip().lower() in ("true", "yes", "1", "y", "approved")
+
+def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
+    try:
+        ws = sh.worksheet("PHRASE_BANK")
+    except Exception:
+        return []
+    vals = ws.get_all_values()
+    if len(vals) < 2:
+        return []
+    headers = [h.strip() for h in vals[0]]
+    idx = {h: i for i, h in enumerate(headers)}
+    out: List[Dict[str, str]] = []
+    for r in vals[1:]:
+        d: Dict[str, str] = {}
+        for h in headers:
+            i = idx[h]
+            d[h] = (r[i] if i < len(r) else "").strip()
+        if any(d.values()):
+            out.append(d)
+    return out
+
+def pick_phrase(bank: List[Dict[str, str]], theme: str, deal_id: str) -> str:
+    # IMPORTANT: channel_hint is descriptive text in your PHRASE_BANK, so we ignore it.
+    theme_u = (theme or "").strip().upper()
+    pool = [
+        r for r in bank
+        if (r.get("phrase") or "").strip()
+        and _truthy(r.get("approved", ""))
+        and (not (r.get("theme") or "").strip() or (r.get("theme") or "").strip().upper() == theme_u)
+    ]
+    if not pool:
+        return ""
+    h = hashlib.md5((deal_id or "x").encode()).hexdigest()
+    return (pool[int(h[:8], 16) % len(pool)].get("phrase", "") or "").strip()
 
 
 # -----------------------------
@@ -211,13 +261,9 @@ def build_vip_message(row: Dict[str, str]) -> str:
     out_d = (row.get("outbound_date", "") or "").strip()
     ret_d = (row.get("return_date", "") or "").strip()
 
-    # LOCKED: phrase_bank ONLY (no why_good / ai_notes)
     phrase = (row.get("phrase_bank", "") or "").strip()
 
-    # VIP booking link: prefer booking_link_vip, then deeplink, then affiliate_url
-    booking = clean_url(
-        pick_first_present(row, ["booking_link_vip", "deeplink", "affiliate_url"])
-    )
+    booking = clean_url(pick_first_present(row, ["booking_link_vip", "deeplink", "affiliate_url"]))
 
     lines: List[str] = []
     lines.append(f"{price} to {country}{(' ' + flag) if flag else ''}".strip())
@@ -236,7 +282,6 @@ def build_vip_message(row: Dict[str, str]) -> str:
 
     return "\n".join(lines).strip()
 
-
 def build_free_message(row: Dict[str, str], stripe_monthly: str, stripe_yearly: str) -> str:
     price = fmt_price_gbp(row.get("price_gbp", ""))
     country = (row.get("destination_country", "") or "").strip()
@@ -251,7 +296,6 @@ def build_free_message(row: Dict[str, str], stripe_monthly: str, stripe_yearly: 
     out_d = (row.get("outbound_date", "") or "").strip()
     ret_d = (row.get("return_date", "") or "").strip()
 
-    # LOCKED: phrase_bank ONLY (no why_good / ai_notes)
     phrase = (row.get("phrase_bank", "") or "").strip()
 
     m = clean_url(stripe_monthly)
@@ -294,10 +338,7 @@ def build_free_message(row: Dict[str, str], stripe_monthly: str, stripe_yearly: 
 # -----------------------------
 
 def row_dict(headers: List[str], vals: List[str]) -> Dict[str, str]:
-    d: Dict[str, str] = {}
-    for i, h in enumerate(headers):
-        d[h] = (vals[i] if i < len(vals) else "") or ""
-    return d
+    return {headers[i]: (vals[i] if i < len(vals) else "") for i in range(len(headers))}
 
 def rank_key(rownum: int, row: Dict[str, str]) -> Tuple[float, dt.datetime, dt.datetime, int]:
     ds = safe_float(row.get("deal_score", "")) or 0.0
@@ -313,7 +354,7 @@ def pick_best_eligible(
     headers: List[str],
     rows: List[List[str]],
     h: Dict[str, int],
-    mode: str,                 # VIP or FREE
+    mode: str,
     consume_status: str,
     ts_col: str,
     free_delay_hours: int = 24,
@@ -355,11 +396,7 @@ def pick_best_eligible(
 def main() -> int:
     run_slot = env_str("RUN_SLOT", "VIP").upper().strip()
 
-    # Map your testing mode to VIP behaviour (so it never accidentally posts FREE)
-    if run_slot in ("FREE", "PM"):
-        mode = "FREE"
-    else:
-        mode = "VIP"  # VIP / AM / TEST / anything else
+    mode = "FREE" if run_slot in ("FREE", "PM") else "VIP"
 
     spreadsheet_id = env_any(["SPREADSHEET_ID", "SHEET_ID"])
     tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
@@ -376,21 +413,15 @@ def main() -> int:
     chan_free = env_any(["TELEGRAM_CHANNEL", "TG_CHANNEL"])
 
     if mode == "VIP":
-        missing = []
-        if not bot_vip: missing.append("TELEGRAM_BOT_TOKEN_VIP")
-        if not chan_vip: missing.append("TELEGRAM_CHANNEL_VIP")
-        if missing:
-            raise RuntimeError(f"Missing Telegram VIP env vars: {', '.join(missing)}")
+        if not bot_vip or not chan_vip:
+            raise RuntimeError("Missing TELEGRAM_BOT_TOKEN_VIP or TELEGRAM_CHANNEL_VIP")
         bot_token, chat_id = bot_vip, chan_vip
         consume_status = "POSTED_INSTAGRAM"
         promote_status = "POSTED_TELEGRAM_VIP"
         ts_col = "posted_telegram_vip_at"
     else:
-        missing = []
-        if not bot_free: missing.append("TELEGRAM_BOT_TOKEN")
-        if not chan_free: missing.append("TELEGRAM_CHANNEL")
-        if missing:
-            raise RuntimeError(f"Missing Telegram FREE env vars: {', '.join(missing)}")
+        if not bot_free or not chan_free:
+            raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL")
         bot_token, chat_id = bot_free, chan_free
         consume_status = "POSTED_TELEGRAM_VIP"
         promote_status = "POSTED_ALL"
@@ -424,13 +455,23 @@ def main() -> int:
 
     rownum, row = picked
     deal_id = (row.get("deal_id") or "").strip()
+    theme = (row.get("deal_theme") or "").strip()
+
+    # Fill phrase_bank if missing (long_haul included)
+    phrase = (row.get("phrase_bank") or "").strip()
+    if not phrase:
+        bank = load_phrase_bank(sh)
+        chosen = pick_phrase(bank, theme, deal_id)
+        if chosen:
+            ws.update([[chosen]], gspread.utils.rowcol_to_a1(rownum, h["phrase_bank"] + 1))
+            row["phrase_bank"] = chosen
+            log(f"🧩 Filled phrase_bank for row {rownum} (theme={theme})")
+
     log(f"📨 Telegram best-pick row {rownum} deal_id={deal_id} MODE={mode} RUN_SLOT={run_slot}")
 
     msg = build_vip_message(row) if mode == "VIP" else build_free_message(row, stripe_monthly, stripe_yearly)
-
     tg_send(bot_token, chat_id, msg)
 
-    # Write timestamp + promote status
     ws.batch_update(
         [
             {"range": gspread.utils.rowcol_to_a1(rownum, h[ts_col] + 1), "values": [[iso_now()]]},

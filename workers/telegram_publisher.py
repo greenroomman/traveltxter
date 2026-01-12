@@ -1,33 +1,31 @@
 # workers/telegram_publisher.py
 #!/usr/bin/env python3
 """
-TravelTxter — Telegram Publisher (PROD SAFE, LOCKED)
+TravelTxter — Telegram Publisher (PROD SAFE, LOCKED) + VIP BUNDLE ADDON
 
-Modes:
+Modes (unchanged contract):
 - VIP: consumes POSTED_INSTAGRAM -> posts VIP -> status POSTED_TELEGRAM_VIP
 - FREE: consumes POSTED_TELEGRAM_VIP older than FREE_DELAY_HOURS -> posts FREE -> status POSTED_ALL
 
-Enforces:
-- Theme-of-the-day gate:
-    theme_of_day = THEME_OF_DAY env override (if set) else deterministic UTC rotation.
-  Row theme must match (deal_theme OR theme). If mismatch -> skip.
+ADDON (VIP bundle):
+- VIP can also include up to (VIP_BUNDLE_SIZE-1) runner-ups with status READY_TO_VIP_BUNDLE
+- Runner-ups are marked POSTED_TELEGRAM_VIP_BUNDLE (so FREE will NOT repost them)
+
+Theme gate (unchanged):
+- Theme-of-the-day resolved from THEME_OF_DAY env override else deterministic UTC rotation.
+- Row theme must match (deal_theme OR theme). If mismatch -> skip.
 
 Notes:
-- AM/PM reinstate is trivial:
-    RUN_SLOT=AM => VIP mode
-    RUN_SLOT=PM => FREE mode
-- Supports both Stripe var naming schemes (future-proof):
-    STRIPE_LINK_MONTHLY / STRIPE_LINK_YEARLY
-    STRIPE_MONTHLY_LINK / STRIPE_YEARLY_LINK
+- Keeps your current status spine and timestamp columns.
+- No changes to rendering/IG pipeline. Telegram remains status-driven.
 """
 
 from __future__ import annotations
 
 import os
 import json
-import hashlib
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 import gspread
@@ -207,13 +205,23 @@ def build_message(row: Dict[str, str], mode: str) -> str:
             lines.append(booking)
         return "\n".join(lines).strip()
 
-    # FREE message includes upgrade CTA
     upgrade = get_upgrade_link()
     lines.append("💎 Want instant access?")
     lines.append("Join TravelTxter VIP:")
     if upgrade:
         lines.append(f"👉 Upgrade now: {upgrade}")
     return "\n".join(lines).strip()
+
+
+def build_vip_bundle_message(rows: List[Dict[str, str]]) -> str:
+    # First row is the Instagram winner, subsequent rows are runner-ups.
+    blocks: List[str] = []
+    for i, row in enumerate(rows):
+        if i == 0:
+            blocks.append(build_message(row, "VIP"))
+        else:
+            blocks.append(build_message(row, "VIP"))
+    return "\n\n<hr/>\n\n".join(blocks).replace("<hr/>", "────────")
 
 
 # ============================================================
@@ -226,12 +234,16 @@ def main() -> int:
     run_slot = env_str("RUN_SLOT", "VIP").upper()
     free_delay_hours = env_int("FREE_DELAY_HOURS", 24)
 
+    # VIP bundle size (total deals in VIP message, incl winner)
+    vip_bundle_size = env_int("VIP_BUNDLE_SIZE", 1)
+    vip_bundle_size = max(1, min(5, vip_bundle_size))  # safety cap (1–5)
+
     if not spreadsheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID/SHEET_ID")
 
     mode = "FREE" if run_slot in ("PM", "FREE") else "VIP"
     theme_today = resolve_theme_of_day()
-    log(f"🎯 Theme of the day (resolved): {theme_today} | MODE={mode} | RUN_SLOT={run_slot}")
+    log(f"🎯 Theme of the day (resolved): {theme_today} | MODE={mode} | RUN_SLOT={run_slot} | VIP_BUNDLE_SIZE={vip_bundle_size}")
 
     if mode == "VIP":
         bot_token = env_str("TELEGRAM_BOT_TOKEN_VIP", "")
@@ -239,6 +251,8 @@ def main() -> int:
         consume_status = "POSTED_INSTAGRAM"
         promote_status = "POSTED_TELEGRAM_VIP"
         ts_col = "posted_telegram_vip_at"
+        runner_status = "READY_TO_VIP_BUNDLE"
+        runner_promote_status = "POSTED_TELEGRAM_VIP_BUNDLE"
     else:
         bot_token = env_str("TELEGRAM_BOT_TOKEN", "")
         chat_id = env_str("TELEGRAM_CHANNEL", "")
@@ -276,25 +290,99 @@ def main() -> int:
 
     now = dt.datetime.utcnow()
 
+    # Helper to convert a sheet row into dict
+    def row_dict(r: List[str]) -> Dict[str, str]:
+        return {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers)) if isinstance(headers[i], str)}
+
+    # ----------------------------
+    # VIP MODE: winner + runner-ups
+    # ----------------------------
+    if mode == "VIP":
+        winner_rownum: Optional[int] = None
+        winner_row: Optional[Dict[str, str]] = None
+
+        # 1) Find first eligible winner (POSTED_INSTAGRAM + theme match)
+        for rownum, r in enumerate(values[1:], start=2):
+            if safe_get(r, h["status"]) != consume_status:
+                continue
+
+            row = row_dict(r)
+            row_theme = norm_theme((row.get("deal_theme") or "").strip()) or norm_theme((row.get("theme") or "").strip())
+            if not row_theme or row_theme != theme_today:
+                continue
+
+            winner_rownum = rownum
+            winner_row = row
+            break
+
+        if not winner_rownum or not winner_row:
+            log("Done. VIP posted 0 (no eligible rows match status+theme gate).")
+            return 0
+
+        # 2) Collect runner-ups (READY_TO_VIP_BUNDLE + theme match)
+        runner_rows: List[Dict[str, str]] = []
+        runner_rownums: List[int] = []
+        if vip_bundle_size > 1:
+            for rownum, r in enumerate(values[1:], start=2):
+                if len(runner_rows) >= (vip_bundle_size - 1):
+                    break
+                if safe_get(r, h["status"]) != runner_status:
+                    continue
+
+                row = row_dict(r)
+                row_theme = norm_theme((row.get("deal_theme") or "").strip()) or norm_theme((row.get("theme") or "").strip())
+                if not row_theme or row_theme != theme_today:
+                    continue
+
+                runner_rows.append(row)
+                runner_rownums.append(rownum)
+
+        bundle_rows = [winner_row] + runner_rows
+        msg = build_vip_bundle_message(bundle_rows)
+        tg_send(bot_token, chat_id, msg)
+
+        # 3) Update statuses + timestamps (batch_update)
+        updates = []
+
+        # Winner: POSTED_TELEGRAM_VIP
+        updates.append({"range": a1(winner_rownum, h[ts_col]), "values": [[iso_now()]]})
+        updates.append({"range": a1(winner_rownum, h["status"]), "values": [[promote_status]]})
+
+        # Runner-ups: POSTED_TELEGRAM_VIP_BUNDLE (so FREE won't repost)
+        for rn in runner_rownums:
+            updates.append({"range": a1(rn, h[ts_col]), "values": [[iso_now()]]})
+            updates.append({"range": a1(rn, h["status"]), "values": [[runner_promote_status]]})
+
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+        log(f"✅ VIP Telegram posted winner row {winner_rownum} -> {promote_status}")
+        if runner_rownums:
+            log(f"✅ VIP Telegram included runner-ups: {len(runner_rownums)} rows -> {runner_promote_status}")
+        return 0
+
+    # ----------------------------
+    # FREE MODE: unchanged
+    # ----------------------------
+
     # Pick first eligible row (simple and safe)
     for rownum, r in enumerate(values[1:], start=2):
         if safe_get(r, h["status"]) != consume_status:
             continue
 
-        row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers)) if isinstance(headers[i], str)}
+        row = row_dict(r)
+
         row_theme = norm_theme((row.get("deal_theme") or "").strip()) or norm_theme((row.get("theme") or "").strip())
         if not row_theme or row_theme != theme_today:
             continue
 
-        if mode == "FREE":
-            vip_ts = parse_iso_z((row.get("posted_telegram_vip_at") or "").strip())
-            if not vip_ts:
-                continue
-            age_hrs = (now - vip_ts).total_seconds() / 3600.0
-            if age_hrs < float(free_delay_hours):
-                continue
+        vip_ts = parse_iso_z((row.get("posted_telegram_vip_at") or "").strip())
+        if not vip_ts:
+            continue
+        age_hrs = (now - vip_ts).total_seconds() / 3600.0
+        if age_hrs < float(free_delay_hours):
+            continue
 
-        msg = build_message(row, mode)
+        msg = build_message(row, "FREE")
         tg_send(bot_token, chat_id, msg)
 
         ws.batch_update(

@@ -4,13 +4,20 @@ workers/instagram_publisher.py
 
 LOCKED SYSTEM RULES:
 - Consume: status == READY_TO_PUBLISH
-- Require: graphic_url present
+- Require: graphic_url present AND fetchable
+- Require: row theme matches THEME OF THE DAY (from CONFIG or env)
 - Produce: status -> POSTED_INSTAGRAM
 
 THIS PATCH FIXES:
-1) Phrase missing: PHRASE_BANK.channel_hint is descriptive in this project, so we DO NOT filter on it.
-2) IG failures from bad graphic_url: we preflight and AUTO-REPAIR common PythonAnywhere static URL variants.
-   If we find a working image URL, we WRITE IT BACK into graphic_url and proceed.
+1) Theme gating: publish ONLY deals matching today's theme (CONFIG-driven).
+2) Phrase missing: PHRASE_BANK.channel_hint is descriptive, so we DO NOT filter on it.
+3) IG failures from bad graphic_url: preflight + AUTO-REPAIR common URL variants,
+   including legacy PythonAnywhere /static/renders -> /renders.
+
+IMPORTANT:
+- Does NOT change rendering logic (render_engine).
+- Does NOT change scorer/feeder selection logic.
+- Only gates Instagram publishing to theme-of-day and improves URL resilience.
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ import json
 import time
 import datetime as dt
 import hashlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -119,6 +126,68 @@ def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str
         log(f"🛠️ Added missing columns: {missing}")
         return headers + missing
     return headers
+
+
+# =========================
+# CONFIG: Theme of the day (LOCKED GATE)
+# =========================
+
+def _norm_theme(s: str) -> str:
+    return (s or "").strip().lower().replace(" ", "_")
+
+
+def load_theme_of_day(sh: gspread.Spreadsheet) -> str:
+    """
+    Reads today's active theme from CONFIG (preferred) or env var THEME_OF_DAY (fallback).
+
+    We do NOT assume CONFIG schema beyond this common pattern:
+      - A key/value table where first column is key and second column is value
+      - OR header row contains 'key' and 'value' columns
+
+    Keys we will accept (case-insensitive):
+      - theme_of_day
+      - active_theme
+      - todays_theme
+      - today_theme
+      - theme
+    """
+    # 1) Try CONFIG tab
+    try:
+        ws = sh.worksheet("CONFIG")
+        values = ws.get_all_values()
+        if values and len(values) >= 2:
+            headers = [h.strip().lower() for h in values[0]]
+            rows = values[1:]
+
+            # Option A: explicit key/value headers
+            if "key" in headers and "value" in headers:
+                k_i = headers.index("key")
+                v_i = headers.index("value")
+                for r in rows:
+                    k = (r[k_i] if k_i < len(r) else "").strip().lower()
+                    v = (r[v_i] if v_i < len(r) else "").strip()
+                    if k in ("theme_of_day", "active_theme", "todays_theme", "today_theme", "theme"):
+                        if v:
+                            return _norm_theme(v)
+
+            # Option B: first two columns are key/value
+            for r in rows:
+                if not r:
+                    continue
+                k = (r[0] if 0 < len(r) else "").strip().lower()
+                v = (r[1] if 1 < len(r) else "").strip()
+                if k in ("theme_of_day", "active_theme", "todays_theme", "today_theme", "theme"):
+                    if v:
+                        return _norm_theme(v)
+    except Exception:
+        pass
+
+    # 2) Fallback: env var
+    env_theme = env_str("THEME_OF_DAY")
+    if env_theme:
+        return _norm_theme(env_theme)
+
+    return ""
 
 
 # =========================
@@ -252,7 +321,7 @@ def _base_from_render_url(render_url: str) -> Optional[str]:
 def absolutise_image_url(image_url: str) -> str:
     """
     IG must fetch this URL publicly.
-    - If url starts with /static/... -> prefix with scheme+host from RENDER_URL
+    - If url starts with /... -> prefix with scheme+host from RENDER_URL
     - If url has no scheme -> prefix https://
     """
     u = (image_url or "").strip()
@@ -274,10 +343,12 @@ def absolutise_image_url(image_url: str) -> str:
 
 def _candidate_url_variants(url: str) -> List[str]:
     """
-    If the URL 404s, try common PythonAnywhere variants.
-    We do NOT guess random things; only these safe swaps:
+    If the URL 404s, try common variants.
+
+    Safe swaps only:
     - https <-> http
     - /static/ <-> /staticfiles/
+    - /static/renders/ <-> /renders/  (PythonAnywhere renderer canonical path)
     """
     u = (url or "").strip()
     if not u:
@@ -291,9 +362,14 @@ def _candidate_url_variants(url: str) -> List[str]:
     elif u.startswith("http://"):
         out.append("https://" + u[len("http://"):])
 
-    # static path swap (on each scheme variant)
+    # path swaps on each scheme variant
     more = []
     for x in out:
+        if "/static/renders/" in x:
+            more.append(x.replace("/static/renders/", "/renders/"))
+        if "/renders/" in x:
+            more.append(x.replace("/renders/", "/static/renders/"))
+
         if "/static/" in x:
             more.append(x.replace("/static/", "/staticfiles/"))
         if "/staticfiles/" in x:
@@ -308,15 +384,6 @@ def _candidate_url_variants(url: str) -> List[str]:
             uniq.append(x)
             seen.add(x)
     return uniq
-
-
-def _fetch_ok_image(url: str) -> bool:
-    headers = {"User-Agent": "traveltxter-ig-preflight/1.0"}
-    r = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
-    if r.status_code != 200:
-        return False
-    ctype = (r.headers.get("Content-Type") or "").lower().strip()
-    return ctype.startswith("image/")
 
 
 def preflight_and_repair_image_url(url: str) -> str:
@@ -397,6 +464,13 @@ def main() -> int:
     sh = open_sheet_with_backoff(get_client(), env_str("SPREADSHEET_ID"))
     ws = sh.worksheet(env_str("RAW_DEALS_TAB", "RAW_DEALS"))
 
+    theme_of_day = load_theme_of_day(sh)
+    if not theme_of_day:
+        # Hard stop: you explicitly said published content MUST conform to theme of the day.
+        raise RuntimeError("Theme-of-day is not set. Provide CONFIG theme_of_day (preferred) or env THEME_OF_DAY.")
+
+    log(f"🎯 Theme of the day (LOCKED): {theme_of_day}")
+
     values = ws.get_all_values()
     if not values:
         log("RAW_DEALS is empty.")
@@ -416,6 +490,9 @@ def main() -> int:
 
     bank = load_phrase_bank(sh)
 
+    posted_any = False
+    skipped_wrong_theme = 0
+
     for rownum, r in enumerate(values[1:], start=2):
         if safe_get(r, h["status"]) != "READY_TO_PUBLISH":
             continue
@@ -425,12 +502,18 @@ def main() -> int:
             continue
 
         deal_id = safe_get(r, h["deal_id"])
-        theme = safe_get(r, h.get("deal_theme", -1)) or safe_get(r, h.get("theme", -1))
+        row_theme_raw = safe_get(r, h.get("deal_theme", -1)) or safe_get(r, h.get("theme", -1))
+        row_theme = _norm_theme(row_theme_raw)
+
+        # THEME GATE (LOCKED)
+        if row_theme != theme_of_day:
+            skipped_wrong_theme += 1
+            continue
 
         # Phrase
         phrase = safe_get(r, h["phrase_bank"])
         if not phrase:
-            phrase = pick_phrase_from_bank(bank, theme, deal_id)
+            phrase = pick_phrase_from_bank(bank, row_theme_raw, deal_id)
             if phrase:
                 ws.update([[phrase]], a1(rownum, h["phrase_bank"]))
 
@@ -448,10 +531,10 @@ def main() -> int:
         )
 
         try:
-            # 1) absolutise if /static/... etc
+            # 1) absolutise if /... etc
             image_url = absolutise_image_url(graphic_url_raw)
 
-            # 2) repair if 404 by trying safe variants; returns working URL or raises
+            # 2) repair if 404 by trying safe variants
             image_url_working = preflight_and_repair_image_url(image_url)
 
             # 3) if repaired, write back to sheet so pipeline stays clean
@@ -473,10 +556,14 @@ def main() -> int:
 
         ws.update([[now_utc_iso()]], a1(rownum, h["posted_instagram_at"]))
         ws.update([["POSTED_INSTAGRAM"]], a1(rownum, h["status"]))
-        log(f"✅ IG posted row {rownum}")
+        log(f"✅ IG posted row {rownum} (theme={row_theme})")
+        posted_any = True
         return 0
 
-    log("No eligible rows.")
+    if skipped_wrong_theme:
+        log(f"ℹ️ Skipped {skipped_wrong_theme} READY_TO_PUBLISH rows due to wrong theme (need theme={theme_of_day}).")
+
+    log("No eligible rows (theme-of-day gate enforced).")
     return 0
 
 

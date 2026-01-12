@@ -1,48 +1,65 @@
 #!/usr/bin/env python3
 """
-workers/instagram_publisher.py
+workers/render_client.py (CLEAN)
 
-LOCKED SYSTEM RULES:
-- Consume: status == READY_TO_PUBLISH
-- Require: graphic_url present AND publicly fetchable (HTTP 200 + image/*)
-- Produce: status -> POSTED_INSTAGRAM
-- If graphic_url is broken (404/500/etc): mark publish_error + set status -> READY_TO_POST and clear graphic_url (so render can regenerate)
+LOCKED PURPOSE:
+- Find RAW_DEALS rows where status == READY_TO_POST
+- Call PythonAnywhere renderer (POST /api/render)
+- Write graphic_url back to RAW_DEALS
+- Promote status -> READY_TO_PUBLISH
 
-This prevents the pipeline getting stuck on one bad row forever.
+IMPORTANT:
+- DOES NOT require any Instagram env vars.
+- PRICE sent as numeric-only (renderer adds £).
+- Dates sent as DDMMYY (no separators).
 """
 
 from __future__ import annotations
 
 import os
 import json
-import time
+import math
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# =========================
+# -------------------------
 # Logging
-# =========================
-
-def now_utc_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
+# -------------------------
 
 def log(msg: str) -> None:
-    print(f"{now_utc_iso()} | {msg}", flush=True)
+    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    print(f"{ts} | {msg}", flush=True)
 
 
-def env_str(name: str, default: str = "") -> str:
+def die(msg: str, code: int = 1) -> None:
+    log(f"FATAL: {msg}")
+    raise SystemExit(code)
+
+
+# -------------------------
+# Env
+# -------------------------
+
+def env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or "").strip()
 
 
-# =========================
+def must_env(name: str) -> str:
+    v = env(name)
+    if not v:
+        die(f"Missing env var: {name}")
+    return v
+
+
+# -------------------------
 # Sheets auth
-# =========================
+# -------------------------
 
 def _parse_sa_json(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
@@ -52,21 +69,130 @@ def _parse_sa_json(raw: str) -> Dict[str, Any]:
         return json.loads(raw.replace("\\n", "\n"))
 
 
-def get_client() -> gspread.Client:
-    raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
+def gs_client() -> gspread.Client:
+    raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
     if not raw:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-
+        die("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
     info = _parse_sa_json(raw)
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
+
+# -------------------------
+# A1 helpers
+# -------------------------
+
+def a1_col(idx0: int) -> str:
+    idx = idx0 + 1
+    s = ""
+    while idx:
+        idx, r = divmod(idx - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def a1_cell(col0: int, row1: int) -> str:
+    return f"{a1_col(col0)}{row1}"
+
+
+# -------------------------
+# Formatting helpers
+# -------------------------
+
+def ddmmyy(iso_date: str) -> str:
+    """
+    Convert YYYY-MM-DD -> DDMMYY (no separators).
+    Example: 2026-01-26 -> 260126
+    """
+    s = (iso_date or "").strip()
+    if not s:
+        return ""
+    try:
+        d = dt.date.fromisoformat(s[:10])
+        return d.strftime("%d%m%y")
+    except Exception:
+        digits = "".join(ch for ch in s if ch.isdigit())
+        return digits[-6:] if len(digits) >= 6 else digits
+
+
+def numeric_price_only(raw: str) -> str:
+    """
+    Renderer adds £ itself, so we send numeric-only string.
+    Rounds up to int.
+    """
+    s = (raw or "").strip().replace("Â£", "").replace("£", "").replace(",", "")
+    try:
+        v = float(s) if s else 0.0
+    except Exception:
+        v = 0.0
+    return str(int(math.ceil(v)))
+
+
+# -------------------------
+# Renderer endpoint logic
+# -------------------------
+
+def _base_from_any_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if not u.startswith("http://") and not u.startswith("https://"):
+        u = "https://" + u
+    u = u.rstrip("/")
+    p = urlparse(u)
+    return urlunparse((p.scheme, p.netloc, "", "", "", "")).rstrip("/")
+
+
+def normalize_renderer(render_url_raw: str) -> Tuple[str, str, str]:
+    """
+    Returns: (render_ep, health_ep, base_url)
+    Accepts:
+      - https://domain
+      - https://domain/api/render
+    Always normalises to POST /api/render.
+    """
+    base = _base_from_any_url(render_url_raw)
+    if not base:
+        die("Missing RENDER_URL")
+    render_ep = base + "/api/render"
+    health_ep = base + "/api/health"
+    return render_ep, health_ep, base
+
+
+def absolutise_url(maybe_url: str, base_url: str) -> str:
+    u = (maybe_url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("/"):
+        return base_url + u
+    pu = urlparse(u)
+    if not pu.scheme:
+        return "https://" + u.lstrip("/")
+    return u
+
+
+def preflight_public_image(url: str) -> None:
+    headers = {"User-Agent": "traveltxter-render-preflight/1.0"}
+    r = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
+    if r.status_code != 200:
+        snippet = ""
+        try:
+            snippet = (r.text or "")[:180].replace("\n", " ")
+        except Exception:
+            snippet = ""
+        raise RuntimeError(f"graphic_url not fetchable (HTTP {r.status_code}) :: {snippet}")
+    ctype = (r.headers.get("Content-Type") or "").lower().strip()
+    if not ctype.startswith("image/"):
+        raise RuntimeError(f"graphic_url not an image (Content-Type={ctype})")
+
+
+# -------------------------
+# Sheet header enforcement
+# -------------------------
 
 def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
     missing = [c for c in required if c not in headers]
@@ -78,310 +204,149 @@ def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str
     return new_headers
 
 
-def safe_get(row: List[str], idx: int) -> str:
-    if idx < 0:
-        return ""
-    if idx >= len(row):
-        return ""
-    return (row[idx] or "").strip()
-
-
-def a1(col0: int, row1: int) -> str:
-    # 0-based col -> A1
-    col = col0 + 1
-    s = ""
-    while col:
-        col, r = divmod(col - 1, 26)
-        s = chr(65 + r) + s
-    return f"{s}{row1}"
-
-
-# =========================
-# URL preflight + repair
-# =========================
-
-def _normalize_url(u: str) -> str:
-    u = (u or "").strip()
-    if not u:
-        return ""
-    # Add scheme if missing
-    if u.startswith("greenroomman.pythonanywhere.com/"):
-        u = "https://" + u
-    if u.startswith("www.") or u.startswith("pythonanywhere.com/"):
-        u = "https://" + u
-    if not u.startswith("http://") and not u.startswith("https://"):
-        # safest default
-        u = "https://" + u.lstrip("/")
-    # Remove accidental double slashes after domain
-    u = u.replace("://", "§§§").replace("//", "/").replace("§§§", "://")
-    return u
-
-
-def preflight_public_image(url: str) -> None:
-    url = _normalize_url(url)
-    headers = {"User-Agent": "traveltxter-ig-preflight/1.0"}
-    r = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
-
-    if r.status_code != 200:
-        snippet = ""
-        try:
-            snippet = (r.text or "")[:220].replace("\n", " ")
-        except Exception:
-            snippet = ""
-        raise RuntimeError(f"graphic_url not fetchable (HTTP {r.status_code}) :: {snippet}")
-
-    ctype = (r.headers.get("Content-Type") or "").lower().strip()
-    if not ctype.startswith("image/"):
-        raise RuntimeError(f"graphic_url not an image (Content-Type={ctype})")
-
-
-def preflight_and_repair_image_url(url: str) -> str:
-    """
-    Try a couple of harmless repairs before failing.
-    Returns a working URL or raises RuntimeError.
-    """
-    candidates = []
-    u = (url or "").strip()
-    if u:
-        candidates.append(u)
-        candidates.append(_normalize_url(u))
-
-    # Common repair: sometimes sheets store without scheme or with extra slashes
-    # (candidates already cover this)
-
-    last_err: Optional[Exception] = None
-    for c in candidates:
-        try:
-            preflight_public_image(c)
-            return _normalize_url(c)
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(str(last_err) if last_err else "Unknown preflight failure")
-
-
-# =========================
-# Caption builder (simple, locked style)
-# =========================
-
-def build_caption_ig(
-    country: str,
-    to_city: str,
-    from_city: str,
-    price_gbp: str,
-    out_d: str,
-    back_d: str,
-    phrase: str,
-) -> str:
-    # Keep this plain and deterministic (no “AI tone”)
-    country = (country or "").strip()
-    to_city = (to_city or "").strip()
-    from_city = (from_city or "").strip()
-
-    price = (price_gbp or "").strip()
-    if not price.startswith("£"):
-        price = "£" + price.replace("Â£", "").replace("£", "").strip()
-
-    # Dates shown as ISO if present (already stored that way in sheet)
-    out_d = (out_d or "").strip()
-    back_d = (back_d or "").strip()
-
-    # Phrase bank is optional
-    phrase = (phrase or "").strip()
-
-    lines = [
-        f"{price} to {to_city}" + (f", {country}" if country else ""),
-        "",
-        f"TO: {to_city.upper()}",
-        f"FROM: {from_city}",
-        f"OUT: {out_d}",
-        f"BACK: {back_d}",
-    ]
-    if phrase:
-        lines += ["", phrase]
-
-    return "\n".join(lines).strip()
-
-
-# =========================
-# Instagram Graph API
-# =========================
-
-def ig_create_and_publish(ig_user_id: str, access_token: str, image_url: str, caption: str) -> str:
-    """
-    Creates media + publishes it. Returns creation_id.
-    """
-    api_base = "https://graph.facebook.com/v19.0"
-
-    # 1) Create media container
-    create_url = f"{api_base}/{ig_user_id}/media"
-    payload = {
-        "image_url": image_url,
-        "caption": caption,
-        "access_token": access_token,
-    }
-    r1 = requests.post(create_url, data=payload, timeout=60)
-    j1 = r1.json() if r1.content else {}
-    if r1.status_code >= 400 or "id" not in j1:
-        raise RuntimeError(f"IG /media failed: {j1}")
-
-    creation_id = j1["id"]
-
-    # 2) Publish (with retries for “not ready yet”)
-    publish_url = f"{api_base}/{ig_user_id}/media_publish"
-    pub_payload = {"creation_id": creation_id, "access_token": access_token}
-
-    last_err = None
-    for attempt in range(1, 8):
-        r2 = requests.post(publish_url, data=pub_payload, timeout=60)
-        j2 = r2.json() if r2.content else {}
-
-        if r2.status_code < 400 and "id" in j2:
-            return creation_id
-
-        last_err = j2
-        time.sleep(3 * attempt)
-
-    raise RuntimeError(f"IG /media_publish failed after retries: {last_err}")
-
-
-# =========================
+# -------------------------
 # Main
-# =========================
+# -------------------------
 
 def main() -> int:
-    spreadsheet_id = env_str("SPREADSHEET_ID")
-    tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-    ig_access_token = env_str("IG_ACCESS_TOKEN")
-    ig_user_id = env_str("IG_USER_ID")
+    spreadsheet_id = must_env("SPREADSHEET_ID")
+    raw_tab = env("RAW_DEALS_TAB", "RAW_DEALS")
+    render_url_raw = must_env("RENDER_URL")
+    max_rows = int(env("RENDER_MAX_ROWS", "1"))
 
-    if not spreadsheet_id:
-        raise RuntimeError("Missing SPREADSHEET_ID")
-    if not ig_access_token or not ig_user_id:
-        raise RuntimeError("Missing IG_ACCESS_TOKEN / IG_USER_ID")
+    render_ep, health_ep, base_url = normalize_renderer(render_url_raw)
 
-    gc = get_client()
+    log(f"Render endpoint: {render_ep}")
+
+    # Best-effort healthcheck (non-fatal)
+    try:
+        r = requests.get(health_ep, timeout=10)
+        log(f"Renderer healthcheck: {r.status_code}")
+    except Exception as e:
+        log(f"Renderer healthcheck failed (non-fatal): {e}")
+
+    gc = gs_client()
     sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(tab)
+    ws = sh.worksheet(raw_tab)
 
     values = ws.get_all_values()
-    if len(values) < 2:
-        log("No rows.")
+    if not values or len(values) < 2:
+        log("RAW_DEALS empty. Nothing to do.")
         return 0
 
     headers = [h.strip() for h in values[0]]
-    required_cols = [
-        "status",
-        "deal_id",
-        "graphic_url",
-        "price_gbp",
-        "origin_city",
-        "destination_city",
-        "destination_country",
-        "outbound_date",
-        "return_date",
-        "deal_theme",
-        "phrase_bank",
-        "posted_instagram_at",
-        "publish_error",
-        "publish_error_at",
-    ]
-    headers = ensure_columns(ws, headers, required_cols)
-
+    headers = ensure_columns(ws, headers, ["graphic_url", "render_error", "rendered_timestamp"])
     values = ws.get_all_values()
     headers = [h.strip() for h in values[0]]
-    rows = values[1:]
+
     h = {name: i for i, name in enumerate(headers)}
 
-    # ✅ NEW BEHAVIOUR:
-    # Scan READY_TO_PUBLISH rows and pick the first one with a WORKING image URL.
-    # If image URL is broken, mark row to be rerendered and continue scanning.
-    target: Optional[Tuple[int, List[str], str]] = None  # (rownum, row_values, working_url)
+    # Required columns (do not guess)
+    required = [
+        "status",
+        "deal_id",
+        "origin_city",
+        "destination_city",
+        "outbound_date",
+        "return_date",
+        "price_gbp",
+        "graphic_url",
+        "render_error",
+        "rendered_timestamp",
+    ]
+    for c in required:
+        if c not in h:
+            die(f"Missing required column in RAW_DEALS: {c}")
 
-    for rownum, r in enumerate(rows, start=2):
-        if safe_get(r, h["status"]).strip() != "READY_TO_PUBLISH":
+    c_status = h["status"]
+    c_deal_id = h["deal_id"]
+    c_origin_city = h["origin_city"]
+    c_dest_city = h["destination_city"]
+    c_outbound = h["outbound_date"]
+    c_return = h["return_date"]
+    c_price = h["price_gbp"]
+    c_graphic = h["graphic_url"]
+    c_err = h["render_error"]
+    c_rts = h["rendered_timestamp"]
+
+    rendered = 0
+
+    for i in range(1, len(values)):
+        if rendered >= max_rows:
+            break
+
+        row = values[i]
+        sheet_row = i + 1
+
+        status = (row[c_status] if c_status < len(row) else "").strip()
+        if status != "READY_TO_POST":
             continue
 
-        raw_url = safe_get(r, h["graphic_url"])
-        if not raw_url:
+        if (row[c_graphic] if c_graphic < len(row) else "").strip():
+            continue
+
+        deal_id = (row[c_deal_id] if c_deal_id < len(row) else "").strip()
+        origin_city = (row[c_origin_city] if c_origin_city < len(row) else "").strip()
+        dest_city = (row[c_dest_city] if c_dest_city < len(row) else "").strip()
+        out_iso = (row[c_outbound] if c_outbound < len(row) else "").strip()
+        ret_iso = (row[c_return] if c_return < len(row) else "").strip()
+        price_raw = (row[c_price] if c_price < len(row) else "").strip()
+
+        payload = {
+            "deal_id": deal_id,
+            "TO": dest_city,
+            "FROM": origin_city,
+            "OUT": ddmmyy(out_iso),
+            "IN": ddmmyy(ret_iso),
+            "PRICE": numeric_price_only(price_raw),  # numeric only
+        }
+
+        log(f"🖼️  Rendering row {sheet_row} deal_id={deal_id} ({origin_city} -> {dest_city})")
+
+        try:
+            resp = requests.post(render_ep, json=payload, timeout=90)
+        except Exception as e:
+            msg = f"Render request failed: {str(e)[:280]}"
+            ws.update([[msg]], a1_cell(c_err, sheet_row))
+            continue
+
+        if resp.status_code >= 400:
+            raw = (resp.text or "")[:400]
+            msg = f"Render HTTP {resp.status_code}: {raw}"
+            ws.update([[msg]], a1_cell(c_err, sheet_row))
             continue
 
         try:
-            working_url = preflight_and_repair_image_url(raw_url)
-
-            # If repaired, write back the working URL
-            if working_url != raw_url:
-                ws.update([[working_url]], a1(h["graphic_url"], rownum))
-
-            target = (rownum, r, working_url)
-            break
-
-        except Exception as e:
-            # Mark this row so render_client can regenerate a fresh URL
-            msg = f"IG preflight failed (rerender): {str(e)[:220]}"
-            ws.batch_update(
-                [
-                    {"range": a1(h["publish_error"], rownum), "values": [[msg]]},
-                    {"range": a1(h["publish_error_at"], rownum), "values": [[now_utc_iso()]]},
-                    {"range": a1(h["graphic_url"], rownum), "values": [[""]]},
-                    {"range": a1(h["status"], rownum), "values": [["READY_TO_POST"]]},
-                ],
-                value_input_option="USER_ENTERED",
-            )
-            log(f"⚠️ Skipped row {rownum} (bad graphic_url) -> set READY_TO_POST")
+            data = resp.json()
+        except Exception:
+            msg = f"Render returned non-JSON: {(resp.text or '')[:280]}"
+            ws.update([[msg]], a1_cell(c_err, sheet_row))
             continue
 
-    if not target:
-        log("No eligible rows with a working graphic_url.")
-        return 0
+        img_url = (data.get("graphic_url") or data.get("image_url") or "").strip()
+        img_url = absolutise_url(img_url, base_url)
 
-    rownum, r, image_url_working = target
-    deal_id = safe_get(r, h["deal_id"])
+        if not img_url:
+            msg = f"Render OK but missing graphic_url: {str(data)[:280]}"
+            ws.update([[msg]], a1_cell(c_err, sheet_row))
+            continue
 
-    # Phrase (optional; already stored by scorer/render steps normally)
-    phrase = safe_get(r, h["phrase_bank"])
+        try:
+            preflight_public_image(img_url)
+        except Exception as e:
+            msg = f"graphic_url preflight failed: {str(e)[:280]}"
+            ws.update([[msg]], a1_cell(c_err, sheet_row))
+            continue
 
-    caption = build_caption_ig(
-        country=safe_get(r, h["destination_country"]),
-        to_city=safe_get(r, h["destination_city"]),
-        from_city=safe_get(r, h["origin_city"]),
-        price_gbp=safe_get(r, h["price_gbp"]),
-        out_d=safe_get(r, h["outbound_date"]),
-        back_d=safe_get(r, h["return_date"]),
-        phrase=phrase,
-    )
+        ws.update([[img_url]], a1_cell(c_graphic, sheet_row))
+        ws.update([["READY_TO_PUBLISH"]], a1_cell(c_status, sheet_row))
+        ws.update([[dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"]], a1_cell(c_rts, sheet_row))
+        ws.update([[""]], a1_cell(c_err, sheet_row))
 
-    log(f"📸 IG posting row {rownum} deal_id={deal_id}")
+        log(f"✅ Rendered row {sheet_row} -> READY_TO_PUBLISH ({img_url})")
+        rendered += 1
 
-    try:
-        ig_create_and_publish(
-            ig_user_id=ig_user_id,
-            access_token=ig_access_token,
-            image_url=image_url_working,
-            caption=caption,
-        )
-    except Exception as e:
-        msg = f"IG publish failed: {str(e)[:240]}"
-        ws.batch_update(
-            [
-                {"range": a1(h["publish_error"], rownum), "values": [[msg]]},
-                {"range": a1(h["publish_error_at"], rownum), "values": [[now_utc_iso()]]},
-            ],
-            value_input_option="USER_ENTERED",
-        )
-        raise
-
-    # Success -> mark posted
-    ws.batch_update(
-        [
-            {"range": a1(h["posted_instagram_at"], rownum), "values": [[now_utc_iso()]]},
-            {"range": a1(h["status"], rownum), "values": [["POSTED_INSTAGRAM"]]},
-            {"range": a1(h["publish_error"], rownum), "values": [[""]]},
-        ],
-        value_input_option="USER_ENTERED",
-    )
-
-    log(f"✅ IG posted row {rownum} deal_id={deal_id}")
+    log(f"Done. Rendered {rendered}.")
     return 0
 
 

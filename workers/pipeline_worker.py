@@ -1,35 +1,15 @@
-# workers/pipeline_worker.py
 #!/usr/bin/env python3
 """
 TravelTxter Pipeline Worker (Feeder + Orchestrator) — LOCKED
 
-This is the production feeder/orchestrator. It:
-- Reads CONFIG (routes/weights)
-- Optionally reads ROUTE_CAPABILITY_MAP (allowed route pairs, origin city mapping)
-- Searches Duffel within safe caps
-- Writes NEW rows to RAW_DEALS (header-mapped writes only)
-- Enriches destination city/country via THEMES then CONFIG_SIGNALS
-- IMPORTANT: origin_city is now guaranteed via:
-    ROUTE_CAPABILITY_MAP origin_city -> fallback UK airport map -> "".
-
-Do NOT reinvent this file. Only surgical fixes.
-
 Surgical Fix (V4.6): Theme/haul-aware origin rotation
-- CONFIG remains the source of DESTINATIONS and route rules.
-- Origins are chosen per theme to avoid LGW-only lock-in:
-  - short-haul themes prefer SW/LCC airports + London LCC fallback
-  - snow themes prefer classic snow airports
-  - long-haul themes prefer LHR/LGW
-- Capability map remains authoritative for allowed (origin,destination) pairs.
-
 Surgical Fix (2026-01-12): ISO date write + RAW append
-- Prevents Google Sheets locale parsing flipping DD/MM into MM/DD.
-
 Surgical Fix (2026-01-12): FEEDER_OPEN_ORIGINS (Reverse capability injection)
-- If FEEDER_OPEN_ORIGINS=true:
-  For each destination, expand candidate origins using reverse lookup from ROUTE_CAPABILITY_MAP
-  (destination -> list of compatible origins), then try planned origins first, then reverse origins,
-  then fallback pools.
+
+Surgical Fix (2026-01-12): 90/10 HYBRID FEEDER
+- 90%: theme-constrained route selection (brand coherence)
+- 10%: single "wildcard" route from enabled CONFIG outside today's theme
+- Deterministic + stateless (Sheets remains the only memory)
 """
 
 from __future__ import annotations
@@ -78,6 +58,10 @@ DEFAULT_DAYS_AHEAD_MAX = int(os.getenv("DAYS_AHEAD_MAX", "90") or "90")
 
 # Trip length defaults (if CONFIG rows omit)
 DEFAULT_TRIP_LENGTH_DAYS = int(os.getenv("TRIP_LENGTH_DAYS", "5") or "5")
+
+# 90/10 hybrid control (deterministic)
+FEEDER_EXPLORE_RUN_MOD = int(os.getenv("FEEDER_EXPLORE_RUN_MOD", "10") or "10")  # 10 => ~10%
+FEEDER_EXPLORE_SALT = (os.getenv("FEEDER_EXPLORE_SALT", "traveltxter") or "traveltxter").strip()
 
 
 # ==================== THEME OF DAY ====================
@@ -149,6 +133,27 @@ def _clean_iata(x: Any) -> str:
 def resolve_origin_city(iata: str, origin_city_map: Dict[str, str]) -> str:
     iata = _clean_iata(iata)
     return (origin_city_map.get(iata) or ORIGIN_CITY_FALLBACK.get(iata) or "").strip()
+
+
+# ==================== 90/10 HYBRID (stateless + deterministic) ====================
+
+def _stable_mod(key: str, mod: int) -> int:
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % max(1, mod)
+
+
+def should_do_explore_this_run(theme_today: str) -> bool:
+    """
+    About 1 in FEEDER_EXPLORE_RUN_MOD runs becomes an explore run.
+    Deterministic: date + RUN_SLOT + GitHub run identifiers.
+    """
+    today = dt.datetime.utcnow().date().isoformat()
+    run_slot = (os.getenv("RUN_SLOT") or "UNSET").strip().upper()
+    gh_run_id = (os.getenv("GITHUB_RUN_ID") or "").strip()
+    gh_run_attempt = (os.getenv("GITHUB_RUN_ATTEMPT") or "").strip()
+
+    key = f"{FEEDER_EXPLORE_SALT}|{today}|{run_slot}|{theme_today}|{gh_run_id}|{gh_run_attempt}"
+    return _stable_mod(key, FEEDER_EXPLORE_RUN_MOD) == 0
 
 
 # ==================== ORIGIN POOLS (Theme/Haul aware) ====================
@@ -443,6 +448,65 @@ def pick_origin_for_dest(
     return None
 
 
+def select_routes_from_dest_configs(
+    dest_configs: List[Dict[str, Any]],
+    quota: int,
+    planned_origins: List[str],
+    allowed_pairs: Set[Tuple[str, str]],
+    dest_to_origins: Dict[str, List[str]],
+    full_origin_pool: List[str],
+    start_di: int = 0,
+    start_oi: int = 0,
+) -> Tuple[List[Tuple[str, str, Dict[str, Any]]], int, int]:
+    selected: List[Tuple[str, str, Dict[str, Any]]] = []
+    di = start_di
+    oi = start_oi
+
+    while len(selected) < quota and di < len(dest_configs):
+        cfg = dest_configs[di]
+        destination = _clean_iata(cfg.get("destination_iata"))
+        if not destination:
+            di += 1
+            continue
+
+        preferred_origin = _clean_iata(cfg.get("origin_iata"))
+        planned_origin = planned_origins[oi % len(planned_origins)] if planned_origins else ""
+        oi += 1
+
+        candidate_try_order: List[str] = []
+
+        # 1) Planned origin first (theme/haul-aware rotation)
+        if planned_origin:
+            candidate_try_order.append(planned_origin)
+
+        # 2) Reverse capability injection (destination -> origins)
+        if FEEDER_OPEN_ORIGINS:
+            rev = dest_to_origins.get(destination, [])[:]
+            rev = sorted(_dedupe_keep_order(rev))
+            candidate_try_order.extend([o for o in rev if o not in candidate_try_order])
+
+        # 3) Fallback pools (inventory safety)
+        candidate_try_order.extend([o for o in full_origin_pool if o not in candidate_try_order])
+
+        candidate_try_order = _dedupe_keep_order(candidate_try_order)
+
+        origin = pick_origin_for_dest(
+            dest=destination,
+            candidate_origins=candidate_try_order,
+            allowed_pairs=allowed_pairs,
+            preferred_origin=preferred_origin,
+        )
+
+        if origin:
+            selected.append((origin, destination, cfg))
+        else:
+            log(f"⏭️  No valid origin found for destination={destination} after capability filtering.")
+
+        di += 1
+
+    return selected, di, oi
+
+
 # ==================== MAIN ====================
 
 def main() -> int:
@@ -476,13 +540,22 @@ def main() -> int:
 
     today_routes.sort(key=lambda r: float(r.get("priority", 9999) or 9999))
 
+    # Explore pool = enabled CONFIG outside today's theme (still curated)
+    explore_routes = [r for r in config_rows if low(r.get("theme", "")) != theme_today]
+
     planned_origins = origin_plan_for_theme(theme_today, ROUTES_PER_RUN)
     planned_origins = enforce_origin_diversity(planned_origins)
 
-    dest_configs = build_today_dest_configs(today_routes)
+    theme_dest_configs = build_today_dest_configs(today_routes)
+    explore_dest_configs = build_today_dest_configs(explore_routes)
 
+    do_explore = should_do_explore_this_run(theme_today)
+    explore_quota = 1 if (do_explore and ROUTES_PER_RUN >= 2 and len(explore_dest_configs) > 0) else 0
+    theme_quota = max(0, ROUTES_PER_RUN - explore_quota)
+
+    log(f"🧠 Feeder strategy: 90/10 | explore_run={do_explore} | theme_quota={theme_quota} | explore_quota={explore_quota} | MOD={FEEDER_EXPLORE_RUN_MOD}")
     log(f"🧭 Planned origins for run: {planned_origins}")
-    log(f"🧭 Unique destinations available for theme: {len(dest_configs)}")
+    log(f"🧭 Unique theme destinations: {len(theme_dest_configs)} | Unique explore destinations: {len(explore_dest_configs)}")
 
     searches_done = 0
     all_deals: List[Dict[str, Any]] = []
@@ -497,54 +570,50 @@ def main() -> int:
 
     selected_routes: List[Tuple[str, str, Dict[str, Any]]] = []
 
-    di = 0
-    oi = 0
-    while len(selected_routes) < ROUTES_PER_RUN and di < len(dest_configs):
-        cfg = dest_configs[di]
-        destination = _clean_iata(cfg.get("destination_iata"))
-        if not destination:
-            di += 1
-            continue
+    # 1) Theme routes (90%)
+    theme_selected, di, oi = select_routes_from_dest_configs(
+        dest_configs=theme_dest_configs,
+        quota=theme_quota,
+        planned_origins=planned_origins,
+        allowed_pairs=allowed_pairs,
+        dest_to_origins=dest_to_origins,
+        full_origin_pool=full_origin_pool,
+        start_di=0,
+        start_oi=0,
+    )
+    selected_routes.extend(theme_selected)
 
-        preferred_origin = _clean_iata(cfg.get("origin_iata"))
-        planned_origin = planned_origins[oi % len(planned_origins)] if planned_origins else ""
-        oi += 1
+    # 2) Explore route (10% => 1 wildcard on explore run)
+    if explore_quota == 1:
+        # Deterministic rotation of explore destinations (no random churn)
+        today = dt.datetime.utcnow().date().isoformat()
+        slot = _run_slot()
+        seed = f"{FEEDER_EXPLORE_SALT}|{today}|{slot}|{theme_today}|EXPLORE"
+        offset = _stable_mod(seed, len(explore_dest_configs))
+        rotated = explore_dest_configs[offset:] + explore_dest_configs[:offset]
 
-        candidate_try_order: List[str] = []
-
-        # 1) Planned origin first (theme/haul-aware rotation)
-        if planned_origin:
-            candidate_try_order.append(planned_origin)
-
-        # 2) NEW: reverse capability injection (destination -> origins)
-        if FEEDER_OPEN_ORIGINS:
-            rev = dest_to_origins.get(destination, [])[:]
-            # Keep deterministic order by sorting; avoid random churn
-            rev = sorted(_dedupe_keep_order(rev))
-            candidate_try_order.extend([o for o in rev if o not in candidate_try_order])
-
-        # 3) Existing fallback pools (inventory safety)
-        candidate_try_order.extend([o for o in full_origin_pool if o not in candidate_try_order])
-
-        candidate_try_order = _dedupe_keep_order(candidate_try_order)
-
-        origin = pick_origin_for_dest(
-            dest=destination,
-            candidate_origins=candidate_try_order,
+        explore_selected, _, _ = select_routes_from_dest_configs(
+            dest_configs=rotated,
+            quota=1,
+            planned_origins=planned_origins,
             allowed_pairs=allowed_pairs,
-            preferred_origin=preferred_origin,
+            dest_to_origins=dest_to_origins,
+            full_origin_pool=full_origin_pool,
+            start_di=0,
+            start_oi=oi,
         )
-
-        if origin:
-            selected_routes.append((origin, destination, cfg))
+        if explore_selected:
+            selected_routes.extend(explore_selected)
+            log(f"🧪 Explore route added: {explore_selected[0][0]}->{explore_selected[0][1]} theme={low(explore_selected[0][2].get('theme',''))}")
         else:
-            log(f"⏭️  No valid origin found for destination={destination} after capability filtering.")
-
-        di += 1
+            log("🧪 Explore route requested but none valid after capability filtering (not an error).")
 
     if not selected_routes:
         log("⚠️ No valid (origin,destination) pairs after capability filtering.")
         return 0
+
+    # Hard cap: never exceed ROUTES_PER_RUN
+    selected_routes = selected_routes[:ROUTES_PER_RUN]
 
     for origin, destination, r in selected_routes:
         if searches_done >= MAX_SEARCHES_PER_RUN:
@@ -588,6 +657,8 @@ def main() -> int:
         if not offers:
             continue
 
+        deal_theme = low(r.get("theme") or theme_today) or theme_today
+
         for off in offers[: min(10, MAX_INSERTS_TOTAL - len(all_deals))]:
             try:
                 total_amount = float(off.get("total_amount") or "0")
@@ -597,8 +668,8 @@ def main() -> int:
             deal_id_seed = f"{origin}->{destination}|{dep_date.isoformat()}|{ret_date.isoformat()}|{total_amount}"
             deal = {
                 "status": "NEW",
-                "deal_theme": theme_today,
-                "theme": theme_today,
+                "deal_theme": deal_theme,
+                "theme": deal_theme,
                 "deal_id": str(abs(hash(deal_id_seed))),
                 "origin_iata": origin,
                 "origin_city": resolve_origin_city(origin, origin_city_map),

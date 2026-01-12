@@ -1,78 +1,123 @@
+# workers/instagram_publisher.py
 #!/usr/bin/env python3
 """
-workers/instagram_publisher.py
+TravelTxter — Instagram Publisher (PROD SAFE, LOCKED)
 
-LOCKED SYSTEM RULES:
-- Consume: status == READY_TO_PUBLISH
-- Require: graphic_url present AND fetchable
-- Require: row theme matches THEME OF THE DAY (from CONFIG or env)
-- Produce: status -> POSTED_INSTAGRAM
+Consumes:
+- RAW_DEALS where status == READY_TO_PUBLISH
 
-THIS PATCH FIXES:
-1) Theme gating: publish ONLY deals matching today's theme (CONFIG-driven).
-2) Phrase missing: PHRASE_BANK.channel_hint is descriptive, so we DO NOT filter on it.
-3) IG failures from bad graphic_url: preflight + AUTO-REPAIR common URL variants,
-   including legacy PythonAnywhere /static/renders -> /renders.
+Enforces:
+- Theme-of-the-day gate:
+    theme_of_day = THEME_OF_DAY env override (if set) else deterministic UTC rotation.
+  Row theme must match (deal_theme OR theme). If mismatch -> skip row.
 
-IMPORTANT:
-- Does NOT change rendering logic (render_engine).
-- Does NOT change scorer/feeder selection logic.
-- Only gates Instagram publishing to theme-of-day and improves URL resilience.
+Publishes:
+- Posts image to Instagram via Graph API
+- Writes posted_instagram_at, status=POSTED_INSTAGRAM
+- On failure, writes publish_error/publish_error_at and re-queues to READY_TO_POST
+  if the failure is image URL fetchability.
+
+Notes:
+- Does NOT depend on CONFIG sheet having theme_of_day (it doesn't in your export).
+- Repairs common PythonAnywhere URL variants (/static/renders vs /renders).
 """
 
 from __future__ import annotations
 
 import os
+import re
 import json
 import time
 import datetime as dt
-import hashlib
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
 
 
-# =========================
+# ============================================================
+# Theme of day (must match pipeline_worker rotation logic)
+# ============================================================
+
+MASTER_THEMES = [
+    "winter_sun",
+    "summer_sun",
+    "beach_break",
+    "snow",
+    "northern_lights",
+    "surf",
+    "adventure",
+    "city_breaks",
+    "culture_history",
+    "long_haul",
+    "luxury_value",
+    "unexpected_value",
+]
+
+
+def theme_of_day_utc() -> str:
+    today = dt.datetime.utcnow().date()
+    doy = int(today.strftime("%j"))
+    return MASTER_THEMES[doy % len(MASTER_THEMES)]
+
+
+def norm_theme(s: str) -> str:
+    return (s or "").strip().lower().replace(" ", "_")
+
+
+def resolve_theme_of_day() -> str:
+    # AM/PM reinstate: set THEME_OF_DAY in workflow for full operator control.
+    override = norm_theme(os.getenv("THEME_OF_DAY", ""))
+    return override if override else norm_theme(theme_of_day_utc())
+
+
+# ============================================================
 # Logging
-# =========================
-
-def now_utc_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
+# ============================================================
 
 def log(msg: str) -> None:
-    print(f"{now_utc_iso()} | {msg}", flush=True)
+    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    print(f"{ts} | {msg}", flush=True)
 
 
-# =========================
-# Env
-# =========================
+# ============================================================
+# Env helpers
+# ============================================================
 
 def env_str(k: str, default: str = "") -> str:
     return (os.environ.get(k, default) or "").strip()
 
 
-# =========================
-# Sheets auth
-# =========================
+def env_any(keys: List[str], default: str = "") -> str:
+    for k in keys:
+        v = env_str(k, "")
+        if v:
+            return v
+    return default
 
-def _extract_sa(raw: str) -> Dict[str, Any]:
+
+def iso_now() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+# ============================================================
+# Google Sheets auth
+# ============================================================
+
+def parse_sa_json(raw: str) -> Dict[str, Any]:
     raw = (raw or "").strip()
     try:
         return json.loads(raw)
-    except Exception:
+    except json.JSONDecodeError:
         return json.loads(raw.replace("\\n", "\n"))
 
 
-def get_client() -> gspread.Client:
-    sa_raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
-    if not sa_raw:
+def gs_client() -> gspread.Client:
+    raw = env_any(["GCP_SA_JSON_ONE_LINE", "GCP_SA_JSON"])
+    if not raw:
         raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-    info = _extract_sa(sa_raw)
+    info = parse_sa_json(raw)
     creds = Credentials.from_service_account_info(
         info,
         scopes=[
@@ -83,487 +128,240 @@ def get_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def open_sheet_with_backoff(gc: gspread.Client, spreadsheet_id: str, attempts: int = 8) -> gspread.Spreadsheet:
-    delay = 4.0
-    for i in range(1, attempts + 1):
-        try:
-            return gc.open_by_key(spreadsheet_id)
-        except APIError as e:
-            if "429" in str(e):
-                log(f"⏳ Sheets quota hit. Retry {i}/{attempts} in {int(delay)}s")
-                time.sleep(delay)
-                delay = min(delay * 1.6, 45.0)
-                continue
-            raise
-    raise RuntimeError("Sheets quota still exceeded after retries")
+def a1(row: int, col0: int) -> str:
+    return gspread.utils.rowcol_to_a1(row, col0 + 1)
 
 
-# =========================
-# A1 helpers
-# =========================
-
-def col_letter(n1: int) -> str:
-    s = ""
-    n = n1
-    while n:
-        n, rr = divmod(n - 1, 26)
-        s = chr(65 + rr) + s
-    return s
-
-
-def a1(rownum: int, col0: int) -> str:
-    return f"{col_letter(col0 + 1)}{rownum}"
-
-
-def safe_get(row: List[str], idx: int) -> str:
-    return row[idx].strip() if 0 <= idx < len(row) else ""
-
-
-def ensure_columns(ws: gspread.Worksheet, headers: List[str], required: List[str]) -> List[str]:
-    missing = [c for c in required if c not in headers]
-    if missing:
-        ws.update([headers + missing], "A1")
-        log(f"🛠️ Added missing columns: {missing}")
-        return headers + missing
-    return headers
-
-
-# =========================
-# CONFIG: Theme of the day (LOCKED GATE)
-# =========================
-
-def _norm_theme(s: str) -> str:
-    return (s or "").strip().lower().replace(" ", "_")
-
-
-def load_theme_of_day(sh: gspread.Spreadsheet) -> str:
-    """
-    Reads today's active theme from CONFIG (preferred) or env var THEME_OF_DAY (fallback).
-
-    We do NOT assume CONFIG schema beyond this common pattern:
-      - A key/value table where first column is key and second column is value
-      - OR header row contains 'key' and 'value' columns
-
-    Keys we will accept (case-insensitive):
-      - theme_of_day
-      - active_theme
-      - todays_theme
-      - today_theme
-      - theme
-    """
-    # 1) Try CONFIG tab
-    try:
-        ws = sh.worksheet("CONFIG")
-        values = ws.get_all_values()
-        if values and len(values) >= 2:
-            headers = [h.strip().lower() for h in values[0]]
-            rows = values[1:]
-
-            # Option A: explicit key/value headers
-            if "key" in headers and "value" in headers:
-                k_i = headers.index("key")
-                v_i = headers.index("value")
-                for r in rows:
-                    k = (r[k_i] if k_i < len(r) else "").strip().lower()
-                    v = (r[v_i] if v_i < len(r) else "").strip()
-                    if k in ("theme_of_day", "active_theme", "todays_theme", "today_theme", "theme"):
-                        if v:
-                            return _norm_theme(v)
-
-            # Option B: first two columns are key/value
-            for r in rows:
-                if not r:
-                    continue
-                k = (r[0] if 0 < len(r) else "").strip().lower()
-                v = (r[1] if 1 < len(r) else "").strip()
-                if k in ("theme_of_day", "active_theme", "todays_theme", "today_theme", "theme"):
-                    if v:
-                        return _norm_theme(v)
-    except Exception:
-        pass
-
-    # 2) Fallback: env var
-    env_theme = env_str("THEME_OF_DAY")
-    if env_theme:
-        return _norm_theme(env_theme)
-
-    return ""
-
-
-# =========================
-# Price normaliser (caption only)
-# =========================
-
-def normalise_gbp_price(raw: str) -> str:
-    """
-    Ensure caption display is exactly '£123.45' (one £ only), if numeric exists.
-    """
-    s = (raw or "").strip()
-    if not s:
+def safe_get(r: List[str], idx: int) -> str:
+    if idx < 0 or idx >= len(r):
         return ""
+    return (r[idx] or "").strip()
 
-    s2 = s.replace("£", "").strip()
+
+# ============================================================
+# Image URL preflight + repair (PythonAnywhere)
+# ============================================================
+
+def preflight(url: str) -> Tuple[int, str]:
     try:
-        v = float(s2.replace(",", ""))
-        return f"£{v:,.2f}"
-    except Exception:
-        s = s.replace("££", "£")
-        if s.startswith("£"):
-            return s
-        if "£" in raw:
-            return "£" + s2
-        return s
+        r = requests.get(url, timeout=25, allow_redirects=True)
+        ct = r.headers.get("Content-Type", "")
+        if r.status_code == 200 and ct.startswith("image/"):
+            return 200, ""
+        snippet = ""
+        if "text" in ct:
+            snippet = (r.text or "")[:180].replace("\n", " ").strip()
+        return int(r.status_code), snippet
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}"[:180]
 
 
-# =========================
-# Phrase Bank
-# =========================
-
-def _truthy(x: Any) -> bool:
-    if x is True:
-        return True
-    if x is False or x is None:
-        return False
-    return str(x).strip().lower() in ("true", "yes", "1", "y", "approved")
-
-
-def load_phrase_bank(sh: gspread.Spreadsheet) -> List[Dict[str, str]]:
-    try:
-        ws = sh.worksheet("PHRASE_BANK")
-    except Exception:
+def candidate_url_variants(raw_url: str) -> List[str]:
+    u = (raw_url or "").strip()
+    if not u:
         return []
-    values = ws.get_all_values()
-    if len(values) < 2:
-        return []
-    headers = values[0]
-    idx = {h: i for i, h in enumerate(headers)}
-    out: List[Dict[str, str]] = []
-    for r in values[1:]:
-        d = {h: (r[idx[h]] if idx[h] < len(r) else "").strip() for h in headers}
-        if any(d.values()):
-            out.append(d)
+    variants = [u]
+
+    base = env_str("PUBLIC_BASE_URL", "https://greenroomman.pythonanywhere.com").rstrip("/")
+
+    # If relative -> absolutise
+    if not u.startswith("http://") and not u.startswith("https://"):
+        if u.startswith("/"):
+            variants.append(base + u)
+        else:
+            variants.append(base + "/" + u)
+    else:
+        variants.append(u)
+
+    abs_u = variants[-1]
+
+    swaps = [
+        ("/static/renders/", "/renders/"),
+        ("/renders/", "/static/renders/"),
+    ]
+    for a, b in swaps:
+        if a in abs_u:
+            variants.append(abs_u.replace(a, b))
+
+    # Try reconstruct from filename
+    m = re.search(r"([^/]+\.png)$", abs_u)
+    if m:
+        fname = m.group(1)
+        variants.append(f"{base}/renders/{fname}")
+        variants.append(f"{base}/static/renders/{fname}")
+
+    # De-dupe
+    out, seen = [], set()
+    for v in variants:
+        if v and v not in seen:
+            out.append(v)
+            seen.add(v)
     return out
 
 
-def _pick_from_pool(pool: List[Dict[str, str]], deal_id: str) -> str:
-    if not pool:
-        return ""
-    h = hashlib.md5((deal_id or "x").encode()).hexdigest()
-    return (pool[int(h[:8], 16) % len(pool)].get("phrase", "") or "").strip()
-
-
-def pick_phrase_from_bank(bank: List[Dict[str, str]], theme: str, deal_id: str) -> str:
-    """
-    IMPORTANT:
-    - PHRASE_BANK.channel_hint is descriptive text, so we DO NOT filter on it.
-    - 1) Try approved + theme match
-    - 2) Fallback to any approved phrase
-    """
-    theme_u = (theme or "").strip().upper()
-
-    themed = [
-        r for r in bank
-        if (r.get("phrase") or "").strip()
-        and _truthy(r.get("approved", ""))
-        and (r.get("theme") or "").strip().upper() == theme_u
-    ]
-    chosen = _pick_from_pool(themed, deal_id)
-    if chosen:
-        return chosen
-
-    any_ok = [
-        r for r in bank
-        if (r.get("phrase") or "").strip()
-        and _truthy(r.get("approved", ""))
-    ]
-    return _pick_from_pool(any_ok, deal_id)
-
-
-# =========================
-# Caption (LOCKED)
-# =========================
-
-def build_caption_ig(country: str, to_city: str, from_city: str, price: str, out_d: str, back_d: str, phrase: str) -> str:
-    lines = [
-        (country or "").strip(),
-        f"To: {(to_city or '').strip()}",
-        f"From: {(from_city or '').strip()}",
-        f"Price: {(price or '').strip()}",
-        f"Out: {(out_d or '').strip()}",
-        f"Return: {(back_d or '').strip()}",
-        "",
-    ]
-
-    if phrase:
-        clean_phrase = (phrase or "").replace('"', "").strip()
-        if clean_phrase:
-            lines.append(f"“{clean_phrase}”")
-            lines.append("")
-
-    lines.append("Link in bio…")
-    return "\n".join([x for x in lines if x is not None]).strip()
-
-
-# =========================
-# URL helpers (AUTO-REPAIR 404s)
-# =========================
-
-def _base_from_render_url(render_url: str) -> Optional[str]:
-    ru = (render_url or "").strip()
-    if not ru:
-        return None
-    p = urlparse(ru)
-    if not p.scheme or not p.netloc:
-        return None
-    return urlunparse((p.scheme, p.netloc, "", "", "", "")).rstrip("/")
-
-
-def absolutise_image_url(image_url: str) -> str:
-    """
-    IG must fetch this URL publicly.
-    - If url starts with /... -> prefix with scheme+host from RENDER_URL
-    - If url has no scheme -> prefix https://
-    """
-    u = (image_url or "").strip()
-    if not u:
-        return ""
-
-    if u.startswith("/"):
-        base = _base_from_render_url(env_str("RENDER_URL"))
-        if base:
-            return base + u
-        return u
-
-    p = urlparse(u)
-    if not p.scheme:
-        return "https://" + u.lstrip("/")
-
-    return u
-
-
-def _candidate_url_variants(url: str) -> List[str]:
-    """
-    If the URL 404s, try common variants.
-
-    Safe swaps only:
-    - https <-> http
-    - /static/ <-> /staticfiles/
-    - /static/renders/ <-> /renders/  (PythonAnywhere renderer canonical path)
-    """
-    u = (url or "").strip()
-    if not u:
-        return []
-
-    out = [u]
-
-    # scheme swap
-    if u.startswith("https://"):
-        out.append("http://" + u[len("https://"):])
-    elif u.startswith("http://"):
-        out.append("https://" + u[len("http://"):])
-
-    # path swaps on each scheme variant
-    more = []
-    for x in out:
-        if "/static/renders/" in x:
-            more.append(x.replace("/static/renders/", "/renders/"))
-        if "/renders/" in x:
-            more.append(x.replace("/renders/", "/static/renders/"))
-
-        if "/static/" in x:
-            more.append(x.replace("/static/", "/staticfiles/"))
-        if "/staticfiles/" in x:
-            more.append(x.replace("/staticfiles/", "/static/"))
-    out.extend(more)
-
-    # de-dupe preserving order
-    seen = set()
-    uniq = []
-    for x in out:
-        if x not in seen:
-            uniq.append(x)
-            seen.add(x)
-    return uniq
-
-
-def preflight_and_repair_image_url(url: str) -> str:
-    """
-    Returns a working, public, direct image URL or raises with a clear error.
-    """
-    candidates = _candidate_url_variants(url)
-    if not candidates:
-        raise RuntimeError("graphic_url is blank after normalisation")
-
-    last_status = None
-    last_snippet = ""
-    for cand in candidates:
-        headers = {"User-Agent": "traveltxter-ig-preflight/1.0"}
-        r = requests.get(cand, stream=True, timeout=30, headers=headers, allow_redirects=True)
-        last_status = r.status_code
-        if r.status_code != 200:
-            try:
-                last_snippet = (r.text or "")[:180].replace("\n", " ")
-            except Exception:
-                last_snippet = ""
-            continue
-
-        ctype = (r.headers.get("Content-Type") or "").lower().strip()
-        if ctype.startswith("image/"):
+def preflight_and_repair_image_url(raw_url: str) -> str:
+    last_status, last_snip = 0, ""
+    for cand in candidate_url_variants(raw_url):
+        status, snip = preflight(cand)
+        last_status, last_snip = status, snip
+        if status == 200:
             return cand
-
-        # 200 but not image
-        try:
-            chunk = next(r.iter_content(chunk_size=512))
-            peek = chunk[:120]
-        except Exception:
-            peek = b""
-        raise RuntimeError(f"graphic_url not an image (Content-Type={ctype}) :: peek={peek!r}")
-
-    raise RuntimeError(f"graphic_url not fetchable (HTTP {last_status}) :: {last_snippet}")
+    raise RuntimeError(f"graphic_url not fetchable (HTTP {last_status}) :: {last_snip}")
 
 
-# =========================
-# Instagram API (retry publish)
-# =========================
+# ============================================================
+# Instagram Graph API
+# ============================================================
 
-def ig_create_and_publish(access_token: str, ig_user_id: str, image_url: str, caption: str) -> None:
-    create_url = f"https://graph.facebook.com/v20.0/{ig_user_id}/media"
-    r1 = requests.post(
-        create_url,
-        data={"image_url": image_url, "caption": caption, "access_token": access_token},
+GRAPH_BASE = "https://graph.facebook.com/v20.0"
+
+
+def ig_create_container(ig_user_id: str, token: str, image_url: str, caption: str) -> str:
+    url = f"{GRAPH_BASE}/{ig_user_id}/media"
+    r = requests.post(
+        url,
+        data={"image_url": image_url, "caption": caption, "access_token": token},
         timeout=60,
     )
-    j1 = r1.json()
-    if "id" not in j1:
-        raise RuntimeError(f"IG /media failed: {j1}")
-
-    creation_id = j1["id"]
-    publish_url = f"https://graph.facebook.com/v20.0/{ig_user_id}/media_publish"
-
-    last = None
-    for attempt in range(1, 11):
-        time.sleep(6)
-        r2 = requests.post(
-            publish_url,
-            data={"creation_id": creation_id, "access_token": access_token},
-            timeout=60,
-        )
-        last = r2.json()
-        if "id" in last:
-            return
-        log(f"⏳ IG not ready yet (attempt {attempt}/10)")
-
-    raise RuntimeError(f"IG /media_publish failed after retries: {last}")
+    j = r.json()
+    if "id" not in j:
+        raise RuntimeError(f"IG create container failed: {j}")
+    return str(j["id"])
 
 
-# =========================
+def ig_publish_container(ig_user_id: str, token: str, creation_id: str) -> str:
+    url = f"{GRAPH_BASE}/{ig_user_id}/media_publish"
+    r = requests.post(
+        url,
+        data={"creation_id": creation_id, "access_token": token},
+        timeout=60,
+    )
+    j = r.json()
+    if "id" not in j:
+        raise RuntimeError(f"IG publish failed: {j}")
+    return str(j["id"])
+
+
+# ============================================================
+# Caption (minimal facts + phrase)
+# ============================================================
+
+def build_caption(row: Dict[str, str], theme_today: str) -> str:
+    phrase = (row.get("phrase_bank") or "").strip()
+    origin = (row.get("origin_city") or row.get("origin_iata") or "").strip()
+    dest = (row.get("destination_city") or row.get("destination_iata") or "").strip()
+    country = (row.get("destination_country") or "").strip()
+    out_date = (row.get("outbound_date") or "").strip()
+    in_date = (row.get("return_date") or "").strip()
+    price = (row.get("price_gbp") or "").strip()
+
+    lines: List[str] = []
+    if phrase:
+        lines.append(phrase)
+        lines.append("")
+
+    lines.append(f"£{price} to {dest}{', ' + country if country else ''}".strip())
+    if origin:
+        lines.append(f"From {origin}")
+    if out_date and in_date:
+        lines.append(f"{out_date} → {in_date}")
+    lines.append("")
+    lines.append(f"Theme today: {theme_today.replace('_', ' ')}")
+    lines.append("#traveltxter #traveldeals #cheapflights")
+    return "\n".join(lines).strip()
+
+
+# ============================================================
 # Main
-# =========================
+# ============================================================
 
 def main() -> int:
-    sh = open_sheet_with_backoff(get_client(), env_str("SPREADSHEET_ID"))
-    ws = sh.worksheet(env_str("RAW_DEALS_TAB", "RAW_DEALS"))
+    spreadsheet_id = env_any(["SPREADSHEET_ID", "SHEET_ID"])
+    raw_tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
+    token = env_str("IG_ACCESS_TOKEN", "")
+    ig_user_id = env_str("IG_USER_ID", "")
 
-    theme_of_day = load_theme_of_day(sh)
-    if not theme_of_day:
-        # Hard stop: you explicitly said published content MUST conform to theme of the day.
-        raise RuntimeError("Theme-of-day is not set. Provide CONFIG theme_of_day (preferred) or env THEME_OF_DAY.")
+    if not spreadsheet_id:
+        raise RuntimeError("Missing SPREADSHEET_ID/SHEET_ID")
+    if not token or not ig_user_id:
+        raise RuntimeError("Missing IG_ACCESS_TOKEN or IG_USER_ID")
 
-    log(f"🎯 Theme of the day (LOCKED): {theme_of_day}")
+    theme_today = resolve_theme_of_day()
+    log(f"🎯 Theme of the day (resolved): {theme_today}")
+
+    gc = gs_client()
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(raw_tab)
 
     values = ws.get_all_values()
-    if not values:
-        log("RAW_DEALS is empty.")
+    if len(values) < 2:
+        log("No rows.")
         return 0
 
-    headers = ensure_columns(
-        ws,
-        values[0],
-        [
-            "status", "deal_id", "graphic_url",
-            "price_gbp", "origin_city", "destination_city", "destination_country",
-            "outbound_date", "return_date", "deal_theme", "theme", "phrase_bank",
-            "posted_instagram_at", "publish_error", "publish_error_at"
-        ],
-    )
-    h = {k: i for i, k in enumerate(headers)}
+    headers = [h.strip() for h in values[0] if h is not None]
+    h = {k: i for i, k in enumerate(values[0]) if isinstance(k, str) and k.strip()}
 
-    bank = load_phrase_bank(sh)
+    required = ["status", "graphic_url", "deal_theme", "theme", "posted_instagram_at", "publish_error", "publish_error_at"]
+    missing = [c for c in required if c not in h]
+    if missing:
+        raise RuntimeError(f"RAW_DEALS missing required columns: {missing}")
 
-    posted_any = False
-    skipped_wrong_theme = 0
-
+    # Find first eligible row
     for rownum, r in enumerate(values[1:], start=2):
-        if safe_get(r, h["status"]) != "READY_TO_PUBLISH":
+        status = safe_get(r, h["status"])
+        if status != "READY_TO_PUBLISH":
             continue
 
-        graphic_url_raw = safe_get(r, h["graphic_url"])
-        if not graphic_url_raw:
+        row = {values[0][i]: (r[i] if i < len(r) else "") for i in range(len(values[0])) if isinstance(values[0][i], str)}
+        row_theme = norm_theme((row.get("deal_theme") or "").strip()) or norm_theme((row.get("theme") or "").strip())
+        if not row_theme or row_theme != theme_today:
             continue
 
-        deal_id = safe_get(r, h["deal_id"])
-        row_theme_raw = safe_get(r, h.get("deal_theme", -1)) or safe_get(r, h.get("theme", -1))
-        row_theme = _norm_theme(row_theme_raw)
-
-        # THEME GATE (LOCKED)
-        if row_theme != theme_of_day:
-            skipped_wrong_theme += 1
+        graphic_url = (row.get("graphic_url") or "").strip()
+        if not graphic_url:
             continue
-
-        # Phrase
-        phrase = safe_get(r, h["phrase_bank"])
-        if not phrase:
-            phrase = pick_phrase_from_bank(bank, row_theme_raw, deal_id)
-            if phrase:
-                ws.update([[phrase]], a1(rownum, h["phrase_bank"]))
-
-        # Caption price
-        price_clean = normalise_gbp_price(safe_get(r, h["price_gbp"]))
-
-        caption = build_caption_ig(
-            safe_get(r, h["destination_country"]),
-            safe_get(r, h["destination_city"]),
-            safe_get(r, h["origin_city"]),
-            price_clean,
-            safe_get(r, h["outbound_date"]),
-            safe_get(r, h["return_date"]),
-            phrase,
-        )
 
         try:
-            # 1) absolutise if /... etc
-            image_url = absolutise_image_url(graphic_url_raw)
+            image_url = preflight_and_repair_image_url(graphic_url)
 
-            # 2) repair if 404 by trying safe variants
-            image_url_working = preflight_and_repair_image_url(image_url)
+            # Write back repaired URL if it changed (keeps pipeline clean)
+            if image_url != graphic_url:
+                ws.update([[image_url]], a1(rownum, h["graphic_url"]))
 
-            # 3) if repaired, write back to sheet so pipeline stays clean
-            if image_url_working != graphic_url_raw:
-                ws.update([[image_url_working]], a1(rownum, h["graphic_url"]))
+            caption = build_caption(row, theme_today)
 
-            # 4) publish
-            ig_create_and_publish(
-                env_str("IG_ACCESS_TOKEN"),
-                env_str("IG_USER_ID"),
-                image_url_working,
-                caption,
+            log(f"📸 Publishing row {rownum} deal_id={row.get('deal_id','')}")
+            creation_id = ig_create_container(ig_user_id, token, image_url, caption)
+            time.sleep(3)
+            media_id = ig_publish_container(ig_user_id, token, creation_id)
+
+            ws.batch_update(
+                [
+                    {"range": a1(rownum, h["posted_instagram_at"]), "values": [[iso_now()]]},
+                    {"range": a1(rownum, h["status"]), "values": [["POSTED_INSTAGRAM"]]},
+                    {"range": a1(rownum, h["publish_error"]), "values": [[""]]},
+                    {"range": a1(rownum, h["publish_error_at"]), "values": [[""]]},
+                ],
+                value_input_option="USER_ENTERED",
             )
 
+            log(f"✅ Instagram published media_id={media_id} row={rownum}")
+            return 0
+
         except Exception as e:
-            ws.update([[str(e)[:300]]], a1(rownum, h["publish_error"]))
-            ws.update([[now_utc_iso()]], a1(rownum, h["publish_error_at"]))
+            err = f"{type(e).__name__}: {e}"
+            ws.update([[err[:300]]], a1(rownum, h["publish_error"]))
+            ws.update([[iso_now()]], a1(rownum, h["publish_error_at"]))
+
+            # If the issue is image URL not fetchable, re-queue for rerender
+            if "graphic_url not fetchable" in err:
+                ws.update([["READY_TO_POST"]], a1(rownum, h["status"]))
+                log(f"⚠️ Image fetch failed; re-queued row {rownum} -> READY_TO_POST")
+                return 0
+
             raise
 
-        ws.update([[now_utc_iso()]], a1(rownum, h["posted_instagram_at"]))
-        ws.update([["POSTED_INSTAGRAM"]], a1(rownum, h["status"]))
-        log(f"✅ IG posted row {rownum} (theme={row_theme})")
-        posted_any = True
-        return 0
-
-    if skipped_wrong_theme:
-        log(f"ℹ️ Skipped {skipped_wrong_theme} READY_TO_PUBLISH rows due to wrong theme (need theme={theme_of_day}).")
-
-    log("No eligible rows (theme-of-day gate enforced).")
+    log("Done. Instagram posted 0 (no eligible rows match theme gate).")
     return 0
 
 

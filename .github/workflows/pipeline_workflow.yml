@@ -1,15 +1,14 @@
-name: TravelTxter Pipeline (AM/PM + Manual TEST)
+name: TravelTxter Pipeline (AM / PM / Manual TEST)
 
 on:
   schedule:
-    # AM run (UTC)
-    - cron: "30 7 * * *"
-    # PM run (UTC)
-    - cron: "30 16 * * *"
+    - cron: "30 7 * * *"   # AM run
+    - cron: "30 16 * * *"  # PM run
+
   workflow_dispatch:
     inputs:
       run_slot:
-        description: "RUN_SLOT to pass to workers (TEST recommended for manual runs)"
+        description: "Run slot (TEST for manual runs)"
         required: true
         default: "TEST"
         type: choice
@@ -19,8 +18,7 @@ on:
           - PM
 
 concurrency:
-  # Keep TEST runs isolated from PROD runs
-  group: traveltxter-${{ (github.event_name == 'workflow_dispatch' && inputs.run_slot == 'TEST') && 'test' || 'prod' }}
+  group: traveltxter-${{ github.event_name == 'workflow_dispatch' && inputs.run_slot == 'TEST' && 'test' || 'prod' }}
   cancel-in-progress: false
 
 jobs:
@@ -43,30 +41,25 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # --------------------------------------------------
-      # Determine RUN_SLOT
-      # - workflow_dispatch: uses input (default TEST)
-      # - schedule: AM or PM based on which cron fired
-      # --------------------------------------------------
+      # -----------------------------------------
+      # Explicit RUN_SLOT assignment (NO GUESSING)
+      # -----------------------------------------
       - name: Set RUN_SLOT
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "RUN_SLOT=${{ inputs.run_slot }}" >> $GITHUB_ENV
           else
-            # schedule event: infer by cron string
-            if [ "${{ github.event.schedule }}" = "30 7 * * *" ]; then
+            if [ "${{ github.event.cron }}" = "30 7 * * *" ]; then
               echo "RUN_SLOT=AM" >> $GITHUB_ENV
             else
               echo "RUN_SLOT=PM" >> $GITHUB_ENV
             fi
           fi
-          echo "Resolved RUN_SLOT=$RUN_SLOT"
+          echo "RUN_SLOT resolved to: $RUN_SLOT"
 
-      # ==================================================
-      # FEEDER
-      # ==================================================
-      - name: Feeder (pipeline_worker)
+      # ================= FEEDER =================
+      - name: Feeder
         run: python workers/pipeline_worker.py
         env:
           RUN_SLOT: ${{ env.RUN_SLOT }}
@@ -75,19 +68,11 @@ jobs:
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
-
-          # Your caps (adjust in GitHub vars/secrets if already used)
           DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
           DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
           DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
 
-          # 90/10 control (optional; defaults exist in code)
-          FEEDER_EXPLORE_RUN_MOD: ${{ vars.FEEDER_EXPLORE_RUN_MOD }}
-          FEEDER_EXPLORE_SALT: ${{ vars.FEEDER_EXPLORE_SALT }}
-
-      # ==================================================
-      # SCORER
-      # ==================================================
+      # ================= SCORER =================
       - name: AI Scorer
         run: python workers/ai_scorer.py
         env:
@@ -97,9 +82,7 @@ jobs:
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-      # ==================================================
-      # LINK ROUTER
-      # ==================================================
+      # ================= ROUTER =================
       - name: Link Router
         run: python workers/link_router.py
         env:
@@ -110,10 +93,8 @@ jobs:
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
 
-      # ==================================================
-      # RENDER
-      # ==================================================
-      - name: Render Client
+      # ================= RENDER =================
+      - name: Render
         run: python workers/render_client.py
         env:
           RUN_SLOT: ${{ env.RUN_SLOT }}
@@ -122,10 +103,8 @@ jobs:
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
 
-      # ==================================================
-      # INSTAGRAM
-      # ==================================================
-      - name: Publish Instagram
+      # ================= INSTAGRAM =================
+      - name: Instagram
         run: python workers/instagram_publisher.py
         env:
           RUN_SLOT: ${{ env.RUN_SLOT }}
@@ -135,10 +114,8 @@ jobs:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-      # ==================================================
-      # TELEGRAM (VIP then FREE)
-      # ==================================================
-      - name: Publish Telegram
+      # ================= TELEGRAM =================
+      - name: Telegram
         run: python workers/telegram_publisher.py
         env:
           RUN_SLOT: ${{ env.RUN_SLOT }}

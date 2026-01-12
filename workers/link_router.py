@@ -1,4 +1,26 @@
 # workers/link_router.py
+"""
+TravelTxter Link Router (V4.6 compatible) — Duffel Links DEMO
+
+Purpose:
+- Populate booking_link_vip for monetisable rows using Duffel Links (demo booking links).
+- DO NOT touch rendering or publishing.
+- DO NOT depend on any local utils/ package.
+- Batch-write updates to avoid Google Sheets 429 write quota errors.
+
+Assumptions (from your current RAW_DEALS schema):
+- origin_iata
+- destination_iata
+- outbound_date   (DD/MM/YYYY)
+- return_date     (DD/MM/YYYY)
+- status
+- booking_link_vip
+
+Eligible statuses:
+- READY_TO_POST
+- READY_TO_PUBLISH
+"""
+
 import os
 import json
 import requests
@@ -9,123 +31,133 @@ from gspread.cell import Cell
 from google.oauth2.service_account import Credentials
 
 
-RAW_DEALS_TAB = os.environ.get("RAW_DEALS_TAB", "RAW_DEALS")
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
-GCP_SA_JSON_ONE_LINE = os.environ.get("GCP_SA_JSON_ONE_LINE")
-DUFFEL_API_KEY = os.environ.get("DUFFEL_API_KEY")
-REDIRECT_BASE_URL = os.environ.get("REDIRECT_BASE_URL")  # required in your env already :contentReference[oaicite:1]{index=1}
+RAW_DEALS_TAB = os.environ.get("RAW_DEALS_TAB", "RAW_DEALS").strip() or "RAW_DEALS"
+SPREADSHEET_ID = (os.environ.get("SPREADSHEET_ID") or os.environ.get("SHEET_ID") or "").strip()
+GCP_SA_JSON_ONE_LINE = (os.environ.get("GCP_SA_JSON_ONE_LINE") or os.environ.get("GCP_SA_JSON") or "").strip()
+
+DUFFEL_API_KEY = (os.environ.get("DUFFEL_API_KEY") or "").strip()
+DUFFEL_API_BASE = (os.environ.get("DUFFEL_API_BASE") or "https://api.duffel.com").strip()
+DUFFEL_VERSION = (os.environ.get("DUFFEL_VERSION") or "v2").strip() or "v2"
+
+# Optional but supported in your stack; if present, Duffel will redirect after search.
+REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 
 NOW = datetime.now(timezone.utc)
 
-DUFFEL_LINKS_ENDPOINT = "https://api.duffel.com/air/links"
-
-HEADERS = {
-    "Authorization": f"Bearer {DUFFEL_API_KEY}",
-    "Duffel-Version": "v2",
-    "Content-Type": "application/json",
-}
+ELIGIBLE_STATUSES = {"READY_TO_POST", "READY_TO_PUBLISH"}
 
 
 def _log(msg: str) -> None:
-    print(f"{NOW.strftime('%Y-%m-%dT%H:%M:%SZ')} | {msg}")
+    ts = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"{ts} | {msg}", flush=True)
 
 
-def _get_gspread_client():
+def _parse_sa_json(raw: str) -> dict:
+    raw = (raw or "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # tolerate escaped newlines
+        return json.loads(raw.replace("\\n", "\n"))
+
+
+def _gs_client() -> gspread.Client:
     if not GCP_SA_JSON_ONE_LINE:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE")
-    sa = json.loads(GCP_SA_JSON_ONE_LINE)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(sa, scopes=scopes)
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+    info = _parse_sa_json(GCP_SA_JSON_ONE_LINE)
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
     return gspread.authorize(creds)
 
 
-def _open_ws(gc, tab_name: str):
-    sh = gc.open_by_key(SPREADSHEET_ID)
-    return sh.worksheet(tab_name)
-
-
-def _headers(ws):
+def _headers(ws) -> list:
     return [h.strip() for h in ws.row_values(1)]
 
 
-def _col_idx_map(headers):
+def _colmap(headers: list) -> dict:
     return {h: i + 1 for i, h in enumerate(headers) if h}
 
 
-def _stringify(v):
-    if v is None:
+def _s(v) -> str:
+    return (str(v or "").strip())
+
+
+def _iata(v) -> str:
+    return _s(v).upper()[:3]
+
+
+def _ddmmyyyy_to_iso(v) -> str:
+    """
+    Accepts:
+      - DD/MM/YYYY
+      - YYYY-MM-DD (passes through)
+    Returns:
+      - YYYY-MM-DD or ""
+    """
+    s = _s(v)
+    if not s:
         return ""
-    return str(v).strip()
-
-
-def _date_only(v):
-    """
-    Duffel needs YYYY-MM-DD. Accepts:
-      - YYYY-MM-DD
-      - ddmmyy / ddmmyyyy not accepted (we do not invent)
-    """
-    s = _stringify(v)
-    # Already ISO date
+    # ISO passthrough
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         return s
+    # DD/MM/YYYY
+    if len(s) == 10 and s[2] == "/" and s[5] == "/":
+        dd = s[0:2]
+        mm = s[3:5]
+        yyyy = s[6:10]
+        if dd.isdigit() and mm.isdigit() and yyyy.isdigit():
+            return f"{yyyy}-{mm}-{dd}"
     return ""
 
 
-def _create_duffel_link(origin_iata, dest_iata, out_date, in_date):
+def _duffel_headers() -> dict:
+    if not DUFFEL_API_KEY:
+        raise RuntimeError("Missing DUFFEL_API_KEY")
+    return {
+        "Authorization": f"Bearer {DUFFEL_API_KEY}",
+        "Duffel-Version": DUFFEL_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _create_duffel_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str) -> str | None:
     """
     Creates a Duffel Links URL (demo booking link).
-    Adds a redirect URL for tracking / future routing (required by your setup).
     """
-    if not (origin_iata and dest_iata and out_date and in_date):
+    if not (origin_iata and dest_iata and out_iso and in_iso):
         return None
 
     payload = {
         "data": {
             "type": "air_links",
             "slices": [
-                {
-                    "origin": origin_iata,
-                    "destination": dest_iata,
-                    "departure_date": out_date,
-                },
-                {
-                    "origin": dest_iata,
-                    "destination": origin_iata,
-                    "departure_date": in_date,
-                },
+                {"origin": origin_iata, "destination": dest_iata, "departure_date": out_iso},
+                {"origin": dest_iata, "destination": origin_iata, "departure_date": in_iso},
             ],
             "passengers": [{"type": "adult"}],
             "cabin_class": "economy",
-            "metadata": {
-                "source": "traveltxter_vip_demo",
-            },
+            "metadata": {"source": "traveltxter_vip_demo"},
         }
     }
 
-    # If you have a redirect base, attach a meaningful redirect URL
     if REDIRECT_BASE_URL:
-        # Keep it simple and deterministic (no schema invention)
         payload["data"]["redirect_url"] = REDIRECT_BASE_URL
 
+    url = f"{DUFFEL_API_BASE}/air/links"
+
     try:
-        r = requests.post(
-            DUFFEL_LINKS_ENDPOINT,
-            headers=HEADERS,
-            json=payload,
-            timeout=20,
-        )
+        r = requests.post(url, headers=_duffel_headers(), json=payload, timeout=25)
     except Exception as e:
-        _log(f"Duffel Links request failed: {e}")
+        _log(f"❌ Duffel Links request exception: {e}")
         return None
 
     if r.status_code != 201:
-        try:
-            _log(f"Duffel Links error {r.status_code}: {r.text[:300]}")
-        except Exception:
-            _log(f"Duffel Links error {r.status_code}")
+        _log(f"❌ Duffel Links error {r.status_code}: {r.text[:300]}")
         return None
 
     try:
@@ -134,15 +166,15 @@ def _create_duffel_link(origin_iata, dest_iata, out_date, in_date):
         return None
 
 
-def _batch_write_cells(ws, row_updates, colmap):
+def _batch_write(ws, updates: list[tuple[int, dict]], cm: dict) -> int:
     """
-    row_updates: list of (row_number, {header:value})
-    Performs ONE batchUpdate call to avoid 429 quota.
+    updates: [(row_number, {"booking_link_vip": "..."}), ...]
+    Performs a single update_cells call to avoid 429 quota.
     """
-    cells = []
-    for row_num, data in row_updates:
+    cells: list[Cell] = []
+    for row_num, data in updates:
         for header, value in data.items():
-            col = colmap.get(header)
+            col = cm.get(header)
             if not col:
                 continue
             cells.append(Cell(row=row_num, col=col, value=value))
@@ -154,81 +186,61 @@ def _batch_write_cells(ws, row_updates, colmap):
     return len(cells)
 
 
-def main():
+def main() -> int:
     if not SPREADSHEET_ID:
-        raise RuntimeError("Missing SPREADSHEET_ID")
-    if not DUFFEL_API_KEY:
-        raise RuntimeError("Missing DUFFEL_API_KEY")
+        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
 
-    gc = _get_gspread_client()
-    ws = _open_ws(gc, RAW_DEALS_TAB)
+    gc = _gs_client()
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.worksheet(RAW_DEALS_TAB)
 
     headers = _headers(ws)
-    colmap = _col_idx_map(headers)
+    cm = _colmap(headers)
 
-    required_cols = ["status", "booking_link_vip"]
-    for c in required_cols:
-        if c not in colmap:
-            raise RuntimeError(f"RAW_DEALS missing required column: {c}")
+    required = ["status", "booking_link_vip", "origin_iata", "destination_iata", "outbound_date", "return_date"]
+    missing = [c for c in required if c not in cm]
+    if missing:
+        raise RuntimeError(f"RAW_DEALS missing required columns: {missing}")
 
-    # Try common column names for route/date data WITHOUT inventing schema:
-    origin_key = None
-    dest_key = None
-    out_key = None
-    in_key = None
-
-    for c in ["origin_iata", "from_iata", "origin", "from_airport"]:
-        if c in colmap:
-            origin_key = c
-            break
-    for c in ["dest_iata", "to_iata", "destination", "to_airport"]:
-        if c in colmap:
-            dest_key = c
-            break
-    for c in ["out_date", "departure_date", "date_out", "depart_date"]:
-        if c in colmap:
-            out_key = c
-            break
-    for c in ["in_date", "return_date", "date_in", "returning_date"]:
-        if c in colmap:
-            in_key = c
-            break
-
-    if not all([origin_key, dest_key, out_key, in_key]):
-        raise RuntimeError(
-            "RAW_DEALS missing route/date columns needed for Duffel Links. "
-            f"Found origin={origin_key} dest={dest_key} out={out_key} in={in_key}"
-        )
-
-    # Pull all records (sheet rows 2..n)
     records = ws.get_all_records()
-    updates = []
 
-    eligible_statuses = {"READY_TO_POST", "READY_TO_PUBLISH"}
+    _log(f"Link router scanning rows: {len(records)}")
+    updates: list[tuple[int, dict]] = []
+    attempted = 0
+    created = 0
 
-    for idx, r in enumerate(records, start=2):
-        status = _stringify(r.get("status"))
-        if status not in eligible_statuses:
+    for idx, r in enumerate(records, start=2):  # sheet row number
+        status = _s(r.get("status"))
+        if status not in ELIGIBLE_STATUSES:
             continue
 
-        existing_link = _stringify(r.get("booking_link_vip"))
-        if existing_link:
+        existing = _s(r.get("booking_link_vip"))
+        if existing:
             continue
 
-        origin_iata = _stringify(r.get(origin_key)).upper()
-        dest_iata = _stringify(r.get(dest_key)).upper()
-        out_date = _date_only(r.get(out_key))
-        in_date = _date_only(r.get(in_key))
+        origin = _iata(r.get("origin_iata"))
+        dest = _iata(r.get("destination_iata"))
+        out_iso = _ddmmyyyy_to_iso(r.get("outbound_date"))
+        in_iso = _ddmmyyyy_to_iso(r.get("return_date"))
 
-        link = _create_duffel_link(origin_iata, dest_iata, out_date, in_date)
+        if not (origin and dest and out_iso and in_iso):
+            continue
+
+        attempted += 1
+        link = _create_duffel_link(origin, dest, out_iso, in_iso)
         if not link:
             continue
 
         updates.append((idx, {"booking_link_vip": link}))
+        created += 1
 
-    n = _batch_write_cells(ws, updates, colmap)
-    _log(f"Done. booking_link_vip populated for {len(updates)} rows. cells written: {n}")
+    cells_written = _batch_write(ws, updates, cm)
+
+    _log(f"Attempted Duffel Links: {attempted}")
+    _log(f"booking_link_vip populated for: {created} rows")
+    _log(f"Cells written (batch): {cells_written}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

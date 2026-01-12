@@ -13,6 +13,14 @@ This is the production feeder/orchestrator. It:
     ROUTE_CAPABILITY_MAP origin_city -> fallback UK airport map -> "".
 
 Do NOT reinvent this file. Only surgical fixes.
+
+Surgical Fix (V4.6): Theme/haul-aware origin rotation
+- CONFIG remains the source of DESTINATIONS and route rules.
+- Origins are chosen per theme to avoid LGW-only lock-in:
+  - short-haul themes prefer SW/LCC airports + London LCC fallback
+  - snow themes prefer classic snow airports
+  - long-haul themes prefer LHR/LGW
+- Capability map remains authoritative for allowed (origin,destination) pairs.
 """
 
 from __future__ import annotations
@@ -130,6 +138,121 @@ def _clean_iata(x: Any) -> str:
 def resolve_origin_city(iata: str, origin_city_map: Dict[str, str]) -> str:
     iata = _clean_iata(iata)
     return (origin_city_map.get(iata) or ORIGIN_CITY_FALLBACK.get(iata) or "").strip()
+
+
+# ==================== ORIGIN POOLS (Theme/Haul aware) ====================
+
+SHORT_HAUL_THEMES = {
+    "winter_sun",
+    "summer_sun",
+    "beach_break",
+    "surf",
+    "city_breaks",
+    "culture_history",
+    "unexpected_value",
+    "adventure",
+}
+
+SNOW_THEMES = {
+    "snow",
+    "northern_lights",
+}
+
+LONG_HAUL_THEMES = {
+    "long_haul",
+    "luxury_value",  # treated as long-haul biased
+}
+
+# SW/LCC first (audience fit), London LCC fallback (inventory safety)
+SHORT_HAUL_PRIMARY = ["BRS", "EXT", "NQY", "CWL", "SOU"]
+SHORT_HAUL_FALLBACK = ["STN", "LTN", "LGW"]  # LCC-heavy London airports + LGW safety
+
+# Snow "classic" airports
+SNOW_POOL = ["BRS", "LGW", "STN", "LTN"]
+
+# Long-haul hub airports
+LONG_HAUL_POOL = ["LHR", "LGW"]
+
+def _run_slot() -> str:
+    # Existing workflows often set RUN_SLOT=AM/PM; if absent, stay deterministic by date only.
+    return (os.getenv("RUN_SLOT") or "").strip().upper()
+
+def _deterministic_pick(seq: List[str], seed: str, k: int) -> List[str]:
+    """
+    Deterministically pick k items from seq without repetition (if possible).
+    """
+    if not seq or k <= 0:
+        return []
+    h = int(hashlib.md5(seed.encode()).hexdigest()[:8], 16)
+    out: List[str] = []
+    n = len(seq)
+    for i in range(k):
+        idx = (h + i) % n
+        val = seq[idx]
+        if val not in out:
+            out.append(val)
+    # If k > unique in seq, allow repeats deterministically
+    while len(out) < k:
+        out.append(seq[(h + len(out)) % n])
+    return out
+
+def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
+    """
+    Returns a list of origins to try for this run (length == routes_per_run),
+    biased per theme/haul, deterministic by date + run slot.
+    Enforces a practical diversity constraint later (max 2 per origin).
+    """
+    today = dt.datetime.utcnow().date().isoformat()
+    slot = _run_slot()
+    seed_base = f"{today}|{slot}|{theme_today}"
+
+    theme_today = low(theme_today)
+
+    if theme_today in LONG_HAUL_THEMES:
+        # Long-haul: mostly hubs
+        # If routes_per_run=3 -> [LHR, LGW, LHR] (deterministic)
+        picks = _deterministic_pick(LONG_HAUL_POOL, seed_base, max(1, min(2, routes_per_run)))
+        out: List[str] = []
+        for i in range(routes_per_run):
+            out.append(picks[i % len(picks)])
+        return out
+
+    if theme_today in SNOW_THEMES:
+        picks = _deterministic_pick(SNOW_POOL, seed_base, min(len(SNOW_POOL), routes_per_run))
+        out: List[str] = []
+        for i in range(routes_per_run):
+            out.append(picks[i % len(picks)])
+        return out
+
+    # Default: short-haul biased
+    # “2+1” rule for ROUTES_PER_RUN=3; “2+2” for 4; “2+” for others.
+    primary_n = 2 if routes_per_run >= 3 else 1
+    fallback_n = max(0, routes_per_run - primary_n)
+
+    prim = _deterministic_pick(SHORT_HAUL_PRIMARY, seed_base + "|P", primary_n)
+    fb = _deterministic_pick(SHORT_HAUL_FALLBACK, seed_base + "|F", fallback_n)
+    return prim + fb
+
+def enforce_origin_diversity(origins: List[str]) -> List[str]:
+    """
+    Ensures no single origin dominates the run.
+    Rule: max 2 occurrences of the same origin unless the list is too small.
+    """
+    counts: Dict[str, int] = {}
+    out: List[str] = []
+    for o in origins:
+        counts.setdefault(o, 0)
+        if counts[o] >= 2:
+            continue
+        out.append(o)
+        counts[o] += 1
+    # If we dropped too many, pad deterministically using existing order (rare)
+    while len(out) < len(origins):
+        for o in origins:
+            if len(out) >= len(origins):
+                break
+            out.append(o)
+    return out[: len(origins)]
 
 
 # ==================== SHEETS INIT ====================
@@ -291,6 +414,46 @@ def append_rows_header_mapped(ws, deals: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
+# ==================== ROUTE SELECTION (surgical) ====================
+
+def build_today_dest_configs(today_routes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    CONFIG remains authoritative. We treat CONFIG rows as destination rules.
+    We select unique destination_iata in priority order (first occurrence wins).
+    """
+    seen: Set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for r in today_routes:
+        dest = _clean_iata(r.get("destination_iata"))
+        if not dest or dest in seen:
+            continue
+        seen.add(dest)
+        out.append(r)
+    return out
+
+def pick_origin_for_dest(
+    dest: str,
+    candidate_origins: List[str],
+    allowed_pairs: Set[Tuple[str, str]],
+    preferred_origin: str = "",
+) -> Optional[str]:
+    """
+    Returns an origin that is allowed for this destination.
+    - If preferred_origin is provided (legacy CONFIG rows), try it first.
+    - Otherwise try candidate_origins in order.
+    """
+    if preferred_origin:
+        o = _clean_iata(preferred_origin)
+        if not allowed_pairs or (o, dest) in allowed_pairs:
+            return o
+
+    for o in candidate_origins:
+        oo = _clean_iata(o)
+        if not allowed_pairs or (oo, dest) in allowed_pairs:
+            return oo
+    return None
+
+
 # ==================== MAIN ====================
 
 def main() -> int:
@@ -326,21 +489,75 @@ def main() -> int:
     # Sort by priority (lower number = higher priority)
     today_routes.sort(key=lambda r: float(r.get("priority", 9999) or 9999))
 
+    # === Surgical origin plan (theme/haul aware) ===
+    planned_origins = origin_plan_for_theme(theme_today, ROUTES_PER_RUN)
+    planned_origins = enforce_origin_diversity(planned_origins)
+
+    # Build destination configs (unique dests in priority order)
+    dest_configs = build_today_dest_configs(today_routes)
+
+    log(f"🧭 Planned origins for run: {planned_origins}")
+    log(f"🧭 Unique destinations available for theme: {len(dest_configs)}")
+
     searches_done = 0
     all_deals: List[Dict[str, Any]] = []
 
-    # Route sampling (respect cap)
-    for r in today_routes[:ROUTES_PER_RUN]:
+    # Build candidate origins list for fallback attempts (primary+fallback)
+    # This preserves reliability when a planned origin isn't allowed for a destination.
+    theme_l = low(theme_today)
+    if theme_l in LONG_HAUL_THEMES:
+        full_origin_pool = LONG_HAUL_POOL[:]
+    elif theme_l in SNOW_THEMES:
+        full_origin_pool = SNOW_POOL[:]
+    else:
+        full_origin_pool = SHORT_HAUL_PRIMARY[:] + SHORT_HAUL_FALLBACK[:]
+
+    # Route selection loop (respect caps)
+    selected_routes: List[Tuple[str, str, Dict[str, Any]]] = []  # (origin, destination, config_row)
+
+    # Try to select up to ROUTES_PER_RUN destinations, pairing with planned origins
+    # If (origin,dest) not allowed, try other origins from the pool (no extra searches; just swaps origin choice).
+    di = 0
+    oi = 0
+    while len(selected_routes) < ROUTES_PER_RUN and di < len(dest_configs):
+        cfg = dest_configs[di]
+        destination = _clean_iata(cfg.get("destination_iata"))
+        if not destination:
+            di += 1
+            continue
+
+        preferred_origin = _clean_iata(cfg.get("origin_iata"))  # legacy support; may be blank
+        planned_origin = planned_origins[oi % len(planned_origins)] if planned_origins else ""
+        oi += 1
+
+        # Try preferred (if CONFIG set), else planned, else pool fallback
+        candidate_try_order = []
+        if planned_origin:
+            candidate_try_order.append(planned_origin)
+        candidate_try_order.extend([o for o in full_origin_pool if o not in candidate_try_order])
+
+        origin = pick_origin_for_dest(
+            dest=destination,
+            candidate_origins=candidate_try_order,
+            allowed_pairs=allowed_pairs,
+            preferred_origin=preferred_origin,
+        )
+
+        if origin:
+            selected_routes.append((origin, destination, cfg))
+
+        di += 1
+
+    if not selected_routes:
+        log("⚠️ No valid (origin,destination) pairs after capability filtering.")
+        return 0
+
+    # Execute searches for selected routes
+    for origin, destination, r in selected_routes:
         if searches_done >= MAX_SEARCHES_PER_RUN:
             break
         if len(all_deals) >= MAX_INSERTS_TOTAL:
             break
-
-        origin = _clean_iata(r.get("origin_iata"))
-        destination = _clean_iata(r.get("destination_iata"))
-
-        if allowed_pairs and (origin, destination) not in allowed_pairs:
-            continue
 
         days_min = int(r.get("days_ahead_min") or DEFAULT_DAYS_AHEAD_MIN)
         days_max = int(r.get("days_ahead_max") or DEFAULT_DAYS_AHEAD_MAX)

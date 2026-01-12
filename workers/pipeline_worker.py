@@ -24,6 +24,12 @@ Surgical Fix (V4.6): Theme/haul-aware origin rotation
 
 Surgical Fix (2026-01-12): ISO date write + RAW append
 - Prevents Google Sheets locale parsing flipping DD/MM into MM/DD.
+
+Surgical Fix (2026-01-12): FEEDER_OPEN_ORIGINS (Reverse capability injection)
+- If FEEDER_OPEN_ORIGINS=true:
+  For each destination, expand candidate origins using reverse lookup from ROUTE_CAPABILITY_MAP
+  (destination -> list of compatible origins), then try planned origins first, then reverse origins,
+  then fallback pools.
 """
 
 from __future__ import annotations
@@ -63,6 +69,9 @@ ROUTES_PER_RUN = int(os.getenv("DUFFEL_ROUTES_PER_RUN", "3") or "3")
 # Optional: strict mode (default TRUE)
 STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lower() == "true")
 
+# NEW: open origins using reverse capability map
+FEEDER_OPEN_ORIGINS = (os.getenv("FEEDER_OPEN_ORIGINS", "false").strip().lower() == "true")
+
 # Date window defaults (if CONFIG rows omit)
 DEFAULT_DAYS_AHEAD_MIN = int(os.getenv("DAYS_AHEAD_MIN", "14") or "14")
 DEFAULT_DAYS_AHEAD_MAX = int(os.getenv("DAYS_AHEAD_MAX", "90") or "90")
@@ -91,8 +100,6 @@ MASTER_THEMES = [
 # ============================================================
 # Origin city fallback (for captions/render when ROUTE_CAPABILITY_MAP lacks origin_city)
 # ============================================================
-# Prefer ROUTE_CAPABILITY_MAP origin_city where available.
-# If missing, fall back to a small, stable UK airport map (do not expand dynamically).
 ORIGIN_CITY_FALLBACK = {
     "LHR": "London",
     "LGW": "London",
@@ -118,6 +125,7 @@ ORIGIN_CITY_FALLBACK = {
     "BFS": "Belfast",
     "BHD": "Belfast",
 }
+
 
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -156,34 +164,22 @@ SHORT_HAUL_THEMES = {
     "adventure",
 }
 
-SNOW_THEMES = {
-    "snow",
-    "northern_lights",
-}
+SNOW_THEMES = {"snow", "northern_lights"}
 
-LONG_HAUL_THEMES = {
-    "long_haul",
-    "luxury_value",  # treated as long-haul biased
-}
+LONG_HAUL_THEMES = {"long_haul", "luxury_value"}
 
-# SW/LCC first (audience fit), London LCC fallback (inventory safety)
 SHORT_HAUL_PRIMARY = ["BRS", "EXT", "NQY", "CWL", "SOU"]
-SHORT_HAUL_FALLBACK = ["STN", "LTN", "LGW"]  # LCC-heavy London airports + LGW safety
+SHORT_HAUL_FALLBACK = ["STN", "LTN", "LGW"]
 
-# Snow "classic" airports
 SNOW_POOL = ["BRS", "LGW", "STN", "LTN"]
-
-# Long-haul hub airports
 LONG_HAUL_POOL = ["LHR", "LGW"]
 
+
 def _run_slot() -> str:
-    # Existing workflows often set RUN_SLOT=AM/PM; if absent, stay deterministic by date only.
     return (os.getenv("RUN_SLOT") or "").strip().upper()
 
+
 def _deterministic_pick(seq: List[str], seed: str, k: int) -> List[str]:
-    """
-    Deterministically pick k items from seq without repetition (if possible).
-    """
     if not seq or k <= 0:
         return []
     h = int(hashlib.md5(seed.encode()).hexdigest()[:8], 16)
@@ -194,21 +190,15 @@ def _deterministic_pick(seq: List[str], seed: str, k: int) -> List[str]:
         val = seq[idx]
         if val not in out:
             out.append(val)
-    # If k > unique in seq, allow repeats deterministically
     while len(out) < k:
         out.append(seq[(h + len(out)) % n])
     return out
 
+
 def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
-    """
-    Returns a list of origins to try for this run (length == routes_per_run),
-    biased per theme/haul, deterministic by date + run slot.
-    Enforces a practical diversity constraint later (max 2 per origin).
-    """
     today = dt.datetime.utcnow().date().isoformat()
     slot = _run_slot()
     seed_base = f"{today}|{slot}|{theme_today}"
-
     theme_today = low(theme_today)
 
     if theme_today in LONG_HAUL_THEMES:
@@ -232,11 +222,8 @@ def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
     fb = _deterministic_pick(SHORT_HAUL_FALLBACK, seed_base + "|F", fallback_n)
     return prim + fb
 
+
 def enforce_origin_diversity(origins: List[str]) -> List[str]:
-    """
-    Ensures no single origin dominates the run.
-    Rule: max 2 occurrences of the same origin unless the list is too small.
-    """
     counts: Dict[str, int] = {}
     out: List[str] = []
     for o in origins:
@@ -311,12 +298,19 @@ def load_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str, str]], Dict[str, str]]:
+def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str, str]], Dict[str, str], Dict[str, List[str]]]:
+    """
+    Returns:
+      allowed_pairs: set((origin_iata, destination_iata))
+      origin_city_map: origin_iata -> origin_city
+      dest_to_origins: destination_iata -> list(origin_iata)  [reverse lookup]
+    """
     ws = sheet.worksheet(CAPABILITY_TAB)
     rows = ws.get_all_records()
 
     allowed: Set[Tuple[str, str]] = set()
     origin_city_map: Dict[str, str] = {}
+    dest_to_origins: Dict[str, List[str]] = {}
 
     for r in rows:
         o = _clean_iata(r.get("origin_iata"))
@@ -325,6 +319,9 @@ def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str
 
         if o and d:
             allowed.add((o, d))
+            dest_to_origins.setdefault(d, [])
+            if o not in dest_to_origins[d]:
+                dest_to_origins[d].append(o)
             if oc and o not in origin_city_map:
                 origin_city_map[o] = oc
 
@@ -334,7 +331,7 @@ def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str
             raise RuntimeError(msg)
         log(f"⚠️ {msg} — continuing WITHOUT capability filtering (not recommended).")
 
-    return allowed, origin_city_map
+    return allowed, origin_city_map, dest_to_origins
 
 
 # ==================== DUFFEL ====================
@@ -399,7 +396,6 @@ def append_rows_header_mapped(ws, deals: List[Dict[str, Any]]) -> int:
             row.append(d.get(h, ""))
         rows.append(row)
 
-    # ✅ surgical: RAW preserves ISO strings; avoids locale date flips
     ws.append_rows(rows, value_input_option="RAW")
     return len(rows)
 
@@ -416,6 +412,18 @@ def build_today_dest_configs(today_routes: List[Dict[str, Any]]) -> List[Dict[st
         seen.add(dest)
         out.append(r)
     return out
+
+
+def _dedupe_keep_order(seq: List[str]) -> List[str]:
+    out: List[str] = []
+    for x in seq:
+        xx = _clean_iata(x)
+        if not xx:
+            continue
+        if xx not in out:
+            out.append(xx)
+    return out
+
 
 def pick_origin_for_dest(
     dest: str,
@@ -448,6 +456,7 @@ def main() -> int:
 
     theme_today = low(os.getenv("THEME_OF_DAY") or "") or low(theme_of_day_utc())
     log(f"🎯 Theme of the day (UTC): {theme_today}")
+    log(f"FEEDER_OPEN_ORIGINS={FEEDER_OPEN_ORIGINS}")
 
     gc = gs_client()
     sh = gc.open_by_key(sheet_id)
@@ -458,7 +467,7 @@ def main() -> int:
     themes_dict = load_themes_dict(sh)
     signals = load_signals(sh)
 
-    allowed_pairs, origin_city_map = load_route_capability_map(sh)
+    allowed_pairs, origin_city_map, dest_to_origins = load_route_capability_map(sh)
 
     today_routes = [r for r in config_rows if low(r.get("theme", "")) == theme_today]
     if not today_routes:
@@ -501,10 +510,23 @@ def main() -> int:
         planned_origin = planned_origins[oi % len(planned_origins)] if planned_origins else ""
         oi += 1
 
-        candidate_try_order = []
+        candidate_try_order: List[str] = []
+
+        # 1) Planned origin first (theme/haul-aware rotation)
         if planned_origin:
             candidate_try_order.append(planned_origin)
+
+        # 2) NEW: reverse capability injection (destination -> origins)
+        if FEEDER_OPEN_ORIGINS:
+            rev = dest_to_origins.get(destination, [])[:]
+            # Keep deterministic order by sorting; avoid random churn
+            rev = sorted(_dedupe_keep_order(rev))
+            candidate_try_order.extend([o for o in rev if o not in candidate_try_order])
+
+        # 3) Existing fallback pools (inventory safety)
         candidate_try_order.extend([o for o in full_origin_pool if o not in candidate_try_order])
+
+        candidate_try_order = _dedupe_keep_order(candidate_try_order)
 
         origin = pick_origin_for_dest(
             dest=destination,
@@ -515,6 +537,8 @@ def main() -> int:
 
         if origin:
             selected_routes.append((origin, destination, cfg))
+        else:
+            log(f"⏭️  No valid origin found for destination={destination} after capability filtering.")
 
         di += 1
 
@@ -580,7 +604,6 @@ def main() -> int:
                 "origin_city": resolve_origin_city(origin, origin_city_map),
                 "destination_iata": destination,
 
-                # ✅ surgical: write ISO to stop date flips
                 "outbound_date": dep_date.strftime("%Y-%m-%d"),
                 "return_date": ret_date.strftime("%Y-%m-%d"),
 

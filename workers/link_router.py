@@ -1,141 +1,81 @@
 # workers/link_router.py
-#!/usr/bin/env python3
-"""
-TravelTxter V4.5x — link_router.py (LOCKED)
-
-ROLE:
-- Populates booking_link_vip for rows that need it
-- Prefers booking_link_vip if already set
-- Falls back to affiliate_url if present
-- NEVER changes status (status gating is handled elsewhere)
-- Never crashes if Duffel Links config is missing
-
-NOTE:
-This file is deliberately "safe-first" so the pipeline can publish reliably.
-If/when you want Duffel Links sessions, we can add that logic without touching
-the rest of the pipeline.
-"""
-
-from __future__ import annotations
-
 import os
-import json
-import time
-import datetime as dt
-from typing import Dict, Any, List, Optional
+import requests
+from utils.sheets import get_worksheet, batch_update_rows
 
-import gspread
-from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
+RAW_DEALS_TAB = os.environ.get("RAW_DEALS_TAB", "RAW_DEALS")
+DUFFEL_API_KEY = os.environ.get("DUFFEL_API_KEY")
 
+DUFFEL_LINKS_ENDPOINT = "https://api.duffel.com/air/links"
 
-# =================================
-# Logging
-# =================================
+HEADERS = {
+    "Authorization": f"Bearer {DUFFEL_API_KEY}",
+    "Duffel-Version": "v2",
+    "Content-Type": "application/json",
+}
 
-def log(msg: str) -> None:
-    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    print(f"{ts} | {msg}", flush=True)
+def create_duffel_demo_link(row):
+    """
+    Creates a Duffel Links session for demo / VIP booking intent.
+    """
+    payload = {
+        "data": {
+            "type": "air_links",
+            "slices": [
+                {
+                    "origin": row["origin_iata"],
+                    "destination": row["dest_iata"],
+                    "departure_date": row["out_date"],
+                },
+                {
+                    "origin": row["dest_iata"],
+                    "destination": row["origin_iata"],
+                    "departure_date": row["in_date"],
+                }
+            ],
+            "passengers": [{"type": "adult"}],
+            "cabin_class": "economy",
+        }
+    }
 
-
-# =================================
-# Env helpers
-# =================================
-
-def env_str(k: str, default: str = "") -> str:
-    v = os.environ.get(k, "")
-    v = (v or "").strip()
-    return v if v else default
-
-
-def parse_sa_json(raw: str) -> Dict[str, Any]:
-    raw = (raw or "").strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return json.loads(raw.replace("\\n", "\n"))
-
-
-def gs_client() -> gspread.Client:
-    raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
-    if not raw:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-    info = parse_sa_json(raw)
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+    r = requests.post(
+        DUFFEL_LINKS_ENDPOINT,
+        headers=HEADERS,
+        json=payload,
+        timeout=15,
     )
-    return gspread.authorize(creds)
 
+    if r.status_code != 201:
+        return None
 
-def iso_now() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return r.json()["data"]["url"]
 
+def main():
+    ws = get_worksheet(RAW_DEALS_TAB)
+    rows = ws.get_all_records()
 
-def a1(row: int, col0: int) -> str:
-    return gspread.utils.rowcol_to_a1(row, col0 + 1)
+    updates = []
 
-
-def safe_get(r: List[str], idx: int) -> str:
-    if idx < 0:
-        return ""
-    if idx >= len(r):
-        return ""
-    return (r[idx] or "").strip()
-
-
-def main() -> int:
-    spreadsheet_id = env_str("SPREADSHEET_ID") or env_str("SHEET_ID")
-    raw_tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
-
-    if not spreadsheet_id:
-        raise RuntimeError("Missing SPREADSHEET_ID/SHEET_ID")
-
-    gc = gs_client()
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(raw_tab)
-
-    values = ws.get_all_values()
-    if len(values) < 2:
-        log("No rows.")
-        return 0
-
-    headers = [h.strip() for h in values[0]]
-    h = {k: i for i, k in enumerate(headers)}
-
-    required = ["status", "deal_id", "affiliate_url", "booking_link_vip", "affiliate_source", "link_routed_at"]
-    missing = [c for c in required if c not in h]
-    if missing:
-        raise RuntimeError(f"RAW_DEALS missing required columns: {missing}")
-
-    eligible_statuses = {"READY_TO_POST", "READY_TO_PUBLISH", "POSTED_INSTAGRAM"}
-
-    updated = 0
-    for rownum, r in enumerate(values[1:], start=2):
-        status = safe_get(r, h["status"])
-        if status not in eligible_statuses:
+    for idx, row in enumerate(rows, start=2):
+        if row.get("status") != "READY_TO_POST":
             continue
 
-        deal_id = safe_get(r, h["deal_id"])
-        if not deal_id:
+        link = create_duffel_demo_link(row)
+
+        if not link:
             continue
 
-        existing = safe_get(r, h["booking_link_vip"])
-        if existing:
-            continue
+        updates.append((
+            idx,
+            {
+                "booking_link_vip": link,
+            }
+        ))
 
-        affiliate_url = safe_get(r, h["affiliate_url"])
-        if not affiliate_url:
-            continue
+    if updates:
+        batch_update_rows(ws, updates)
 
-        ws.update([[affiliate_url]], a1(rownum, h["booking_link_vip"]))
-        ws.update([["affiliate_url"]], a1(rownum, h["affiliate_source"]))
-        ws.update([[iso_now()]], a1(rownum, h["link_routed_at"]))
-        updated += 1
-
-    log(f"Done. booking_link_vip populated for {updated} rows.")
-    return 0
-
+    print(f"booking_link_vip populated for {len(updates)} rows.")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

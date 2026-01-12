@@ -1,3 +1,156 @@
+name: TravelTxter Pipeline (AM/PM + Manual TEST)
+
+on:
+  schedule:
+    # AM run (UTC)
+    - cron: "30 7 * * *"
+    # PM run (UTC)
+    - cron: "30 16 * * *"
+  workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "RUN_SLOT to pass to workers (TEST recommended for manual runs)"
+        required: true
+        default: "TEST"
+        type: choice
+        options:
+          - TEST
+          - AM
+          - PM
+
+concurrency:
+  # Keep TEST runs isolated from PROD runs
+  group: traveltxter-${{ (github.event_name == 'workflow_dispatch' && inputs.run_slot == 'TEST') && 'test' || 'prod' }}
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # --------------------------------------------------
+      # Determine RUN_SLOT
+      # - workflow_dispatch: uses input (default TEST)
+      # - schedule: AM or PM based on which cron fired
+      # --------------------------------------------------
+      - name: Set RUN_SLOT
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_SLOT=${{ inputs.run_slot }}" >> $GITHUB_ENV
+          else
+            # schedule event: infer by cron string
+            if [ "${{ github.event.schedule }}" = "30 7 * * *" ]; then
+              echo "RUN_SLOT=AM" >> $GITHUB_ENV
+            else
+              echo "RUN_SLOT=PM" >> $GITHUB_ENV
+            fi
+          fi
+          echo "Resolved RUN_SLOT=$RUN_SLOT"
+
+      # ==================================================
+      # FEEDER
+      # ==================================================
+      - name: Feeder (pipeline_worker)
+        run: python workers/pipeline_worker.py
+        env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+
+          # Your caps (adjust in GitHub vars/secrets if already used)
+          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
+          DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
+          DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+
+          # 90/10 control (optional; defaults exist in code)
+          FEEDER_EXPLORE_RUN_MOD: ${{ vars.FEEDER_EXPLORE_RUN_MOD }}
+          FEEDER_EXPLORE_SALT: ${{ vars.FEEDER_EXPLORE_SALT }}
+
+      # ==================================================
+      # SCORER
+      # ==================================================
+      - name: AI Scorer
+        run: python workers/ai_scorer.py
+        env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      # ==================================================
+      # LINK ROUTER
+      # ==================================================
+      - name: Link Router
+        run: python workers/link_router.py
+        env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
+
+      # ==================================================
+      # RENDER
+      # ==================================================
+      - name: Render Client
+        run: python workers/render_client.py
+        env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+
+      # ==================================================
+      # INSTAGRAM
+      # ==================================================
+      - name: Publish Instagram
+        run: python workers/instagram_publisher.py
+        env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+
+      # ==================================================
+      # TELEGRAM (VIP then FREE)
+      # ==================================================
+      - name: Publish Telegram
+        run: python workers/telegram_publisher.py
+        env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
+          STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
 name: TravelTxter V4.5x Pipeline (TEST MODE)
 
 on:

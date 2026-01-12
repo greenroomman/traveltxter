@@ -21,6 +21,9 @@ Surgical Fix (V4.6): Theme/haul-aware origin rotation
   - snow themes prefer classic snow airports
   - long-haul themes prefer LHR/LGW
 - Capability map remains authoritative for allowed (origin,destination) pairs.
+
+Surgical Fix (2026-01-12): ISO date write + RAW append
+- Prevents Google Sheets locale parsing flipping DD/MM into MM/DD.
 """
 
 from __future__ import annotations
@@ -209,8 +212,6 @@ def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
     theme_today = low(theme_today)
 
     if theme_today in LONG_HAUL_THEMES:
-        # Long-haul: mostly hubs
-        # If routes_per_run=3 -> [LHR, LGW, LHR] (deterministic)
         picks = _deterministic_pick(LONG_HAUL_POOL, seed_base, max(1, min(2, routes_per_run)))
         out: List[str] = []
         for i in range(routes_per_run):
@@ -224,8 +225,6 @@ def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
             out.append(picks[i % len(picks)])
         return out
 
-    # Default: short-haul biased
-    # “2+1” rule for ROUTES_PER_RUN=3; “2+2” for 4; “2+” for others.
     primary_n = 2 if routes_per_run >= 3 else 1
     fallback_n = max(0, routes_per_run - primary_n)
 
@@ -246,7 +245,6 @@ def enforce_origin_diversity(origins: List[str]) -> List[str]:
             continue
         out.append(o)
         counts[o] += 1
-    # If we dropped too many, pad deterministically using existing order (rare)
     while len(out) < len(origins):
         for o in origins:
             if len(out) >= len(origins):
@@ -282,7 +280,6 @@ def gs_client() -> gspread.Client:
 def load_config_rows(sheet: gspread.Spreadsheet) -> List[Dict[str, Any]]:
     ws = sheet.worksheet(CONFIG_TAB)
     rows = ws.get_all_records()
-    # enabled must be truthy
     out = []
     for r in rows:
         enabled = str(r.get("enabled", "")).strip().lower()
@@ -315,11 +312,6 @@ def load_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
 
 
 def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str, str]], Dict[str, str]]:
-    """
-    Returns:
-      - allowed_pairs: set of (origin_iata, destination_iata)
-      - origin_city_map: origin_iata -> origin_city (best effort)
-    """
     ws = sheet.worksheet(CAPABILITY_TAB)
     rows = ws.get_all_records()
 
@@ -368,11 +360,9 @@ def duffel_search_offer_request(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ==================== ENRICH DEAL ====================
 
 def enrich_deal(deal: Dict[str, Any], themes_dict: Dict[str, List[Dict[str, Any]]], signals: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Priority: THEMES > CONFIG_SIGNALS for destination city/country."""
     dest = deal.get("destination_iata", "")
     theme = deal.get("deal_theme") or deal.get("theme") or ""
 
-    # THEMES lookup (theme-specific)
     if theme and theme in themes_dict:
         for d in themes_dict[theme]:
             if d.get("destination_iata") == dest:
@@ -382,7 +372,6 @@ def enrich_deal(deal: Dict[str, Any], themes_dict: Dict[str, List[Dict[str, Any]
                     deal["destination_country"] = d["destination_country"]
                 break
 
-    # CONFIG_SIGNALS fallback
     if dest in signals:
         s = signals[dest]
         if not deal.get("destination_city") and s.get("destination_city"):
@@ -410,17 +399,14 @@ def append_rows_header_mapped(ws, deals: List[Dict[str, Any]]) -> int:
             row.append(d.get(h, ""))
         rows.append(row)
 
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    # ✅ surgical: RAW preserves ISO strings; avoids locale date flips
+    ws.append_rows(rows, value_input_option="RAW")
     return len(rows)
 
 
 # ==================== ROUTE SELECTION (surgical) ====================
 
 def build_today_dest_configs(today_routes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    CONFIG remains authoritative. We treat CONFIG rows as destination rules.
-    We select unique destination_iata in priority order (first occurrence wins).
-    """
     seen: Set[str] = set()
     out: List[Dict[str, Any]] = []
     for r in today_routes:
@@ -437,11 +423,6 @@ def pick_origin_for_dest(
     allowed_pairs: Set[Tuple[str, str]],
     preferred_origin: str = "",
 ) -> Optional[str]:
-    """
-    Returns an origin that is allowed for this destination.
-    - If preferred_origin is provided (legacy CONFIG rows), try it first.
-    - Otherwise try candidate_origins in order.
-    """
     if preferred_origin:
         o = _clean_iata(preferred_origin)
         if not allowed_pairs or (o, dest) in allowed_pairs:
@@ -465,7 +446,6 @@ def main() -> int:
     if not sheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID/SHEET_ID")
 
-    # Theme-of-day (feeder intent)
     theme_today = low(os.getenv("THEME_OF_DAY") or "") or low(theme_of_day_utc())
     log(f"🎯 Theme of the day (UTC): {theme_today}")
 
@@ -480,20 +460,16 @@ def main() -> int:
 
     allowed_pairs, origin_city_map = load_route_capability_map(sh)
 
-    # Filter config rows to today theme (feeder intent)
     today_routes = [r for r in config_rows if low(r.get("theme", "")) == theme_today]
     if not today_routes:
         log(f"⚠️ No enabled CONFIG routes found for theme={theme_today}")
         return 0
 
-    # Sort by priority (lower number = higher priority)
     today_routes.sort(key=lambda r: float(r.get("priority", 9999) or 9999))
 
-    # === Surgical origin plan (theme/haul aware) ===
     planned_origins = origin_plan_for_theme(theme_today, ROUTES_PER_RUN)
     planned_origins = enforce_origin_diversity(planned_origins)
 
-    # Build destination configs (unique dests in priority order)
     dest_configs = build_today_dest_configs(today_routes)
 
     log(f"🧭 Planned origins for run: {planned_origins}")
@@ -502,8 +478,6 @@ def main() -> int:
     searches_done = 0
     all_deals: List[Dict[str, Any]] = []
 
-    # Build candidate origins list for fallback attempts (primary+fallback)
-    # This preserves reliability when a planned origin isn't allowed for a destination.
     theme_l = low(theme_today)
     if theme_l in LONG_HAUL_THEMES:
         full_origin_pool = LONG_HAUL_POOL[:]
@@ -512,11 +486,8 @@ def main() -> int:
     else:
         full_origin_pool = SHORT_HAUL_PRIMARY[:] + SHORT_HAUL_FALLBACK[:]
 
-    # Route selection loop (respect caps)
-    selected_routes: List[Tuple[str, str, Dict[str, Any]]] = []  # (origin, destination, config_row)
+    selected_routes: List[Tuple[str, str, Dict[str, Any]]] = []
 
-    # Try to select up to ROUTES_PER_RUN destinations, pairing with planned origins
-    # If (origin,dest) not allowed, try other origins from the pool (no extra searches; just swaps origin choice).
     di = 0
     oi = 0
     while len(selected_routes) < ROUTES_PER_RUN and di < len(dest_configs):
@@ -526,11 +497,10 @@ def main() -> int:
             di += 1
             continue
 
-        preferred_origin = _clean_iata(cfg.get("origin_iata"))  # legacy support; may be blank
+        preferred_origin = _clean_iata(cfg.get("origin_iata"))
         planned_origin = planned_origins[oi % len(planned_origins)] if planned_origins else ""
         oi += 1
 
-        # Try preferred (if CONFIG set), else planned, else pool fallback
         candidate_try_order = []
         if planned_origin:
             candidate_try_order.append(planned_origin)
@@ -552,7 +522,6 @@ def main() -> int:
         log("⚠️ No valid (origin,destination) pairs after capability filtering.")
         return 0
 
-    # Execute searches for selected routes
     for origin, destination, r in selected_routes:
         if searches_done >= MAX_SEARCHES_PER_RUN:
             break
@@ -564,14 +533,12 @@ def main() -> int:
         trip_len = int(r.get("trip_length_days") or DEFAULT_TRIP_LENGTH_DAYS)
         max_conn = int(r.get("max_connections") or 0)
 
-        # choose travel dates deterministically per route/day
         seed = f"{dt.datetime.utcnow().date().isoformat()}|{origin}|{destination}|{trip_len}"
         hsh = int(hashlib.md5(seed.encode()).hexdigest()[:8], 16)
         dep_offset = days_min + (hsh % max(1, (days_max - days_min + 1)))
         dep_date = (dt.datetime.utcnow().date() + dt.timedelta(days=dep_offset))
         ret_date = (dep_date + dt.timedelta(days=trip_len))
 
-        # Duffel payload
         payload = {
             "data": {
                 "slices": [
@@ -597,39 +564,27 @@ def main() -> int:
         if not offers:
             continue
 
-        # Take a small sample of offers for free tier yield
         for off in offers[: min(10, MAX_INSERTS_TOTAL - len(all_deals))]:
             try:
                 total_amount = float(off.get("total_amount") or "0")
             except Exception:
                 total_amount = 0.0
 
-            # Build seed for stable deal_id
             deal_id_seed = f"{origin}->{destination}|{dep_date.isoformat()}|{ret_date.isoformat()}|{total_amount}"
             deal = {
-                # status lifecycle
                 "status": "NEW",
-
-                # theme (write both for compatibility)
                 "deal_theme": theme_today,
                 "theme": theme_today,
-
-                # identifiers
                 "deal_id": str(abs(hash(deal_id_seed))),
-
-                # route
                 "origin_iata": origin,
-                "origin_city": resolve_origin_city(origin, origin_city_map),  # map->fallback
+                "origin_city": resolve_origin_city(origin, origin_city_map),
                 "destination_iata": destination,
 
-                # dates
-                "outbound_date": dep_date.strftime("%d/%m/%Y"),
-                "return_date": ret_date.strftime("%d/%m/%Y"),
+                # ✅ surgical: write ISO to stop date flips
+                "outbound_date": dep_date.strftime("%Y-%m-%d"),
+                "return_date": ret_date.strftime("%Y-%m-%d"),
 
-                # price
                 "price_gbp": math.ceil(total_amount) if total_amount else "",
-
-                # placeholders downstream may fill
                 "destination_city": "",
                 "destination_country": "",
                 "graphic_url": "",

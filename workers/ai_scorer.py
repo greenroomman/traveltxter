@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone, timedelta
 
 import gspread
+from gspread.cell import Cell
 from google.oauth2.service_account import Credentials
 
 
@@ -11,16 +12,15 @@ RAW_DEALS_TAB = os.environ.get("RAW_DEALS_TAB", "RAW_DEALS")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 GCP_SA_JSON_ONE_LINE = os.environ.get("GCP_SA_JSON_ONE_LINE")
 
-# Run controls (your workflow already sets these; defaults are safe)
+RAW_DEALS_VIEW_TAB = os.environ.get("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
+ZONE_THEME_BENCHMARKS_TAB = os.environ.get("ZONE_THEME_BENCHMARKS_TAB", "ZONE_THEME_BENCHMARKS")
+
 MAX_ROWS_PER_RUN = int(os.environ.get("MAX_ROWS_PER_RUN", 50))
-WINNERS_PER_RUN = int(os.environ.get("WINNERS_PER_RUN", 3))  # can be overridden by env
+WINNERS_PER_RUN = int(os.environ.get("WINNERS_PER_RUN", 1))  # workflow currently sets 1 :contentReference[oaicite:2]{index=2}
 VARIETY_LOOKBACK_HOURS = int(os.environ.get("VARIETY_LOOKBACK_HOURS", 120))
 DEST_REPEAT_PENALTY = int(os.environ.get("DEST_REPEAT_PENALTY", 80))
 THEME_REPEAT_PENALTY = int(os.environ.get("THEME_REPEAT_PENALTY", 30))
 HARD_BLOCK_BAD_DEALS = os.environ.get("HARD_BLOCK_BAD_DEALS", "true").lower() == "true"
-
-RAW_DEALS_VIEW_TAB = os.environ.get("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
-ZONE_THEME_BENCHMARKS_TAB = os.environ.get("ZONE_THEME_BENCHMARKS_TAB", "ZONE_THEME_BENCHMARKS")
 
 NOW = datetime.now(timezone.utc)
 
@@ -94,38 +94,24 @@ def _stringify_id(v):
 
 
 def _build_deal_id_row_map(raw_records, raw_headers):
-    """
-    Returns:
-      deal_id_key: column header used in RAW_DEALS
-      mapping: {deal_id_str: row_number_int}
-    """
-    # Try common deal id column names (must match your sheet)
     candidates = ["deal_id", "dealid", "id", "offer_id", "duffel_offer_id"]
     deal_id_key = None
     for c in candidates:
         if c in raw_headers:
             deal_id_key = c
             break
-
     if not deal_id_key:
-        raise RuntimeError(
-            f"RAW_DEALS is missing a deal id column. Tried: {candidates}"
-        )
+        raise RuntimeError(f"RAW_DEALS missing deal id column. Tried: {candidates}")
 
     mapping = {}
-    # raw_records aligns with sheet rows starting at row 2
-    for i, r in enumerate(raw_records, start=2):
+    for i, r in enumerate(raw_records, start=2):  # row 2 = first data row
         did = _stringify_id(r.get(deal_id_key))
         if did:
             mapping[did] = i
-
     return deal_id_key, mapping
 
 
 def _compute_variety_penalties(raw_records, candidate_view_row):
-    """
-    Uses RAW_DEALS history to apply fatigue penalties.
-    """
     cutoff = NOW - timedelta(hours=VARIETY_LOOKBACK_HOURS)
 
     cand_dest = (
@@ -166,28 +152,18 @@ def _compute_variety_penalties(raw_records, candidate_view_row):
         if cand_theme and r_theme and str(r_theme).strip().lower() == str(cand_theme).strip().lower():
             theme_hits += 1
 
-    # "Prevent same destination more than twice" -> apply penalty if already >=2 hits
     dest_penalty = DEST_REPEAT_PENALTY if dest_hits >= 2 else 0
-    # Theme fatigue softer
     theme_penalty = THEME_REPEAT_PENALTY if theme_hits >= 3 else 0
-
     return dest_penalty, theme_penalty
 
 
 def _worthiness_from_view(row):
-    """
-    Prefer the spreadsheet brain if present:
-      - worthiness_score / price_value_score etc.
-      - worthiness_verdict / verdict if present
-    Otherwise fall back to conservative heuristics.
-    """
     score_key = _first_present_key(row, ["worthiness_score", "price_value_score", "value_score"])
     verdict_key = _first_present_key(row, ["worthiness_verdict", "verdict"])
 
     if score_key:
         score = _safe_float(row.get(score_key), 0.0)
-        verdict = (row.get(verdict_key) if verdict_key else "") or ""
-        verdict = verdict.strip()
+        verdict = ((row.get(verdict_key) if verdict_key else "") or "").strip()
 
         if not verdict:
             if score >= 85:
@@ -202,7 +178,6 @@ def _worthiness_from_view(row):
         why = row.get("why_good") or row.get("why") or row.get("insight") or ""
         return score, verdict, str(why)[:500]
 
-    # fallback heuristic
     price_key = _first_present_key(row, ["price_gbp", "price", "total_price"])
     normal_key = _first_present_key(row, ["normal_price", "benchmark_normal_price", "normal_price_gbp"])
 
@@ -221,19 +196,25 @@ def _worthiness_from_view(row):
     return 10.0, "⏸ HOLD", "No benchmark normal price available"
 
 
-def _update_cells(ws, updates, colmap):
+def _batch_write_cells(ws, row_updates, colmap):
     """
-    updates: list of (row_number, {header: value})
-    Uses update_cell to avoid gspread range quirks.
+    row_updates: list of (row_number, {header:value})
+    Uses ONE batch call via update_cells (fixes 429 quota).
     """
-    calls = 0
-    for row_num, data in updates:
+    cells = []
+    for row_num, data in row_updates:
         for header, value in data.items():
-            if header not in colmap:
+            col = colmap.get(header)
+            if not col:
                 continue
-            ws.update_cell(row_num, colmap[header], value)
-            calls += 1
-    return calls
+            cells.append(Cell(row=row_num, col=col, value=value))
+
+    if not cells:
+        return 0
+
+    # This is a single Sheets API batchUpdate call
+    ws.update_cells(cells, value_input_option="RAW")
+    return len(cells)
 
 
 def main():
@@ -258,13 +239,10 @@ def main():
 
     raw_headers = _headers(ws_raw)
     raw_colmap = _col_idx_map(raw_headers)
-
     raw_records = ws_raw.get_all_records()
 
-    # Build mapping from RAW_DEALS deal_id -> sheet row number
-    deal_id_key_raw, deal_id_to_rownum = _build_deal_id_row_map(raw_records, raw_headers)
+    _, deal_id_to_rownum = _build_deal_id_row_map(raw_records, raw_headers)
 
-    # Find deal id key in view
     if not view_rows:
         _log("RAW_DEALS_VIEW empty. Exiting.")
         return
@@ -275,7 +253,7 @@ def main():
             deal_id_key_view = c
             break
     if not deal_id_key_view:
-        raise RuntimeError("RAW_DEALS_VIEW is missing a deal id column (expected deal_id/id/offer_id variants)")
+        raise RuntimeError("RAW_DEALS_VIEW missing a deal id column (deal_id/id/offer_id variants)")
 
     new = [r for r in view_rows if (r.get("status") or "").strip() == "NEW"]
     _log(f"Found NEW rows: {len(new)}")
@@ -286,7 +264,7 @@ def main():
     new = new[:MAX_ROWS_PER_RUN]
 
     scored_updates = []
-    scored_candidates = []
+    candidates = []
 
     for r in new:
         deal_id = _stringify_id(r.get(deal_id_key_view))
@@ -295,7 +273,6 @@ def main():
 
         raw_row_number = deal_id_to_rownum.get(deal_id)
         if not raw_row_number:
-            # view may contain derived rows; if not present in raw, skip
             continue
 
         worthiness_score, verdict, why = _worthiness_from_view(r)
@@ -322,31 +299,26 @@ def main():
             )
         )
 
-        scored_candidates.append(
+        candidates.append(
             {
                 "raw_row_number": raw_row_number,
-                "deal_id": deal_id,
-                "worthiness_score": worthiness_score,
                 "deal_score": deal_score,
+                "worthiness_score": worthiness_score,
                 "verdict": verdict,
             }
         )
 
     _log("Batch writing columns: deal_score, dest_variety_score, theme_variety_score, scored_timestamp, why_good, ai_notes, worthiness_score, worthiness_verdict, status")
-    calls = _update_cells(ws_raw, scored_updates, raw_colmap)
-    _log(f"✅ Batch updates complete. update_cell calls used: {calls}")
+    n_cells = _batch_write_cells(ws_raw, scored_updates, raw_colmap)
+    _log(f"✅ Batch updates complete. cells written: {n_cells}")
 
-    publishable = [c for c in scored_candidates if c["verdict"] in ("🔥 ELITE", "✅ POST")]
+    publishable = [c for c in candidates if c["verdict"] in ("🔥 ELITE", "✅ POST")]
     publishable.sort(key=lambda x: x["deal_score"], reverse=True)
 
     winners = publishable[:WINNERS_PER_RUN]
 
-    status_updates = []
-    for w in winners:
-        status_updates.append((w["raw_row_number"], {"status": "READY_TO_POST"}))
-
-    if status_updates:
-        _update_cells(ws_raw, status_updates, raw_colmap)
+    status_updates = [(w["raw_row_number"], {"status": "READY_TO_POST"}) for w in winners]
+    _batch_write_cells(ws_raw, status_updates, raw_colmap)
 
     _log(f"✅ Winners promoted to READY_TO_POST: {len(status_updates)} (WINNERS_PER_RUN={WINNERS_PER_RUN})")
 

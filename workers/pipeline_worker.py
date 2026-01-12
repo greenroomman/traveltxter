@@ -1,67 +1,37 @@
+# workers/pipeline_worker.py
 #!/usr/bin/env python3
 """
-TravelTxter Pipeline Worker (Feeder) — ROUTE_CAPABILITY_MAP ENABLED (LOCKED)
+TravelTxter V4.5x — pipeline_worker.py (LOCKED)
 
-Reads:
-- CONFIG_ORIGIN_POOLS (origin_iata, priority, notes)
-- THEMES (theme, destination_iata, destination_city, destination_country, priority, notes)
-- CONFIG_SIGNALS (iata_hint, destination_city, destination_country, country_code, region, notes)
-- ROUTE_CAPABILITY_MAP (origin_city, origin_iata, destination_city, destination_iata)
+ROLE:
+- Reads CONFIG (enabled origins/themes) and THEMES (destination pools)
+- Applies ROUTE_CAPABILITY_MAP filtering
+- Calls Duffel to discover offers (capped for free tier)
+- Inserts NEW rows into RAW_DEALS (facts only)
+- NEVER publishes, NEVER renders, NEVER scores beyond supply heuristics
 
-Writes:
-- RAW_DEALS (header-mapped): NEW rows only
+This file is production-locked. Do not refactor unless the pipeline spine is changing.
 """
+
+from __future__ import annotations
 
 import os
 import json
+import time
+import math
 import random
 import datetime as dt
-from typing import Dict, Any, List, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# ==================== LOGGING ====================
+# ============================================================
+# Theme rotation (LOCKED — must match other workers)
+# ============================================================
 
-def log(msg: str) -> None:
-    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    print(f"{ts} | {msg}", flush=True)
-
-
-# ==================== ENV / CONSTANTS ====================
-
-# Sheet + auth
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID")
-GCP_SA_JSON_ONE_LINE = os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
-
-# Tabs (LOCKED: do not override with env to avoid silent miswiring)
-RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
-THEMES_TAB = "THEMES"
-ORIGINS_TAB = "CONFIG_ORIGIN_POOLS"
-SIGNALS_TAB = "CONFIG_SIGNALS"
-CAPABILITY_TAB = "ROUTE_CAPABILITY_MAP"
-
-# Duffel
-DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY")
-
-# Limits (LOCKED ENV VAR NAMES)
-MAX_SEARCHES = int(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "10"))
-MAX_INSERTS_TOTAL = int(os.getenv("DUFFEL_MAX_INSERTS", "50"))
-MAX_INSERTS_PER_SEARCH = int(os.getenv("DUFFEL_MAX_INSERTS_PER_SEARCH", "5"))
-
-# Variety constraints
-MIN_ORIGINS_LOADED = int(os.getenv("MIN_ORIGINS_LOADED", "5"))          # abort if fewer than this loaded
-MIN_ORIGIN_VARIETY = int(os.getenv("MIN_ORIGIN_VARIETY", "3"))         # must achieve >= this unique origins in selected routes
-
-# Date window
-DAYS_AHEAD_MIN = int(os.getenv("DAYS_AHEAD_MIN", "21"))
-DAYS_AHEAD_MAX = int(os.getenv("DAYS_AHEAD_MAX", "90"))
-TRIP_LEN_MIN = int(os.getenv("TRIP_LEN_MIN", "3"))
-TRIP_LEN_MAX = int(os.getenv("TRIP_LEN_MAX", "7"))
-
-# Canonical theme order (cycle)
 MASTER_THEMES = [
     "winter_sun",
     "summer_sun",
@@ -77,452 +47,310 @@ MASTER_THEMES = [
     "unexpected_value",
 ]
 
-# Optional: strict mode (default TRUE)
-STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lower() == "true")
+
+def log(msg: str) -> None:
+    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    print(f"{ts} | {msg}", flush=True)
 
 
-# ==================== SHEETS INIT ====================
-
-def init_sheets() -> gspread.Spreadsheet:
-    if not SPREADSHEET_ID:
-        raise RuntimeError("Missing SPREADSHEET_ID (or SHEET_ID)")
-    if not GCP_SA_JSON_ONE_LINE:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE (or GCP_SA_JSON)")
-
-    sa = json.loads(GCP_SA_JSON_ONE_LINE)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(sa, scopes=scopes)
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(SPREADSHEET_ID)
+def env_int(k: str, default: int) -> int:
+    v = os.getenv(k, "").strip()
+    return int(v) if v else int(default)
 
 
-# ==================== LOADERS ====================
-
-def _clean_iata(x: Any) -> str:
-    s = str(x or "").strip().upper()
-    return s
-
-def load_origins(sheet: gspread.Spreadsheet) -> List[Dict[str, Any]]:
-    ws = sheet.worksheet(ORIGINS_TAB)
-    rows = ws.get_all_records()
-    origins: List[Dict[str, Any]] = []
-
-    for r in rows:
-        iata = _clean_iata(r.get("origin_iata"))
-        if not iata:
-            continue
-        try:
-            pr = int(str(r.get("priority", "")).strip())
-        except Exception:
-            pr = 50
-        origins.append({"origin_iata": iata, "priority": pr, "notes": str(r.get("notes", "")).strip()})
-
-    # Dedup by iata keep highest priority
-    best: Dict[str, Dict[str, Any]] = {}
-    for o in origins:
-        cur = best.get(o["origin_iata"])
-        if not cur or o["priority"] > cur["priority"]:
-            best[o["origin_iata"]] = o
-
-    origins = list(best.values())
-    origins.sort(key=lambda x: x["priority"], reverse=True)
-
-    if len(origins) < MIN_ORIGINS_LOADED:
-        raise RuntimeError(f"Insufficient origins: {len(origins)} < {MIN_ORIGINS_LOADED}")
-
-    log(f"✓ Loaded {len(origins)} origins from {ORIGINS_TAB}")
-    log("  Origins: " + ", ".join([f"{o['origin_iata']}({o['priority']})" for o in origins[:20]]))
-    return origins
-
-def load_themes(sheet: gspread.Spreadsheet) -> Dict[str, List[Dict[str, Any]]]:
-    ws = sheet.worksheet(THEMES_TAB)
-    rows = ws.get_all_records()
-
-    themes: Dict[str, List[Dict[str, Any]]] = {}
-    for r in rows:
-        theme = str(r.get("theme", "")).strip()
-        dest = _clean_iata(r.get("destination_iata"))
-        if not theme or not dest:
-            continue
-        try:
-            pr = int(str(r.get("priority", "")).strip())
-        except Exception:
-            pr = 50
-
-        themes.setdefault(theme, []).append({
-            "destination_iata": dest,
-            "destination_city": str(r.get("destination_city", "")).strip(),
-            "destination_country": str(r.get("destination_country", "")).strip(),
-            "priority": pr,
-            "notes": str(r.get("notes", "")).strip(),
-        })
-
-    for t in themes:
-        # dedup dest keep highest priority
-        by_dest: Dict[str, Dict[str, Any]] = {}
-        for d in themes[t]:
-            cur = by_dest.get(d["destination_iata"])
-            if not cur or d["priority"] > cur["priority"]:
-                by_dest[d["destination_iata"]] = d
-        themes[t] = sorted(by_dest.values(), key=lambda x: x["priority"], reverse=True)
-
-    log(f"✓ Loaded THEMES for {len(themes)} themes")
-    return themes
-
-def load_config_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
-    ws = sheet.worksheet(SIGNALS_TAB)
-    rows = ws.get_all_records()
-
-    signals: Dict[str, Dict[str, Any]] = {}
-    for r in rows:
-        # tolerate legacy column names
-        iata = _clean_iata(r.get("iata_hint") or r.get("iata") or r.get("iata_code"))
-        if not iata:
-            continue
-        signals[iata] = {
-            "destination_city": str(r.get("destination_city", "")).strip(),
-            "destination_country": str(r.get("destination_country", "")).strip(),
-            "country_code": str(r.get("country_code", "")).strip().upper(),
-            "region": str(r.get("region", "")).strip().lower(),
-            "notes": str(r.get("notes", "")).strip(),
-        }
-
-    log(f"✓ Loaded {len(signals)} CONFIG_SIGNALS entries")
-    return signals
-
-def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str, str]], Dict[str, str]]:
-    """
-    Returns:
-      - allowed_pairs: set of (origin_iata, destination_iata)
-      - origin_city_map: origin_iata -> origin_city (best effort)
-    """
-    ws = sheet.worksheet(CAPABILITY_TAB)
-    rows = ws.get_all_records()
-
-    allowed: Set[Tuple[str, str]] = set()
-    origin_city_map: Dict[str, str] = {}
-
-    for r in rows:
-        o = _clean_iata(r.get("origin_iata"))
-        d = _clean_iata(r.get("destination_iata"))
-        oc = str(r.get("origin_city", "")).strip()
-
-        if o and d:
-            allowed.add((o, d))
-            if oc and o not in origin_city_map:
-                origin_city_map[o] = oc
-
-    if not allowed:
-        msg = f"{CAPABILITY_TAB} is empty or missing required headers"
-        if STRICT_CAPABILITY_MAP:
-            raise RuntimeError(msg)
-        log(f"⚠️ {msg} — continuing WITHOUT capability filtering (not recommended).")
-
-    log(f"✓ Loaded {len(allowed)} allowed route pairs from {CAPABILITY_TAB}")
-    return allowed, origin_city_map
+def env_float(k: str, default: float) -> float:
+    v = os.getenv(k, "").strip()
+    return float(v) if v else float(default)
 
 
-# ==================== THEME SELECT ====================
-
-def select_theme_for_today(themes_dict: Dict[str, List[Dict[str, Any]]]) -> Tuple[str, List[Dict[str, Any]]]:
-    if not themes_dict:
-        raise RuntimeError("No themes available")
-
-    day_of_year = dt.datetime.utcnow().timetuple().tm_yday
-    idx = day_of_year % len(MASTER_THEMES)
-    selected = MASTER_THEMES[idx]
-
-    # find next theme with destinations if empty
-    for _ in range(len(MASTER_THEMES)):
-        if selected in themes_dict and themes_dict[selected]:
-            log(f"✓ Selected theme: {selected} ({len(themes_dict[selected])} destinations)")
-            return selected, themes_dict[selected]
-        idx = (idx + 1) % len(MASTER_THEMES)
-        selected = MASTER_THEMES[idx]
-
-    raise RuntimeError("No destinations in THEMES for any canonical theme")
+def env_str(k: str, default: str = "") -> str:
+    v = os.getenv(k, "").strip()
+    return v if v else default
 
 
-# ==================== SAMPLERS ====================
-
-def weighted_sample(items: List[Dict[str, Any]], n: int, key: str, weight_key: str) -> List[str]:
-    """Priority-weighted sampling without replacement."""
-    if not items:
-        return []
-    if len(items) <= n:
-        return [str(i[key]) for i in items]
-
-    pool = items[:]
-    weights = [max(1, int(i.get(weight_key, 1))) for i in pool]
-    chosen: List[str] = []
-
-    for _ in range(min(n, len(pool))):
-        total = sum(weights)
-        r = random.uniform(0, total)
-        cum = 0
-        pick_idx = None
-        for i, w in enumerate(weights):
-            cum += w
-            if r <= cum:
-                pick_idx = i
-                break
-        if pick_idx is None:
-            pick_idx = len(pool) - 1
-
-        chosen.append(str(pool[pick_idx][key]))
-        pool.pop(pick_idx)
-        weights.pop(pick_idx)
-
-    return chosen
-
-def build_routes_with_variety(
-    origin_pool: List[Dict[str, Any]],
-    dest_pool: List[Dict[str, Any]],
-    allowed_pairs: Set[Tuple[str, str]],
-    max_routes: int,
-    min_origin_variety: int
-) -> List[Tuple[str, str]]:
-    """
-    Build a candidate set from pools, filter by allowed_pairs,
-    then select up to max_routes ensuring >= min_origin_variety unique origins.
-    """
-    # Sample larger pools to avoid zip-bias
-    sampled_origins = weighted_sample(origin_pool, n=max_routes * 4, key="origin_iata", weight_key="priority")
-    sampled_dests = weighted_sample(dest_pool, n=max_routes * 6, key="destination_iata", weight_key="priority")
-
-    # Cartesian product -> filter by capability map
-    candidates = [(o, d) for o in sampled_origins for d in sampled_dests if o and d and o != d]
-    if allowed_pairs:
-        candidates = [r for r in candidates if r in allowed_pairs]
-
-    # Dedup + shuffle
-    candidates = list(dict.fromkeys(candidates))
-    random.shuffle(candidates)
-
-    if not candidates:
-        raise RuntimeError("No candidate routes after capability filtering. Check ROUTE_CAPABILITY_MAP vs THEMES/ORIGINS.")
-
-    # Select ensuring origin variety early
-    selected: List[Tuple[str, str]] = []
-    used_origins: Set[str] = set()
-
-    # First pass: force origin variety
-    for o, d in candidates:
-        if o in used_origins:
-            continue
-        selected.append((o, d))
-        used_origins.add(o)
-        if len(used_origins) >= min_origin_variety:
-            break
-
-    if len(used_origins) < min_origin_variety:
-        raise RuntimeError(f"Variety guarantee failed: {len(used_origins)} < {min_origin_variety}")
-
-    # Second pass: fill remaining slots
-    for o, d in candidates:
-        if len(selected) >= max_routes:
-            break
-        if (o, d) in selected:
-            continue
-        selected.append((o, d))
-
-    log(f"✓ Built {len(selected)} routes with {len(used_origins)} unique origins (min required {min_origin_variety})")
-    return selected
+def norm(s: str) -> str:
+    return (s or "").strip()
 
 
-# ==================== DUFFEL SEARCH ====================
+def low(s: str) -> str:
+    return norm(s).lower().replace(" ", "_")
 
-def duffel_search(origin: str, destination: str, out_date: str, in_date: str) -> List[Dict[str, Any]]:
-    if not DUFFEL_API_KEY:
+
+def today_theme_utc() -> str:
+    today = dt.datetime.utcnow().date()
+    doy = int(today.strftime("%j"))
+    return MASTER_THEMES[doy % len(MASTER_THEMES)]
+
+
+def parse_sa_json(raw: str) -> Dict[str, Any]:
+    raw = (raw or "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return json.loads(raw.replace("\\n", "\n"))
+
+
+def gs_client() -> gspread.Client:
+    raw = env_str("GCP_SA_JSON_ONE_LINE") or env_str("GCP_SA_JSON")
+    if not raw:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+    info = parse_sa_json(raw)
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    return gspread.authorize(creds)
+
+
+def duffel_headers() -> Dict[str, str]:
+    key = env_str("DUFFEL_API_KEY")
+    if not key:
         raise RuntimeError("Missing DUFFEL_API_KEY")
-
-    url = "https://api.duffel.com/air/offer_requests"
-    headers = {
-        "Authorization": f"Bearer {DUFFEL_API_KEY}",
-        "Duffel-Version": "v2",
+    return {
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
+        "Duffel-Version": "v2",
     }
+
+
+def duffel_offer_request(origin: str, dest: str, out_date: str, in_date: str, max_connections: int) -> Dict[str, Any]:
+    url = "https://api.duffel.com/air/offer_requests"
     payload = {
         "data": {
             "slices": [
-                {"origin": origin, "destination": destination, "departure_date": out_date},
-                {"origin": destination, "destination": origin, "departure_date": in_date},
+                {"origin": origin, "destination": dest, "departure_date": out_date},
+                {"origin": dest, "destination": origin, "departure_date": in_date},
             ],
             "passengers": [{"type": "adult"}],
             "cabin_class": "economy",
+            "max_connections": max_connections,
         }
     }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code >= 300:
-        log(f"❌ Duffel error {r.status_code}: {r.text[:300]}")
-        return []
-
-    data = r.json().get("data", {})
-    offers = data.get("offers") or []
-    return offers
+    r = requests.post(url, headers=duffel_headers(), json=payload, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Duffel offer_requests failed: {r.status_code} {r.text[:400]}")
+    return r.json()
 
 
-# ==================== ENRICHMENT ====================
-
-def enrich_deal(deal: Dict[str, Any], themes_dict: Dict[str, List[Dict[str, Any]]], signals: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Priority: THEMES > CONFIG_SIGNALS for destination city/country."""
-    dest = deal.get("destination_iata", "")
-    theme = deal.get("deal_theme") or deal.get("theme") or ""
-
-    # THEMES lookup (theme-specific)
-    if theme and theme in themes_dict:
-        for d in themes_dict[theme]:
-            if d.get("destination_iata") == dest:
-                if d.get("destination_city"):
-                    deal["destination_city"] = d["destination_city"]
-                if d.get("destination_country"):
-                    deal["destination_country"] = d["destination_country"]
-                break
-
-    # CONFIG_SIGNALS fallback
-    if dest in signals:
-        if not deal.get("destination_city") and signals[dest].get("destination_city"):
-            deal["destination_city"] = signals[dest]["destination_city"]
-        if not deal.get("destination_country") and signals[dest].get("destination_country"):
-            deal["destination_country"] = signals[dest]["destination_country"]
-
-    return deal
+def duffel_offers(offer_request_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    url = f"https://api.duffel.com/air/offers?offer_request_id={offer_request_id}&limit={limit}"
+    r = requests.get(url, headers=duffel_headers(), timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Duffel offers fetch failed: {r.status_code} {r.text[:400]}")
+    j = r.json()
+    return (j.get("data") or [])
 
 
-# ==================== WRITE RAW_DEALS ====================
-
-def append_rows_header_mapped(ws, deals: List[Dict[str, Any]]) -> int:
-    if not deals:
-        return 0
-
-    headers = ws.row_values(1)
-    if not headers:
-        raise RuntimeError("RAW_DEALS header row is empty")
-
-    rows_to_append = []
-    for d in deals:
-        row = []
-        for h in headers:
-            row.append(d.get(h, ""))
-        rows_to_append.append(row)
-
-    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-    return len(rows_to_append)
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip().replace("£", "").replace(",", "")
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
 
 
-# ==================== MAIN ====================
+def iso_now() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def load_sheet_rows(ws: gspread.Worksheet) -> Tuple[List[str], List[List[str]]]:
+    values = ws.get_all_values()
+    if not values:
+        return [], []
+    headers = [str(h).strip() for h in values[0]]
+    rows = values[1:]
+    return headers, rows
+
 
 def main() -> int:
-    log("=" * 80)
-    log("TRAVELTXTER PIPELINE WORKER — ROUTE_CAPABILITY_MAP ENABLED")
-    log("=" * 80)
-    log(f"MAX_SEARCHES={MAX_SEARCHES}, MAX_INSERTS_TOTAL={MAX_INSERTS_TOTAL}, MAX_INSERTS_PER_SEARCH={MAX_INSERTS_PER_SEARCH}")
-    log(f"Variety: MIN_ORIGINS_LOADED={MIN_ORIGINS_LOADED}, MIN_ORIGIN_VARIETY={MIN_ORIGIN_VARIETY}")
-    log(f"STRICT_CAPABILITY_MAP={STRICT_CAPABILITY_MAP}")
+    spreadsheet_id = env_str("SPREADSHEET_ID") or env_str("SHEET_ID")
+    if not spreadsheet_id:
+        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
 
-    sheet = init_sheets()
-    ws_raw = sheet.worksheet(RAW_DEALS_TAB)
+    raw_tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
+    max_inserts = env_int("DUFFEL_MAX_INSERTS", 15)
+    routes_per_run = env_int("DUFFEL_ROUTES_PER_RUN", 4)
+    max_searches = env_int("DUFFEL_MAX_SEARCHES_PER_RUN", 4)
+    days_ahead = env_int("DAYS_AHEAD", 60)
+    trip_len_min = env_int("TRIP_LEN_MIN", 3)
+    trip_len_max = env_int("TRIP_LEN_MAX", 7)
+    max_connections = env_int("MAX_CONNECTIONS", 1)
 
-    origins = load_origins(sheet)
-    themes_dict = load_themes(sheet)
-    signals = load_config_signals(sheet)
-    allowed_pairs, origin_city_map = load_route_capability_map(sheet)
+    gc = gs_client()
+    sh = gc.open_by_key(spreadsheet_id)
 
-    theme, theme_destinations = select_theme_for_today(themes_dict)
+    ws_raw = sh.worksheet(raw_tab)
+    ws_themes = sh.worksheet("THEMES")
+    ws_cap = sh.worksheet("ROUTE_CAPABILITY_MAP")
 
-    # Build routes (theme-driven + capability filtered)
-    routes = build_routes_with_variety(
-        origin_pool=origins,
-        dest_pool=theme_destinations,
-        allowed_pairs=allowed_pairs,
-        max_routes=MAX_SEARCHES,
-        min_origin_variety=MIN_ORIGIN_VARIETY
-    )
+    theme_today = today_theme_utc()
+    log(f"🎯 Theme of the day (UTC): {theme_today}")
 
-    log(f"✓ Routes for theme '{theme}': " + ", ".join([f"{o}->{d}" for o, d in routes[:12]]))
+    # Load destination pool for theme_today
+    th_headers, th_rows = load_sheet_rows(ws_themes)
+    th = {h: i for i, h in enumerate(th_headers)}
 
-    # Search + collect deals
-    all_deals: List[Dict[str, Any]] = []
-    searches_done = 0
-
-    for origin, destination in routes:
-        if searches_done >= MAX_SEARCHES:
-            break
-        if len(all_deals) >= MAX_INSERTS_TOTAL:
-            break
-
-        # Dates
-        depart_offset = random.randint(DAYS_AHEAD_MIN, DAYS_AHEAD_MAX)
-        trip_len = random.randint(TRIP_LEN_MIN, TRIP_LEN_MAX)
-        out_date = (dt.date.today() + dt.timedelta(days=depart_offset)).isoformat()
-        in_date = (dt.date.today() + dt.timedelta(days=depart_offset + trip_len)).isoformat()
-
-        log(f"Duffel: Searching {origin}->{destination} {out_date}/{in_date}")
-        offers = duffel_search(origin, destination, out_date, in_date)
-        searches_done += 1
-
-        if not offers:
+    dest_pool: List[Dict[str, str]] = []
+    for r in th_rows:
+        if low(r[th["theme"]] if th["theme"] < len(r) else "") != theme_today:
             continue
+        dest_pool.append({
+            "destination_iata": norm(r[th["destination_iata"]] if th["destination_iata"] < len(r) else ""),
+            "destination_city": norm(r[th["destination_city"]] if th["destination_city"] < len(r) else ""),
+            "destination_country": norm(r[th["destination_country"]] if th["destination_country"] < len(r) else ""),
+        })
 
-        # sort cheapest first
-        try:
-            offers = sorted(offers, key=lambda x: float(x.get("total_amount", "999999")))
-        except Exception:
-            pass
-
-        offers = offers[:MAX_INSERTS_PER_SEARCH]
-
-        for offer in offers:
-            if len(all_deals) >= MAX_INSERTS_TOTAL:
-                break
-
-            price = offer.get("total_amount", "")
-            deal_id_seed = f"{origin}{destination}{out_date}{offer.get('id','')}"
-            deal = {
-                # status lifecycle
-                "status": "NEW",
-
-                # theme (write both for compatibility)
-                "deal_theme": theme,
-                "theme": theme,
-
-                # identifiers
-                "deal_id": str(abs(hash(deal_id_seed))),
-
-                # route
-                "origin_iata": origin,
-                "origin_city": origin_city_map.get(origin, ""),  # from ROUTE_CAPABILITY_MAP
-                "destination_iata": destination,
-
-                # dates + price
-                "outbound_date": out_date,
-                "return_date": in_date,
-                "price_gbp": price,
-                "currency": offer.get("total_currency", "GBP"),
-
-                # friction proxy
-                "stops": max(0, len((offer.get("slices") or [{}])[0].get("segments") or []) - 1),
-
-                # timestamps (write both for compatibility)
-                "created_utc": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-                "inserted_utc": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-            }
-
-            # destination enrichment (THEMES > CONFIG_SIGNALS)
-            deal = enrich_deal(deal, themes_dict, signals)
-
-            all_deals.append(deal)
-
-    log(f"✓ Searches completed: {searches_done}")
-    log(f"✓ Deals collected: {len(all_deals)} (cap {MAX_INSERTS_TOTAL})")
-
-    if not all_deals:
-        log("⚠️ No deals found. (Not an error; depends on availability/prices.)")
+    if not dest_pool:
+        log("⚠️ No destinations found for theme today (THEMES tab). Exiting.")
         return 0
 
-    inserted = append_rows_header_mapped(ws_raw, all_deals)
-    log(f"✅ Inserted {inserted} rows into {RAW_DEALS_TAB}")
+    # Load route capability map (allowed origin/dest)
+    cap_headers, cap_rows = load_sheet_rows(ws_cap)
+    cap = {h: i for i, h in enumerate(cap_headers)}
+    allowed_pairs = set()
+    for r in cap_rows:
+        o = norm(r[cap.get("origin_iata", 0)] if cap.get("origin_iata", 0) < len(r) else "")
+        d = norm(r[cap.get("destination_iata", 1)] if cap.get("destination_iata", 1) < len(r) else "")
+        if o and d:
+            allowed_pairs.add((o, d))
+
+    # Load CONFIG origins for this theme (simple table: enabled/priority/theme/origin_iata)
+    cfg = sh.worksheet("CONFIG")
+    cfg_headers, cfg_rows = load_sheet_rows(cfg)
+    ci = {h: i for i, h in enumerate(cfg_headers)}
+    origins: List[str] = []
+    for r in cfg_rows:
+        enabled = r[ci["enabled"]] if ci["enabled"] < len(r) else ""
+        theme = low(r[ci["theme"]] if ci["theme"] < len(r) else "")
+        origin_iata = norm(r[ci["origin_iata"]] if ci["origin_iata"] < len(r) else "")
+        if str(enabled).strip().lower() in ("true", "yes", "1") and theme == theme_today and origin_iata:
+            origins.append(origin_iata)
+
+    if not origins:
+        log("⚠️ No enabled origins for today’s theme in CONFIG. Exiting.")
+        return 0
+
+    # Build candidate routes (origin × dest pool) filtered by allowed_pairs
+    routes: List[Tuple[str, Dict[str, str]]] = []
+    for o in origins:
+        for d in dest_pool:
+            di = d["destination_iata"]
+            if (o, di) in allowed_pairs:
+                routes.append((o, d))
+
+    random.shuffle(routes)
+    routes = routes[: max(1, routes_per_run)]
+    log(f"Built {len(routes)} candidate routes for theme={theme_today}")
+
+    # Prepare RAW_DEALS headers
+    raw_values = ws_raw.get_all_values()
+    if not raw_values:
+        raise RuntimeError("RAW_DEALS has no headers.")
+    raw_headers = [str(h).strip() for h in raw_values[0]]
+    rh = {h: i for i, h in enumerate(raw_headers)}
+
+    required_cols = [
+        "status","deal_id","price_gbp","origin_city","origin_iata","destination_country","destination_city","destination_iata",
+        "outbound_date","return_date","stops","deal_theme","created_utc","affiliate_url","currency","carriers","deeplink","theme",
+        "banked_utc","reason_banked",
+    ]
+    missing = [c for c in required_cols if c not in rh]
+    if missing:
+        raise RuntimeError(f"RAW_DEALS missing required columns: {missing}")
+
+    inserts: List[List[Any]] = []
+    searches_used = 0
+
+    for origin_iata, dest in routes:
+        if searches_used >= max_searches:
+            break
+
+        # choose dates
+        out = (dt.datetime.utcnow().date() + dt.timedelta(days=random.randint(14, days_ahead))).strftime("%Y-%m-%d")
+        trip_len = random.randint(trip_len_min, trip_len_max)
+        inn = (dt.datetime.strptime(out, "%Y-%m-%d").date() + dt.timedelta(days=trip_len)).strftime("%Y-%m-%d")
+
+        log(f"Duffel: Searching {origin_iata}->{dest['destination_iata']} {out}/{inn}")
+        searches_used += 1
+
+        try:
+            req = duffel_offer_request(origin_iata, dest["destination_iata"], out, inn, max_connections=max_connections)
+            offer_request_id = req["data"]["id"]
+            offers = duffel_offers(offer_request_id, limit=50)
+        except Exception as e:
+            log(f"❌ Duffel error: {e}")
+            continue
+
+        # Insert top offers (capped)
+        for off in offers:
+            if len(inserts) >= max_inserts:
+                break
+
+            total = safe_float(off.get("total_amount"))
+            if total is None:
+                continue
+
+            carriers = []
+            try:
+                carriers = [s.get("marketing_carrier", {}).get("name", "") for s in (off.get("slices") or [])]
+            except Exception:
+                carriers = []
+
+            stops = 0
+            try:
+                # crude: if any slice has >1 segment, count stops
+                for s in (off.get("slices") or []):
+                    segs = s.get("segments") or []
+                    if len(segs) > 1:
+                        stops = max(stops, len(segs) - 1)
+            except Exception:
+                stops = 0
+
+            deal_id = str(off.get("id") or f"{origin_iata}-{dest['destination_iata']}-{out}-{inn}-{total}")
+            row = [""] * len(raw_headers)
+
+            def setv(col: str, val: Any) -> None:
+                row[rh[col]] = val
+
+            setv("status", "NEW")
+            setv("deal_id", deal_id)
+            setv("price_gbp", round(float(total), 2))
+            setv("origin_city", "")  # optional; downstream can enrich
+            setv("origin_iata", origin_iata)
+            setv("destination_country", dest["destination_country"])
+            setv("destination_city", dest["destination_city"])
+            setv("destination_iata", dest["destination_iata"])
+            setv("outbound_date", out)
+            setv("return_date", inn)
+            setv("stops", int(stops))
+            setv("deal_theme", theme_today)
+            setv("created_utc", iso_now())
+            setv("currency", "GBP")
+            setv("carriers", ", ".join([c for c in carriers if c]))
+            setv("deeplink", "")  # link_router may fill later
+            setv("theme", theme_today)  # compatibility
+            setv("banked_utc", "")
+            setv("reason_banked", "")
+
+            inserts.append(row)
+
+        if len(inserts) >= max_inserts:
+            break
+
+    if not inserts:
+        log("No inserts.")
+        return 0
+
+    # Append to RAW_DEALS
+    ws_raw.append_rows(inserts, value_input_option="USER_ENTERED")
+    log(f"✅ Inserted {len(inserts)} NEW rows into RAW_DEALS. Searches used: {searches_used}")
     return 0
 
 

@@ -57,7 +57,7 @@ REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 
 DEMO_BASE_URL = (os.environ.get("DEMO_BASE_URL") or "").strip()
 if not DEMO_BASE_URL:
-    DEMO_BASE_URL = REDIRECT_BASE_URL or "https://traveltxter.co.uk/deal"
+    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or "https://traveltxter.com/deal"
 
 MAX_ROWS_PER_RUN = int(os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "20")
 

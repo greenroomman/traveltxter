@@ -62,7 +62,7 @@ REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 # ✅ Phase 2+ hardening: never allow empty base URL (prevents "https://?deal_id=...")
 DEMO_BASE_URL = (os.environ.get("DEMO_BASE_URL") or "").strip()
 if not DEMO_BASE_URL:
-    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or "http://traveltxter.co.uk/"
+    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or "http://traveltxter.com/"
 
 MAX_ROWS_PER_RUN = int(os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "20")
 

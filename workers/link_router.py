@@ -27,7 +27,7 @@ Duffel:
 - REDIRECT_BASE_URL (optional; used as Duffel link redirect_url if set)
 
 Demo fallback:
-- DEMO_BASE_URL (optional). If not set, uses REDIRECT_BASE_URL if present, else https://traveltxter.co.uk/deal
+- DEMO_BASE_URL (optional). If not set, uses REDIRECT_BASE_URL if present, else http://www.traveltxter.com/
 - The demo link is honest and deterministic (query params).
 """
 
@@ -59,10 +59,11 @@ DUFFEL_API_BASE = (os.environ.get("DUFFEL_API_BASE") or "https://api.duffel.com"
 DUFFEL_VERSION = (os.environ.get("DUFFEL_VERSION") or "v2").strip()  # must be v2
 REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 
-# ✅ Phase 2+ hardening: never allow empty base URL (prevents "https://?deal_id=...")
+# ✅ Hard guard: never allow empty base URL (prevents "https://?deal_id=...")
 DEMO_BASE_URL = (os.environ.get("DEMO_BASE_URL") or "").strip()
 if not DEMO_BASE_URL:
-    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or "http://traveltxter.com/"
+    # fall back to redirect base url if it is non-empty, else homepage
+    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or "http://www.traveltxter.com/"
 
 MAX_ROWS_PER_RUN = int(os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "20")
 
@@ -194,7 +195,6 @@ def _create_duffel_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: 
         return None
 
     if not (200 <= r.status_code < 300):
-        # Key behaviour: do NOT block pipeline; fall back to demo link
         snippet = _s(r.text)[:250]
         _log(f"❌ Duffel Links error {r.status_code}: {snippet}")
         return None
@@ -228,7 +228,10 @@ def _create_demo_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: s
         "src": "vip_demo",
     }
     qs = urlencode({k: v for k, v in params.items() if v})
-    base = (DEMO_BASE_URL or "").strip().rstrip("?") or "https://traveltxter.co.uk/deal"
+
+    # Ensure base is never empty; default to homepage.
+    base = (DEMO_BASE_URL or "").strip().rstrip("?") or "http://www.traveltxter.com/"
+
     if "?" in base:
         return f"{base}&{qs}"
     return f"{base}?{qs}"
@@ -254,7 +257,7 @@ def main() -> int:
 
     headers = _headers(ws)
 
-    # ✅ Phase 2+ hardening: shared schema validation (fail loud)
+    # ✅ Shared schema validation (fail loud; avoids silent column drift corruption)
     SheetContract.validate_schema(headers, required=[
         "status",
         "deal_id",
@@ -305,7 +308,6 @@ def main() -> int:
 
         link = _create_duffel_link(origin, dest, out_iso, in_iso)
         if not link:
-            # Always fall back to demo link to prevent dead VIP posts
             price_val = _s(r.get(price_col)) if price_col else ""
             link = _create_demo_link(deal_id, origin, dest, out_iso, in_iso, price_val)
             used_demo += 1

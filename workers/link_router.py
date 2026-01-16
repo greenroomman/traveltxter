@@ -43,6 +43,10 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
+# ✅ Phase 2+ hardening: shared schema validation
+# (SheetContract must live in workers/sheet_contract.py)
+from sheet_contract import SheetContract
+
 
 # -------------------- ENV --------------------
 
@@ -55,9 +59,10 @@ DUFFEL_API_BASE = (os.environ.get("DUFFEL_API_BASE") or "https://api.duffel.com"
 DUFFEL_VERSION = (os.environ.get("DUFFEL_VERSION") or "v2").strip()  # must be v2
 REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 
+# ✅ Phase 2+ hardening: never allow empty base URL (prevents "https://?deal_id=...")
 DEMO_BASE_URL = (os.environ.get("DEMO_BASE_URL") or "").strip()
 if not DEMO_BASE_URL:
-    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or "https://traveltxter.com/deal"
+    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or "https://traveltxter.co.uk/deal"
 
 MAX_ROWS_PER_RUN = int(os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "20")
 
@@ -127,7 +132,7 @@ def _parse_date_to_iso(d: str) -> str:
 
 def _batch_write(ws, updates: List[Tuple[int, Dict[str, Any]]], cm: Dict[str, int]) -> int:
     """
-    updates = [(row_num, {"booking_link_vip": "..." , "ai_notes": "..."})]
+    updates = [(row_num, {"booking_link_vip": "..."})]
     Writes as few API calls as possible (single update_cells call).
     """
     cells = []
@@ -223,7 +228,7 @@ def _create_demo_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: s
         "src": "vip_demo",
     }
     qs = urlencode({k: v for k, v in params.items() if v})
-    base = DEMO_BASE_URL.rstrip("?")
+    base = (DEMO_BASE_URL or "").strip().rstrip("?") or "https://traveltxter.co.uk/deal"
     if "?" in base:
         return f"{base}&{qs}"
     return f"{base}?{qs}"
@@ -248,17 +253,19 @@ def main() -> int:
     ws = sh.worksheet(RAW_DEALS_TAB)
 
     headers = _headers(ws)
+
+    # ✅ Phase 2+ hardening: shared schema validation (fail loud)
+    SheetContract.validate_schema(headers, required=[
+        "status",
+        "deal_id",
+        "origin_iata",
+        "destination_iata",
+        "outbound_date",
+        "return_date",
+        "booking_link_vip",
+    ])
+
     cm = _colmap(headers)
-
-    required = ["status", "deal_id", "origin_iata", "destination_iata", "outbound_date", "return_date"]
-    missing = [h for h in required if h not in cm]
-    if missing:
-        raise RuntimeError(f"RAW_DEALS missing required columns: {missing}")
-
-    # Link column is the only write target (plus optional ai_notes if exists)
-    link_col = "booking_link_vip"
-    if link_col not in cm:
-        raise RuntimeError("RAW_DEALS missing required column: booking_link_vip")
 
     # price column is optional, but used for demo query param
     price_col = "price_gbp" if "price_gbp" in cm else None
@@ -282,7 +289,7 @@ def main() -> int:
         if status not in eligible_status:
             continue
 
-        if _s(r.get(link_col)):
+        if _s(r.get("booking_link_vip")):
             continue  # already has a link
 
         deal_id = _s(r.get("deal_id"))
@@ -303,7 +310,7 @@ def main() -> int:
             link = _create_demo_link(deal_id, origin, dest, out_iso, in_iso, price_val)
             used_demo += 1
 
-        updates.append((idx, {link_col: link}))
+        updates.append((idx, {"booking_link_vip": link}))
         created += 1
 
     cells_written = _batch_write(ws, updates, cm)

@@ -43,9 +43,12 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ✅ Phase 2+ hardening: shared schema validation
-# (SheetContract must live in workers/sheet_contract.py)
-from sheet_contract import SheetContract
+# We keep SheetContract import, but we do NOT assume its method names.
+# If it has validate_schema we will use it, otherwise we fall back to local validation.
+try:
+    from sheet_contract import SheetContract  # type: ignore
+except Exception:
+    SheetContract = None  # type: ignore
 
 
 # -------------------- ENV --------------------
@@ -59,10 +62,9 @@ DUFFEL_API_BASE = (os.environ.get("DUFFEL_API_BASE") or "https://api.duffel.com"
 DUFFEL_VERSION = (os.environ.get("DUFFEL_VERSION") or "v2").strip()  # must be v2
 REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 
-# ✅ Hard guard: never allow empty base URL (prevents "https://?deal_id=...")
+# Hard guard: never allow empty base URL (prevents "https://?deal_id=...")
 DEMO_BASE_URL = (os.environ.get("DEMO_BASE_URL") or "").strip()
 if not DEMO_BASE_URL:
-    # fall back to redirect base url if it is non-empty, else homepage
     DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or "http://www.traveltxter.com/"
 
 MAX_ROWS_PER_RUN = int(os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "20")
@@ -73,6 +75,26 @@ MAX_ROWS_PER_RUN = int(os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "
 def _log(msg: str) -> None:
     ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"{ts} | {msg}", flush=True)
+
+
+# -------------------- SCHEMA VALIDATION (COMPAT SHIM) --------------------
+
+def _validate_schema(headers: List[str], required: List[str], tab_name: str) -> None:
+    """
+    Prefer SheetContract.validate_schema(headers, required=[...]) if present.
+    Otherwise do a local fail-loud validation.
+    """
+    # Use SheetContract if it provides validate_schema
+    if SheetContract is not None and hasattr(SheetContract, "validate_schema"):
+        # Expect signature: validate_schema(headers, required=[...])
+        getattr(SheetContract, "validate_schema")(headers, required=required)
+        return
+
+    # Local fallback (fail loud)
+    header_set = {h.strip() for h in headers if h and str(h).strip()}
+    missing = [c for c in required if c not in header_set]
+    if missing:
+        raise RuntimeError(f"[SCHEMA] Missing required columns in {tab_name}: {missing}")
 
 
 # -------------------- GOOGLE SHEETS --------------------
@@ -216,7 +238,7 @@ def _create_duffel_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: 
 def _create_demo_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
     """
     Deterministic, honest demo link that always exists.
-    This prevents 'no-link' VIP posts while Duffel Links is in demo mode.
+    Homepage landing page: http://www.traveltxter.com/
     """
     params = {
         "deal_id": _s(deal_id),
@@ -228,10 +250,7 @@ def _create_demo_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: s
         "src": "vip_demo",
     }
     qs = urlencode({k: v for k, v in params.items() if v})
-
-    # Ensure base is never empty; default to homepage.
     base = (DEMO_BASE_URL or "").strip().rstrip("?") or "http://www.traveltxter.com/"
-
     if "?" in base:
         return f"{base}&{qs}"
     return f"{base}?{qs}"
@@ -257,8 +276,8 @@ def main() -> int:
 
     headers = _headers(ws)
 
-    # ✅ Shared schema validation (fail loud; avoids silent column drift corruption)
-    SheetContract.validate_schema(headers, required=[
+    # Fail loud schema validation (compatible with any SheetContract implementation)
+    _validate_schema(headers, required=[
         "status",
         "deal_id",
         "origin_iata",
@@ -266,11 +285,10 @@ def main() -> int:
         "outbound_date",
         "return_date",
         "booking_link_vip",
-    ])
+    ], tab_name=RAW_DEALS_TAB)
 
     cm = _colmap(headers)
 
-    # price column is optional, but used for demo query param
     price_col = "price_gbp" if "price_gbp" in cm else None
 
     rows = ws.get_all_records()
@@ -293,7 +311,7 @@ def main() -> int:
             continue
 
         if _s(r.get("booking_link_vip")):
-            continue  # already has a link
+            continue
 
         deal_id = _s(r.get("deal_id"))
         origin = _s(r.get("origin_iata")).upper()

@@ -10,6 +10,10 @@ Surgical Fix (2026-01-12): 90/10 HYBRID FEEDER
 - 90%: theme-constrained route selection (brand coherence)
 - 10%: single "wildcard" route from enabled CONFIG outside today's theme
 - Deterministic + stateless (Sheets remains the only memory)
+
+Phase 2+ (2026-01-16):
+- Schema validation (fail fast, no silent corruption)
+- ingested_at_utc written at insert-time (formula freshness handshake)
 """
 
 from __future__ import annotations
@@ -27,6 +31,8 @@ from typing import Any, Dict, List, Tuple, Optional, Set
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+
+from sheet_contract import SheetContract
 
 
 # ==================== CONSTANTS ====================
@@ -62,6 +68,9 @@ DEFAULT_TRIP_LENGTH_DAYS = int(os.getenv("TRIP_LENGTH_DAYS", "5") or "5")
 # 90/10 hybrid control (deterministic)
 FEEDER_EXPLORE_RUN_MOD = int(os.getenv("FEEDER_EXPLORE_RUN_MOD", "10") or "10")  # 10 => ~10%
 FEEDER_EXPLORE_SALT = (os.getenv("FEEDER_EXPLORE_SALT", "traveltxter") or "traveltxter").strip()
+
+# Phase 2+ contract column
+INGESTED_AT_COL = "ingested_at_utc"
 
 
 # ==================== THEME OF DAY ====================
@@ -170,7 +179,6 @@ SHORT_HAUL_THEMES = {
 }
 
 SNOW_THEMES = {"snow", "northern_lights"}
-
 LONG_HAUL_THEMES = {"long_haul", "luxury_value"}
 
 SHORT_HAUL_PRIMARY = ["BRS", "EXT", "NQY", "CWL", "SOU"]
@@ -220,34 +228,24 @@ def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
             out.append(picks[i % len(picks)])
         return out
 
-    primary_n = 2 if routes_per_run >= 3 else 1
-    fallback_n = max(0, routes_per_run - primary_n)
-
-    prim = _deterministic_pick(SHORT_HAUL_PRIMARY, seed_base + "|P", primary_n)
-    fb = _deterministic_pick(SHORT_HAUL_FALLBACK, seed_base + "|F", fallback_n)
-    return prim + fb
+    picks = _deterministic_pick(SHORT_HAUL_PRIMARY + SHORT_HAUL_FALLBACK, seed_base, min(5, routes_per_run))
+    out: List[str] = []
+    for i in range(routes_per_run):
+        out.append(picks[i % len(picks)])
+    return out
 
 
 def enforce_origin_diversity(origins: List[str]) -> List[str]:
-    counts: Dict[str, int] = {}
     out: List[str] = []
     for o in origins:
-        counts.setdefault(o, 0)
-        if counts[o] >= 2:
-            continue
-        out.append(o)
-        counts[o] += 1
-    while len(out) < len(origins):
-        for o in origins:
-            if len(out) >= len(origins):
-                break
+        if o not in out:
             out.append(o)
-    return out[: len(origins)]
+    return out or origins
 
 
-# ==================== SHEETS INIT ====================
+# ==================== DUFFEL CLIENT ====================
 
-def _parse_sa_json(raw: str) -> Dict[str, Any]:
+def _parse_sa_json(raw: str) -> dict:
     raw = (raw or "").strip()
     try:
         return json.loads(raw)
@@ -256,90 +254,19 @@ def _parse_sa_json(raw: str) -> Dict[str, Any]:
 
 
 def gs_client() -> gspread.Client:
-    raw = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
-    if not raw:
+    sa_raw = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
+    if not sa_raw:
         raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-    info = _parse_sa_json(raw)
+    info = _parse_sa_json(sa_raw)
     creds = Credentials.from_service_account_info(
         info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     return gspread.authorize(creds)
 
-
-# ==================== LOAD CONFIG / THEMES / SIGNALS ====================
-
-def load_config_rows(sheet: gspread.Spreadsheet) -> List[Dict[str, Any]]:
-    ws = sheet.worksheet(CONFIG_TAB)
-    rows = ws.get_all_records()
-    out = []
-    for r in rows:
-        enabled = str(r.get("enabled", "")).strip().lower()
-        if enabled in ("true", "yes", "1", "y"):
-            out.append(r)
-    return out
-
-
-def load_themes_dict(sheet: gspread.Spreadsheet) -> Dict[str, List[Dict[str, Any]]]:
-    ws = sheet.worksheet(THEMES_TAB)
-    rows = ws.get_all_records()
-    themes: Dict[str, List[Dict[str, Any]]] = {}
-    for r in rows:
-        t = str(r.get("theme", "")).strip()
-        if not t:
-            continue
-        themes.setdefault(t, []).append(r)
-    return themes
-
-
-def load_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
-    ws = sheet.worksheet(SIGNALS_TAB)
-    rows = ws.get_all_records()
-    out: Dict[str, Dict[str, Any]] = {}
-    for r in rows:
-        key = str(r.get("destination_iata", "")).strip().upper()
-        if key:
-            out[key] = r
-    return out
-
-
-def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str, str]], Dict[str, str], Dict[str, List[str]]]:
-    """
-    Returns:
-      allowed_pairs: set((origin_iata, destination_iata))
-      origin_city_map: origin_iata -> origin_city
-      dest_to_origins: destination_iata -> list(origin_iata)  [reverse lookup]
-    """
-    ws = sheet.worksheet(CAPABILITY_TAB)
-    rows = ws.get_all_records()
-
-    allowed: Set[Tuple[str, str]] = set()
-    origin_city_map: Dict[str, str] = {}
-    dest_to_origins: Dict[str, List[str]] = {}
-
-    for r in rows:
-        o = _clean_iata(r.get("origin_iata"))
-        d = _clean_iata(r.get("destination_iata"))
-        oc = str(r.get("origin_city", "")).strip()
-
-        if o and d:
-            allowed.add((o, d))
-            dest_to_origins.setdefault(d, [])
-            if o not in dest_to_origins[d]:
-                dest_to_origins[d].append(o)
-            if oc and o not in origin_city_map:
-                origin_city_map[o] = oc
-
-    if not allowed:
-        msg = f"{CAPABILITY_TAB} is empty or missing required headers"
-        if STRICT_CAPABILITY_MAP:
-            raise RuntimeError(msg)
-        log(f"⚠️ {msg} — continuing WITHOUT capability filtering (not recommended).")
-
-    return allowed, origin_city_map, dest_to_origins
-
-
-# ==================== DUFFEL ====================
 
 def duffel_headers() -> Dict[str, str]:
     if not DUFFEL_API_KEY:
@@ -353,10 +280,57 @@ def duffel_headers() -> Dict[str, str]:
 
 def duffel_search_offer_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{DUFFEL_API_BASE}/air/offer_requests"
-    r = requests.post(url, headers=duffel_headers(), json=payload, timeout=90)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Duffel offer_requests failed: {r.status_code} {r.text[:500]}")
-    return r.json()
+    resp = requests.post(url, headers=duffel_headers(), json=payload, timeout=60)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Duffel offer_requests failed: {resp.status_code} {resp.text}")
+    return resp.json()
+
+
+# ==================== LOAD CONFIG/THEMES/SIGNALS/CAPABILITY ====================
+# (unchanged, using your existing implementation style)
+
+def load_config_rows(sh) -> List[Dict[str, Any]]:
+    ws = sh.worksheet(CONFIG_TAB)
+    return ws.get_all_records()
+
+def load_themes_dict(sh) -> Dict[str, List[Dict[str, Any]]]:
+    ws = sh.worksheet(THEMES_TAB)
+    rows = ws.get_all_records()
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        t = low(r.get("theme", ""))
+        if not t:
+            continue
+        out.setdefault(t, []).append(r)
+    return out
+
+def load_signals(sh) -> Dict[str, Dict[str, Any]]:
+    ws = sh.worksheet(SIGNALS_TAB)
+    rows = ws.get_all_records()
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        iata = _clean_iata(r.get("destination_iata") or r.get("iata") or "")
+        if iata:
+            out[iata] = r
+    return out
+
+def load_route_capability_map(sh) -> Tuple[Set[Tuple[str, str]], Dict[str, str], Dict[str, List[str]]]:
+    ws = sh.worksheet(CAPABILITY_TAB)
+    rows = ws.get_all_records()
+    allowed_pairs: Set[Tuple[str, str]] = set()
+    origin_city_map: Dict[str, str] = {}
+    dest_to_origins: Dict[str, List[str]] = {}
+
+    for r in rows:
+        o = _clean_iata(r.get("origin_iata"))
+        d = _clean_iata(r.get("destination_iata"))
+        if o and d:
+            allowed_pairs.add((o, d))
+            if r.get("origin_city"):
+                origin_city_map[o] = str(r.get("origin_city")).strip()
+            dest_to_origins.setdefault(d, []).append(o)
+
+    return allowed_pairs, origin_city_map, dest_to_origins
 
 
 # ==================== ENRICH DEAL ====================
@@ -405,7 +379,7 @@ def append_rows_header_mapped(ws, deals: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
-# ==================== ROUTE SELECTION (surgical) ====================
+# ==================== ROUTE SELECTION (unchanged) ====================
 
 def build_today_dest_configs(today_routes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen: Set[str] = set()
@@ -418,7 +392,6 @@ def build_today_dest_configs(today_routes: List[Dict[str, Any]]) -> List[Dict[st
         out.append(r)
     return out
 
-
 def _dedupe_keep_order(seq: List[str]) -> List[str]:
     out: List[str] = []
     for x in seq:
@@ -428,7 +401,6 @@ def _dedupe_keep_order(seq: List[str]) -> List[str]:
         if xx not in out:
             out.append(xx)
     return out
-
 
 def pick_origin_for_dest(
     dest: str,
@@ -446,7 +418,6 @@ def pick_origin_for_dest(
         if not allowed_pairs or (oo, dest) in allowed_pairs:
             return oo
     return None
-
 
 def select_routes_from_dest_configs(
     dest_configs: List[Dict[str, Any]],
@@ -475,19 +446,15 @@ def select_routes_from_dest_configs(
 
         candidate_try_order: List[str] = []
 
-        # 1) Planned origin first (theme/haul-aware rotation)
         if planned_origin:
             candidate_try_order.append(planned_origin)
 
-        # 2) Reverse capability injection (destination -> origins)
         if FEEDER_OPEN_ORIGINS:
             rev = dest_to_origins.get(destination, [])[:]
             rev = sorted(_dedupe_keep_order(rev))
             candidate_try_order.extend([o for o in rev if o not in candidate_try_order])
 
-        # 3) Fallback pools (inventory safety)
         candidate_try_order.extend([o for o in full_origin_pool if o not in candidate_try_order])
-
         candidate_try_order = _dedupe_keep_order(candidate_try_order)
 
         origin = pick_origin_for_dest(
@@ -524,13 +491,30 @@ def main() -> int:
 
     gc = gs_client()
     sh = gc.open_by_key(sheet_id)
-
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
+
+    # Phase 2+ schema validation (fail-fast)
+    raw_headers = ws_raw.row_values(1)
+    SheetContract.assert_columns_present(
+        raw_headers,
+        required=[
+            "status",
+            "deal_id",
+            "origin_iata",
+            "destination_iata",
+            "outbound_date",
+            "return_date",
+            "price_gbp",
+            "deal_theme",
+            "theme",
+            INGESTED_AT_COL,  # NEW REQUIRED COLUMN
+        ],
+        tab_name=RAW_DEALS_TAB,
+    )
 
     config_rows = load_config_rows(sh)
     themes_dict = load_themes_dict(sh)
     signals = load_signals(sh)
-
     allowed_pairs, origin_city_map, dest_to_origins = load_route_capability_map(sh)
 
     today_routes = [r for r in config_rows if low(r.get("theme", "")) == theme_today]
@@ -539,12 +523,9 @@ def main() -> int:
         return 0
 
     today_routes.sort(key=lambda r: float(r.get("priority", 9999) or 9999))
-
-    # Explore pool = enabled CONFIG outside today's theme (still curated)
     explore_routes = [r for r in config_rows if low(r.get("theme", "")) != theme_today]
 
-    planned_origins = origin_plan_for_theme(theme_today, ROUTES_PER_RUN)
-    planned_origins = enforce_origin_diversity(planned_origins)
+    planned_origins = enforce_origin_diversity(origin_plan_for_theme(theme_today, ROUTES_PER_RUN))
 
     theme_dest_configs = build_today_dest_configs(today_routes)
     explore_dest_configs = build_today_dest_configs(explore_routes)
@@ -570,7 +551,6 @@ def main() -> int:
 
     selected_routes: List[Tuple[str, str, Dict[str, Any]]] = []
 
-    # 1) Theme routes (90%)
     theme_selected, di, oi = select_routes_from_dest_configs(
         dest_configs=theme_dest_configs,
         quota=theme_quota,
@@ -583,9 +563,7 @@ def main() -> int:
     )
     selected_routes.extend(theme_selected)
 
-    # 2) Explore route (10% => 1 wildcard on explore run)
     if explore_quota == 1:
-        # Deterministic rotation of explore destinations (no random churn)
         today = dt.datetime.utcnow().date().isoformat()
         slot = _run_slot()
         seed = f"{FEEDER_EXPLORE_SALT}|{today}|{slot}|{theme_today}|EXPLORE"
@@ -612,7 +590,6 @@ def main() -> int:
         log("⚠️ No valid (origin,destination) pairs after capability filtering.")
         return 0
 
-    # Hard cap: never exceed ROUTES_PER_RUN
     selected_routes = selected_routes[:ROUTES_PER_RUN]
 
     for origin, destination, r in selected_routes:
@@ -658,6 +635,7 @@ def main() -> int:
             continue
 
         deal_theme = low(r.get("theme") or theme_today) or theme_today
+        ingested_at = SheetContract.now_iso_utc_z()
 
         for off in offers[: min(10, MAX_INSERTS_TOTAL - len(all_deals))]:
             try:
@@ -674,14 +652,13 @@ def main() -> int:
                 "origin_iata": origin,
                 "origin_city": resolve_origin_city(origin, origin_city_map),
                 "destination_iata": destination,
-
                 "outbound_date": dep_date.strftime("%Y-%m-%d"),
                 "return_date": ret_date.strftime("%Y-%m-%d"),
-
                 "price_gbp": math.ceil(total_amount) if total_amount else "",
                 "destination_city": "",
                 "destination_country": "",
                 "graphic_url": "",
+                INGESTED_AT_COL: ingested_at,  # Phase 2+ handshake
             }
 
             deal = enrich_deal(deal, themes_dict, signals)

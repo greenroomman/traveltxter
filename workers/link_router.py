@@ -1,34 +1,28 @@
+#!/usr/bin/env python3
 # workers/link_router.py
 """
-TravelTxter Link Router (V4.6 compatible) — Duffel Links DEMO + SAFE FALLBACK
+TravelTxter Link Router (V4.6 compatible) — Duffel Links + Demo fallback
 
-Purpose (DO NOT CHANGE PIPELINE):
+Purpose (LOCKED):
 - Populate booking_link_vip for monetisable rows.
-- Primary: try Duffel Links (demo booking links).
-- Fallback: if Duffel Links fails (incl 404), write a deterministic DEMO link so VIP posts never have dead/no links.
+- Primary: try Duffel Links (if available).
+- Fallback: deterministic DEMO link so VIP posts never have dead links.
 - DO NOT touch rendering or publishing.
-- DO NOT depend on any local utils/ package.
-- Batch-write updates to avoid Google Sheets 429 write quota errors.
+- Stateless: Sheets is the only memory.
 
 Eligibility:
 - status in {"READY_TO_POST", "READY_TO_PUBLISH"}
-- booking_link_vip is blank (or missing)
+- booking_link_vip is blank
 - origin_iata, destination_iata, outbound_date, return_date present
 
-Environment:
-- SPREADSHEET_ID or SHEET_ID (required)
-- GCP_SA_JSON_ONE_LINE or GCP_SA_JSON (required)
-- RAW_DEALS_TAB (default "RAW_DEALS")
+Demo base:
+- DEMO_BASE_URL if set, else REDIRECT_BASE_URL, else http://www.traveltxter.com/
+- Landing page is homepage with query params: http://www.traveltxter.com/?deal_id=...
 
 Duffel:
-- DUFFEL_API_KEY (optional but recommended; if missing we go straight to demo links)
-- DUFFEL_API_BASE (default "https://api.duffel.com")
-- DUFFEL_VERSION (default "v2")  # must be v2
-- REDIRECT_BASE_URL (optional; used as Duffel link redirect_url if set)
-
-Demo fallback:
-- DEMO_BASE_URL (optional). If not set, uses REDIRECT_BASE_URL if present, else http://www.traveltxter.com/
-- The demo link is honest and deterministic (query params).
+- DUFFEL_API_KEY optional; if missing we go straight to demo links
+- DUFFEL_API_BASE default https://api.duffel.com
+- DUFFEL_VERSION default v2 (must be v2)
 """
 
 from __future__ import annotations
@@ -43,29 +37,25 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-# We keep SheetContract import, but we do NOT assume its method names.
-# If it has validate_schema we will use it, otherwise we fall back to local validation.
-try:
-    from sheet_contract import SheetContract  # type: ignore
-except Exception:
-    SheetContract = None  # type: ignore
-
 
 # -------------------- ENV --------------------
 
-RAW_DEALS_TAB = os.environ.get("RAW_DEALS_TAB", "RAW_DEALS").strip() or "RAW_DEALS"
+RAW_DEALS_TAB = (os.environ.get("RAW_DEALS_TAB", "RAW_DEALS") or "RAW_DEALS").strip() or "RAW_DEALS"
 SPREADSHEET_ID = (os.environ.get("SPREADSHEET_ID") or os.environ.get("SHEET_ID") or "").strip()
 GCP_SA_JSON_ONE_LINE = (os.environ.get("GCP_SA_JSON_ONE_LINE") or os.environ.get("GCP_SA_JSON") or "").strip()
 
 DUFFEL_API_KEY = (os.environ.get("DUFFEL_API_KEY") or "").strip()
 DUFFEL_API_BASE = (os.environ.get("DUFFEL_API_BASE") or "https://api.duffel.com").strip().rstrip("/")
-DUFFEL_VERSION = (os.environ.get("DUFFEL_VERSION") or "v2").strip()  # must be v2
+DUFFEL_VERSION = (os.environ.get("DUFFEL_VERSION") or "v2").strip() or "v2"
+
 REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 
-# Hard guard: never allow empty base URL (prevents "https://?deal_id=...")
+# Canonical homepage base (your instruction)
+DEFAULT_HOME_BASE = "http://www.traveltxter.com/"
+
 DEMO_BASE_URL = (os.environ.get("DEMO_BASE_URL") or "").strip()
 if not DEMO_BASE_URL:
-    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or "http://www.traveltxter.com/"
+    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or DEFAULT_HOME_BASE
 
 MAX_ROWS_PER_RUN = int(os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "20")
 
@@ -77,24 +67,27 @@ def _log(msg: str) -> None:
     print(f"{ts} | {msg}", flush=True)
 
 
-# -------------------- SCHEMA VALIDATION (COMPAT SHIM) --------------------
+# -------------------- SCHEMA VALIDATION (self-contained) --------------------
 
-def _validate_schema(headers: List[str], required: List[str], tab_name: str) -> None:
-    """
-    Prefer SheetContract.validate_schema(headers, required=[...]) if present.
-    Otherwise do a local fail-loud validation.
-    """
-    # Use SheetContract if it provides validate_schema
-    if SheetContract is not None and hasattr(SheetContract, "validate_schema"):
-        # Expect signature: validate_schema(headers, required=[...])
-        getattr(SheetContract, "validate_schema")(headers, required=required)
-        return
+REQUIRED_COLUMNS = [
+    "status",
+    "deal_id",
+    "origin_iata",
+    "destination_iata",
+    "outbound_date",
+    "return_date",
+    "price_gbp",
+    "booking_link_vip",
+]
 
-    # Local fallback (fail loud)
-    header_set = {h.strip() for h in headers if h and str(h).strip()}
-    missing = [c for c in required if c not in header_set]
+ELIGIBLE_STATUSES = {"READY_TO_POST", "READY_TO_PUBLISH"}
+
+
+def _validate_headers(headers: List[str]) -> None:
+    hset = {h.strip() for h in headers if str(h).strip()}
+    missing = [c for c in REQUIRED_COLUMNS if c not in hset]
     if missing:
-        raise RuntimeError(f"[SCHEMA] Missing required columns in {tab_name}: {missing}")
+        raise RuntimeError(f"RAW_DEALS schema missing required columns: {missing}")
 
 
 # -------------------- GOOGLE SHEETS --------------------
@@ -123,7 +116,7 @@ def _gs_client() -> gspread.Client:
 
 
 def _headers(ws) -> List[str]:
-    return [h.strip() for h in ws.row_values(1)]
+    return [str(h).strip() for h in ws.row_values(1)]
 
 
 def _colmap(headers: List[str]) -> Dict[str, int]:
@@ -136,16 +129,14 @@ def _s(v: Any) -> str:
 
 def _parse_date_to_iso(d: str) -> str:
     """
-    Accepts: "YYYY-MM-DD" or "DD/MM/YYYY" (common in your sheet)
+    Accepts: "YYYY-MM-DD" or "DD/MM/YYYY"
     Returns: "YYYY-MM-DD" or "" if cannot parse.
     """
     d = _s(d)
     if not d:
         return ""
-    # Already ISO
     if len(d) == 10 and d[4] == "-" and d[7] == "-":
         return d
-    # DD/MM/YYYY
     try:
         dt = datetime.strptime(d, "%d/%m/%Y")
         return dt.strftime("%Y-%m-%d")
@@ -158,7 +149,7 @@ def _batch_write(ws, updates: List[Tuple[int, Dict[str, Any]]], cm: Dict[str, in
     updates = [(row_num, {"booking_link_vip": "..."})]
     Writes as few API calls as possible (single update_cells call).
     """
-    cells = []
+    cells: List[gspread.cell.Cell] = []
     for row_num, payload in updates:
         for header, value in payload.items():
             if header not in cm:
@@ -176,7 +167,7 @@ def _duffel_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {DUFFEL_API_KEY}",
         "Content-Type": "application/json",
-        "Duffel-Version": DUFFEL_VERSION,  # must be v2
+        "Duffel-Version": DUFFEL_VERSION,
         "Accept": "application/json",
     }
 
@@ -204,12 +195,10 @@ def _create_duffel_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: 
         }
     }
 
-    # Optional redirect target (must be a real URL if set)
     if REDIRECT_BASE_URL:
         payload["data"]["redirect_url"] = REDIRECT_BASE_URL
 
     url = f"{DUFFEL_API_BASE}/air/links"
-
     try:
         r = requests.post(url, headers=_duffel_headers(), json=payload, timeout=25)
     except Exception as e:
@@ -235,11 +224,15 @@ def _create_duffel_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: 
 
 # -------------------- DEMO FALLBACK --------------------
 
+def _normalize_base(base: str) -> str:
+    # Ensure we don't end up with "http://.../??a=b"
+    b = (base or "").strip()
+    if not b:
+        b = DEFAULT_HOME_BASE
+    return b.rstrip()  # do not strip trailing slash; homepage is OK
+
+
 def _create_demo_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
-    """
-    Deterministic, honest demo link that always exists.
-    Homepage landing page: http://www.traveltxter.com/
-    """
     params = {
         "deal_id": _s(deal_id),
         "from": _s(origin_iata).upper(),
@@ -250,7 +243,7 @@ def _create_demo_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: s
         "src": "vip_demo",
     }
     qs = urlencode({k: v for k, v in params.items() if v})
-    base = (DEMO_BASE_URL or "").strip().rstrip("?") or "http://www.traveltxter.com/"
+    base = _normalize_base(DEMO_BASE_URL)
     if "?" in base:
         return f"{base}&{qs}"
     return f"{base}?{qs}"
@@ -275,70 +268,54 @@ def main() -> int:
     ws = sh.worksheet(RAW_DEALS_TAB)
 
     headers = _headers(ws)
-
-    # Fail loud schema validation (compatible with any SheetContract implementation)
-    _validate_schema(headers, required=[
-        "status",
-        "deal_id",
-        "origin_iata",
-        "destination_iata",
-        "outbound_date",
-        "return_date",
-        "booking_link_vip",
-    ], tab_name=RAW_DEALS_TAB)
-
+    _validate_headers(headers)
     cm = _colmap(headers)
 
-    price_col = "price_gbp" if "price_gbp" in cm else None
-
-    rows = ws.get_all_records()
-    if not rows:
-        _log("No rows in RAW_DEALS. Exiting.")
-        return 0
-
-    eligible_status = {"READY_TO_POST", "READY_TO_PUBLISH"}
-    attempted = 0
-    created = 0
-    used_demo = 0
+    records = ws.get_all_records()
     updates: List[Tuple[int, Dict[str, Any]]] = []
 
-    for idx, r in enumerate(rows, start=2):  # sheet row numbers (header row is 1)
-        if created >= MAX_ROWS_PER_RUN:
+    attempted = 0
+    used_fallback = 0
+
+    # get_all_records() indexes data rows starting at row 2
+    for i, r in enumerate(records, start=2):
+        if len(updates) >= MAX_ROWS_PER_RUN:
             break
 
         status = _s(r.get("status")).upper()
-        if status not in eligible_status:
+        if status not in ELIGIBLE_STATUSES:
             continue
 
-        if _s(r.get("booking_link_vip")):
+        current_link = _s(r.get("booking_link_vip"))
+        if current_link:
             continue
 
         deal_id = _s(r.get("deal_id"))
-        origin = _s(r.get("origin_iata")).upper()
-        dest = _s(r.get("destination_iata")).upper()
+        o = _s(r.get("origin_iata")).upper()
+        d = _s(r.get("destination_iata")).upper()
         out_iso = _parse_date_to_iso(r.get("outbound_date"))
         in_iso = _parse_date_to_iso(r.get("return_date"))
+        price = _s(r.get("price_gbp"))
 
-        if not (origin and dest and out_iso and in_iso):
+        if not (deal_id and o and d and out_iso and in_iso):
             continue
 
         attempted += 1
 
-        link = _create_duffel_link(origin, dest, out_iso, in_iso)
+        link = _create_duffel_link(o, d, out_iso, in_iso)
         if not link:
-            price_val = _s(r.get(price_col)) if price_col else ""
-            link = _create_demo_link(deal_id, origin, dest, out_iso, in_iso, price_val)
-            used_demo += 1
+            link = _create_demo_link(deal_id, o, d, out_iso, in_iso, price)
+            used_fallback += 1
 
-        updates.append((idx, {"booking_link_vip": link}))
-        created += 1
+        updates.append((i, {"booking_link_vip": link}))
 
-    cells_written = _batch_write(ws, updates, cm)
+    written_cells = _batch_write(ws, updates, cm)
 
     _log(f"Attempted link generations: {attempted}")
-    _log(f"booking_link_vip populated for: {created} rows")
-    _log(f"Fallback demo links used: {used_demo}")
-    _log(f"Cells written (batch): {cells_written}")
+    _log(f"booking_link_vip populated for: {len(updates)} rows")
+    _log(f"Fallback demo links used: {used_fallback}")
+    _log(f"Cells written (batch): {written_cells}")
+
     return 0
 
 

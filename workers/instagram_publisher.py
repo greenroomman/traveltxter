@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # workers/instagram_publisher.py
 """
-TravelTxter — Instagram Publisher (FULL REPLACEMENT — V4.6)
+TravelTxter — Instagram Publisher (FULL REPLACEMENT — V4.6.2)
 
 LOCKED PURPOSE:
 - Publish RAW_DEALS rows where status == READY_TO_PUBLISH
@@ -19,7 +19,7 @@ Price: £<xxx>
 Out: YYYY-MM-DD
 Return: YYYY-MM-DD
 
-[PHRASE BANK]
+[PHRASE]
 Link in bio…
 """
 
@@ -36,10 +36,6 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-
-# ============================================================
-# THEME OF DAY (must match pipeline_worker rotation)
-# ============================================================
 
 MASTER_THEMES = [
     "winter_sun",
@@ -72,10 +68,6 @@ def resolve_theme_of_day() -> str:
     return override if override else norm_theme(theme_of_day_utc())
 
 
-# ============================================================
-# LOGGING / ENV
-# ============================================================
-
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     print(f"{ts} | {msg}", flush=True)
@@ -88,10 +80,6 @@ def iso_now() -> str:
 def env(k: str, default: str = "") -> str:
     return (os.environ.get(k, default) or "").strip()
 
-
-# ============================================================
-# GOOGLE SHEETS AUTH
-# ============================================================
 
 def parse_sa_json(raw: str) -> Dict[str, Any]:
     try:
@@ -118,10 +106,6 @@ def gs_client() -> gspread.Client:
 def a1(row: int, col0: int) -> str:
     return gspread.utils.rowcol_to_a1(row, col0 + 1)
 
-
-# ============================================================
-# IMAGE URL HANDLING (PythonAnywhere-safe)
-# ============================================================
 
 def preflight(url: str) -> Tuple[int, str]:
     try:
@@ -188,10 +172,6 @@ def preflight_and_repair_image_url(raw_url: str) -> str:
     raise RuntimeError(f"graphic_url not fetchable (HTTP {last_status}) :: {last_snip}")
 
 
-# ============================================================
-# INSTAGRAM GRAPH API
-# ============================================================
-
 GRAPH_BASE = "https://graph.facebook.com/v20.0"
 
 
@@ -219,19 +199,22 @@ def ig_publish_container(ig_user_id: str, token: str, creation_id: str) -> str:
     return str(j["id"])
 
 
-# ============================================================
-# CAPTION (LOCKED TEMPLATE)
-# ============================================================
+def _phrase_from_row(row: Dict[str, str]) -> str:
+    p = (row.get("phrase_used") or "").strip()
+    if p:
+        return p
+    return (row.get("phrase_bank") or "").strip()
+
 
 def build_caption(row: Dict[str, str]) -> str:
     country = (row.get("destination_country") or "").strip()
-    flag = (row.get("country_flag") or "").strip()  # optional column if you have it
+    flag = (row.get("country_flag") or "").strip()
     dest = (row.get("destination_city") or row.get("destination_iata") or "").strip()
     origin = (row.get("origin_city") or row.get("origin_iata") or "").strip()
     price = (row.get("price_gbp") or "").strip().replace("£", "").strip()
     out_date = (row.get("outbound_date") or "").strip()
     ret_date = (row.get("return_date") or "").strip()
-    phrase = (row.get("phrase_bank") or "").strip()
+    phrase = _phrase_from_row(row)
 
     first_line = country if country else (row.get("destination_iata") or "").strip()
     if flag:
@@ -251,10 +234,6 @@ def build_caption(row: Dict[str, str]) -> str:
     lines.append("Link in bio…")
     return "\n".join([l for l in lines if l is not None]).strip()
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main() -> int:
     spreadsheet_id = env("SPREADSHEET_ID") or env("SHEET_ID")
@@ -286,6 +265,7 @@ def main() -> int:
         "deal_theme",
         "theme",
         "ingested_at_utc",
+        "phrase_used",  # NEW PRIMARY
         "posted_instagram_at",
         "publish_error",
         "publish_error_at",

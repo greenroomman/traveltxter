@@ -1,24 +1,34 @@
-name: TravelTxter Pipeline (V4.6 – Supply Unlocked)
+# .github/workflows/pipeline_workflow.yml
+name: TravelTxter Pipeline (AM / PM / Manual TEST)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "30 7 * * *"
-    - cron: "30 16 * * *"
+    - cron: "30 7 * * *"   # AM run
+    - cron: "30 16 * * *"  # PM run
+  workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "Run slot (TEST for manual runs)"
+        required: true
+        default: "TEST"
+        type: choice
+        options: [TEST, AM, PM]
 
 concurrency:
-  group: traveltxter-pipeline
+  group: traveltxter-${{ github.event_name == 'workflow_dispatch' && inputs.run_slot == 'TEST' && 'test' || 'prod' }}
   cancel-in-progress: false
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -26,95 +36,129 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # -----------------------------
-      # FEEDER (SUPPLY ENGINE)
-      # -----------------------------
-      - name: Run Feeder
+      - name: Set RUN_SLOT
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_SLOT=${{ inputs.run_slot }}" >> $GITHUB_ENV
+          else
+            if [ "${{ github.event.cron }}" = "30 7 * * *" ]; then
+              echo "RUN_SLOT=AM" >> $GITHUB_ENV
+            else
+              echo "RUN_SLOT=PM" >> $GITHUB_ENV
+            fi
+          fi
+          echo "RUN_SLOT resolved to: $RUN_SLOT"
+
+      # ================= FEEDER =================
+      - name: Feeder
         run: python workers/pipeline_worker.py
         env:
-          # ---- Secrets ----
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
 
-          # ---- Sheet tabs (LOCKED) ----
+          # Tabs (LOCKED)
           RAW_DEALS_TAB: RAW_DEALS
           CONFIG_TAB: CONFIG
           THEMES_TAB: THEMES
           SIGNALS_TAB: CONFIG_SIGNALS
           CAPABILITY_TAB: ROUTE_CAPABILITY_MAP
 
-          # ---- SUPPLY PRESSURE (CRITICAL) ----
-          DUFFEL_MAX_INSERTS: 50
-          DUFFEL_OFFERS_PER_SEARCH: 50
-          DUFFEL_ROUTES_PER_RUN: 8
-          DUFFEL_MAX_SEARCHES_PER_RUN: 8
+          # Supply pressure (from Variables)
+          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
+          DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
+          DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+          DUFFEL_OFFERS_PER_SEARCH: ${{ vars.DUFFEL_OFFERS_PER_SEARCH }}
 
-          # ---- ORIGIN DIVERSITY ----
-          FEEDER_OPEN_ORIGINS: "true"
-          RESPECT_CONFIG_ORIGIN: "false"
+          # Diversity / route legality
+          STRICT_CAPABILITY_MAP: "true"
+          FEEDER_OPEN_ORIGINS: ${{ vars.FEEDER_OPEN_ORIGINS }}
+          RESPECT_CONFIG_ORIGIN: ${{ vars.RESPECT_CONFIG_ORIGIN }}
+          FEEDER_SLEEP_SECONDS: ${{ vars.FEEDER_SLEEP_SECONDS }}
 
-          # ---- Timing / pacing ----
-          FEEDER_SLEEP_SECONDS: 0.4
+          # Wildcard (hub-arbitrage) lane
+          WILDCARD_ENABLED: "true"
+          WILDCARD_HUBS: "DUB,IST,DOH,DXB"
+          WILDCARD_MAX_SEARCHES_PER_RUN: "1"
+          WILDCARD_MAX_CONNECTIONS: "1"
+          WILDCARD_TAG_THEME: "unexpected_value"
 
-      # -----------------------------
-      # WAIT FOR SHEET RECALC
-      # -----------------------------
-      - name: Wait for Google Sheets recalculation
+      - name: Wait for Sheets recalculation
         run: sleep 90
 
-      # -----------------------------
-      # SCORER
-      # -----------------------------
-      - name: Run AI Scorer
+      # ================= SCORER =================
+      - name: AI Scorer
         run: python workers/ai_scorer.py
         env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: RAW_DEALS
-          MIN_INGEST_AGE_SECONDS: 90
-          WINNERS_PER_RUN: 1
-          VARIETY_LOOKBACK_HOURS: 120
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
 
-      # -----------------------------
-      # LINK ROUTER
-      # -----------------------------
-      - name: Run Link Router
+          RAW_DEALS_TAB: RAW_DEALS
+          RAW_DEALS_VIEW_TAB: RAW_DEALS_VIEW
+
+          # Freshness handshake (use your repo var)
+          INGESTED_AT_COL: "created_utc"
+          MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS }}
+
+          # Selection controls (use your repo vars if present)
+          WINNERS_PER_RUN: ${{ vars.WINNERS_PER_RUN }}
+          VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
+          DEST_REPEAT_PENALTY: ${{ vars.DEST_REPEAT_PENALTY }}
+
+          # Wildcard quota
+          WILDCARD_MAX_WINNERS: "1"
+          WILDCARD_MIN_SCORE: "60"
+          WILDCARD_THEMES: "unexpected_value,long_haul"
+
+      # ================= ROUTER =================
+      - name: Link Router
         run: python workers/link_router.py
         env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
 
-      # -----------------------------
-      # RENDER
-      # -----------------------------
-      - name: Run Renderer
+      # ================= RENDER =================
+      - name: Render
         run: python workers/render_client.py
         env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
-          RENDER_MAX_ROWS: 1
+          RENDER_MAX_ROWS: ${{ vars.RENDER_MAX_ROWS }}
 
-      # -----------------------------
-      # INSTAGRAM
-      # -----------------------------
-      - name: Publish Instagram
+      # ================= INSTAGRAM =================
+      - name: Instagram
         run: python workers/instagram_publisher.py
         env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
 
-      # -----------------------------
-      # TELEGRAM
-      # -----------------------------
-      - name: Publish Telegram
+      # ================= TELEGRAM =================
+      - name: Telegram
         run: python workers/telegram_publisher.py
         env:
+          RUN_SLOT: ${{ env.RUN_SLOT }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: RAW_DEALS
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          STRIPE_MONTHLY_LINK: ${{ secrets.STRIPE_LINK_MONTHLY }}
+          STRIPE_YEARLY_LINK: ${{ secrets.STRIPE_LINK_YEARLY }}

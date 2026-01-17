@@ -18,6 +18,14 @@ Surgical Fix (2026-01-16): ZERO-YIELD FEEDER RECOVERY (no refactor)
 Surgical Fix (V4.6): OFFERS_PER_SEARCH (increase yield per Duffel search without increasing searches)
 - Duffel may return ~50 offers; previously only first 10 were considered
 - New env DUFFEL_OFFERS_PER_SEARCH (default 50) controls how many offers we evaluate per search
+
+HOTFIX (2026-01-17): ORIGIN ROTATION PRECEDENCE
+- Problem observed: planned origins show ['SOU','BRS','LTN','LGW'] but Duffel searches were all BRS->...
+- Root cause: CONFIG origin_iata was treated as a "preferred_origin" override (always wins).
+- Fix: planned origin rotation now takes precedence by default.
+- New env RESPECT_CONFIG_ORIGIN (default false):
+    - false: planned origin first, CONFIG origin used only as fallback candidate.
+    - true: CONFIG origin becomes first-choice candidate (legacy behavior).
 """
 
 from __future__ import annotations
@@ -62,6 +70,9 @@ STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lowe
 
 # NEW: open origins using reverse capability map
 FEEDER_OPEN_ORIGINS = (os.getenv("FEEDER_OPEN_ORIGINS", "false").strip().lower() == "true")
+
+# HOTFIX: whether CONFIG origin_iata should override planned origin rotation
+RESPECT_CONFIG_ORIGIN = (os.getenv("RESPECT_CONFIG_ORIGIN", "false").strip().lower() == "true")
 
 # Sparse themes have thin inventory from many regional airports.
 # For these themes we allow reverse-capability origin selection even if
@@ -452,15 +463,11 @@ def pick_origin_for_dest(
     dest: str,
     candidate_origins: List[str],
     allowed_pairs: Set[Tuple[str, str]],
-    preferred_origin: str = "",
 ) -> Optional[str]:
-    if preferred_origin:
-        o = _clean_iata(preferred_origin)
-        if not allowed_pairs or (o, dest) in allowed_pairs:
-            return o
-
     for o in candidate_origins:
         oo = _clean_iata(o)
+        if not oo:
+            continue
         if not allowed_pairs or (oo, dest) in allowed_pairs:
             return oo
     return None
@@ -488,23 +495,33 @@ def select_routes_from_dest_configs(
             di += 1
             continue
 
-        preferred_origin = _clean_iata(cfg.get("origin_iata"))
+        cfg_origin = _clean_iata(cfg.get("origin_iata"))
         planned_origin = planned_origins[oi % len(planned_origins)] if planned_origins else ""
         oi += 1
 
         candidate_try_order: List[str] = []
 
-        # 1) Planned origin first (theme/haul-aware rotation)
-        if planned_origin:
-            candidate_try_order.append(planned_origin)
+        # Precedence:
+        # - Default: planned origin first, CONFIG origin as fallback
+        # - If RESPECT_CONFIG_ORIGIN=true: CONFIG origin first, planned as fallback
+        if RESPECT_CONFIG_ORIGIN:
+            if cfg_origin:
+                candidate_try_order.append(cfg_origin)
+            if planned_origin:
+                candidate_try_order.append(planned_origin)
+        else:
+            if planned_origin:
+                candidate_try_order.append(planned_origin)
+            if cfg_origin:
+                candidate_try_order.append(cfg_origin)
 
-        # 2) Reverse capability injection (destination -> origins)
+        # Reverse capability injection (destination -> origins)
         if open_origins:
             rev = dest_to_origins.get(destination, [])[:]
             rev = sorted(_dedupe_keep_order(rev))
             candidate_try_order.extend([o for o in rev if o not in candidate_try_order])
 
-        # 3) Fallback pools (inventory safety)
+        # Fallback pools (inventory safety)
         candidate_try_order.extend([o for o in full_origin_pool if o not in candidate_try_order])
 
         candidate_try_order = _dedupe_keep_order(candidate_try_order)
@@ -513,7 +530,6 @@ def select_routes_from_dest_configs(
             dest=destination,
             candidate_origins=candidate_try_order,
             allowed_pairs=allowed_pairs,
-            preferred_origin=preferred_origin,
         )
 
         if origin:
@@ -541,6 +557,7 @@ def main() -> int:
     log(f"🎯 Theme of the day (UTC): {theme_today}")
     open_origins_effective = FEEDER_OPEN_ORIGINS or (theme_today in SPARSE_THEMES)
     log(f"FEEDER_OPEN_ORIGINS={FEEDER_OPEN_ORIGINS} | sparse_theme_override={theme_today in SPARSE_THEMES} | effective={open_origins_effective}")
+    log(f"RESPECT_CONFIG_ORIGIN={RESPECT_CONFIG_ORIGIN} (default false; planned origin rotation takes precedence)")
 
     gc = gs_client()
     sh = gc.open_by_key(sheet_id)

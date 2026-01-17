@@ -2,19 +2,18 @@
 """
 workers/render_client.py
 
-Render Client — V4.6
+Render Client — V4.6.1 HOTFIX
 FULL REPLACEMENT
 
-LOCKED BEHAVIOUR
+FIX:
+- Robust GCP_SA_JSON parsing (matches pipeline_worker / link_router)
+- Prevent JSONDecodeError when secret already contains real newlines
+
+LOCKED BEHAVIOUR:
 - Google Sheets is the single source of truth
 - RAW_DEALS_VIEW is never written to
 - Renderer is stateless
-- ALWAYS prioritise newest eligible deals (NOT sheet order)
-
-SELECTION RULE (CRITICAL)
-1. Eligible status
-2. Newest ingested_at_utc DESC
-3. Row number DESC
+- ALWAYS prioritise newest eligible deals (fresh-first)
 """
 
 import os
@@ -32,10 +31,8 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
 RENDER_URL = os.getenv("RENDER_URL")
 RENDER_MAX_ROWS = int(os.getenv("RENDER_MAX_ROWS", "1") or "1")
-
 RUN_SLOT = os.getenv("RUN_SLOT", "UNKNOWN")
 
-# Statuses allowed to render
 ELIGIBLE_STATUSES = {
     "READY_TO_PUBLISH",
     "READY_TO_POST",
@@ -51,11 +48,18 @@ def log(msg: str):
 
 # ==================== GOOGLE SHEETS ====================
 
+def parse_sa_json(raw: str) -> dict:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return json.loads(raw.replace("\\n", "\n"))
+
+
 def gs_client():
     raw = os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON")
-    info = json.loads(raw.replace("\\n", "\n"))
+    info = parse_sa_json(raw)
     creds = Credentials.from_service_account_info(
         info,
         scopes=[
@@ -91,20 +95,15 @@ def main():
 
     headers = ws.row_values(1)
     rows = ws.get_all_values()[1:]
-
     idx = {h: i for i, h in enumerate(headers)}
 
-    required = ["status", "ingested_at_utc", "graphic_url"]
-    for col in required:
+    for col in ("status", "ingested_at_utc", "graphic_url"):
         if col not in idx:
             raise RuntimeError(f"Missing required column: {col}")
 
-    # --------------------
-    # FILTER ELIGIBLE ROWS
-    # --------------------
     eligible = []
 
-    for i, row in enumerate(rows, start=2):  # sheet row number
+    for i, row in enumerate(rows, start=2):
         status = row[idx["status"]].strip()
         graphic_url = row[idx["graphic_url"]].strip()
         ingested = row[idx["ingested_at_utc"]].strip()
@@ -112,14 +111,13 @@ def main():
         if status not in ELIGIBLE_STATUSES:
             continue
         if graphic_url:
-            continue  # already rendered
+            continue
 
         ts = parse_utc(ingested)
         eligible.append(
             {
                 "row_num": i,
                 "ingested_at": ts,
-                "row": row,
             }
         )
 
@@ -127,43 +125,29 @@ def main():
         log("No eligible rows to render.")
         return 0
 
-    # --------------------
-    # SORT: NEWEST FIRST
-    # --------------------
     eligible.sort(
-        key=lambda r: (
-            r["ingested_at"] or dt.datetime.min,
-            r["row_num"],
-        ),
+        key=lambda r: (r["ingested_at"] or dt.datetime.min, r["row_num"]),
         reverse=True,
     )
 
     to_render = eligible[:RENDER_MAX_ROWS]
+    log(f"Eligible rows: {len(eligible)} | Rendering: {len(to_render)}")
 
-    log(f"Eligible rows found: {len(eligible)} | Rendering: {len(to_render)}")
-
-    # --------------------
-    # RENDER LOOP
-    # --------------------
     for item in to_render:
         row_num = item["row_num"]
-        ingested = item["ingested_at"]
+        log(f"🖼️ Rendering row {row_num}")
 
-        log(f"🖼️ Rendering row {row_num} (ingested_at_utc={ingested})")
-
-        payload = {
-            "row_number": row_num,
-        }
-
-        r = requests.post(RENDER_URL, json=payload, timeout=60)
+        r = requests.post(
+            RENDER_URL,
+            json={"row_number": row_num},
+            timeout=60,
+        )
 
         if r.status_code != 200:
-            log(f"❌ Render failed for row {row_num}: {r.status_code}")
+            log(f"❌ Render failed row {row_num}: HTTP {r.status_code}")
             continue
 
-        data = r.json()
-        graphic_url = data.get("graphic_url")
-
+        graphic_url = r.json().get("graphic_url")
         if not graphic_url:
             log(f"❌ No graphic_url returned for row {row_num}")
             continue
@@ -172,10 +156,9 @@ def main():
         ws.update([[graphic_url]], cell)
 
         log(f"✅ Rendered row {row_num}")
-
         time.sleep(1)
 
-    log("Done. Render cycle complete.")
+    log("Render cycle complete.")
     return 0
 
 

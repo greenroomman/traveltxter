@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 workers/telegram_publisher.py
-FULL REPLACEMENT — V4.6 (LOCKED)
+FULL REPLACEMENT — V4.6.2 (LOCKED)
 
 PURPOSE (LOCKED):
 - Publish Telegram VIP first, then Telegram FREE after delay
@@ -14,10 +14,6 @@ SELECTION RULE (CRITICAL, LOCKED):
 2) theme matches theme-of-the-day
 3) NEWEST ingested_at_utc DESC
 4) tie-breaker: highest row number
-
-MEDIA OUTPUT (LOCKED):
-- TELEGRAM VIP format (price-led, why-is-it-good, booking link)
-- TELEGRAM FREE format (price-led, upsell block, hyperlinks)
 """
 
 from __future__ import annotations
@@ -31,10 +27,6 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-
-# ============================================================
-# THEME OF DAY (MUST MATCH PIPELINE WORKER)
-# ============================================================
 
 MASTER_THEMES = [
     "winter_sun",
@@ -67,10 +59,6 @@ def resolve_theme_of_day() -> str:
     return override if override else norm_theme(theme_of_day_utc())
 
 
-# ============================================================
-# LOGGING / ENV
-# ============================================================
-
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     print(f"{ts} | {msg}", flush=True)
@@ -95,10 +83,6 @@ def parse_iso(ts: str) -> Optional[dt.datetime]:
     except Exception:
         return None
 
-
-# ============================================================
-# GOOGLE SHEETS
-# ============================================================
 
 def parse_sa_json(raw: str) -> Dict[str, Any]:
     try:
@@ -126,10 +110,6 @@ def a1(row: int, col0: int) -> str:
     return gspread.utils.rowcol_to_a1(row, col0 + 1)
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-
 def tg_send(bot_token: str, chat_id: str, text: str) -> None:
     r = requests.post(
         f"https://api.telegram.org/bot{bot_token}/sendMessage",
@@ -150,9 +130,14 @@ def esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-# ============================================================
-# MESSAGE BUILDERS (LOCKED FORMATS)
-# ============================================================
+def _phrase_from_row(row: Dict[str, str]) -> str:
+    # Primary new contract: phrase_used
+    p = (row.get("phrase_used") or "").strip()
+    if p:
+        return p
+    # Backward compat fallback
+    return (row.get("phrase_bank") or "").strip()
+
 
 def build_vip_message(row: Dict[str, str]) -> str:
     price = esc(row.get("price_gbp"))
@@ -161,7 +146,7 @@ def build_vip_message(row: Dict[str, str]) -> str:
     origin = esc(row.get("origin_city") or row.get("origin_iata"))
     out_date = esc(row.get("outbound_date"))
     back_date = esc(row.get("return_date"))
-    phrase = esc(row.get("phrase_bank"))
+    phrase = esc(_phrase_from_row(row))
     booking = esc(row.get("booking_link_vip") or row.get("affiliate_url") or row.get("deeplink"))
 
     lines: List[str] = []
@@ -188,7 +173,7 @@ def build_free_message(row: Dict[str, str], upgrade_monthly: str, upgrade_yearly
     origin = esc(row.get("origin_city") or row.get("origin_iata"))
     out_date = esc(row.get("outbound_date"))
     back_date = esc(row.get("return_date"))
-    phrase = esc(row.get("phrase_bank"))
+    phrase = esc(_phrase_from_row(row))
 
     lines: List[str] = []
     lines.append(f"£{price} to {dest}")
@@ -216,10 +201,6 @@ def build_free_message(row: Dict[str, str], upgrade_monthly: str, upgrade_yearly
         lines.append(f"<a href=\"{upgrade_yearly}\">Upgrade yearly</a>")
     return "\n".join(lines).strip()
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main() -> int:
     spreadsheet_id = env("SPREADSHEET_ID") or env("SHEET_ID")
@@ -265,7 +246,8 @@ def main() -> int:
         "status", "deal_theme", "theme", "ingested_at_utc",
         "price_gbp", "origin_city", "origin_iata",
         "destination_city", "destination_iata", "destination_country",
-        "outbound_date", "return_date", "phrase_bank",
+        "outbound_date", "return_date",
+        "phrase_used",  # NEW PRIMARY
         "booking_link_vip", "affiliate_url", "deeplink",
         "posted_telegram_vip_at", "posted_telegram_free_at",
         ts_col,
@@ -276,9 +258,6 @@ def main() -> int:
 
     now = dt.datetime.utcnow()
 
-    # --------------------
-    # COLLECT ELIGIBLE ROWS (FRESH-FIRST)
-    # --------------------
     eligible = []
 
     for rownum, r in enumerate(values[1:], start=2):
@@ -311,9 +290,6 @@ def main() -> int:
     rownum = target["rownum"]
     row = target["row"]
 
-    # --------------------
-    # BUILD + SEND MESSAGE
-    # --------------------
     if mode == "VIP":
         msg = build_vip_message(row)
     else:

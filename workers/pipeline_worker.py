@@ -2,26 +2,37 @@
 """
 workers/pipeline_worker.py
 
-TravelTxter Pipeline Worker (Feeder) — V4.6 (Surgical Fix)
+TravelTxter Pipeline Worker (Feeder) — V4.6 (LIVE AMENDMENT)
 
-Fixes (2026-01-17):
-1) ORIGIN PRECEDENCE BUG:
-   - Previously: CONFIG origin_iata (preferred_origin) always overrides planned origin rotation.
-   - Now: planned origin rotation is the default source of truth.
-   - Optional: set RESPECT_CONFIG_ORIGIN=true to allow CONFIG origin to override.
+Core contract (LOCKED):
+- Google Sheets is the single stateful memory.
+- Worker is stateless + deterministic.
+- Writes ONLY to RAW_DEALS (append NEW rows).
+- Must always write created_utc (and created_at/timestamp if those headers exist).
+- Must not depend on RAW_DEALS_VIEW formulas to land rows.
 
-2) LOW YIELD PER SEARCH:
-   - Previously: capped to 10 offers per search (even if DUFFEL_MAX_INSERTS=50).
-   - Now: DUFFEL_OFFERS_PER_SEARCH controls how many offers to ingest per search (default 50),
-     bounded by remaining inserts.
+What this worker must do (Box 1):
+1) Land supply:
+   - Execute up to DUFFEL_MAX_SEARCHES_PER_RUN searches across DUFFEL_ROUTES_PER_RUN routes.
+   - Ingest up to DUFFEL_MAX_INSERTS rows total (across all searches).
+   - Ingest up to DUFFEL_OFFERS_PER_SEARCH offers per search (bounded by remaining inserts).
 
-3) TIMESTAMP LANDING:
-   - Always writes created_utc (and created_at/timestamp if present).
-   - Appends using header-normalised mapping to avoid whitespace header mismatch.
+2) Avoid “BRS-only collapse”:
+   - Planned origin rotation is default truth.
+   - CONFIG origin_iata is optional override only when RESPECT_CONFIG_ORIGIN=true.
+   - Optional: FEEDER_OPEN_ORIGINS=true allows reverse capability injection (dest -> origins).
+
+3) Optional controlled wildcard (hub-arbitrage) lane:
+   - Enabled via WILDCARD_ENABLED=true
+   - Uses max_connections=WILDCARD_MAX_CONNECTIONS (default 1)
+   - Filters offers to those whose intermediate stop airports include any of WILDCARD_HUBS
+     (e.g. DUB, IST, DOH, DXB)
+   - Tags such rows as WILDCARD_TAG_THEME (default "unexpected_value")
+   - Uses up to WILDCARD_MAX_SEARCHES_PER_RUN searches, but never exceeds overall MAX_SEARCHES_PER_RUN.
 
 Guardrails:
-- Sheets remains the single stateful memory.
-- Stateless + deterministic selection.
+- Does NOT “judge” deals beyond basic data sanity (no pricing rules enforced here by default).
+- If you want a hard sanity cap at ingest, set FEEDER_HARD_MAX_PRICE_GBP (optional).
 """
 
 from __future__ import annotations
@@ -52,21 +63,25 @@ DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY", "").strip()
 DUFFEL_API_BASE = os.getenv("DUFFEL_API_BASE", "https://api.duffel.com").strip()
 DUFFEL_VERSION = os.getenv("DUFFEL_VERSION", "v2").strip() or "v2"
 
-# Safety caps (governor)
+# Supply pressure (governor)
 MAX_INSERTS_TOTAL = int(os.getenv("DUFFEL_MAX_INSERTS", "3") or "3")
 MAX_SEARCHES_PER_RUN = int(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "4") or "4")
 ROUTES_PER_RUN = int(os.getenv("DUFFEL_ROUTES_PER_RUN", "3") or "3")
 
-# How many offers to ingest per Duffel search (key fix)
+# How many offers to ingest per Duffel search
 OFFERS_PER_SEARCH = int(os.getenv("DUFFEL_OFFERS_PER_SEARCH", "50") or "50")
 
-# Optional: strict capability filtering (default TRUE)
+# Optional ingest sanity cap (OFF by default). If set, skip offers above this GBP amount.
+FEEDER_HARD_MAX_PRICE_GBP_RAW = (os.getenv("FEEDER_HARD_MAX_PRICE_GBP") or "").strip()
+FEEDER_HARD_MAX_PRICE_GBP = float(FEEDER_HARD_MAX_PRICE_GBP_RAW) if FEEDER_HARD_MAX_PRICE_GBP_RAW else None
+
+# Capability filtering
 STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lower() == "true")
 
 # Reverse capability origin selection (destination -> origins)
 FEEDER_OPEN_ORIGINS = (os.getenv("FEEDER_OPEN_ORIGINS", "false").strip().lower() == "true")
 
-# NEW: allow CONFIG origin override (default FALSE)
+# Allow CONFIG origin override
 RESPECT_CONFIG_ORIGIN = (os.getenv("RESPECT_CONFIG_ORIGIN", "false").strip().lower() == "true")
 
 # Date defaults
@@ -82,6 +97,13 @@ FEEDER_EXPLORE_SALT = (os.getenv("FEEDER_EXPLORE_SALT", "traveltxter") or "trave
 
 # Optional pause
 FEEDER_SLEEP_SECONDS = float(os.getenv("FEEDER_SLEEP_SECONDS", "0") or "0")
+
+# Optional wildcard lane (hub-arbitrage)
+WILDCARD_ENABLED = (os.getenv("WILDCARD_ENABLED", "false").strip().lower() == "true")
+WILDCARD_HUBS = [x.strip().upper() for x in (os.getenv("WILDCARD_HUBS", "") or "").split(",") if x.strip()]
+WILDCARD_MAX_SEARCHES_PER_RUN = int(os.getenv("WILDCARD_MAX_SEARCHES_PER_RUN", "0") or "0")
+WILDCARD_MAX_CONNECTIONS = int(os.getenv("WILDCARD_MAX_CONNECTIONS", "1") or "1")
+WILDCARD_TAG_THEME = (os.getenv("WILDCARD_TAG_THEME", "unexpected_value").strip().lower() or "unexpected_value")
 
 
 # ==================== THEMES ====================
@@ -103,12 +125,8 @@ MASTER_THEMES = [
 
 SPARSE_THEMES = {"northern_lights"}
 
-SHORT_HAUL_THEMES = {
-    "winter_sun", "summer_sun", "beach_break", "surf",
-    "city_breaks", "culture_history", "unexpected_value", "adventure"
-}
-SNOW_THEMES = {"snow", "northern_lights"}
 LONG_HAUL_THEMES = {"long_haul", "luxury_value"}
+SNOW_THEMES = {"snow", "northern_lights"}
 
 SHORT_HAUL_PRIMARY = ["BRS", "EXT", "NQY", "CWL", "SOU"]
 SHORT_HAUL_FALLBACK = ["STN", "LTN", "LGW"]
@@ -392,7 +410,7 @@ def pick_origin_for_dest(
     preferred_origin: str = "",
 ) -> Optional[str]:
     """
-    Critical fix: CONFIG preferred origin should NOT override planned rotation by default.
+    Critical: CONFIG preferred origin should NOT override planned rotation by default.
     - If RESPECT_CONFIG_ORIGIN=true, preferred_origin is tried first.
     - Otherwise, planned/candidate origins are tried first, and preferred_origin is only a fallback.
     """
@@ -442,16 +460,13 @@ def select_routes_from_dest_configs(
 
         candidate_try_order: List[str] = []
 
-        # planned origin first
         if planned_origin:
             candidate_try_order.append(planned_origin)
 
-        # reverse capability injection (destination -> origins)
         if open_origins:
             rev = sorted(_dedupe_keep_order(dest_to_origins.get(destination, [])[:]))
             candidate_try_order.extend([o for o in rev if o not in candidate_try_order])
 
-        # fallback pools
         candidate_try_order.extend([o for o in full_origin_pool if o not in candidate_try_order])
         candidate_try_order = _dedupe_keep_order(candidate_try_order)
 
@@ -471,6 +486,24 @@ def select_routes_from_dest_configs(
     return selected, di, oi
 
 
+def _offer_stop_airports(offer: Dict[str, Any]) -> Set[str]:
+    """
+    Extract intermediate stop airport IATA codes from a Duffel offer.
+    Robust to schema variance: tries slices -> segments structure.
+    """
+    hubs: Set[str] = set()
+    slices = offer.get("slices") or []
+    for sl in slices:
+        segs = sl.get("segments") or []
+        # intermediate stops are destinations of all but last segment
+        for seg in segs[:-1]:
+            dest = seg.get("destination") or {}
+            iata = _clean_iata(dest.get("iata_code") or dest.get("iata") or "")
+            if iata:
+                hubs.add(iata)
+    return hubs
+
+
 def main() -> int:
     log("=" * 80)
     log("TRAVELTXTTER PIPELINE WORKER (FEEDER) START")
@@ -486,6 +519,11 @@ def main() -> int:
     log(f"FEEDER_OPEN_ORIGINS={FEEDER_OPEN_ORIGINS} | sparse_theme_override={theme_today in SPARSE_THEMES} | effective={open_origins_effective}")
     log(f"RESPECT_CONFIG_ORIGIN={RESPECT_CONFIG_ORIGIN}")
     log(f"DUFFEL_OFFERS_PER_SEARCH={OFFERS_PER_SEARCH} | DUFFEL_MAX_INSERTS={MAX_INSERTS_TOTAL} | DUFFEL_MAX_SEARCHES_PER_RUN={MAX_SEARCHES_PER_RUN} | DUFFEL_ROUTES_PER_RUN={ROUTES_PER_RUN}")
+    log(f"WILDCARD_ENABLED={WILDCARD_ENABLED} | hubs={','.join(WILDCARD_HUBS) if WILDCARD_HUBS else '(none)'} | wildcard_max_searches={WILDCARD_MAX_SEARCHES_PER_RUN} | wildcard_max_conn={WILDCARD_MAX_CONNECTIONS}")
+    if FEEDER_HARD_MAX_PRICE_GBP is not None:
+        log(f"FEEDER_HARD_MAX_PRICE_GBP={FEEDER_HARD_MAX_PRICE_GBP}")
+    else:
+        log("FEEDER_HARD_MAX_PRICE_GBP=(off)")
 
     do_explore = should_do_explore_this_run(theme_today)
 
@@ -569,6 +607,7 @@ def main() -> int:
 
     searches_done = 0
     all_deals: List[Dict[str, Any]] = []
+    wildcard_searches_done = 0
 
     def run_routes(routes: List[Tuple[str, str, Dict[str, Any]]], label: str) -> None:
         nonlocal searches_done, all_deals
@@ -620,17 +659,22 @@ def main() -> int:
                 continue
 
             deal_theme = low(r.get("theme") or theme_today) or theme_today
-
             created_utc = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
             remaining = MAX_INSERTS_TOTAL - len(all_deals)
             take = min(OFFERS_PER_SEARCH, max(0, remaining))
 
             for off in offers[:take]:
+                if len(all_deals) >= MAX_INSERTS_TOTAL:
+                    break
+
                 try:
                     total_amount = float(off.get("total_amount") or "0")
                 except Exception:
                     total_amount = 0.0
+
+                if FEEDER_HARD_MAX_PRICE_GBP is not None and total_amount > FEEDER_HARD_MAX_PRICE_GBP:
+                    continue
 
                 deal_id_seed = f"{origin}->{destination}|{dep_date.isoformat()}|{ret_date.isoformat()}|{total_amount}|{off.get('id','')}"
                 deal_id = str(int(hashlib.sha256(deal_id_seed.encode()).hexdigest()[:12], 16))
@@ -656,12 +700,171 @@ def main() -> int:
                 deal = enrich_deal(deal, themes_dict, signals)
                 all_deals.append(deal)
 
+    def run_wildcard_lane() -> None:
+        """
+        Controlled hub-arbitrage lane:
+        - Uses off-theme destinations (explore set) to avoid cannibalising the daily theme.
+        - Searches with max_connections=WILDCARD_MAX_CONNECTIONS
+        - Filters offers to those whose stop airports include any of WILDCARD_HUBS
+        - Tags deals as WILDCARD_TAG_THEME
+        """
+        nonlocal searches_done, wildcard_searches_done, all_deals
+
+        if not WILDCARD_ENABLED:
+            return
+        if not WILDCARD_HUBS:
+            return
+        if WILDCARD_MAX_SEARCHES_PER_RUN <= 0:
+            return
+        if searches_done >= MAX_SEARCHES_PER_RUN:
+            return
+        if len(all_deals) >= MAX_INSERTS_TOTAL:
+            return
+        if not explore_dest_configs:
+            return
+
+        # Deterministic pick: use a rotating offset so we don't hammer the same wildcard dest.
+        today = dt.datetime.utcnow().date().isoformat()
+        slot = _run_slot() or "UNSET"
+        seed = f"{FEEDER_EXPLORE_SALT}|{today}|{slot}|WILDCARD"
+        offset = _stable_mod(seed, len(explore_dest_configs))
+        rotated = explore_dest_configs[offset:] + explore_dest_configs[:offset]
+
+        # Choose origin pool: allow broader supply for wildcards (include MAN + London + one regional)
+        wildcard_origin_pool = _dedupe_keep_order(planned_origins + ["MAN", "LGW", "STN", "LTN", "LHR"])
+
+        # Run up to wildcard max searches, but never exceed global search cap.
+        tries = 0
+        for cfg in rotated:
+            if tries >= WILDCARD_MAX_SEARCHES_PER_RUN:
+                break
+            if searches_done >= MAX_SEARCHES_PER_RUN:
+                break
+            if len(all_deals) >= MAX_INSERTS_TOTAL:
+                break
+
+            destination = _clean_iata(cfg.get("destination_iata"))
+            if not destination:
+                continue
+
+            # Choose an origin that is valid for this destination
+            origin = None
+            for o in wildcard_origin_pool:
+                oo = _clean_iata(o)
+                if not allowed_pairs or (oo, destination) in allowed_pairs:
+                    origin = oo
+                    break
+            if not origin:
+                continue
+
+            # Use the cfg's date windows if present, else defaults
+            days_min = int(cfg.get("days_ahead_min") or DEFAULT_DAYS_AHEAD_MIN)
+            days_max = int(cfg.get("days_ahead_max") or DEFAULT_DAYS_AHEAD_MAX)
+            trip_len = int(cfg.get("trip_length_days") or DEFAULT_TRIP_LENGTH_DAYS)
+
+            seed2 = f"{dt.datetime.utcnow().date().isoformat()}|{origin}|{destination}|{trip_len}|WILDCARD"
+            hsh = int(hashlib.md5(seed2.encode()).hexdigest()[:8], 16)
+            dep_offset = days_min + (hsh % max(1, (days_max - days_min + 1)))
+            dep_date = (dt.datetime.utcnow().date() + dt.timedelta(days=dep_offset))
+            ret_date = (dep_date + dt.timedelta(days=trip_len))
+
+            payload = {
+                "data": {
+                    "slices": [
+                        {"origin": origin, "destination": destination, "departure_date": dep_date.isoformat()},
+                        {"origin": destination, "destination": origin, "departure_date": ret_date.isoformat()},
+                    ],
+                    "passengers": [{"type": "adult"}],
+                    "cabin_class": (cfg.get("cabin_class") or "economy"),
+                    "max_connections": int(WILDCARD_MAX_CONNECTIONS),
+                    "return_offers": True,
+                }
+            }
+
+            tries += 1
+            try:
+                log(f"Duffel[WILDCARD]: Searching {origin}->{destination} {dep_date.isoformat()}/{ret_date.isoformat()} max_conn={WILDCARD_MAX_CONNECTIONS} hubs={','.join(WILDCARD_HUBS)}")
+                resp = duffel_search_offer_request(payload)
+                searches_done += 1
+                wildcard_searches_done += 1
+                if FEEDER_SLEEP_SECONDS > 0:
+                    import time
+                    time.sleep(FEEDER_SLEEP_SECONDS)
+            except Exception as e:
+                log(f"❌ Duffel[WILDCARD] error: {e}")
+                continue
+
+            offers = (resp.get("data") or {}).get("offers") or []
+            if not offers:
+                log("Duffel[WILDCARD]: offers_returned=0")
+                continue
+
+            # Filter to offers that actually route via one of the hubs
+            filtered: List[Dict[str, Any]] = []
+            for off in offers:
+                stops = _offer_stop_airports(off)
+                if stops.intersection(set(WILDCARD_HUBS)):
+                    filtered.append(off)
+
+            log(f"Duffel[WILDCARD]: offers_returned={len(offers)} | via_hubs={len(filtered)} | will_take_up_to={min(OFFERS_PER_SEARCH, MAX_INSERTS_TOTAL - len(all_deals))}")
+
+            if not filtered:
+                continue
+
+            created_utc = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+            remaining = MAX_INSERTS_TOTAL - len(all_deals)
+            take = min(OFFERS_PER_SEARCH, max(0, remaining))
+
+            # Tag theme as wildcard tag (unexpected_value by default)
+            deal_theme = WILDCARD_TAG_THEME
+
+            for off in filtered[:take]:
                 if len(all_deals) >= MAX_INSERTS_TOTAL:
                     break
 
+                try:
+                    total_amount = float(off.get("total_amount") or "0")
+                except Exception:
+                    total_amount = 0.0
+
+                if FEEDER_HARD_MAX_PRICE_GBP is not None and total_amount > FEEDER_HARD_MAX_PRICE_GBP:
+                    continue
+
+                deal_id_seed = f"{origin}->{destination}|{dep_date.isoformat()}|{ret_date.isoformat()}|{total_amount}|{off.get('id','')}"
+                deal_id = str(int(hashlib.sha256(deal_id_seed.encode()).hexdigest()[:12], 16))
+
+                deal = {
+                    "status": "NEW",
+                    "deal_theme": deal_theme,
+                    "theme": deal_theme,
+                    "deal_id": deal_id,
+                    "origin_iata": origin,
+                    "origin_city": resolve_origin_city(origin, origin_city_map),
+                    "destination_iata": destination,
+                    "outbound_date": dep_date.strftime("%Y-%m-%d"),
+                    "return_date": ret_date.strftime("%Y-%m-%d"),
+                    "price_gbp": math.ceil(total_amount) if total_amount else "",
+                    "destination_city": "",
+                    "destination_country": "",
+                    "created_utc": created_utc,
+                    "created_at": created_utc,
+                    "timestamp": created_utc,
+                }
+
+                deal = enrich_deal(deal, themes_dict, signals)
+                all_deals.append(deal)
+
+            # If we successfully landed any wildcard deals, stop early to keep it “rare”
+            if all_deals and wildcard_searches_done > 0:
+                break
+
     run_routes(selected_routes, label="PRIMARY")
 
-    log(f"✓ Searches completed: {searches_done}")
+    # Optional wildcard lane (only if capacity remains)
+    if WILDCARD_ENABLED and len(all_deals) < MAX_INSERTS_TOTAL and searches_done < MAX_SEARCHES_PER_RUN:
+        run_wildcard_lane()
+
+    log(f"✓ Searches completed: {searches_done} (wildcard_searches={wildcard_searches_done})")
     log(f"✓ Deals collected: {len(all_deals)} (cap {MAX_INSERTS_TOTAL})")
 
     if not all_deals:

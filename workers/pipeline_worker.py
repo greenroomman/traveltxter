@@ -3,20 +3,27 @@
 workers/pipeline_worker.py
 
 TravelTxter Pipeline Worker (FEEDER) — V4.6
-Fix: ALWAYS write created_utc (and also created_at / timestamp if present)
+CRITICAL FIX (2026-01-17):
+- created_utc WAS NOT LANDING because RAW_DEALS headers likely contain trailing/leading spaces.
+- We were writing deal["created_utc"] (clean key), but append_rows used the *raw* header string
+  (e.g. "created_utc " != "created_utc"), so it wrote blanks.
 
-Why:
-- ai_scorer uses a freshness gate (MIN_INGEST_AGE_SECONDS) to allow Sheets formulas to recalc
-- If created_utc is blank, the gate can deadlock or behave unpredictably on legacy rows
-- RAW_DEALS schema includes created_utc and created_at and timestamp
+This replacement makes appends **header-normalized**:
+- Reads RAW_DEALS header row
+- Uses BOTH:
+    - raw header list (for column order)
+    - normalized header list (strip spaces)
+- When building row values, it looks up deal values by normalized key.
 
-Also included:
-- Planned origin rotation precedence (prevents “all searches BRS->…”)
-- DUFFEL_OFFERS_PER_SEARCH (increase yield per search without increasing searches)
+Result:
+- created_utc / created_at / timestamp will populate reliably even if sheet headers have whitespace.
+
+Log evidence this is the current failure mode:
+- ai_scorer: "missing_ingest_ts=155" and no promotion/publish. :contentReference[oaicite:0]{index=0}
 
 Guardrails:
-- Google Sheets remains single stateful memory
-- Deterministic selection (no random churn)
+- Google Sheets is the single stateful memory
+- Deterministic route selection
 """
 
 from __future__ import annotations
@@ -293,15 +300,31 @@ def enrich_deal(
     return deal
 
 
-def append_rows_header_mapped(ws, deals: List[Dict[str, Any]]) -> int:
+def append_rows_header_normalized(ws, deals: List[Dict[str, Any]]) -> int:
+    """
+    Append rows to RAW_DEALS using *normalized* header lookup.
+
+    Key fix:
+    - If sheet headers have whitespace (e.g. "created_utc "), we still map to deal["created_utc"].
+    """
     if not deals:
         return 0
-    headers = ws.row_values(1)
-    if not headers:
+
+    raw_headers = ws.row_values(1)
+    if not raw_headers:
         raise RuntimeError("RAW_DEALS header row is empty")
+
+    # Preserve order, but normalize keys for lookup
+    norm_headers = [h.strip() for h in raw_headers]
+
     rows = []
     for d in deals:
-        rows.append([d.get(h, "") for h in headers])
+        row = []
+        for h_norm in norm_headers:
+            # Lookup by normalized key (so "created_utc " works)
+            row.append(d.get(h_norm, ""))
+        rows.append(row)
+
     ws.append_rows(rows, value_input_option="RAW")
     return len(rows)
 
@@ -327,7 +350,7 @@ def _deterministic_pick(seq: List[str], seed: str, k: int) -> List[str]:
             out.append(v)
     while len(out) < k:
         out.append(seq[(h + len(out)) % n])
-    return out
+    return out[:k]
 
 
 def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
@@ -348,7 +371,7 @@ def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
     fallback_n = max(0, routes_per_run - primary_n)
     prim = _deterministic_pick(SHORT_HAUL_PRIMARY, seed + "|P", primary_n)
     fb = _deterministic_pick(SHORT_HAUL_FALLBACK, seed + "|F", fallback_n)
-    return prim + fb
+    return (prim + fb)[:routes_per_run]
 
 
 def enforce_origin_diversity(origins: List[str]) -> List[str]:
@@ -420,7 +443,7 @@ def select_routes_from_dest_configs(
         planned_origin = planned_origins[oi % len(planned_origins)] if planned_origins else ""
         oi += 1
 
-        # Precedence: planned origin first by default.
+        # planned origin first by default
         if RESPECT_CONFIG_ORIGIN:
             candidate_try_order = [cfg_origin, planned_origin]
         else:
@@ -475,7 +498,8 @@ def main() -> int:
 
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
     raw_headers = ws_raw.row_values(1)
-    raw_header_set = {h.strip() for h in raw_headers if h}
+    norm_headers = [h.strip() for h in raw_headers]
+    raw_header_set = {h for h in norm_headers if h}
 
     config_rows = load_config_rows(sh)
     themes_dict = load_themes_dict(sh)
@@ -606,10 +630,8 @@ def main() -> int:
 
             deal_theme = low(cfg.get("theme") or theme_today) or theme_today
 
-            # ---- CRITICAL: created_utc must always be written ----
-            # Use ISO UTC with Z
             created_utc = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-            created_at = created_utc  # keep consistent; sheet can format/display as needed
+            created_at = created_utc
             timestamp = created_utc
 
             remaining = MAX_INSERTS_TOTAL - len(all_deals)
@@ -640,7 +662,7 @@ def main() -> int:
                     "theme": deal_theme,
                 }
 
-                # Only add these fields if headers exist (prevents silent misalignment)
+                # Write timestamps by normalized key, matching append_rows_header_normalized
                 if "created_utc" in raw_header_set:
                     deal["created_utc"] = created_utc
                 if "created_at" in raw_header_set:
@@ -663,7 +685,7 @@ def main() -> int:
         log("⚠️ No deals found. (Not an error; depends on availability/prices.)")
         return 0
 
-    inserted = append_rows_header_mapped(ws_raw, all_deals)
+    inserted = append_rows_header_normalized(ws_raw, all_deals)
     log(f"✅ Inserted {inserted} rows into {RAW_DEALS_TAB}")
     return 0
 

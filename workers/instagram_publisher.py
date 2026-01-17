@@ -5,18 +5,22 @@ TravelTxter — Instagram Publisher (FULL REPLACEMENT — V4.6)
 
 LOCKED PURPOSE:
 - Publish RAW_DEALS rows where status == READY_TO_PUBLISH
-- ENFORCE theme-of-the-day gate
-- ALWAYS prioritise NEWEST deals (fresh-first, never sheet-order)
+- Enforce THEME-OF-THE-DAY gate
+- ALWAYS prioritise NEWEST eligible deal (ingested_at_utc DESC, then row DESC)
 - Publish via Instagram Graph API
 - Update status -> POSTED_INSTAGRAM
-- On image fetch failure: re-queue to READY_TO_POST
+- On image fetch failure: re-queue -> READY_TO_POST
 
-CRITICAL SELECTION RULE (LOCKED):
-1) status == READY_TO_PUBLISH
-2) theme matches theme-of-the-day
-3) graphic_url present + fetchable
-4) NEWEST ingested_at_utc DESC
-5) Tie-breaker: highest row number
+LOCKED INSTAGRAM OUTPUT:
+Country [country flag]
+To: <City>
+From: <City>
+Price: £<xxx>
+Out: YYYY-MM-DD
+Return: YYYY-MM-DD
+
+[PHRASE BANK]
+Link in bio…
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ from google.oauth2.service_account import Credentials
 
 
 # ============================================================
-# Theme of day (MUST MATCH pipeline_worker rotation)
+# THEME OF DAY (must match pipeline_worker rotation)
 # ============================================================
 
 MASTER_THEMES = [
@@ -69,7 +73,7 @@ def resolve_theme_of_day() -> str:
 
 
 # ============================================================
-# Logging
+# LOGGING / ENV
 # ============================================================
 
 def log(msg: str) -> None:
@@ -81,16 +85,12 @@ def iso_now() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-# ============================================================
-# Env helpers
-# ============================================================
-
 def env(k: str, default: str = "") -> str:
     return (os.environ.get(k, default) or "").strip()
 
 
 # ============================================================
-# Google Sheets auth
+# GOOGLE SHEETS AUTH
 # ============================================================
 
 def parse_sa_json(raw: str) -> Dict[str, Any]:
@@ -103,7 +103,7 @@ def parse_sa_json(raw: str) -> Dict[str, Any]:
 def gs_client() -> gspread.Client:
     raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
     if not raw:
-        raise RuntimeError("Missing GCP_SA_JSON")
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
     info = parse_sa_json(raw)
     creds = Credentials.from_service_account_info(
         info,
@@ -120,13 +120,13 @@ def a1(row: int, col0: int) -> str:
 
 
 # ============================================================
-# Image URL handling (PythonAnywhere-safe)
+# IMAGE URL HANDLING (PythonAnywhere-safe)
 # ============================================================
 
 def preflight(url: str) -> Tuple[int, str]:
     try:
         r = requests.get(url, timeout=25, allow_redirects=True)
-        ct = r.headers.get("Content-Type", "")
+        ct = (r.headers.get("Content-Type", "") or "").strip().lower()
         if r.status_code == 200 and ct.startswith("image/"):
             return 200, ""
         snippet = ""
@@ -141,8 +141,8 @@ def candidate_url_variants(raw_url: str) -> List[str]:
     u = (raw_url or "").strip()
     if not u:
         return []
-    variants = [u]
 
+    variants = [u]
     base = env("PUBLIC_BASE_URL", "https://greenroomman.pythonanywhere.com").rstrip("/")
 
     if not u.startswith("http://") and not u.startswith("https://"):
@@ -169,7 +169,8 @@ def candidate_url_variants(raw_url: str) -> List[str]:
         variants.append(f"{base}/renders/{fname}")
         variants.append(f"{base}/static/renders/{fname}")
 
-    out, seen = [], set()
+    out: List[str] = []
+    seen = set()
     for v in variants:
         if v and v not in seen:
             out.append(v)
@@ -188,7 +189,7 @@ def preflight_and_repair_image_url(raw_url: str) -> str:
 
 
 # ============================================================
-# Instagram Graph API
+# INSTAGRAM GRAPH API
 # ============================================================
 
 GRAPH_BASE = "https://graph.facebook.com/v20.0"
@@ -219,32 +220,40 @@ def ig_publish_container(ig_user_id: str, token: str, creation_id: str) -> str:
 
 
 # ============================================================
-# Caption
+# CAPTION (LOCKED TEMPLATE)
 # ============================================================
 
-def build_caption(row: Dict[str, str], theme_today: str) -> str:
-    phrase = (row.get("phrase_bank") or "").strip()
-    origin = (row.get("origin_city") or row.get("origin_iata") or "").strip()
-    dest = (row.get("destination_city") or row.get("destination_iata") or "").strip()
+def build_caption(row: Dict[str, str]) -> str:
     country = (row.get("destination_country") or "").strip()
+    flag = (row.get("country_flag") or "").strip()  # optional column if you have it
+    dest = (row.get("destination_city") or row.get("destination_iata") or "").strip()
+    origin = (row.get("origin_city") or row.get("origin_iata") or "").strip()
+    price = (row.get("price_gbp") or "").strip().replace("£", "").strip()
     out_date = (row.get("outbound_date") or "").strip()
-    in_date = (row.get("return_date") or "").strip()
-    price = (row.get("price_gbp") or "").strip()
+    ret_date = (row.get("return_date") or "").strip()
+    phrase = (row.get("phrase_bank") or "").strip()
 
-    lines: List[str] = []
+    first_line = country if country else (row.get("destination_iata") or "").strip()
+    if flag:
+        first_line = f"{first_line} {flag}".strip()
+
+    lines: List[str] = [
+        first_line,
+        f"To: {dest}",
+        f"From: {origin}",
+        f"Price: £{price}",
+        f"Out: {out_date}",
+        f"Return: {ret_date}",
+        "",
+    ]
     if phrase:
-        lines += [phrase, ""]
-    lines.append(f"£{price} to {dest}{', ' + country if country else ''}".strip())
-    if origin:
-        lines.append(f"From {origin}")
-    if out_date and in_date:
-        lines.append(f"{out_date} → {in_date}")
-    lines += ["", f"Theme today: {theme_today.replace('_', ' ')}", "#traveltxter #traveldeals #cheapflights"]
-    return "\n".join(lines).strip()
+        lines.append(phrase)
+    lines.append("Link in bio…")
+    return "\n".join([l for l in lines if l is not None]).strip()
 
 
 # ============================================================
-# Main
+# MAIN
 # ============================================================
 
 def main() -> int:
@@ -254,7 +263,7 @@ def main() -> int:
     ig_user_id = env("IG_USER_ID")
 
     if not spreadsheet_id or not token or not ig_user_id:
-        raise RuntimeError("Missing required env vars")
+        raise RuntimeError("Missing required env vars: SPREADSHEET_ID, IG_ACCESS_TOKEN, IG_USER_ID")
 
     theme_today = resolve_theme_of_day()
     log(f"🎯 Theme of the day: {theme_today}")
@@ -285,13 +294,10 @@ def main() -> int:
         if c not in h:
             raise RuntimeError(f"Missing column: {c}")
 
-    # --------------------
-    # COLLECT ELIGIBLE ROWS
-    # --------------------
-    eligible = []
+    eligible: List[Dict[str, Any]] = []
 
     for i, r in enumerate(values[1:], start=2):
-        if r[h["status"]].strip() != "READY_TO_PUBLISH":
+        if (r[h["status"]] or "").strip() != "READY_TO_PUBLISH":
             continue
 
         row = {headers[j]: (r[j] if j < len(r) else "") for j in range(len(headers))}
@@ -308,24 +314,14 @@ def main() -> int:
         except Exception:
             ts = dt.datetime.min
 
-        eligible.append(
-            {
-                "row_num": i,
-                "ts": ts,
-                "row": row,
-            }
-        )
+        eligible.append({"row_num": i, "ts": ts, "row": row})
 
     if not eligible:
-        log("No eligible rows match theme gate.")
+        log("No eligible rows match status + theme gate.")
         return 0
 
-    # --------------------
-    # SORT: NEWEST FIRST
-    # --------------------
     eligible.sort(key=lambda x: (x["ts"], x["row_num"]), reverse=True)
     target = eligible[0]
-
     rownum = target["row_num"]
     row = target["row"]
 
@@ -334,9 +330,9 @@ def main() -> int:
         if image_url != row["graphic_url"]:
             ws.update([[image_url]], a1(rownum, h["graphic_url"]))
 
-        caption = build_caption(row, theme_today)
+        caption = build_caption(row)
 
-        log(f"📸 Publishing row {rownum} deal_id={row.get('deal_id','')}")
+        log(f"📸 Publishing row {rownum} deal_id={(row.get('deal_id') or '').strip()}")
         creation_id = ig_create_container(ig_user_id, token, image_url, caption)
         time.sleep(3)
         media_id = ig_publish_container(ig_user_id, token, creation_id)

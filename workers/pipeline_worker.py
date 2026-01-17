@@ -2,20 +2,16 @@ name: TravelTxter Pipeline (AM / PM / Manual TEST)
 
 on:
   schedule:
-    - cron: "30 7 * * *"   # AM run
-    - cron: "30 16 * * *"  # PM run
-
+    - cron: "30 7 * * *"
+    - cron: "30 16 * * *"
   workflow_dispatch:
     inputs:
       run_slot:
-        description: "Run slot (TEST for manual runs)"
+        description: "Run slot"
         required: true
         default: "TEST"
         type: choice
-        options:
-          - TEST
-          - AM
-          - PM
+        options: [TEST, AM, PM]
 
 concurrency:
   group: traveltxter-${{ github.event_name == 'workflow_dispatch' && inputs.run_slot == 'TEST' && 'test' || 'prod' }}
@@ -55,7 +51,6 @@ jobs:
           fi
           echo "RUN_SLOT resolved to: $RUN_SLOT"
 
-      # ================= FEEDER =================
       - name: Feeder
         run: python workers/pipeline_worker.py
         env:
@@ -67,23 +62,19 @@ jobs:
           DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
           DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
           DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
-
-          # Price gate controls (optional vars; safe if unset)
           PRICE_GATE_ENABLED: "true"
           PRICE_GATE_MULTIPLIER: ${{ vars.PRICE_GATE_MULTIPLIER }}
           PRICE_GATE_MIN_CAP_GBP: ${{ vars.PRICE_GATE_MIN_CAP_GBP }}
           PRICE_GATE_FALLBACK_BEHAVIOR: ${{ vars.PRICE_GATE_FALLBACK_BEHAVIOR }}
 
-      # ====== MANDATORY WAIT FOR SHEETS RECALC / FRESHNESS ======
       - name: Wait for Sheets recalculation
         shell: bash
         run: |
           SEC="${{ vars.MIN_INGEST_AGE_SECONDS }}"
           if [ -z "$SEC" ]; then SEC="90"; fi
-          echo "Sleeping ${SEC}s to allow Sheets formulas to recalc..."
+          echo "Sleeping ${SEC}s..."
           sleep "$SEC"
 
-      # ================= SCORER =================
       - name: AI Scorer
         run: python workers/ai_scorer.py
         env:
@@ -94,7 +85,6 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS }}
 
-      # ================= ROUTER =================
       - name: Link Router
         run: python workers/link_router.py
         env:
@@ -105,7 +95,6 @@ jobs:
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
 
-      # ================= RENDER =================
       - name: Render
         run: python workers/render_client.py
         env:
@@ -115,7 +104,6 @@ jobs:
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
 
-      # ================= INSTAGRAM =================
       - name: Instagram
         run: python workers/instagram_publisher.py
         env:
@@ -126,7 +114,6 @@ jobs:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
 
-      # ================= TELEGRAM =================
       - name: Telegram
         run: python workers/telegram_publisher.py
         env:
@@ -138,5 +125,3 @@ jobs:
           TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
-          STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}

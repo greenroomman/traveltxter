@@ -5,6 +5,11 @@ TravelTxter ai_scorer.py (V4.6) — PURE VIEW JUDGE (Spreadsheet Brain Contract)
 Phase 2+ (2026-01-16):
 - Schema validation via sheet_contract.py
 - Formula freshness handshake: only consider NEW rows older than MIN_INGEST_AGE_SECONDS
+
+HOTFIX (2026-01-17):
+- Default INGESTED_AT_COL changed from "ingested_at_utc" -> "created_utc"
+  Reason: RAW_DEALS does not contain ingested_at_utc in the locked schema export,
+  causing ALL NEW rows to be treated as "too fresh" forever and blocking publishing.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ from __future__ import annotations
 import os
 import json
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 import gspread
 from gspread.cell import Cell
@@ -54,7 +59,8 @@ BACKLOG_THEME_FIRST = (os.environ.get("BACKLOG_THEME_FIRST", "true") or "true").
 ENFORCE_DISTINCT_DESTS = (os.environ.get("ENFORCE_DISTINCT_DESTS", "true") or "true").strip().lower() in ("1", "true", "yes", "y")
 
 # Phase 2+ handshake controls
-INGESTED_AT_COL = os.environ.get("INGESTED_AT_COL", "ingested_at_utc").strip() or "ingested_at_utc"
+# HOTFIX: default to created_utc (exists in RAW_DEALS locked schema); ingested_at_utc does not.
+INGESTED_AT_COL = os.environ.get("INGESTED_AT_COL", "created_utc").strip() or "created_utc"
 MIN_INGEST_AGE_SECONDS = int(os.environ.get("MIN_INGEST_AGE_SECONDS", "90") or "90")
 
 
@@ -272,6 +278,8 @@ def main() -> int:
         return 0
 
     raw_headers = _headers(ws_raw)
+
+    # Contract: require the ingest timestamp column we are actually using.
     SheetContract.assert_columns_present(
         raw_headers,
         required=["status", "deal_id", INGESTED_AT_COL],

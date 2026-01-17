@@ -71,6 +71,11 @@ jobs:
           DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
           DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
           DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+          DUFFEL_OFFERS_PER_SEARCH: ${{ vars.DUFFEL_OFFERS_PER_SEARCH }}
+
+      # ===== Wait for Google Sheets formulas =====
+      - name: Wait for Sheets recalculation
+        run: sleep 90
 
       # ================= SCORER =================
       - name: AI Scorer
@@ -81,6 +86,8 @@ jobs:
           RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          INGESTED_AT_COL: created_utc
+          MIN_INGEST_AGE_SECONDS: "90"
 
       # ================= ROUTER =================
       - name: Link Router

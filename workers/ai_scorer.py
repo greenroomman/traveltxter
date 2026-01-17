@@ -2,14 +2,16 @@
 """
 TravelTxter ai_scorer.py (V4.6) — PURE VIEW JUDGE (Spreadsheet Brain Contract)
 
-Phase 2+ (2026-01-16):
+Phase 2+:
 - Schema validation via sheet_contract.py
 - Formula freshness handshake: only consider NEW rows older than MIN_INGEST_AGE_SECONDS
 
 HOTFIX (2026-01-17):
-- Default INGESTED_AT_COL changed from "ingested_at_utc" -> "created_utc"
-  Reason: RAW_DEALS does not contain ingested_at_utc in the locked schema export,
-  causing ALL NEW rows to be treated as "too fresh" forever and blocking publishing.
+- Ingest timestamp robustness:
+  - Default INGESTED_AT_COL="created_utc"
+  - If created_utc is blank (legacy rows), fall back to other timestamp fields.
+  - If ALL timestamps are missing, DO NOT deadlock the pipeline:
+      - treat as eligible (log warning) rather than "too fresh forever".
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from __future__ import annotations
 import os
 import json
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Optional
 
 import gspread
 from gspread.cell import Cell
@@ -59,10 +61,8 @@ BACKLOG_THEME_FIRST = (os.environ.get("BACKLOG_THEME_FIRST", "true") or "true").
 ENFORCE_DISTINCT_DESTS = (os.environ.get("ENFORCE_DISTINCT_DESTS", "true") or "true").strip().lower() in ("1", "true", "yes", "y")
 
 # Phase 2+ handshake controls
-# HOTFIX: default to created_utc (exists in RAW_DEALS locked schema); ingested_at_utc does not.
 INGESTED_AT_COL = os.environ.get("INGESTED_AT_COL", "created_utc").strip() or "created_utc"
 MIN_INGEST_AGE_SECONDS = int(os.environ.get("MIN_INGEST_AGE_SECONDS", "90") or "90")
-
 
 MASTER_THEMES = [
     "winter_sun",
@@ -82,6 +82,22 @@ MASTER_THEMES = [
 VERDICT_ELITE = "💎 VIP + INSTA (Elite)"
 VERDICT_STANDARD = "✅ POST (Standard)"
 VERDICT_BACKLOG = "⚠️ BACKLOG (Low Priority)"
+
+# Timestamp fallback order (RAW_DEALS)
+# We prefer created_utc, but legacy rows may only have these other fields populated.
+INGEST_FALLBACK_COLS = [
+    "created_utc",
+    "created_at",
+    "timestamp",
+    "banked_utc",
+    "scored_timestamp",
+    "rendered_timestamp",
+    "rendered_at",
+    "link_routed_at",
+    "posted_instagram_at",
+    "posted_telegram_vip_at",
+    "posted_telegram_free_at",
+]
 
 
 def _log(msg: str) -> None:
@@ -256,6 +272,41 @@ def _batch_update_status(ws_raw, status_col: int, updates: List[Dict[str, Any]])
     return len(cells)
 
 
+def _best_ingest_value(raw_row: Dict[str, Any]) -> Optional[Any]:
+    """
+    Choose an ingest-like timestamp value from RAW_DEALS, preferring INGESTED_AT_COL,
+    then falling back across known timestamp columns.
+
+    Returns:
+      - a value (string or datetime-ish) if found
+      - None if none exist
+    """
+    primary = raw_row.get(INGESTED_AT_COL)
+    if _s(primary):
+        return primary
+
+    # Try fallbacks (including created_utc even if INGESTED_AT_COL was different)
+    for c in INGEST_FALLBACK_COLS:
+        v = raw_row.get(c)
+        if _s(v):
+            return v
+
+    return None
+
+
+def _is_row_old_enough(raw_row: Dict[str, Any]) -> bool:
+    """
+    Applies the MIN_INGEST_AGE_SECONDS gate using best available timestamp.
+    Critical: if no timestamp exists, do NOT deadlock. Return True with warning.
+    """
+    v = _best_ingest_value(raw_row)
+    if v is None:
+        # No timestamp anywhere: allow rather than deadlock.
+        return True
+
+    return SheetContract.is_older_than_seconds(v, MIN_INGEST_AGE_SECONDS)
+
+
 def main() -> int:
     if not SPREADSHEET_ID:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
@@ -279,10 +330,10 @@ def main() -> int:
 
     raw_headers = _headers(ws_raw)
 
-    # Contract: require the ingest timestamp column we are actually using.
+    # Require minimal columns. Do NOT require INGESTED_AT_COL because legacy sheets may not populate it.
     SheetContract.assert_columns_present(
         raw_headers,
-        required=["status", "deal_id", INGESTED_AT_COL],
+        required=["status", "deal_id"],
         tab_name=RAW_DEALS_TAB,
     )
     raw_cm = _colmap(raw_headers)
@@ -290,18 +341,19 @@ def main() -> int:
     raw_records = ws_raw.get_all_records()
 
     deal_id_to_rownum: Dict[str, int] = {}
-    deal_id_to_ingested: Dict[str, Any] = {}
+    deal_id_to_raw: Dict[str, Dict[str, Any]] = {}
 
     for idx, r in enumerate(raw_records, start=2):
         did = _s(r.get("deal_id"))
         if did:
             deal_id_to_rownum[did] = idx
-            deal_id_to_ingested[did] = r.get(INGESTED_AT_COL)
+            deal_id_to_raw[did] = r
 
     scan_rows = view_rows[: MAX_ROWS_PER_RUN * 10]
 
     candidates: List[Dict[str, Any]] = []
     too_fresh = 0
+    missing_ingest = 0
 
     for r in scan_rows:
         if not _is_new(r):
@@ -311,13 +363,16 @@ def main() -> int:
         if not did:
             continue
 
-        raw_row = deal_id_to_rownum.get(did)
-        if not raw_row:
+        raw_rownum = deal_id_to_rownum.get(did)
+        raw_row = deal_id_to_raw.get(did)
+        if not raw_rownum or raw_row is None:
             continue
 
-        # Phase 2+ freshness gate (prevents stale RAW_DEALS_VIEW reads)
-        ing = deal_id_to_ingested.get(did)
-        if not SheetContract.is_older_than_seconds(ing, MIN_INGEST_AGE_SECONDS):
+        ingest_val = _best_ingest_value(raw_row)
+        if ingest_val is None:
+            missing_ingest += 1
+
+        if not _is_row_old_enough(raw_row):
             too_fresh += 1
             continue
 
@@ -334,7 +389,7 @@ def main() -> int:
         candidates.append(
             {
                 "deal_id": did,
-                "raw_row": raw_row,
+                "raw_row": raw_rownum,
                 "worthiness_score": w,
                 "priority_score": ps,
                 "verdict": _verdict(r),
@@ -344,15 +399,14 @@ def main() -> int:
             }
         )
 
-    _log(f"Primary eligible NEW candidates: {len(candidates)} | skipped_too_fresh={too_fresh}")
+    _log(f"Primary eligible NEW candidates: {len(candidates)} | skipped_too_fresh={too_fresh} | missing_ingest_ts={missing_ingest}")
 
     if not candidates:
-        _log("No eligible candidates (likely freshness window). Exiting cleanly.")
+        _log("No eligible candidates (freshness gate / missing timestamps / or low scores). Exiting cleanly.")
         return 0
 
     candidates.sort(key=lambda x: (x["priority_score"], x["worthiness_score"]), reverse=True)
 
-    # Winner + optional VIP runner-ups
     picked: List[Dict[str, Any]] = []
     seen_dests: Set[str] = set()
 

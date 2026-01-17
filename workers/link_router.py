@@ -23,6 +23,9 @@ Duffel:
 - DUFFEL_API_KEY optional; if missing we go straight to demo links
 - DUFFEL_API_BASE default https://api.duffel.com
 - DUFFEL_VERSION default v2 (must be v2)
+
+FIX (minimal):
+- Duffel Links endpoint is /links (NOT /air/links)
 """
 
 from __future__ import annotations
@@ -198,7 +201,9 @@ def _create_duffel_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: 
     if REDIRECT_BASE_URL:
         payload["data"]["redirect_url"] = REDIRECT_BASE_URL
 
-    url = f"{DUFFEL_API_BASE}/air/links"
+    # FIX: Duffel Links endpoint is /links (NOT /air/links)
+    url = f"{DUFFEL_API_BASE}/links"
+
     try:
         r = requests.post(url, headers=_duffel_headers(), json=payload, timeout=25)
     except Exception as e:

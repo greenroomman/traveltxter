@@ -2,16 +2,9 @@
 """
 TravelTxter ai_scorer.py (V4.6) — PURE VIEW JUDGE (Spreadsheet Brain Contract)
 
-Phase 2+:
+Phase 2+ (2026-01-16):
 - Schema validation via sheet_contract.py
 - Formula freshness handshake: only consider NEW rows older than MIN_INGEST_AGE_SECONDS
-
-HOTFIX (2026-01-17):
-- Ingest timestamp robustness:
-  - Default INGESTED_AT_COL="created_utc"
-  - If created_utc is blank (legacy rows), fall back to other timestamp fields.
-  - If ALL timestamps are missing, DO NOT deadlock the pipeline:
-      - treat as eligible (log warning) rather than "too fresh forever".
 """
 
 from __future__ import annotations
@@ -19,7 +12,7 @@ from __future__ import annotations
 import os
 import json
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Set, Optional
+from typing import Any, Dict, List, Set
 
 import gspread
 from gspread.cell import Cell
@@ -61,8 +54,9 @@ BACKLOG_THEME_FIRST = (os.environ.get("BACKLOG_THEME_FIRST", "true") or "true").
 ENFORCE_DISTINCT_DESTS = (os.environ.get("ENFORCE_DISTINCT_DESTS", "true") or "true").strip().lower() in ("1", "true", "yes", "y")
 
 # Phase 2+ handshake controls
-INGESTED_AT_COL = os.environ.get("INGESTED_AT_COL", "created_utc").strip() or "created_utc"
+INGESTED_AT_COL = os.environ.get("INGESTED_AT_COL", "ingested_at_utc").strip() or "ingested_at_utc"
 MIN_INGEST_AGE_SECONDS = int(os.environ.get("MIN_INGEST_AGE_SECONDS", "90") or "90")
+
 
 MASTER_THEMES = [
     "winter_sun",
@@ -82,22 +76,6 @@ MASTER_THEMES = [
 VERDICT_ELITE = "💎 VIP + INSTA (Elite)"
 VERDICT_STANDARD = "✅ POST (Standard)"
 VERDICT_BACKLOG = "⚠️ BACKLOG (Low Priority)"
-
-# Timestamp fallback order (RAW_DEALS)
-# We prefer created_utc, but legacy rows may only have these other fields populated.
-INGEST_FALLBACK_COLS = [
-    "created_utc",
-    "created_at",
-    "timestamp",
-    "banked_utc",
-    "scored_timestamp",
-    "rendered_timestamp",
-    "rendered_at",
-    "link_routed_at",
-    "posted_instagram_at",
-    "posted_telegram_vip_at",
-    "posted_telegram_free_at",
-]
 
 
 def _log(msg: str) -> None:
@@ -251,60 +229,12 @@ def _eligible_primary(row: Dict[str, Any], theme_today: str) -> bool:
     return False
 
 
-def _eligible_backlog(row: Dict[str, Any], theme_today: str, theme_first: bool) -> bool:
-    if not _passes_value_gate(row):
-        return False
-    if _verdict(row) != VERDICT_BACKLOG:
-        return False
-    w = _safe_float(row.get("worthiness_score"), 0.0)
-    if w < BACKLOG_MIN_SCORE:
-        return False
-    if theme_first:
-        return _theme_match(row, theme_today)
-    return True
-
-
 def _batch_update_status(ws_raw, status_col: int, updates: List[Dict[str, Any]]) -> int:
     if not updates:
         return 0
     cells = [Cell(row=u["row"], col=status_col, value=u["value"]) for u in updates]
     ws_raw.update_cells(cells, value_input_option="RAW")
     return len(cells)
-
-
-def _best_ingest_value(raw_row: Dict[str, Any]) -> Optional[Any]:
-    """
-    Choose an ingest-like timestamp value from RAW_DEALS, preferring INGESTED_AT_COL,
-    then falling back across known timestamp columns.
-
-    Returns:
-      - a value (string or datetime-ish) if found
-      - None if none exist
-    """
-    primary = raw_row.get(INGESTED_AT_COL)
-    if _s(primary):
-        return primary
-
-    # Try fallbacks (including created_utc even if INGESTED_AT_COL was different)
-    for c in INGEST_FALLBACK_COLS:
-        v = raw_row.get(c)
-        if _s(v):
-            return v
-
-    return None
-
-
-def _is_row_old_enough(raw_row: Dict[str, Any]) -> bool:
-    """
-    Applies the MIN_INGEST_AGE_SECONDS gate using best available timestamp.
-    Critical: if no timestamp exists, do NOT deadlock. Return True with warning.
-    """
-    v = _best_ingest_value(raw_row)
-    if v is None:
-        # No timestamp anywhere: allow rather than deadlock.
-        return True
-
-    return SheetContract.is_older_than_seconds(v, MIN_INGEST_AGE_SECONDS)
 
 
 def main() -> int:
@@ -329,11 +259,9 @@ def main() -> int:
         return 0
 
     raw_headers = _headers(ws_raw)
-
-    # Require minimal columns. Do NOT require INGESTED_AT_COL because legacy sheets may not populate it.
     SheetContract.assert_columns_present(
         raw_headers,
-        required=["status", "deal_id"],
+        required=["status", "deal_id", INGESTED_AT_COL],
         tab_name=RAW_DEALS_TAB,
     )
     raw_cm = _colmap(raw_headers)
@@ -341,19 +269,23 @@ def main() -> int:
     raw_records = ws_raw.get_all_records()
 
     deal_id_to_rownum: Dict[str, int] = {}
-    deal_id_to_raw: Dict[str, Dict[str, Any]] = {}
+    deal_id_to_ingested: Dict[str, Any] = {}
 
     for idx, r in enumerate(raw_records, start=2):
         did = _s(r.get("deal_id"))
         if did:
             deal_id_to_rownum[did] = idx
-            deal_id_to_raw[did] = r
+            deal_id_to_ingested[did] = r.get(INGESTED_AT_COL)
 
-    scan_rows = view_rows[: MAX_ROWS_PER_RUN * 10]
+    # IMPORTANT FIX:
+    # Feeder appends NEW rows at the bottom of RAW_DEALS/RAW_DEALS_VIEW.
+    # Scanning from the top misses the newest supply entirely.
+    scan_n = max(50, MAX_ROWS_PER_RUN * 10)
+    scan_rows = view_rows[-scan_n:]  # tail window (most recent)
+    _log(f"Scanning RAW_DEALS_VIEW tail window: {len(scan_rows)} rows (of total {len(view_rows)})")
 
     candidates: List[Dict[str, Any]] = []
     too_fresh = 0
-    missing_ingest = 0
 
     for r in scan_rows:
         if not _is_new(r):
@@ -363,16 +295,13 @@ def main() -> int:
         if not did:
             continue
 
-        raw_rownum = deal_id_to_rownum.get(did)
-        raw_row = deal_id_to_raw.get(did)
-        if not raw_rownum or raw_row is None:
+        raw_row = deal_id_to_rownum.get(did)
+        if not raw_row:
             continue
 
-        ingest_val = _best_ingest_value(raw_row)
-        if ingest_val is None:
-            missing_ingest += 1
-
-        if not _is_row_old_enough(raw_row):
+        # Phase 2+ freshness gate (prevents stale RAW_DEALS_VIEW reads)
+        ing = deal_id_to_ingested.get(did)
+        if not SheetContract.is_older_than_seconds(ing, MIN_INGEST_AGE_SECONDS):
             too_fresh += 1
             continue
 
@@ -389,7 +318,7 @@ def main() -> int:
         candidates.append(
             {
                 "deal_id": did,
-                "raw_row": raw_rownum,
+                "raw_row": raw_row,
                 "worthiness_score": w,
                 "priority_score": ps,
                 "verdict": _verdict(r),
@@ -399,10 +328,10 @@ def main() -> int:
             }
         )
 
-    _log(f"Primary eligible NEW candidates: {len(candidates)} | skipped_too_fresh={too_fresh} | missing_ingest_ts={missing_ingest}")
+    _log(f"Primary eligible NEW candidates: {len(candidates)} | skipped_too_fresh={too_fresh}")
 
     if not candidates:
-        _log("No eligible candidates (freshness gate / missing timestamps / or low scores). Exiting cleanly.")
+        _log("No eligible candidates (view gating / thresholds / or formula outputs not populated yet). Exiting cleanly.")
         return 0
 
     candidates.sort(key=lambda x: (x["priority_score"], x["worthiness_score"]), reverse=True)
@@ -417,7 +346,7 @@ def main() -> int:
         picked.append(c)
         if c["dest_key"]:
             seen_dests.add(c["dest_key"])
-        if len(picked) >= (1 + VIP_RUNNERS_UP):
+        if len(picked) >= 1:  # WINNERS_PER_RUN is currently 1 in workflow; keep deterministic
             break
 
     if not picked:
@@ -426,13 +355,10 @@ def main() -> int:
 
     status_col = raw_cm["status"]
 
-    updates: List[Dict[str, Any]] = []
-    updates.append({"row": picked[0]["raw_row"], "value": "READY_TO_POST"})
-    for rr in picked[1:]:
-        updates.append({"row": rr["raw_row"], "value": "READY_TO_VIP_BUNDLE"})
+    updates: List[Dict[str, Any]] = [{"row": picked[0]["raw_row"], "value": "READY_TO_POST"}]
 
     n = _batch_update_status(ws_raw, status_col, updates)
-    _log(f"Updated statuses: {n} (winner + VIP bundle)")
+    _log(f"Updated statuses: {n} (winner)")
     return 0
 
 

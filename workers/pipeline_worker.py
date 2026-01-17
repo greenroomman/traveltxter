@@ -14,6 +14,10 @@ Surgical Fix (2026-01-12): 90/10 HYBRID FEEDER
 Surgical Fix (2026-01-16): ZERO-YIELD FEEDER RECOVERY (no refactor)
 - Sparse-theme override: enable reverse-origin selection when theme has thin inventory
 - Forced explore burst when primary pass yields 0 deals (within remaining search budget)
+
+Surgical Fix (V4.6): OFFERS_PER_SEARCH (increase yield per Duffel search without increasing searches)
+- Duffel may return ~50 offers; previously only first 10 were considered
+- New env DUFFEL_OFFERS_PER_SEARCH (default 50) controls how many offers we evaluate per search
 """
 
 from __future__ import annotations
@@ -49,6 +53,9 @@ DUFFEL_VERSION = os.getenv("DUFFEL_VERSION", "v2").strip() or "v2"
 MAX_INSERTS_TOTAL = int(os.getenv("DUFFEL_MAX_INSERTS", "3") or "3")
 MAX_SEARCHES_PER_RUN = int(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "4") or "4")
 ROUTES_PER_RUN = int(os.getenv("DUFFEL_ROUTES_PER_RUN", "3") or "3")
+
+# NEW: how many Duffel offers we *consider* per search (Duffel may return ~50)
+OFFERS_PER_SEARCH = int(os.getenv("DUFFEL_OFFERS_PER_SEARCH", "50") or "50")
 
 # Optional: strict mode (default TRUE)
 STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lower() == "true")
@@ -676,7 +683,7 @@ def main() -> int:
 
             deal_theme = low(r.get("theme") or theme_today) or theme_today
 
-            for off in offers[: min(10, MAX_INSERTS_TOTAL - len(all_deals))]:
+            for off in offers[: min(OFFERS_PER_SEARCH, MAX_INSERTS_TOTAL - len(all_deals))]:
                 try:
                     total_amount = float(off.get("total_amount") or "0")
                 except Exception:

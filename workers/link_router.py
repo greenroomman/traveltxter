@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 # workers/link_router.py
 """
-TravelTxter Link Router – V4.7 (Fixed Duffel Links + Skyscanner Fallback)
+TravelTxter Link Router – V4.7.1 (Duffel Links optional + Google Flights default fallback)
 
 Purpose:
-- Populate booking_link_vip for monetisable rows
-- Primary: Duffel Links (if account has access)
-- Fallback: Skyscanner deep links (actual searchable flights)
-- DO NOT use homepage links (not useful for booking)
+- Populate booking_link_vip for selected rows (READY_* only)
+- Primary (optional): Duffel Links (if account has access)
+- Default fallback: Google Flights deep links (no affiliate approval required)
+- Optional fallback: Skyscanner deep links (if you ever get approved later)
+- Last resort: Homepage link with query params (not recommended)
 
-Changes in V4.7:
-- Fixed: Duffel Links 403 error handling
-- Fixed: Fallback now uses Skyscanner deep links (users can actually book)
-- Added: Better error logging
-- Added: Option to save offer_id for future custom booking page
+Why Google Flights default:
+- Highest trust + best UX
+- No approval / traffic requirements
+- Works cleanly inside Telegram/Instagram
 
 Eligibility:
 - status in {"READY_TO_POST", "READY_TO_PUBLISH"}
 - booking_link_vip is blank
 - origin_iata, destination_iata, outbound_date, return_date present
+
+Notes:
+- This file only writes to RAW_DEALS.booking_link_vip
+- It is deterministic and stateless: same row inputs -> same link outputs
 """
 
 from __future__ import annotations
@@ -44,14 +48,15 @@ DUFFEL_API_KEY = (os.environ.get("DUFFEL_API_KEY") or "").strip()
 DUFFEL_API_BASE = (os.environ.get("DUFFEL_API_BASE") or "https://api.duffel.com").strip().rstrip("/")
 DUFFEL_VERSION = (os.environ.get("DUFFEL_VERSION") or "v2").strip() or "v2"
 
-# Set to false if you don't have Duffel Links access (403 errors)
+# Set to true ONLY if your Duffel account has Links access (otherwise you’ll see 403)
 DUFFEL_LINKS_ENABLED = (os.environ.get("DUFFEL_LINKS_ENABLED") or "false").strip().lower() == "true"
 
 REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 DEFAULT_HOME_BASE = "http://www.traveltxter.com/"
 
-# Fallback strategy: "skyscanner" or "homepage"
-FALLBACK_STRATEGY = (os.environ.get("FALLBACK_STRATEGY") or "skyscanner").strip().lower()
+# Fallback strategy: "google" (default), "skyscanner", or "homepage"
+# Owner intent: choose the path that works without third-party approvals.
+FALLBACK_STRATEGY = (os.environ.get("FALLBACK_STRATEGY") or "google").strip().lower()
 
 MAX_ROWS_PER_RUN = int((os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "20").strip() or "20")
 
@@ -215,7 +220,6 @@ def _create_duffel_links_session(origin_iata: str, dest_iata: str, out_iso: str,
         return None
 
     if r.status_code == 403:
-        # Feature not available on this account
         _log("⚠️ Duffel Links not available (403). Account may not have access to this feature.")
         _log("   Consider: (1) Contact help@duffel.com to enable, or (2) Set DUFFEL_LINKS_ENABLED=false")
         return None
@@ -241,47 +245,33 @@ def _create_duffel_links_session(origin_iata: str, dest_iata: str, out_iso: str,
 
 def _create_skyscanner_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str) -> str:
     """
-    Create deep link to Skyscanner search results.
-    Users land on actual flight search and can book immediately.
-    
-    Format: https://www.skyscanner.net/transport/flights/ORIGIN/DEST/YYMMDD/YYMMDD/
-    Example: https://www.skyscanner.net/transport/flights/LHR/BKK/20260218/20260228/
+    Skyscanner deep link to flight search results.
+    NOTE: useful only if you later get affiliate access; otherwise this is just convenience.
     """
-    # Convert ISO dates (2026-02-18) to compact format (20260218)
     out_compact = out_iso.replace("-", "")
     in_compact = in_iso.replace("-", "")
-    
     origin = origin_iata.upper()
     dest = dest_iata.upper()
-    
-    url = f"https://www.skyscanner.net/transport/flights/{origin}/{dest}/{out_compact}/{in_compact}/"
-    
-    return url
+    return f"https://www.skyscanner.net/transport/flights/{origin}/{dest}/{out_compact}/{in_compact}/"
 
 
 def _create_google_flights_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str) -> str:
     """
-    Alternative: Create deep link to Google Flights search.
+    Google Flights deep link to a prefilled search query.
+    Works without affiliate approvals; best trust/UX for Telegram/Instagram.
     """
     origin = origin_iata.upper()
     dest = dest_iata.upper()
-    
-    # Google Flights uses a query parameter format
     query = f"flights from {origin} to {dest} on {out_iso} return {in_iso}"
     encoded_query = urlencode({"q": query})
-    
-    url = f"https://www.google.com/travel/flights?{encoded_query}"
-    
-    return url
+    return f"https://www.google.com/travel/flights?{encoded_query}"
 
 
 def _create_homepage_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
     """
-    Last resort: Link to homepage with query params.
-    Not ideal - users can't actually book from this.
+    Last resort only: homepage with query params.
     """
     base = (REDIRECT_BASE_URL or DEFAULT_HOME_BASE).strip().rstrip()
-    
     params = {
         "deal_id": _s(deal_id),
         "from": _s(origin_iata).upper(),
@@ -291,25 +281,21 @@ def _create_homepage_link(deal_id: str, origin_iata: str, dest_iata: str, out_is
         "price": _s(price_gbp).replace("£", "").strip(),
         "src": "vip_fallback",
     }
-    
     qs = urlencode({k: v for k, v in params.items() if v})
-    
-    if "?" in base:
-        return f"{base}&{qs}"
-    return f"{base}?{qs}"
+    return f"{base}&{qs}" if "?" in base else f"{base}?{qs}"
 
 
 def _create_fallback_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
     """
     Create fallback booking link based on FALLBACK_STRATEGY.
+    Supported: google (default), skyscanner, homepage.
     """
     if FALLBACK_STRATEGY == "skyscanner":
         return _create_skyscanner_link(origin_iata, dest_iata, out_iso, in_iso)
-    elif FALLBACK_STRATEGY == "google":
-        return _create_google_flights_link(origin_iata, dest_iata, out_iso, in_iso)
-    else:
-        # Default to homepage
+    if FALLBACK_STRATEGY == "homepage":
         return _create_homepage_link(deal_id, origin_iata, dest_iata, out_iso, in_iso, price_gbp)
+    # Default: Google Flights
+    return _create_google_flights_link(origin_iata, dest_iata, out_iso, in_iso)
 
 
 # -------------------- MAIN --------------------
@@ -319,7 +305,7 @@ def main() -> int:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
 
     _log("============================================================")
-    _log("🚀 TravelTxter Link Router V4.7 (Duffel Links + Smart Fallback)")
+    _log("🚀 TravelTxter Link Router V4.7.1 (Duffel Links optional + Fallback)")
     _log("============================================================")
     _log(f"RAW_DEALS_TAB={RAW_DEALS_TAB}")
     _log(f"DUFFEL_API_BASE={DUFFEL_API_BASE} DUFFEL_VERSION={DUFFEL_VERSION}")
@@ -367,14 +353,12 @@ def main() -> int:
 
         attempted += 1
 
-        # Try Duffel Links first (if enabled and available)
         link = _create_duffel_links_session(o, d, out_iso, in_iso, deal_id)
-        
+
         if link:
             duffel_ok += 1
             _log(f"✅ Duffel Links: {deal_id} | {o}→{d}")
         else:
-            # Use smart fallback (Skyscanner/Google/Homepage)
             link = _create_fallback_link(deal_id, o, d, out_iso, in_iso, price)
             used_fallback += 1
             _log(f"🔗 Fallback ({FALLBACK_STRATEGY}): {deal_id} | {o}→{d}")

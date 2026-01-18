@@ -1,20 +1,5 @@
-#!/usr/bin/env python3
-"""
-workers/telegram_publisher.py
-FULL REPLACEMENT — V4.6.2 (LOCKED)
-
-PURPOSE (LOCKED):
-- Publish Telegram VIP first, then Telegram FREE after delay
-- ALWAYS select NEWEST eligible deal (fresh-first, never sheet order)
-- Enforce THEME-OF-THE-DAY gate
-- Enforce LOCKED MEDIA OUTPUT FORMATS (as specified)
-
-SELECTION RULE (CRITICAL, LOCKED):
-1) status eligible for this mode
-2) theme matches theme-of-the-day
-3) NEWEST ingested_at_utc DESC
-4) tie-breaker: highest row number
-"""
+# workers/telegram_publisher.py
+# FULL REPLACEMENT (V4.7) — phrase_used preferred, phrase_bank fallback
 
 from __future__ import annotations
 
@@ -130,12 +115,10 @@ def esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _phrase_from_row(row: Dict[str, str]) -> str:
-    # Primary new contract: phrase_used
+def phrase_from_row(row: Dict[str, str]) -> str:
     p = (row.get("phrase_used") or "").strip()
     if p:
         return p
-    # Backward compat fallback
     return (row.get("phrase_bank") or "").strip()
 
 
@@ -146,13 +129,11 @@ def build_vip_message(row: Dict[str, str]) -> str:
     origin = esc(row.get("origin_city") or row.get("origin_iata"))
     out_date = esc(row.get("outbound_date"))
     back_date = esc(row.get("return_date"))
-    phrase = esc(_phrase_from_row(row))
+    phrase = esc(phrase_from_row(row))
     booking = esc(row.get("booking_link_vip") or row.get("affiliate_url") or row.get("deeplink"))
 
     lines: List[str] = []
-    lines.append(f"£{price} to {dest}")
-    if country:
-        lines[-1] += f" {country}"
+    lines.append(f"£{price} to {dest}" + (f" {country}" if country else ""))
     lines.append(f"TO: {dest.upper()}")
     lines.append(f"FROM: {origin}")
     lines.append(f"OUT: {out_date}")
@@ -173,12 +154,10 @@ def build_free_message(row: Dict[str, str], upgrade_monthly: str, upgrade_yearly
     origin = esc(row.get("origin_city") or row.get("origin_iata"))
     out_date = esc(row.get("outbound_date"))
     back_date = esc(row.get("return_date"))
-    phrase = esc(_phrase_from_row(row))
+    phrase = esc(phrase_from_row(row))
 
     lines: List[str] = []
-    lines.append(f"£{price} to {dest}")
-    if country:
-        lines[-1] += f" {country}"
+    lines.append(f"£{price} to {dest}" + (f" {country}" if country else ""))
     lines.append(f"TO: {dest.upper()}")
     lines.append(f"FROM: {origin}")
     lines.append(f"OUT: {out_date}")
@@ -192,7 +171,6 @@ def build_free_message(row: Dict[str, str], upgrade_monthly: str, upgrade_yearly
     lines.append("")
     lines.append("• VIP members saw this 24 hours ago")
     lines.append("• Direct booking links")
-    lines.append("• We find exclusive mistake fares")
     lines.append("• Subscription: £3 p/m or £30 p/a")
     lines.append("")
     if upgrade_monthly:
@@ -206,7 +184,6 @@ def main() -> int:
     spreadsheet_id = env("SPREADSHEET_ID") or env("SHEET_ID")
     raw_tab = env("RAW_DEALS_TAB", "RAW_DEALS")
     run_slot = env("RUN_SLOT", "VIP").upper()
-
     free_delay_hours = env_int("FREE_DELAY_HOURS", 24)
 
     theme_today = resolve_theme_of_day()
@@ -247,7 +224,7 @@ def main() -> int:
         "price_gbp", "origin_city", "origin_iata",
         "destination_city", "destination_iata", "destination_country",
         "outbound_date", "return_date",
-        "phrase_used",  # NEW PRIMARY
+        "phrase_used", "phrase_bank",
         "booking_link_vip", "affiliate_url", "deeplink",
         "posted_telegram_vip_at", "posted_telegram_free_at",
         ts_col,
@@ -257,11 +234,10 @@ def main() -> int:
             raise RuntimeError(f"Missing column: {c}")
 
     now = dt.datetime.utcnow()
-
     eligible = []
 
     for rownum, r in enumerate(values[1:], start=2):
-        if r[h["status"]].strip() != consume_status:
+        if (r[h["status"]] or "").strip() != consume_status:
             continue
 
         row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
@@ -286,19 +262,10 @@ def main() -> int:
 
     eligible.sort(key=lambda x: (x["ts"], x["rownum"]), reverse=True)
     target = eligible[0]
-
     rownum = target["rownum"]
     row = target["row"]
 
-    if mode == "VIP":
-        msg = build_vip_message(row)
-    else:
-        msg = build_free_message(
-            row,
-            env("STRIPE_LINK_MONTHLY"),
-            env("STRIPE_LINK_YEARLY"),
-        )
-
+    msg = build_vip_message(row) if mode == "VIP" else build_free_message(row, env("STRIPE_LINK_MONTHLY"), env("STRIPE_LINK_YEARLY"))
     tg_send(bot_token, chat_id, msg)
 
     ws.batch_update(

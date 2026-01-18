@@ -2,16 +2,29 @@
 """
 workers/pipeline_worker.py
 
-TravelTxter Pipeline Worker (FEEDER) — V4.7.9.1
-Authorized scope:
-- SAFE ENV CASTING: tolerate empty-string env vars (e.g., PRICE_GATE_MULTIPLIER="")
-- RULE B SELECTION: origin-diversified route selection (one-per-origin-first) while preserving 90/10 split
-- Keep: planned-origin enforcement when FEEDER_OPEN_ORIGINS=False
-- Keep: Date clamp (inventory-friendly) — CONFIG already set 21/84, we also clamp as guardrail
-- Keep: One deterministic retry when Duffel returns 0 offers (uses 21–60 day window)
-- Keep: Benchmarks contract: ZONE_THEME_BENCHMARKS uses `max_price` (+ optional `error_price`)
+TravelTxter Pipeline Worker (FEEDER) — V4.7.10 (ORIGIN-PLANNER + CONFIG CONSISTENCY)
+LOCKED PRINCIPLES:
+- Build from the existing file (no reinvention, no new architecture, no tab renames).
+- Replace full file only.
+- Google Sheets is the single source of truth.
+- Do NOT write to RAW_DEALS_VIEW.
 
-No redesigns. No schema changes. No tab renames. RAW_DEALS_VIEW not touched.
+What this version fixes (system-wide, not "today's theme"):
+1) SAFE ENV CASTING (empty-string tolerant) for ALL int/float env reads used by feeder.
+2) ORIGIN PLANNING as a first-class, theme-aware policy (audience fit + route availability),
+   producing enough unique origins to support DUFFEL_MAX_INSERTS given DUFFEL_MAX_INSERTS_PER_ORIGIN.
+3) MATH GUARDRAIL + SELF-CONSISTENT ROUTE COUNT:
+   - required_origins = ceil(DUFFEL_MAX_INSERTS / DUFFEL_MAX_INSERTS_PER_ORIGIN)
+   - effective_routes_per_run = min(DUFFEL_MAX_SEARCHES_PER_RUN, max(DUFFEL_ROUTES_PER_RUN, required_origins))
+   This prevents the "max inserts = 40" silent ceiling when DUFFEL_ROUTES_PER_RUN=4 but max inserts expects 50.
+   (We log it explicitly when we auto-bump.)
+4) Route selection enforces "one per origin first" (Rule B) using the planned origins.
+
+No changes to:
+- benchmark contract (ZONE_THEME_BENCHMARKS)
+- capability filtering (ROUTE_CAPABILITY_MAP)
+- dedupe / gating behavior
+- RAW_DEALS schema mapping (header-mapped append)
 """
 
 from __future__ import annotations
@@ -47,30 +60,25 @@ DUFFEL_VERSION = os.getenv("DUFFEL_VERSION", "v2").strip() or "v2"
 RUN_SLOT = (os.getenv("RUN_SLOT") or "").strip().upper()
 
 
-# ==================== GOVERNORS ====================
+# ==================== GOVERNORS (SAFE CASTING) ====================
 
 def _get_int(primary: str, fallback: str, default: int) -> int:
     v = (os.getenv(primary) or "").strip()
     if v:
         try:
-            return int(v)
+            return int(float(v))
         except Exception:
             pass
     v2 = (os.getenv(fallback) or "").strip()
     if v2:
         try:
-            return int(v2)
+            return int(float(v2))
         except Exception:
             pass
-    return default
+    return int(default)
 
 
 def _get_float(primary: str, fallback: str, default: float) -> float:
-    """
-    Safe float reader:
-    - treats empty string as unset
-    - returns default if conversion fails
-    """
     v = (os.getenv(primary) or "").strip()
     if v:
         try:
@@ -100,25 +108,23 @@ FEEDER_OPEN_ORIGINS = (os.getenv("FEEDER_OPEN_ORIGINS", "false").strip().lower()
 STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lower() == "true")
 RESPECT_CONFIG_ORIGIN = (os.getenv("RESPECT_CONFIG_ORIGIN", "false").strip().lower() == "true")
 
-DEFAULT_DAYS_AHEAD_MIN = int(os.getenv("DAYS_AHEAD_MIN", "21") or "21")
-DEFAULT_DAYS_AHEAD_MAX = int(os.getenv("DAYS_AHEAD_MAX", "84") or "84")
-DEFAULT_TRIP_LENGTH_DAYS = int(os.getenv("TRIP_LENGTH_DAYS", "5") or "5")
+DEFAULT_DAYS_AHEAD_MIN = _get_int("DAYS_AHEAD_MIN", "DAYS_AHEAD_MIN", 21)
+DEFAULT_DAYS_AHEAD_MAX = _get_int("DAYS_AHEAD_MAX", "DAYS_AHEAD_MAX", 84)
+DEFAULT_TRIP_LENGTH_DAYS = _get_int("TRIP_LENGTH_DAYS", "TRIP_LENGTH_DAYS", 5)
 
-# Inventory window guardrail (CONFIG set 21/84; we enforce as clamp to prevent regression)
-INVENTORY_MIN_DAYS = int(os.getenv("INVENTORY_MIN_DAYS", "21") or "21")
-INVENTORY_MAX_DAYS = int(os.getenv("INVENTORY_MAX_DAYS", "84") or "84")
+INVENTORY_MIN_DAYS = _get_int("INVENTORY_MIN_DAYS", "INVENTORY_MIN_DAYS", 21)
+INVENTORY_MAX_DAYS = _get_int("INVENTORY_MAX_DAYS", "INVENTORY_MAX_DAYS", 84)
 
-FEEDER_EXPLORE_RUN_MOD = int(os.getenv("FEEDER_EXPLORE_RUN_MOD", "10") or "10")
+FEEDER_EXPLORE_RUN_MOD = _get_int("FEEDER_EXPLORE_RUN_MOD", "FEEDER_EXPLORE_RUN_MOD", 10)
 FEEDER_EXPLORE_SALT = (os.getenv("FEEDER_EXPLORE_SALT", "traveltxter") or "traveltxter").strip()
 
 PRICE_GATE_ENABLED = (os.getenv("PRICE_GATE_ENABLED", "true").strip().lower() == "true")
-PRICE_GATE_MULTIPLIER = _get_float("PRICE_GATE_MULTIPLIER", "PRICE_GATE_MULTIPLIER", 1.0)  # SAFE
-PRICE_GATE_MIN_CAP_GBP = _get_float("PRICE_GATE_MIN_CAP_GBP", "PRICE_GATE_MIN_CAP_GBP", 80.0)  # SAFE
+PRICE_GATE_MULTIPLIER = _get_float("PRICE_GATE_MULTIPLIER", "PRICE_GATE_MULTIPLIER", 1.0)
+PRICE_GATE_MIN_CAP_GBP = _get_float("PRICE_GATE_MIN_CAP_GBP", "PRICE_GATE_MIN_CAP_GBP", 80.0)
 PRICE_GATE_FALLBACK_BEHAVIOR = (os.getenv("PRICE_GATE_FALLBACK_BEHAVIOR", "BLOCK").strip().upper() or "BLOCK")
 
-# Retry behavior (one retry only when offers_returned=0; uses 21–60 day window)
 ZERO_OFFER_RETRY_ENABLED = (os.getenv("ZERO_OFFER_RETRY_ENABLED", "true").strip().lower() == "true")
-ZERO_OFFER_RETRY_MAX_DAYS = int(os.getenv("ZERO_OFFER_RETRY_MAX_DAYS", "60") or "60")  # retry window upper bound
+ZERO_OFFER_RETRY_MAX_DAYS = _get_int("ZERO_OFFER_RETRY_MAX_DAYS", "ZERO_OFFER_RETRY_MAX_DAYS", 60)
 
 
 # ==================== THEMES ====================
@@ -138,38 +144,25 @@ MASTER_THEMES = [
     "unexpected_value",
 ]
 
-SPARSE_THEMES = {"northern_lights"}
+SPARSE_THEMES = {"northern_lights"}  # kept from baseline (can relax origin constraints if needed)
 
-# Adventure hub preference (planned origins) to reduce repeated 0-offer waste
+# Pools (these are NOT “today hacks”; they’re building blocks for every theme policy)
+SW_ENGLAND_DEFAULT = ["BRS", "EXT", "NQY", "SOU", "CWL", "BOH"]
+LONDON_LCC = ["STN", "LTN", "LGW"]
+LONDON_FULL = ["LHR", "LGW", "STN", "LTN", "LCY", "SEN"]
+MIDLANDS = ["BHX", "EMA"]
+NORTH = ["MAN", "LBA", "NCL", "LPL"]
+SCOTLAND = ["EDI", "GLA"]
+NI = ["BFS", "BHD"]
+
+# Optional “hub” lists remain available but are no longer theme-special-cased as the sole logic
 ADVENTURE_HUBS = ["LGW", "LHR", "STN", "LTN", "MAN", "BHX"]
 
-SW_ENGLAND_DEFAULT = ["BRS", "EXT", "NQY", "SOU", "CWL", "BOH"]
-SHORT_HAUL_FALLBACK = ["STN", "LTN", "LGW", "BHX", "MAN"]
-UK_WIDE_FALLBACK = ["MAN", "LBA", "NCL", "EDI", "GLA", "BFS", "BHD", "LPL", "EMA"]
-
 ORIGIN_CITY_FALLBACK = {
-    "LHR": "London",
-    "LGW": "London",
-    "STN": "London",
-    "LTN": "London",
-    "LCY": "London",
-    "SEN": "London",
-    "MAN": "Manchester",
-    "BHX": "Birmingham",
-    "EMA": "East Midlands",
-    "LPL": "Liverpool",
-    "LBA": "Leeds",
-    "NCL": "Newcastle",
-    "EDI": "Edinburgh",
-    "GLA": "Glasgow",
-    "BFS": "Belfast",
-    "BHD": "Belfast",
-    "BRS": "Bristol",
-    "EXT": "Exeter",
-    "NQY": "Newquay",
-    "SOU": "Southampton",
-    "CWL": "Cardiff",
-    "BOH": "Bournemouth",
+    "LHR": "London", "LGW": "London", "STN": "London", "LTN": "London", "LCY": "London", "SEN": "London",
+    "MAN": "Manchester", "BHX": "Birmingham", "EMA": "East Midlands", "LPL": "Liverpool", "LBA": "Leeds",
+    "NCL": "Newcastle", "EDI": "Edinburgh", "GLA": "Glasgow", "BFS": "Belfast", "BHD": "Belfast",
+    "BRS": "Bristol", "EXT": "Exeter", "NQY": "Newquay", "SOU": "Southampton", "CWL": "Cardiff", "BOH": "Bournemouth",
 }
 
 
@@ -214,17 +207,6 @@ def should_do_explore_this_run(theme_today: str) -> bool:
     return _stable_mod(key, FEEDER_EXPLORE_RUN_MOD) == 0
 
 
-def _deterministic_pick(seq: List[str], seed: str, k: int) -> List[str]:
-    if not seq or k <= 0:
-        return []
-    h = int(hashlib.md5(seed.encode("utf-8")).hexdigest()[:8], 16)
-    out: List[str] = []
-    n = len(seq)
-    for i in range(k):
-        out.append(seq[(h + i) % n])
-    return out
-
-
 def _sw_england_origins_from_env() -> List[str]:
     raw = (os.getenv("SW_ENGLAND_ORIGINS", "") or "").strip()
     if not raw:
@@ -234,23 +216,105 @@ def _sw_england_origins_from_env() -> List[str]:
     return parts or SW_ENGLAND_DEFAULT[:]
 
 
-def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
-    """
-    Planned origins determine what the feeder may use when FEEDER_OPEN_ORIGINS=False.
-    We ensure >=5 planned origins when possible to support 50 total inserts at 10/origin.
-    """
-    today = dt.datetime.utcnow().date().isoformat()
-    seed = f"{today}|{RUN_SLOT}|{theme_today}"
+def _det_hash_score(seed: str, item: str) -> int:
+    """Deterministic pseudo-random score (higher is better)."""
+    h = hashlib.sha256(f"{seed}|{item}".encode("utf-8")).hexdigest()
+    return int(h[:10], 16)
 
+
+def _weighted_pick_unique(seed: str, pools: List[Tuple[List[str], int]], k: int) -> List[str]:
+    """
+    Deterministic weighted picking without replacement.
+    Build candidate list with weights, score deterministically, pick top K unique.
+    """
+    candidates: List[Tuple[int, str]] = []
+    for origins, w in pools:
+        w_int = max(0, int(w))
+        for o in _dedupe_keep_order(origins):
+            if w_int <= 0:
+                continue
+            # weight influences ranking by repeating score bands (not true randomness; stable)
+            score = _det_hash_score(seed, o) + (w_int * 1_000_000)
+            candidates.append((score, o))
+
+    candidates.sort(reverse=True, key=lambda t: t[0])
+    out: List[str] = []
+    for _, o in candidates:
+        if o not in out:
+            out.append(o)
+        if len(out) >= k:
+            break
+    return out
+
+
+def required_unique_origins() -> int:
+    if DUFFEL_MAX_INSERTS_PER_ORIGIN <= 0:
+        return 1
+    return int(math.ceil(DUFFEL_MAX_INSERTS / float(DUFFEL_MAX_INSERTS_PER_ORIGIN)))
+
+
+def effective_routes_per_run() -> int:
+    """
+    Self-consistency guardrail:
+    - to reach DUFFEL_MAX_INSERTS under per-origin caps, you need at least required_origins routes/origins.
+    - but never exceed DUFFEL_MAX_SEARCHES_PER_RUN.
+    """
+    req = required_unique_origins()
+    eff = max(DUFFEL_ROUTES_PER_RUN, req)
+    eff = min(eff, max(1, DUFFEL_MAX_SEARCHES_PER_RUN))
+    return eff
+
+
+def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
+    """
+    Theme-aware origin planning (whole-system, not theme hacks).
+    - Uses SW England as a meaningful audience anchor where appropriate (e.g. surf),
+      but includes controlled fallback share to high-connectivity airports to avoid wasted searches.
+    - Deterministic rotation by date + run slot + theme.
+    """
     sw = _dedupe_keep_order(_sw_england_origins_from_env())
+    seed = f"{dt.datetime.utcnow().date().isoformat()}|{RUN_SLOT}|{theme_today}|ORIGIN_PLAN"
 
-    if theme_today == "adventure":
-        base = _dedupe_keep_order(ADVENTURE_HUBS + SHORT_HAUL_FALLBACK + sw + UK_WIDE_FALLBACK)
+    # Theme -> pool weights (audience fit + network reality)
+    # Weights are not absolutes; they shape the 5+ origin set.
+    if theme_today == "surf":
+        pools = [(sw, 80), (LONDON_LCC, 20)]
+    elif theme_today == "snow":
+        pools = [(LONDON_LCC + MIDLANDS, 65), (NORTH + SCOTLAND, 25), (sw, 10)]
+    elif theme_today == "winter_sun":
+        pools = [(LONDON_LCC + MIDLANDS, 45), (NORTH, 35), (sw, 20)]
+    elif theme_today == "summer_sun" or theme_today == "beach_break":
+        pools = [(sw, 50), (LONDON_LCC + MIDLANDS, 30), (NORTH, 20)]
+    elif theme_today == "city_breaks" or theme_today == "culture_history":
+        pools = [(LONDON_LCC + MIDLANDS, 45), (NORTH + SCOTLAND, 35), (sw, 20)]
+    elif theme_today == "northern_lights":
+        # Sparse theme; include higher-connectivity airports to reduce 0-offer likelihood
+        pools = [(LONDON_FULL + NORTH + SCOTLAND + MIDLANDS, 80), (sw, 20)]
+    elif theme_today == "adventure":
+        # Use broader network but keep SW in mix; not a “hub-only today” hack
+        pools = [(LONDON_FULL + MIDLANDS + NORTH, 60), (sw, 40)]
+    elif theme_today == "long_haul":
+        pools = [(LONDON_FULL, 65), (NORTH + MIDLANDS + SCOTLAND, 35)]
+    elif theme_today == "luxury_value" or theme_today == "unexpected_value":
+        pools = [(LONDON_FULL + MIDLANDS, 50), (NORTH + SCOTLAND, 30), (sw, 20)]
     else:
-        base = _dedupe_keep_order(sw + SHORT_HAUL_FALLBACK + UK_WIDE_FALLBACK)
+        pools = [(sw, 50), (LONDON_LCC + MIDLANDS, 30), (NORTH + SCOTLAND, 20)]
 
-    plan_n = min(len(base), max(5, routes_per_run))
-    return _deterministic_pick(base, seed, plan_n)
+    plan = _weighted_pick_unique(seed, pools, plan_n)
+
+    # Absolute safety: ensure at least 5 if possible (your operational need for 50@10/origin)
+    if len(plan) < min(5, plan_n):
+        # Add deterministic extras from a broad fallback
+        broad = _dedupe_keep_order(sw + LONDON_LCC + MIDLANDS + NORTH + SCOTLAND + NI)
+        extra_seed = seed + "|FILL"
+        extras = _weighted_pick_unique(extra_seed, [(broad, 1)], plan_n)
+        for o in extras:
+            if o not in plan:
+                plan.append(o)
+            if len(plan) >= plan_n:
+                break
+
+    return plan
 
 
 def resolve_origin_city(iata: str, origin_city_map: Dict[str, str]) -> str:
@@ -314,9 +378,7 @@ def load_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def load_route_capability_map(
-    sheet: gspread.Spreadsheet,
-) -> Tuple[Set[Tuple[str, str]], Dict[str, str]]:
+def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str, str]], Dict[str, str]]:
     ws = sheet.worksheet(CAPABILITY_TAB)
     rows = ws.get_all_records()
 
@@ -364,14 +426,6 @@ def _split_examples(x: Any) -> List[str]:
 
 
 def load_zone_theme_benchmarks(sheet: gspread.Spreadsheet) -> List[Dict[str, Any]]:
-    """
-    Optimized benchmark contract:
-    - theme
-    - origin_iata
-    - destination_examples (optional)
-    - max_price (required)
-    - error_price (optional)
-    """
     ws = sheet.worksheet(BENCHMARKS_TAB)
     rows = ws.get_all_records()
     out: List[Dict[str, Any]] = []
@@ -399,12 +453,7 @@ def load_zone_theme_benchmarks(sheet: gspread.Spreadsheet) -> List[Dict[str, Any
     return out
 
 
-def compute_ingest_cap_gbp(
-    benchmarks: List[Dict[str, Any]],
-    theme: str,
-    origin: str,
-    destination: str,
-) -> Optional[float]:
+def compute_ingest_cap_gbp(benchmarks: List[Dict[str, Any]], theme: str, origin: str, destination: str) -> Optional[float]:
     t = str(theme or "").strip()
     o = _clean_iata(origin)
     d = _clean_iata(destination)
@@ -499,11 +548,9 @@ def offer_duration_minutes_safe(offer: Dict[str, Any]) -> int:
             if ch.isdigit():
                 num += ch
             elif ch == "H":
-                h = int(num or "0")
-                num = ""
+                h = int(num or "0"); num = ""
             elif ch == "M":
-                m = int(num or "0")
-                num = ""
+                m = int(num or "0"); num = ""
             else:
                 num = ""
         return h * 60 + m
@@ -524,11 +571,7 @@ def offer_duration_minutes_safe(offer: Dict[str, Any]) -> int:
 
 # ==================== ENRICH ====================
 
-def enrich_deal(
-    deal: Dict[str, Any],
-    themes_dict: Dict[str, List[Dict[str, Any]]],
-    signals: Dict[str, Dict[str, Any]],
-) -> Dict[str, Any]:
+def enrich_deal(deal: Dict[str, Any], themes_dict: Dict[str, List[Dict[str, Any]]], signals: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     dest = _clean_iata(deal.get("destination_iata", ""))
     theme = str(deal.get("deal_theme") or deal.get("theme") or "").strip()
 
@@ -575,10 +618,10 @@ def append_rows_header_mapped(ws, deals: List[Dict[str, Any]]) -> int:
 # ==================== DATE PICKING ====================
 
 def clamp_window(days_min: int, days_max: int) -> Tuple[int, int]:
-    mn = max(days_min, INVENTORY_MIN_DAYS)
-    mx = min(days_max, INVENTORY_MAX_DAYS)
+    mn = max(int(days_min), int(INVENTORY_MIN_DAYS))
+    mx = min(int(days_max), int(INVENTORY_MAX_DAYS))
     if mx < mn:
-        return days_min, days_max
+        return int(days_min), int(days_max)
     return mn, mx
 
 
@@ -587,46 +630,8 @@ def pick_dates(seed: str, days_min: int, days_max: int, trip_len: int) -> Tuple[
     span = max(1, (days_max - days_min + 1))
     dep_offset = days_min + (hsh % span)
     dep_date = dt.datetime.utcnow().date() + dt.timedelta(days=dep_offset)
-    ret_date = dep_date + dt.timedelta(days=trip_len)
+    ret_date = dep_date + dt.timedelta(days=int(trip_len))
     return dep_date, ret_date
-
-
-# ==================== ORIGIN ENFORCEMENT ====================
-
-def pick_origin_for_dest(
-    dest: str,
-    planned_origins: List[str],
-    allowed_pairs: Set[Tuple[str, str]],
-    preferred_origin: str,
-    open_origins_effective: bool,
-) -> Optional[str]:
-    """
-    ENFORCEMENT:
-    - When open_origins_effective is False, we ONLY choose from planned_origins (plus optional preferred origin if RESPECT_CONFIG_ORIGIN).
-    - No fallback to “any airport” list.
-    """
-    dest = _clean_iata(dest)
-    preferred_origin = _clean_iata(preferred_origin)
-
-    candidates: List[str] = []
-
-    if preferred_origin and RESPECT_CONFIG_ORIGIN:
-        candidates.append(preferred_origin)
-
-    for o in planned_origins:
-        oo = _clean_iata(o)
-        if oo and oo not in candidates:
-            candidates.append(oo)
-
-    if open_origins_effective:
-        # Intentionally no expansion here — explainable + stable.
-        pass
-
-    for o in candidates:
-        if not allowed_pairs or (o, dest) in allowed_pairs:
-            return o
-
-    return None
 
 
 # ==================== MAIN ====================
@@ -644,17 +649,32 @@ def main() -> int:
 
     sparse_theme_override = theme_today in SPARSE_THEMES
     open_origins_effective = bool(FEEDER_OPEN_ORIGINS or sparse_theme_override)
-    log(f"FEEDER_OPEN_ORIGINS={FEEDER_OPEN_ORIGINS} | sparse_theme_override={sparse_theme_override} | effective={open_origins_effective}")
-    log(f"RESPECT_CONFIG_ORIGIN={RESPECT_CONFIG_ORIGIN}")
+
+    req_origins = required_unique_origins()
+    eff_routes = effective_routes_per_run()
+
+    # Math / capacity guardrail (this is the “stop chasing ghosts” log)
+    theoretical_max_by_routes = DUFFEL_MAX_INSERTS_PER_ROUTE * eff_routes
+    theoretical_max_by_origins = DUFFEL_MAX_INSERTS_PER_ORIGIN * eff_routes  # since Rule B targets 1 origin per route first
+    theoretical_max = min(DUFFEL_MAX_INSERTS, theoretical_max_by_routes, theoretical_max_by_origins)
+
+    if eff_routes != DUFFEL_ROUTES_PER_RUN:
+        log(f"⚠️ CONFIG_GUARDRAIL: DUFFEL_ROUTES_PER_RUN={DUFFEL_ROUTES_PER_RUN} < required_origins={req_origins} "
+            f"for DUFFEL_MAX_INSERTS={DUFFEL_MAX_INSERTS} @ {DUFFEL_MAX_INSERTS_PER_ORIGIN}/origin. "
+            f"Auto-bumping effective_routes_per_run => {eff_routes} (capped by DUFFEL_MAX_SEARCHES_PER_RUN={DUFFEL_MAX_SEARCHES_PER_RUN}).")
+
+    log(f"ORIGIN_POLICY: FEEDER_OPEN_ORIGINS={FEEDER_OPEN_ORIGINS} | sparse_override={sparse_theme_override} | effective_open={open_origins_effective}")
+    log(f"CAPS: MAX_INSERTS={DUFFEL_MAX_INSERTS} | PER_ORIGIN={DUFFEL_MAX_INSERTS_PER_ORIGIN} | PER_ROUTE={DUFFEL_MAX_INSERTS_PER_ROUTE} | "
+        f"MAX_SEARCHES={DUFFEL_MAX_SEARCHES_PER_RUN} | ROUTES_PER_RUN(env)={DUFFEL_ROUTES_PER_RUN} | ROUTES_PER_RUN(effective)={eff_routes}")
+    log(f"CAPACITY_NOTE: theoretical_max_inserts_this_run <= {theoretical_max} (based on caps + effective routes)")
+    log(f"PRICE_GATE: fallback={PRICE_GATE_FALLBACK_BEHAVIOR} | mult={PRICE_GATE_MULTIPLIER} | mincap={PRICE_GATE_MIN_CAP_GBP}")
+    log(f"INVENTORY_WINDOW_DAYS={INVENTORY_MIN_DAYS}-{INVENTORY_MAX_DAYS} | ZERO_OFFER_RETRY_ENABLED={ZERO_OFFER_RETRY_ENABLED} retry_window_max={ZERO_OFFER_RETRY_MAX_DAYS}")
 
     explore_run = should_do_explore_this_run(theme_today)
-    theme_quota = DUFFEL_ROUTES_PER_RUN if not explore_run else max(0, DUFFEL_ROUTES_PER_RUN - 1)
+    # Keep 90/10 idea but ensure we don’t violate “need enough origins”:
+    theme_quota = eff_routes if not explore_run else max(0, eff_routes - 1)
     explore_quota = 0 if not explore_run else 1
-    log(f"🧠 Feeder strategy: 90/10 | explore_run={explore_run} | theme_quota={theme_quota} | explore_quota={explore_quota} | MOD={FEEDER_EXPLORE_RUN_MOD}")
-
-    log(f"CAPS: DUFFEL_MAX_INSERTS={DUFFEL_MAX_INSERTS} | PER_ORIGIN={DUFFEL_MAX_INSERTS_PER_ORIGIN} | PER_ROUTE={DUFFEL_MAX_INSERTS_PER_ROUTE} | MAX_SEARCHES={DUFFEL_MAX_SEARCHES_PER_RUN} | OFFERS_PER_SEARCH={DUFFEL_OFFERS_PER_SEARCH}")
-    log(f"PRICE_GATE_FALLBACK_BEHAVIOR={PRICE_GATE_FALLBACK_BEHAVIOR} | PRICE_GATE_MULTIPLIER={PRICE_GATE_MULTIPLIER} | PRICE_GATE_MIN_CAP_GBP={PRICE_GATE_MIN_CAP_GBP}")
-    log(f"INVENTORY_WINDOW_DAYS={INVENTORY_MIN_DAYS}-{INVENTORY_MAX_DAYS} | ZERO_OFFER_RETRY_ENABLED={ZERO_OFFER_RETRY_ENABLED} retry_window_max={ZERO_OFFER_RETRY_MAX_DAYS}")
+    log(f"🧠 Strategy: 90/10 | explore_run={explore_run} | theme_quota={theme_quota} | explore_quota={explore_quota} | MOD={FEEDER_EXPLORE_RUN_MOD}")
 
     gc = gs_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -679,7 +699,6 @@ def main() -> int:
     theme_routes = [r for r in config_rows if str(r.get("theme") or "").strip() == theme_today]
     explore_routes = [r for r in config_rows if str(r.get("theme") or "").strip() != theme_today]
 
-    # Unique destinations only
     def unique_dest_configs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen: Set[str] = set()
         out: List[Dict[str, Any]] = []
@@ -694,11 +713,13 @@ def main() -> int:
     theme_dest_configs = unique_dest_configs(theme_routes)
     explore_dest_configs = unique_dest_configs(explore_routes)
 
-    planned_origins = origin_plan_for_theme(theme_today, DUFFEL_ROUTES_PER_RUN)
-    log(f"🧭 Planned origins for run ({len(planned_origins)}): {planned_origins}")
+    # Planned origins must support max inserts:
+    plan_n = max(5, req_origins, eff_routes)
+    planned_origins = origin_plan_for_theme(theme_today, plan_n)
+    log(f"🧭 Planned origins for run ({len(planned_origins)}; required={plan_n}): {planned_origins}")
     log(f"🧭 Unique theme destinations: {len(theme_dest_configs)} | Unique explore destinations: {len(explore_dest_configs)}")
 
-    # -------- RULE B SELECTION (origin-diversified one-per-origin-first) --------
+    # -------- RULE B SELECTION (one per origin first) --------
 
     def route_precheck_ok(origin: str, dest: str, deal_theme: str) -> bool:
         if allowed_pairs and (origin, dest) not in allowed_pairs:
@@ -712,17 +733,13 @@ def main() -> int:
         return True
 
     def select_routes_rule_b(dest_configs: List[Dict[str, Any]], quota: int) -> List[Tuple[str, str, Dict[str, Any]]]:
-        """
-        Rule B: select at most one route per origin first, then fill remaining deterministically.
-        Still destination-led (dest_configs order), but origin-diversified to avoid ORIGIN_CAP choke.
-        """
         if quota <= 0 or not dest_configs:
             return []
 
         picked: List[Tuple[str, str, Dict[str, Any]]] = []
         used_dests: Set[str] = set()
 
-        # Pass 1: one per origin
+        # Pass 1: one route per origin
         for origin in planned_origins:
             if len(picked) >= quota:
                 break
@@ -731,16 +748,13 @@ def main() -> int:
                 if not dest or dest in used_dests:
                     continue
                 deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
-
-                # enforce planned-origin + capability + benchmarks
                 if not route_precheck_ok(origin, dest, deal_theme):
                     continue
-
                 picked.append((origin, dest, cfg))
                 used_dests.add(dest)
                 break
 
-        # Pass 2: fill remaining deterministically (still diversified by origin loop)
+        # Pass 2: fill remaining (still origin-looped)
         safety = 0
         while len(picked) < quota and safety < 5000:
             safety += 1
@@ -772,10 +786,9 @@ def main() -> int:
         seed = f"{FEEDER_EXPLORE_SALT}|{today}|{RUN_SLOT}|{theme_today}|EXPLORE"
         offset = _stable_mod(seed, max(1, len(explore_dest_configs)))
         rotated = explore_dest_configs[offset:] + explore_dest_configs[:offset]
-        # explore quota is 1, but still use Rule B selection for consistency
         selected_routes.extend(select_routes_rule_b(rotated, 1))
 
-    # Hard cap at MAX_SEARCHES_PER_RUN (selection stage)
+    # Hard cap by MAX_SEARCHES_PER_RUN
     if len(selected_routes) > DUFFEL_MAX_SEARCHES_PER_RUN:
         selected_routes = selected_routes[:DUFFEL_MAX_SEARCHES_PER_RUN]
 
@@ -891,7 +904,6 @@ def main() -> int:
                 deal["timestamp"] = now_iso
 
             deal = enrich_deal(deal, themes_dict, signals)
-
             deals_out.append(deal)
             inserted_here += 1
 
@@ -920,8 +932,6 @@ def main() -> int:
         days_min = int(cfg.get("days_ahead_min") or DEFAULT_DAYS_AHEAD_MIN)
         days_max = int(cfg.get("days_ahead_max") or DEFAULT_DAYS_AHEAD_MAX)
         trip_len = int(cfg.get("trip_length_days") or DEFAULT_TRIP_LENGTH_DAYS)
-
-        # Clamp (guardrail)
         days_min, days_max = clamp_window(days_min, days_max)
 
         seed = f"{dt.datetime.utcnow().date().isoformat()}|{origin}|{destination}|{trip_len}|{RUN_SLOT}"
@@ -939,7 +949,6 @@ def main() -> int:
                 continue
             log(f"⚠️ BENCHMARK_MISS (pre-check) {origin}->{destination} theme={deal_theme} | fallback=ALLOW (no cap)")
 
-        # Primary search
         try:
             offers_returned, deals_out = run_search(origin, destination, dep_date, ret_date, cfg, cap_gbp)
         except Exception as e:
@@ -949,7 +958,6 @@ def main() -> int:
         if deals_out:
             all_deals.extend(deals_out)
         else:
-            # One deterministic retry on 0 offers (inventory timing)
             if ZERO_OFFER_RETRY_ENABLED and offers_returned == 0 and searches_done < DUFFEL_MAX_SEARCHES_PER_RUN and len(all_deals) < DUFFEL_MAX_INSERTS:
                 retry_max = min(ZERO_OFFER_RETRY_MAX_DAYS, INVENTORY_MAX_DAYS)
                 retry_min = INVENTORY_MIN_DAYS

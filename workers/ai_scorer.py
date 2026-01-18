@@ -1,23 +1,21 @@
 # workers/ai_scorer.py
 """
-TravelTxter ai_scorer.py (V4.6.2) — VIEW JUDGE + PHRASE ASSIGNER (Spreadsheet Brain Contract)
+TravelTxter ai_scorer.py (V4.7) — VIEW JUDGE + PHRASE ASSIGNMENT (Spreadsheet Brain Contract)
 
 Locked constraints respected:
-- No redesign
+- No redesigns
 - No renames
 - No schema/workflow changes
 - RAW_DEALS is canonical; RAW_DEALS_VIEW is read-only
 
-Change in this version:
-- When promoting NEW -> READY_TO_POST, scorer assigns an approved phrase and writes:
-  - RAW_DEALS.phrase_used (primary)
-  - RAW_DEALS.phrase_bank (optional mirror for backward compatibility if column exists)
+New behaviour:
+- When promoting a winner (NEW -> READY_TO_POST), select ONE approved phrase
+  based on (destination_iata + dynamic_theme), and write it to:
+    - RAW_DEALS.phrase_used  (preferred audit column)
+    - RAW_DEALS.phrase_bank  (mirror for backward compatibility)
 
 Phrase source:
 - PHRASE_BANK tab (read-only)
-
-Deterministic selection (no randomness):
-- Uses stable hash of (deal_id, dest_iata, theme) to pick a phrase from candidates.
 """
 
 from __future__ import annotations
@@ -72,9 +70,9 @@ ENFORCE_DISTINCT_DESTS = (os.environ.get("ENFORCE_DISTINCT_DESTS", "true") or "t
 INGESTED_AT_COL = os.environ.get("INGESTED_AT_COL", "ingested_at_utc").strip() or "ingested_at_utc"
 MIN_INGEST_AGE_SECONDS = int(os.environ.get("MIN_INGEST_AGE_SECONDS", "90") or "90")
 
-# RAW_DEALS phrase columns
+# Phrase output columns in RAW_DEALS
 PHRASE_USED_COL = os.environ.get("PHRASE_USED_COL", "phrase_used").strip() or "phrase_used"
-PHRASE_BANK_COL = os.environ.get("PHRASE_BANK_COL", "phrase_bank").strip() or "phrase_bank"  # optional mirror
+PHRASE_BANK_COL = os.environ.get("PHRASE_BANK_COL", "phrase_bank").strip() or "phrase_bank"
 
 
 MASTER_THEMES = [
@@ -129,7 +127,6 @@ def _headers(ws) -> List[str]:
 
 
 def _colmap(headers: List[str]) -> Dict[str, int]:
-    # 1-indexed for gspread Cell
     return {h: i + 1 for i, h in enumerate(headers) if h}
 
 
@@ -148,17 +145,12 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-def _truthy(v: Any) -> bool:
-    x = _s(v).strip().upper()
-    return x in ("TRUE", "YES", "Y", "1", "ON", "APPROVED")
+def _norm_theme(v: Any) -> str:
+    return _s(v).strip().lower().replace(" ", "_")
 
 
-def _norm_theme(s: Any) -> str:
-    return _s(s).strip().lower().replace(" ", "_")
-
-
-def _norm_iata(s: Any) -> str:
-    return _s(s).strip().upper()
+def _norm_iata(v: Any) -> str:
+    return _s(v).strip().upper()
 
 
 def _theme_of_day_utc() -> str:
@@ -262,6 +254,11 @@ def _eligible_primary(row: Dict[str, Any], theme_today: str) -> bool:
     return False
 
 
+def _truthy(v: Any) -> bool:
+    x = _s(v).strip().upper()
+    return x in ("TRUE", "YES", "Y", "1", "ON", "APPROVED")
+
+
 def _stable_index(key: str, n: int) -> int:
     if n <= 0:
         return 0
@@ -269,74 +266,47 @@ def _stable_index(key: str, n: int) -> int:
     return int(h[:8], 16) % n
 
 
-def _select_phrase(
-    phrase_rows: List[Dict[str, Any]],
-    destination_iata: str,
-    theme: str,
-    deal_id: str,
-) -> str:
+def _phrase_rows_normalise(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Deterministic phrase selection based on:
-    1) Exact match: (dest + theme)
-    2) Same dest, any theme
-    3) Theme-only phrase
-    4) Blank
+    Accepts either schema:
+      A) destination_iata, theme, phrase, approved, usage_notes
+      B) theme, category (dest:XXX), phrase, approved, ...
+    Normalises to keys: destination_iata, theme, phrase, approved
     """
-    dest = _norm_iata(destination_iata)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        phrase = _s(r.get("phrase"))
+        if not phrase:
+            continue
+
+        theme = _norm_theme(r.get("theme"))
+        approved = _truthy(r.get("approved"))
+
+        dest = _norm_iata(r.get("destination_iata"))
+        if not dest:
+            cat = _s(r.get("category")).strip().lower()
+            if cat.startswith("dest:"):
+                dest = _norm_iata(cat.split("dest:", 1)[1])
+
+        if not dest or not theme:
+            continue
+
+        out.append({"destination_iata": dest, "theme": theme, "phrase": phrase, "approved": approved})
+    return out
+
+
+def _select_phrase(phrase_rows: List[Dict[str, Any]], dest_iata: str, theme: str, deal_id: str) -> str:
+    dest = _norm_iata(dest_iata)
     th = _norm_theme(theme)
 
-    if not phrase_rows:
+    candidates = [p for p in phrase_rows if p.get("approved") and p["destination_iata"] == dest and p["theme"] == th]
+    if not candidates:
         return ""
 
-    # Normalise a few possible PHRASE_BANK shapes without assuming schema changes:
-    # We try to support both:
-    # - destination_iata/theme/phrase/approved
-    # - theme/category/phrase/approved where category includes "dest:XXX"
-    def row_phrase(r: Dict[str, Any]) -> str:
-        return _s(r.get("phrase"))
-
-    def row_theme(r: Dict[str, Any]) -> str:
-        return _norm_theme(r.get("theme"))
-
-    def row_dest(r: Dict[str, Any]) -> str:
-        # Supports either explicit destination_iata or encoded in category
-        d = _norm_iata(r.get("destination_iata"))
-        if d:
-            return d
-        cat = _s(r.get("category")).strip().lower()
-        if cat.startswith("dest:"):
-            return _norm_iata(cat.split("dest:", 1)[1])
-        return ""
-
-    def is_theme_only(r: Dict[str, Any]) -> bool:
-        cat = _s(r.get("category")).strip().lower()
-        # Accept empty category or explicit theme-only markers
-        if not cat:
-            return True
-        return cat in ("theme", "theme_only", "theme_phrase", "generic")
-
-    def approved(r: Dict[str, Any]) -> bool:
-        return _truthy(r.get("approved"))
-
-    # Candidate pools
-    exact = [r for r in phrase_rows if approved(r) and row_dest(r) == dest and row_theme(r) == th and row_phrase(r)]
-    if exact:
-        i = _stable_index(f"{deal_id}|{dest}|{th}|exact", len(exact))
-        return row_phrase(sorted(exact, key=lambda x: row_phrase(x)))[i]  # sorted for stability
-
-    same_dest = [r for r in phrase_rows if approved(r) and row_dest(r) == dest and row_phrase(r)]
-    if same_dest:
-        same_dest_sorted = sorted(same_dest, key=lambda x: (row_theme(x), row_phrase(x)))
-        i = _stable_index(f"{deal_id}|{dest}|any", len(same_dest_sorted))
-        return row_phrase(same_dest_sorted[i])
-
-    theme_only = [r for r in phrase_rows if approved(r) and row_theme(r) == th and is_theme_only(r) and row_phrase(r)]
-    if theme_only:
-        theme_only_sorted = sorted(theme_only, key=lambda x: row_phrase(x))
-        i = _stable_index(f"{deal_id}|{th}|theme_only", len(theme_only_sorted))
-        return row_phrase(theme_only_sorted[i])
-
-    return ""
+    # deterministic choice: sort by phrase, pick via stable hash
+    candidates_sorted = sorted(candidates, key=lambda x: x["phrase"])
+    i = _stable_index(f"{deal_id}|{dest}|{th}", len(candidates_sorted))
+    return candidates_sorted[i]["phrase"]
 
 
 def _batch_update_cells(ws_raw, cells: List[Cell]) -> int:
@@ -362,12 +332,13 @@ def main() -> int:
     ws_view = sh.worksheet(RAW_DEALS_VIEW_TAB)
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
 
-    # Phrase bank read (read-only). If missing, proceed with blank phrase.
+    # Phrase bank (read-only). If missing/unreadable, phrase will be blank.
     phrase_rows: List[Dict[str, Any]] = []
     try:
         ws_phrase = sh.worksheet(PHRASE_BANK_TAB)
-        phrase_rows = ws_phrase.get_all_records()
-        _log(f"Loaded PHRASE_BANK rows: {len(phrase_rows)}")
+        raw_phrase = ws_phrase.get_all_records()
+        phrase_rows = _phrase_rows_normalise(raw_phrase)
+        _log(f"Loaded PHRASE_BANK rows: {len(phrase_rows)} (normalised from {len(raw_phrase)})")
     except Exception as e:
         _log(f"PHRASE_BANK not readable ({type(e).__name__}: {e}). Proceeding without phrases.")
 
@@ -377,11 +348,9 @@ def main() -> int:
         return 0
 
     raw_headers = _headers(ws_raw)
-
-    # Require phrase_used because publishers will read it.
     SheetContract.assert_columns_present(
         raw_headers,
-        required=["status", "deal_id", INGESTED_AT_COL, PHRASE_USED_COL],
+        required=["status", "deal_id", INGESTED_AT_COL, PHRASE_USED_COL, PHRASE_BANK_COL],
         tab_name=RAW_DEALS_TAB,
     )
     raw_cm = _colmap(raw_headers)
@@ -429,6 +398,7 @@ def main() -> int:
         w = _safe_float(r.get("worthiness_score"), 0.0)
         tm = _theme_match(r, theme_today)
         ps = _priority_score(w, tm)
+        dest = _destination_key(r)
 
         candidates.append(
             {
@@ -439,8 +409,8 @@ def main() -> int:
                 "verdict": _verdict(r),
                 "theme_match": tm,
                 "dynamic_theme": _norm_theme(r.get("dynamic_theme")),
-                "dest_key": _destination_key(r),
-                "destination_iata": _norm_iata(r.get("destination_iata")),
+                "dest_iata": _norm_iata(r.get("destination_iata")),
+                "dest_key": dest,
             }
         )
 
@@ -462,7 +432,7 @@ def main() -> int:
         picked.append(c)
         if c["dest_key"]:
             seen_dests.add(c["dest_key"])
-        if len(picked) >= 1:  # workflow uses WINNERS_PER_RUN=1; keep deterministic
+        if len(picked) >= 1:
             break
 
     if not picked:
@@ -472,37 +442,22 @@ def main() -> int:
     winner = picked[0]
     rownum = int(winner["raw_row"])
     deal_id = _s(winner["deal_id"])
-    dest_iata = _norm_iata(winner.get("destination_iata"))
-    phrase_theme = _norm_theme(winner.get("dynamic_theme")) or _norm_theme(theme_today)
+    dest_iata = _norm_iata(winner.get("dest_iata"))
+    dyn_theme = _norm_theme(winner.get("dynamic_theme"))
 
-    phrase = _select_phrase(
-        phrase_rows=phrase_rows,
-        destination_iata=dest_iata,
-        theme=phrase_theme,
-        deal_id=deal_id,
-    )
+    phrase = _select_phrase(phrase_rows, dest_iata=dest_iata, theme=dyn_theme, deal_id=deal_id)
 
-    # Build cell updates (single update_cells call)
     cells: List[Cell] = []
-    status_col = raw_cm["status"]
-    cells.append(Cell(row=rownum, col=status_col, value="READY_TO_POST"))
-
-    # phrase_used is required by contract now
-    phrase_used_col = raw_cm.get(PHRASE_USED_COL)
-    if phrase_used_col:
-        cells.append(Cell(row=rownum, col=phrase_used_col, value=phrase))
-
-    # Optional mirror to phrase_bank for backward compatibility if column exists
-    phrase_bank_col = raw_cm.get(PHRASE_BANK_COL)
-    if phrase_bank_col:
-        cells.append(Cell(row=rownum, col=phrase_bank_col, value=phrase))
+    cells.append(Cell(row=rownum, col=raw_cm["status"], value="READY_TO_POST"))
+    cells.append(Cell(row=rownum, col=raw_cm[PHRASE_USED_COL], value=phrase))
+    cells.append(Cell(row=rownum, col=raw_cm[PHRASE_BANK_COL], value=phrase))
 
     n = _batch_update_cells(ws_raw, cells)
 
-    preview = (phrase or "").strip()
-    if len(preview) > 80:
-        preview = preview[:77] + "..."
-    _log(f"Updated row {rownum}: status=READY_TO_POST | phrase_used={(preview or '[blank]')} | cells={n}")
+    preview = phrase.strip()
+    if len(preview) > 90:
+        preview = preview[:87] + "..."
+    _log(f"Updated row {rownum}: status=READY_TO_POST | phrase={(preview or '[blank]')} | cells={n}")
     return 0
 
 

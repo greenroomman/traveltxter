@@ -23,6 +23,10 @@ jobs:
     env:
       PYTHONPATH: ${{ github.workspace }}
 
+      # Option 1: Assistive booking links (no affiliate approval required)
+      DUFFEL_LINKS_ENABLED: "false"
+      FALLBACK_STRATEGY: "google"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +53,11 @@ jobs:
               echo "RUN_SLOT=PM" >> $GITHUB_ENV
             fi
           fi
-          echo "RUN_SLOT resolved to: $RUN_SLOT"
+
+      - name: Show RUN_SLOT
+        shell: bash
+        run: |
+          echo "RUN_SLOT resolved to: ${{ env.RUN_SLOT }}"
 
       - name: Feeder
         run: python workers/pipeline_worker.py
@@ -93,7 +101,10 @@ jobs:
           RAW_DEALS_TAB: RAW_DEALS
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          DUFFEL_VERSION: "v2"
           REDIRECT_BASE_URL: ${{ vars.REDIRECT_BASE_URL }}
+          DUFFEL_LINKS_ENABLED: ${{ env.DUFFEL_LINKS_ENABLED }}
+          FALLBACK_STRATEGY: ${{ env.FALLBACK_STRATEGY }}
 
       - name: Render
         run: python workers/render_client.py

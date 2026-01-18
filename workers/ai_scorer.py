@@ -1,8 +1,8 @@
 # workers/ai_scorer.py
-# V4.7.1 — scorer + deterministic phrase selector (hotfix: int-safe _norm)
+# V4.7.2 — scorer: NEW -> (READY_TO_POST for winners) else -> SCORED
 # Contract:
-# - RAW_DEALS is canonical
-# - RAW_DEALS_VIEW is read-only
+# - RAW_DEALS is canonical (writes happen here only)
+# - RAW_DEALS_VIEW is read-only (intelligence / formulas)
 # - Phrase selection happens ONCE at promotion time
 # - Publishers never select language
 # - Full-file replacement only
@@ -10,7 +10,7 @@
 import os
 import json
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import gspread
 from gspread.cell import Cell
@@ -26,6 +26,13 @@ SA_JSON = os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
 
 MIN_INGEST_AGE_SECONDS = int(os.getenv("MIN_INGEST_AGE_SECONDS", "90"))
 WINNERS_PER_RUN = int(os.getenv("WINNERS_PER_RUN", "1"))
+
+# Optional freshness window: only consider NEW rows ingested within this many hours.
+# Set 0 or blank to disable.
+ELIGIBLE_WINDOW_HOURS = int(os.getenv("ELIGIBLE_WINDOW_HOURS", "72"))
+
+# Optional winner threshold (only applied if worthiness_score exists)
+MIN_WORTHINESS_SCORE = float(os.getenv("MIN_WORTHINESS_SCORE", "0"))
 
 PHRASE_USED_COL = "phrase_used"
 PHRASE_BANK_COL = "phrase_bank"
@@ -102,6 +109,16 @@ def _parse_iso_utc(ts_raw):
         return None
 
 
+def _float_or_none(v):
+    s = _norm(v)
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
 def main():
     if not SPREADSHEET_ID:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
@@ -147,6 +164,9 @@ def main():
             raise RuntimeError(f"Missing required RAW_DEALS column: {required}")
 
     now = datetime.now(timezone.utc)
+    min_allowed_ts = None
+    if ELIGIBLE_WINDOW_HOURS and ELIGIBLE_WINDOW_HOURS > 0:
+        min_allowed_ts = now - timedelta(hours=ELIGIBLE_WINDOW_HOURS)
 
     # Map deal_id -> RAW_DEALS row number and ingested_at
     deal_row = {}
@@ -157,8 +177,14 @@ def main():
             deal_row[did] = idx
             deal_ingested[did] = r.get("ingested_at_utc")
 
+    # Build candidate list from VIEW rows with status=NEW
     candidates = []
-    too_fresh = 0
+    skipped = {
+        "too_fresh": 0,
+        "no_ingest_ts": 0,
+        "too_old": 0,
+        "missing_raw_row": 0,
+    }
 
     for r in view_rows:
         if _norm(r.get("status")) != "NEW":
@@ -168,40 +194,97 @@ def main():
         if not did:
             continue
         if did not in deal_row:
+            skipped["missing_raw_row"] += 1
             continue
 
         ts = _parse_iso_utc(deal_ingested.get(did))
         if not ts:
+            skipped["no_ingest_ts"] += 1
             continue
 
         if (now - ts).total_seconds() < MIN_INGEST_AGE_SECONDS:
-            too_fresh += 1
+            skipped["too_fresh"] += 1
             continue
 
-        candidates.append(r)
+        if min_allowed_ts and ts < min_allowed_ts:
+            skipped["too_old"] += 1
+            continue
 
-    _log(f"Eligible NEW candidates: {len(candidates)} | skipped_too_fresh={too_fresh}")
+        # Intelligence fields (best-effort; don't hard fail if missing)
+        hard_reject = _truthy(r.get("hard_reject"))
+        worth = _float_or_none(r.get("worthiness_score"))
+
+        candidates.append(
+            {
+                "did": did,
+                "rownum": deal_row[did],
+                "dest": _norm_iata(r.get("destination_iata")),
+                "theme": _norm_theme(r.get("dynamic_theme")),
+                "hard_reject": hard_reject,
+                "worthiness": worth,
+            }
+        )
+
+    _log(
+        "Eligible NEW candidates: "
+        f"{len(candidates)} | skipped_too_fresh={skipped['too_fresh']} "
+        f"skipped_no_ingest_ts={skipped['no_ingest_ts']} skipped_too_old={skipped['too_old']} "
+        f"skipped_missing_raw_row={skipped['missing_raw_row']}"
+    )
 
     if not candidates:
         _log("No eligible NEW rows")
         return 0
 
-    promoted = 0
+    # Decide winners:
+    # - never pick hard_reject
+    # - if worthiness exists, sort desc and apply optional threshold
+    eligible_for_winner = [c for c in candidates if not c["hard_reject"]]
+
+    if not eligible_for_winner:
+        _log("All eligible candidates were hard_reject=TRUE; marking evaluated rows as SCORED only.")
+        eligible_for_winner = []
+
+    # Sort winners by worthiness if available; else stable by deal_id hash
+    def _winner_sort_key(c):
+        # worthiness: higher first; None treated as very low
+        w = c["worthiness"]
+        if w is None:
+            w = -1e9
+        return (-w, c["did"])
+
+    eligible_for_winner.sort(key=_winner_sort_key)
+
+    winners = []
+    for c in eligible_for_winner:
+        if len(winners) >= WINNERS_PER_RUN:
+            break
+        if c["worthiness"] is not None and c["worthiness"] < MIN_WORTHINESS_SCORE:
+            continue
+        winners.append(c)
+
+    winner_ids = {w["did"] for w in winners}
+
+    # Updates:
+    # 1) Mark all evaluated candidates as SCORED (except winners)
+    # 2) Promote winners to READY_TO_POST + lock phrase
     updates = []
 
-    for r in candidates:
-        if promoted >= WINNERS_PER_RUN:
-            break
+    scored_count = 0
+    for c in candidates:
+        if c["did"] in winner_ids:
+            continue
+        updates.append(Cell(c["rownum"], col["status"], "SCORED"))
+        scored_count += 1
 
-        did = _norm(r.get("deal_id"))
-        rownum = deal_row[did]
+    promoted = 0
+    for c in winners:
+        did = c["did"]
+        rownum = c["rownum"]
+        dest = c["dest"]
+        theme = c["theme"]
 
-        dest = _norm_iata(r.get("destination_iata"))
-        theme = _norm_theme(r.get("dynamic_theme"))
-
-        phrases = sorted(
-            [p["phrase"] for p in phrase_index if p["dest"] == dest and p["theme"] == theme]
-        )
+        phrases = sorted([p["phrase"] for p in phrase_index if p["dest"] == dest and p["theme"] == theme])
         phrase = _stable_pick(f"{did}|{dest}|{theme}", phrases)
 
         updates.append(Cell(rownum, col["status"], "READY_TO_POST"))
@@ -209,7 +292,13 @@ def main():
         updates.append(Cell(rownum, col[PHRASE_BANK_COL], phrase))
 
         promoted += 1
-        _log(f"Promoted {did} → READY_TO_POST | dest={dest} theme={theme} phrase={'YES' if phrase else 'NO'}")
+        _log(
+            f"Promoted {did} → READY_TO_POST | dest={dest} theme={theme} "
+            f"worthiness={c['worthiness'] if c['worthiness'] is not None else 'NA'} "
+            f"phrase={'YES' if phrase else 'NO'}"
+        )
+
+    _log(f"Marked SCORED (evaluated non-winners): {scored_count} | winners_promoted: {promoted}")
 
     if updates:
         ws_raw.update_cells(updates, value_input_option="RAW")

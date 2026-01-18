@@ -2,17 +2,25 @@
 """
 workers/pipeline_worker.py
 
-TravelTxter Pipeline Worker (FEEDER) — V4.7.4
-- Benchmark pre-check (BLOCK avoids wasted searches)
-- Safe-field ranking: best N out of many (price, connections, duration)
-- Flood control: per-route + per-origin caps
-- Origin resilience: always maintains >=5 viable origins in the run plan (where possible)
-- Variable compatibility: prefers DUFFEL_* vars; falls back to FEEDER_* where DUFFEL_* absent
+TravelTxter Pipeline Worker (FEEDER) — V4.7.6
+FIX: ZONE_THEME_BENCHMARKS now uses `max_price` (and optional `error_price`) instead of legacy `expensive_price`.
 
-LOCKED PRINCIPLES
-- Sheets is single source of truth. Worker is stateless.
-- No schema changes. No tab renames.
-- RAW_DEALS_VIEW is read-only (this worker does not touch it).
+What this file does (no redesigns):
+- Loads benchmarks using (theme, origin_iata) with cap_gbp derived from:
+    cap_gbp = max_price + error_price (if error_price exists else max_price)
+  Then applies optional multiplier and min cap:
+    cap_gbp = max(PRICE_GATE_MIN_CAP_GBP, cap_gbp * PRICE_GATE_MULTIPLIER)
+- If PRICE_GATE_FALLBACK_BEHAVIOR=BLOCK and cap missing => skip search BEFORE Duffel call (prevents wasted searches)
+- Queries Duffel
+- Filters GBP offers
+- Filters <= cap_gbp (if cap exists)
+- Ranks "best N out of many" deterministically by:
+    price asc, connections asc, duration asc (safe-field)
+- Enforces caps:
+    DUFFEL_MAX_INSERTS (total), DUFFEL_MAX_INSERTS_PER_ORIGIN, DUFFEL_MAX_INSERTS_PER_ROUTE
+- Appends to RAW_DEALS with status=NEW and always sets ingested_at_utc if column exists
+
+No schema changes. No renames. No RAW_DEALS_VIEW writes.
 """
 
 from __future__ import annotations
@@ -39,9 +47,6 @@ SIGNALS_TAB = os.getenv("SIGNALS_TAB", os.getenv("CONFIG_SIGNALS_TAB", "CONFIG_S
 CAPABILITY_TAB = os.getenv("CAPABILITY_TAB", "ROUTE_CAPABILITY_MAP").strip() or "ROUTE_CAPABILITY_MAP"
 BENCHMARKS_TAB = os.getenv("BENCHMARKS_TAB", "ZONE_THEME_BENCHMARKS").strip() or "ZONE_THEME_BENCHMARKS"
 
-# Optional audit tab (not required to exist)
-FEEDER_LOG_TAB = os.getenv("FEEDER_LOG_TAB", "").strip()
-
 SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or "").strip()
 
 DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY", "").strip()
@@ -50,16 +55,17 @@ DUFFEL_VERSION = os.getenv("DUFFEL_VERSION", "v2").strip() or "v2"
 
 RUN_SLOT = (os.getenv("RUN_SLOT") or "").strip().upper()
 
+
 # ==================== GOVERNORS (prefer DUFFEL_*; fallback to FEEDER_*) ====================
 
 def _get_int(primary: str, fallback: str, default: int) -> int:
-    v = os.getenv(primary, "").strip()
+    v = (os.getenv(primary) or "").strip()
     if v:
         try:
             return int(v)
         except Exception:
             pass
-    v2 = os.getenv(fallback, "").strip()
+    v2 = (os.getenv(fallback) or "").strip()
     if v2:
         try:
             return int(v2)
@@ -67,11 +73,11 @@ def _get_int(primary: str, fallback: str, default: int) -> int:
             pass
     return default
 
+
 DUFFEL_MAX_INSERTS = _get_int("DUFFEL_MAX_INSERTS", "FEEDER_MAX_INSERTS", 3)
 DUFFEL_MAX_SEARCHES_PER_RUN = _get_int("DUFFEL_MAX_SEARCHES_PER_RUN", "FEEDER_MAX_SEARCHES", 4)
 DUFFEL_ROUTES_PER_RUN = _get_int("DUFFEL_ROUTES_PER_RUN", "FEEDER_ROUTES_PER_RUN", 3)
 
-# Per-search take (still bounded by remaining total + route/origin caps)
 DUFFEL_OFFERS_PER_SEARCH = _get_int("DUFFEL_OFFERS_PER_SEARCH", "OFFERS_PER_SEARCH", 50)
 
 DUFFEL_MAX_INSERTS_PER_ROUTE = _get_int("DUFFEL_MAX_INSERTS_PER_ROUTE", "MAX_INSERTS_PER_ROUTE", 10)
@@ -79,27 +85,23 @@ DUFFEL_MAX_INSERTS_PER_ORIGIN = _get_int("DUFFEL_MAX_INSERTS_PER_ORIGIN", "MAX_I
 
 FEEDER_SLEEP_SECONDS = float(os.getenv("FEEDER_SLEEP_SECONDS", "0") or "0")
 
-# Flags
 FEEDER_OPEN_ORIGINS = (os.getenv("FEEDER_OPEN_ORIGINS", "false").strip().lower() == "true")
 STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lower() == "true")
 RESPECT_CONFIG_ORIGIN = (os.getenv("RESPECT_CONFIG_ORIGIN", "false").strip().lower() == "true")
 
-# Date defaults
 DEFAULT_DAYS_AHEAD_MIN = int(os.getenv("DAYS_AHEAD_MIN", "14") or "14")
 DEFAULT_DAYS_AHEAD_MAX = int(os.getenv("DAYS_AHEAD_MAX", "90") or "90")
 DEFAULT_TRIP_LENGTH_DAYS = int(os.getenv("TRIP_LENGTH_DAYS", "5") or "5")
 
-# Deterministic explore
 FEEDER_EXPLORE_RUN_MOD = int(os.getenv("FEEDER_EXPLORE_RUN_MOD", "10") or "10")
 FEEDER_EXPLORE_SALT = (os.getenv("FEEDER_EXPLORE_SALT", "traveltxter") or "traveltxter").strip()
 
-# Phase 1 price gate
 PRICE_GATE_ENABLED = (os.getenv("PRICE_GATE_ENABLED", "true").strip().lower() == "true")
-PRICE_GATE_MULTIPLIER = float(os.getenv("PRICE_GATE_MULTIPLIER", "1.5") or "1.5")
+PRICE_GATE_MULTIPLIER = float(os.getenv("PRICE_GATE_MULTIPLIER", "1.0") or "1.0")
 PRICE_GATE_MIN_CAP_GBP = float(os.getenv("PRICE_GATE_MIN_CAP_GBP", "80") or "80")
 PRICE_GATE_FALLBACK_BEHAVIOR = (os.getenv("PRICE_GATE_FALLBACK_BEHAVIOR", "BLOCK").strip().upper() or "BLOCK")
-# ALLOW -> search even if benchmark missing (no cap)
-# BLOCK -> skip route if benchmark missing (avoids wasting Duffel search)
+# BLOCK -> skip search if benchmark missing
+# ALLOW -> search without cap
 
 
 # ==================== THEMES (LOCKED LIST) ====================
@@ -120,17 +122,14 @@ MASTER_THEMES = [
 ]
 
 SPARSE_THEMES = {"northern_lights"}
+
 SNOW_THEMES = {"snow", "northern_lights"}
 LONG_HAUL_THEMES = {"long_haul", "luxury_value"}
 
-# Origins (ensure commas are correct; no concatenated strings)
 SW_ENGLAND_DEFAULT = ["BRS", "EXT", "NQY", "SOU", "CWL", "BOH"]
 
-# Core pools
 SHORT_HAUL_PRIMARY = ["BRS", "EXT", "NQY", "CWL", "SOU", "BOH"]
 SHORT_HAUL_FALLBACK = ["STN", "LTN", "LGW", "BHX", "MAN"]
-
-# "Further afield" resilience pool (north of London and wider UK)
 UK_WIDE_FALLBACK = ["MAN", "LBA", "NCL", "EDI", "GLA", "BFS", "BHD", "LPL", "EMA"]
 
 SNOW_POOL = ["BRS", "LGW", "STN", "LTN", "BHX", "MAN", "EDI", "GLA"]
@@ -224,12 +223,6 @@ def _sw_england_origins_from_env() -> List[str]:
 
 
 def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
-    """
-    Ensures the plan contains >=5 unique origins when possible, because:
-    - DUFFEL_MAX_INSERTS_PER_ORIGIN=10
-    - DUFFEL_MAX_INSERTS=50
-    -> needs ~5 origins to hit 50 without falling short.
-    """
     today = dt.datetime.utcnow().date().isoformat()
     seed = f"{today}|{RUN_SLOT}|{theme_today}"
 
@@ -243,8 +236,7 @@ def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
     else:
         base = base_short
 
-    # Always plan at least 5 origins where possible, regardless of routes_per_run.
-    plan_n = min(len(base), max(5, routes_per_run))
+    plan_n = min(len(base), max(5, routes_per_run))  # resilience for 50@10/origin
     return _deterministic_pick(base, seed, plan_n)
 
 
@@ -363,22 +355,38 @@ def _split_examples(x: Any) -> List[str]:
 
 
 def load_zone_theme_benchmarks(sheet: gspread.Spreadsheet) -> List[Dict[str, Any]]:
+    """
+    Reads the optimized benchmark contract:
+    - theme (string)
+    - origin_iata (IATA)
+    - destination_examples (optional CSV list)
+    - max_price (required numeric cap)
+    - error_price (optional numeric buffer)
+    """
     ws = sheet.worksheet(BENCHMARKS_TAB)
     rows = ws.get_all_records()
     out: List[Dict[str, Any]] = []
+
     for r in rows:
         theme = str(r.get("theme") or "").strip()
         origin = _clean_iata(r.get("origin_iata") or "")
         examples = _split_examples(r.get("destination_examples") or "")
-        expensive = _to_float(r.get("expensive_price"))
+
+        max_price = _to_float(r.get("max_price"))
+        error_price = _to_float(r.get("error_price")) or 0.0
+
         if not theme or not origin:
             continue
+        if max_price is None:
+            continue
+
         out.append(
             {
                 "theme": theme,
                 "origin_iata": origin,
                 "destination_examples": examples,
-                "expensive_price": expensive,
+                "max_price": float(max_price),
+                "error_price": float(error_price),
             }
         )
     return out
@@ -390,33 +398,43 @@ def compute_ingest_cap_gbp(
     origin: str,
     destination: str,
 ) -> Optional[float]:
+    """
+    Cap resolution:
+    - Prefer row where destination is in destination_examples (if provided)
+    - Else fall back to first matching (theme, origin) row
+    - cap_base = max_price + error_price
+    - cap_final = max(PRICE_GATE_MIN_CAP_GBP, cap_base * PRICE_GATE_MULTIPLIER)
+    """
     t = str(theme or "").strip()
     o = _clean_iata(origin)
     d = _clean_iata(destination)
 
-    best: Optional[float] = None
-    fallback: Optional[float] = None
+    best: Optional[Dict[str, Any]] = None
+    fallback: Optional[Dict[str, Any]] = None
 
     for r in benchmarks:
         if str(r.get("theme", "")).strip() != t:
             continue
         if _clean_iata(r.get("origin_iata")) != o:
             continue
-        exp = r.get("expensive_price")
-        if exp is None:
-            continue
+
+        if fallback is None:
+            fallback = r
+
         examples = r.get("destination_examples") or []
         if examples and d in examples:
-            best = float(exp)
+            best = r
             break
-        if fallback is None:
-            fallback = float(exp)
 
-    exp_use = best if best is not None else fallback
-    if exp_use is None:
+    chosen = best if best is not None else fallback
+    if not chosen:
         return None
 
-    cap = max(float(PRICE_GATE_MIN_CAP_GBP), float(exp_use) * float(PRICE_GATE_MULTIPLIER))
+    base = float(chosen.get("max_price") or 0.0) + float(chosen.get("error_price") or 0.0)
+    if base <= 0:
+        return None
+
+    cap = max(float(PRICE_GATE_MIN_CAP_GBP), base * float(PRICE_GATE_MULTIPLIER))
     return float(cap)
 
 
@@ -453,19 +471,18 @@ def offer_price_gbp(offer: Dict[str, Any]) -> float:
 def offer_connections_safe(offer: Dict[str, Any]) -> int:
     try:
         slices = offer.get("slices") or []
-        seg_total = 0
-        for s in slices:
-            segs = s.get("segments") or []
-            seg_total += len(segs)
-        if seg_total <= 0:
+        if not slices:
             return 99
-        # segments across 2 slices: (out segments + in segments)
-        # connections approx: (out-1) + (in-1)
         if len(slices) >= 2:
             out_segs = len((slices[0] or {}).get("segments") or [])
             in_segs = len((slices[1] or {}).get("segments") or [])
+            if out_segs <= 0 or in_segs <= 0:
+                return 99
             return max(0, (out_segs - 1)) + max(0, (in_segs - 1))
-        return max(0, seg_total - 1)
+        seg_total = 0
+        for s in slices:
+            seg_total += len((s or {}).get("segments") or [])
+        return max(0, seg_total - 1) if seg_total > 0 else 99
     except Exception:
         return 99
 
@@ -497,7 +514,7 @@ def offer_duration_minutes_safe(offer: Dict[str, Any]) -> int:
         total = 0
         found = False
         for sl in slices:
-            dur = sl.get("duration")
+            dur = (sl or {}).get("duration")
             if dur:
                 found = True
                 total += parse_iso_dur(dur)
@@ -662,7 +679,6 @@ def main() -> int:
     explore_quota = 0 if not explore_run else 1
     log(f"🧠 Feeder strategy: 90/10 | explore_run={explore_run} | theme_quota={theme_quota} | explore_quota={explore_quota} | MOD={FEEDER_EXPLORE_RUN_MOD}")
 
-    # Effective caps (logged)
     log(f"CAPS: DUFFEL_MAX_INSERTS={DUFFEL_MAX_INSERTS} | PER_ORIGIN={DUFFEL_MAX_INSERTS_PER_ORIGIN} | PER_ROUTE={DUFFEL_MAX_INSERTS_PER_ROUTE} | MAX_SEARCHES={DUFFEL_MAX_SEARCHES_PER_RUN} | OFFERS_PER_SEARCH={DUFFEL_OFFERS_PER_SEARCH}")
     log(f"PRICE_GATE_FALLBACK_BEHAVIOR={PRICE_GATE_FALLBACK_BEHAVIOR} | PRICE_GATE_MULTIPLIER={PRICE_GATE_MULTIPLIER} | PRICE_GATE_MIN_CAP_GBP={PRICE_GATE_MIN_CAP_GBP}")
 
@@ -804,7 +820,6 @@ def main() -> int:
             log("Duffel[PRIMARY]: offers_returned=0")
             continue
 
-        # GBP filter
         gbp_offers: List[Dict[str, Any]] = []
         rejected_non_gbp = 0
         for off in offers:
@@ -813,7 +828,6 @@ def main() -> int:
                 continue
             gbp_offers.append(off)
 
-        # Cap filter (if present)
         rejected_price = 0
         if PRICE_GATE_ENABLED and cap_gbp is not None:
             in_cap: List[Dict[str, Any]] = []
@@ -832,7 +846,6 @@ def main() -> int:
             )
             continue
 
-        # Rank: price asc, connections asc, duration asc (safe fields)
         def rank_key(off: Dict[str, Any]) -> Tuple[float, int, int]:
             return (offer_price_gbp(off), offer_connections_safe(off), offer_duration_minutes_safe(off))
 

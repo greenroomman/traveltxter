@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 # workers/link_router.py
 """
-TravelTxter Link Router — V4.6.4 (Duffel Links Sessions fix)
+TravelTxter Link Router – V4.7 (Fixed Duffel Links + Skyscanner Fallback)
 
-Purpose (LOCKED):
-- Populate booking_link_vip for monetisable rows.
-- Primary: Duffel Links *session* URL (real Duffel booking UI).
-- Fallback: deterministic DEMO link on traveltxter.com so VIP posts never have dead links.
-- DO NOT touch rendering or publishing.
-- Stateless: Sheets is the only memory.
+Purpose:
+- Populate booking_link_vip for monetisable rows
+- Primary: Duffel Links (if account has access)
+- Fallback: Skyscanner deep links (actual searchable flights)
+- DO NOT use homepage links (not useful for booking)
+
+Changes in V4.7:
+- Fixed: Duffel Links 403 error handling
+- Fixed: Fallback now uses Skyscanner deep links (users can actually book)
+- Added: Better error logging
+- Added: Option to save offer_id for future custom booking page
 
 Eligibility:
 - status in {"READY_TO_POST", "READY_TO_PUBLISH"}
 - booking_link_vip is blank
 - origin_iata, destination_iata, outbound_date, return_date present
-
-Duffel Links (current contract):
-- Create a session via POST /links/sessions
-- Use the returned data.url (links.duffel.com... unless custom subdomain)
-Docs:
-- https://duffel.com/docs/guides/duffel-links
-- https://duffel.com/docs/api/sessions
 """
 
 from __future__ import annotations
@@ -46,14 +44,14 @@ DUFFEL_API_KEY = (os.environ.get("DUFFEL_API_KEY") or "").strip()
 DUFFEL_API_BASE = (os.environ.get("DUFFEL_API_BASE") or "https://api.duffel.com").strip().rstrip("/")
 DUFFEL_VERSION = (os.environ.get("DUFFEL_VERSION") or "v2").strip() or "v2"
 
-DUFFEL_LINKS_ENABLED = (os.environ.get("DUFFEL_LINKS_ENABLED") or "true").strip().lower() == "true"
+# Set to false if you don't have Duffel Links access (403 errors)
+DUFFEL_LINKS_ENABLED = (os.environ.get("DUFFEL_LINKS_ENABLED") or "false").strip().lower() == "true"
 
 REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 DEFAULT_HOME_BASE = "http://www.traveltxter.com/"
 
-DEMO_BASE_URL = (os.environ.get("DEMO_BASE_URL") or "").strip()
-if not DEMO_BASE_URL:
-    DEMO_BASE_URL = (REDIRECT_BASE_URL or "").strip() or DEFAULT_HOME_BASE
+# Fallback strategy: "skyscanner" or "homepage"
+FALLBACK_STRATEGY = (os.environ.get("FALLBACK_STRATEGY") or "skyscanner").strip().lower()
 
 MAX_ROWS_PER_RUN = int((os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "20").strip() or "20")
 
@@ -170,8 +168,6 @@ def _ensure_base_url() -> str:
 
 
 def _make_outcome_urls(base: str, deal_id: str) -> Dict[str, str]:
-    # Keep simple + deterministic. Your site can ignore these for now.
-    # Required by Duffel sessions API.
     qp = urlencode({"deal_id": deal_id, "src": "duffel_links"})
     sep = "&" if "?" in base else "?"
     success = f"{base}{sep}{qp}&outcome=success"
@@ -182,7 +178,8 @@ def _make_outcome_urls(base: str, deal_id: str) -> Dict[str, str]:
 
 def _create_duffel_links_session(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, deal_id: str) -> Optional[str]:
     """
-    Creates a Duffel Links *session* and returns the session URL (Duffel-hosted booking UI).
+    Creates a Duffel Links session and returns the session URL.
+    Returns None if Duffel Links not available (403) or any error.
     """
     if not (DUFFEL_LINKS_ENABLED and DUFFEL_API_KEY):
         return None
@@ -214,7 +211,13 @@ def _create_duffel_links_session(origin_iata: str, dest_iata: str, out_iso: str,
     try:
         r = requests.post(url, headers=_duffel_headers(), json=payload, timeout=25)
     except Exception as e:
-        _log(f"❌ Duffel Links session exception: {e}")
+        _log(f"⚠️ Duffel Links session exception: {e}")
+        return None
+
+    if r.status_code == 403:
+        # Feature not available on this account
+        _log("⚠️ Duffel Links not available (403). Account may not have access to this feature.")
+        _log("   Consider: (1) Contact help@duffel.com to enable, or (2) Set DUFFEL_LINKS_ENABLED=false")
         return None
 
     if not (200 <= r.status_code < 300):
@@ -230,20 +233,55 @@ def _create_duffel_links_session(origin_iata: str, dest_iata: str, out_iso: str,
     except Exception:
         pass
 
-    _log("❌ Duffel Links session response missing data.url; falling back")
+    _log("⚠️ Duffel Links session response missing data.url")
     return None
 
 
-# -------------------- DEMO FALLBACK --------------------
+# -------------------- FALLBACK LINKS --------------------
 
-def _normalize_base(base: str) -> str:
-    b = (base or "").strip()
-    if not b:
-        b = DEFAULT_HOME_BASE
-    return b.rstrip()
+def _create_skyscanner_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str) -> str:
+    """
+    Create deep link to Skyscanner search results.
+    Users land on actual flight search and can book immediately.
+    
+    Format: https://www.skyscanner.net/transport/flights/ORIGIN/DEST/YYMMDD/YYMMDD/
+    Example: https://www.skyscanner.net/transport/flights/LHR/BKK/20260218/20260228/
+    """
+    # Convert ISO dates (2026-02-18) to compact format (20260218)
+    out_compact = out_iso.replace("-", "")
+    in_compact = in_iso.replace("-", "")
+    
+    origin = origin_iata.upper()
+    dest = dest_iata.upper()
+    
+    url = f"https://www.skyscanner.net/transport/flights/{origin}/{dest}/{out_compact}/{in_compact}/"
+    
+    return url
 
 
-def _create_demo_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
+def _create_google_flights_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str) -> str:
+    """
+    Alternative: Create deep link to Google Flights search.
+    """
+    origin = origin_iata.upper()
+    dest = dest_iata.upper()
+    
+    # Google Flights uses a query parameter format
+    query = f"flights from {origin} to {dest} on {out_iso} return {in_iso}"
+    encoded_query = urlencode({"q": query})
+    
+    url = f"https://www.google.com/travel/flights?{encoded_query}"
+    
+    return url
+
+
+def _create_homepage_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
+    """
+    Last resort: Link to homepage with query params.
+    Not ideal - users can't actually book from this.
+    """
+    base = (REDIRECT_BASE_URL or DEFAULT_HOME_BASE).strip().rstrip()
+    
     params = {
         "deal_id": _s(deal_id),
         "from": _s(origin_iata).upper(),
@@ -251,13 +289,27 @@ def _create_demo_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: s
         "out": _s(out_iso),
         "in": _s(in_iso),
         "price": _s(price_gbp).replace("£", "").strip(),
-        "src": "vip_demo",
+        "src": "vip_fallback",
     }
+    
     qs = urlencode({k: v for k, v in params.items() if v})
-    base = _normalize_base(DEMO_BASE_URL)
+    
     if "?" in base:
         return f"{base}&{qs}"
     return f"{base}?{qs}"
+
+
+def _create_fallback_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
+    """
+    Create fallback booking link based on FALLBACK_STRATEGY.
+    """
+    if FALLBACK_STRATEGY == "skyscanner":
+        return _create_skyscanner_link(origin_iata, dest_iata, out_iso, in_iso)
+    elif FALLBACK_STRATEGY == "google":
+        return _create_google_flights_link(origin_iata, dest_iata, out_iso, in_iso)
+    else:
+        # Default to homepage
+        return _create_homepage_link(deal_id, origin_iata, dest_iata, out_iso, in_iso, price_gbp)
 
 
 # -------------------- MAIN --------------------
@@ -267,13 +319,13 @@ def main() -> int:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
 
     _log("============================================================")
-    _log("🚀 TravelTxter Link Router starting (Duffel Links Sessions + Demo fallback)")
+    _log("🚀 TravelTxter Link Router V4.7 (Duffel Links + Smart Fallback)")
     _log("============================================================")
     _log(f"RAW_DEALS_TAB={RAW_DEALS_TAB}")
-    _log(f"DUFFEL_API_BASE={DUFFEL_API_BASE} DUFFEL_VERSION={DUFFEL_VERSION} DUFFEL_API_KEY={'set' if DUFFEL_API_KEY else 'missing'}")
+    _log(f"DUFFEL_API_BASE={DUFFEL_API_BASE} DUFFEL_VERSION={DUFFEL_VERSION}")
+    _log(f"DUFFEL_API_KEY={'set' if DUFFEL_API_KEY else 'missing'}")
     _log(f"DUFFEL_LINKS_ENABLED={DUFFEL_LINKS_ENABLED}")
-    _log(f"REDIRECT_BASE_URL={(REDIRECT_BASE_URL or '').strip() or '(blank)'}")
-    _log(f"DEMO_BASE_URL={DEMO_BASE_URL}")
+    _log(f"FALLBACK_STRATEGY={FALLBACK_STRATEGY}")
     _log(f"MAX_ROWS_PER_RUN={MAX_ROWS_PER_RUN}")
 
     gc = _gs_client()
@@ -315,12 +367,17 @@ def main() -> int:
 
         attempted += 1
 
+        # Try Duffel Links first (if enabled and available)
         link = _create_duffel_links_session(o, d, out_iso, in_iso, deal_id)
+        
         if link:
             duffel_ok += 1
+            _log(f"✅ Duffel Links: {deal_id} | {o}→{d}")
         else:
-            link = _create_demo_link(deal_id, o, d, out_iso, in_iso, price)
+            # Use smart fallback (Skyscanner/Google/Homepage)
+            link = _create_fallback_link(deal_id, o, d, out_iso, in_iso, price)
             used_fallback += 1
+            _log(f"🔗 Fallback ({FALLBACK_STRATEGY}): {deal_id} | {o}→{d}")
 
         updates.append((i, {"booking_link_vip": link}))
 
@@ -328,9 +385,18 @@ def main() -> int:
 
     _log(f"Attempted link generations: {attempted}")
     _log(f"booking_link_vip populated for: {len(updates)} rows")
-    _log(f"Duffel session links created: {duffel_ok}")
-    _log(f"Fallback demo links used: {used_fallback}")
+    _log(f"Duffel Links created: {duffel_ok}")
+    _log(f"Fallback links used: {used_fallback} (strategy: {FALLBACK_STRATEGY})")
     _log(f"Cells written (batch): {written_cells}")
+
+    if duffel_ok == 0 and attempted > 0 and DUFFEL_LINKS_ENABLED:
+        _log("")
+        _log("⚠️  NOTICE: Duffel Links is enabled but no links were created.")
+        _log("   This likely means your Duffel account doesn't have access to Links.")
+        _log("   Options:")
+        _log("   1. Contact help@duffel.com to enable Duffel Links on your account")
+        _log("   2. Set DUFFEL_LINKS_ENABLED=false to skip trying")
+        _log(f"   3. Current fallback ({FALLBACK_STRATEGY}) is working and users can book")
 
     return 0
 

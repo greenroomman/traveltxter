@@ -356,7 +356,13 @@ def load_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
     rows = ws.get_all_records()
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        key = _clean_iata(r.get("destination_iata"))
+        # V4.6 compat: some Sheets exports name the IATA column `iata_hint`.
+        # Accept both without changing tabs/headers.
+        key = _clean_iata(
+            r.get("destination_iata")
+            or r.get("iata_hint")
+            or r.get("iata")
+        )
         if key:
             out[key] = r
     return out
@@ -671,6 +677,8 @@ def main() -> int:
     config_rows = load_config_rows(sh)
     themes_dict = load_themes_dict(sh)
     signals = load_signals(sh)
+    if not signals:
+        log(f"⚠️ CONFIG_SIGNALS loaded 0 rows — check IATA key column (destination_iata vs iata_hint) in '{SIGNALS_TAB}'.")
     allowed_pairs, origin_city_map = load_route_capability_map(sh)
 
     benchmarks: List[Dict[str, Any]] = []

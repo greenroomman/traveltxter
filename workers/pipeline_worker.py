@@ -108,8 +108,8 @@ SPARSE_THEMES = {"northern_lights"}
 SNOW_THEMES = {"snow", "northern_lights"}
 LONG_HAUL_THEMES = {"long_haul", "luxury_value"}
 
-SHORT_HAUL_PRIMARY = ["BRS", "EXT", "NQY", "CWL", "SOU"]
-SHORT_HAUL_FALLBACK = ["STN", "LTN", "LGW"]
+SHORT_HAUL_PRIMARY = ["BRS", "MAN", "LGW", "STN", "SOU"]
+SHORT_HAUL_FALLBACK = ["STN", "LTN", "BRS"]
 SNOW_POOL = ["BRS", "LGW", "STN", "LTN"]
 LONG_HAUL_POOL = ["LHR", "LGW"]
 

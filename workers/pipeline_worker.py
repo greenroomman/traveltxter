@@ -2,29 +2,21 @@
 """
 workers/pipeline_worker.py
 
-TravelTxter Pipeline Worker (FEEDER) — V4.7.10 (ORIGIN-PLANNER + CONFIG CONSISTENCY)
+TravelTxter Pipeline Worker (FEEDER) — V4.7.10 + HYGIENE GATE (V4.6 LOCK-COMPAT)
+
 LOCKED PRINCIPLES:
 - Build from the existing file (no reinvention, no new architecture, no tab renames).
 - Replace full file only.
 - Google Sheets is the single source of truth.
 - Do NOT write to RAW_DEALS_VIEW.
 
-What this version fixes (system-wide, not "today's theme"):
-1) SAFE ENV CASTING (empty-string tolerant) for ALL int/float env reads used by feeder.
-2) ORIGIN PLANNING as a first-class, theme-aware policy (audience fit + route availability),
-   producing enough unique origins to support DUFFEL_MAX_INSERTS given DUFFEL_MAX_INSERTS_PER_ORIGIN.
-3) MATH GUARDRAIL + SELF-CONSISTENT ROUTE COUNT:
-   - required_origins = ceil(DUFFEL_MAX_INSERTS / DUFFEL_MAX_INSERTS_PER_ORIGIN)
-   - effective_routes_per_run = min(DUFFEL_MAX_SEARCHES_PER_RUN, max(DUFFEL_ROUTES_PER_RUN, required_origins))
-   This prevents the "max inserts = 40" silent ceiling when DUFFEL_ROUTES_PER_RUN=4 but max inserts expects 50.
-   (We log it explicitly when we auto-bump.)
-4) Route selection enforces "one per origin first" (Rule B) using the planned origins.
+This change adds ONE thing:
+✅ "HYGIENE GATE" to prevent obviously doomed offers entering RAW_DEALS:
+- Hard cap on connections (short-haul vs long-haul)
+- Hard cap on total itinerary duration minutes (short-haul vs long-haul)
+- Inner "quality band" under the benchmark cap (short-haul vs long-haul)
 
-No changes to:
-- benchmark contract (ZONE_THEME_BENCHMARKS)
-- capability filtering (ROUTE_CAPABILITY_MAP)
-- dedupe / gating behavior
-- RAW_DEALS schema mapping (header-mapped append)
+Everything else is unchanged.
 """
 
 from __future__ import annotations
@@ -126,6 +118,22 @@ PRICE_GATE_FALLBACK_BEHAVIOR = (os.getenv("PRICE_GATE_FALLBACK_BEHAVIOR", "BLOCK
 ZERO_OFFER_RETRY_ENABLED = (os.getenv("ZERO_OFFER_RETRY_ENABLED", "true").strip().lower() == "true")
 ZERO_OFFER_RETRY_MAX_DAYS = _get_int("ZERO_OFFER_RETRY_MAX_DAYS", "ZERO_OFFER_RETRY_MAX_DAYS", 60)
 
+# ==================== HYGIENE GATE (NEW) ====================
+# Goal: prevent obviously doomed offers entering RAW_DEALS (connections/duration/near-cap filler).
+HYGIENE_ENABLED = (os.getenv("HYGIENE_ENABLED", "true").strip().lower() == "true")
+
+# Connections: short-haul vs long-haul
+OFFER_MAX_CONNECTIONS_SHORTHAUL = _get_int("OFFER_MAX_CONNECTIONS_SHORTHAUL", "OFFER_MAX_CONNECTIONS_SHORTHAUL", 1)
+OFFER_MAX_CONNECTIONS_LONGHAUL = _get_int("OFFER_MAX_CONNECTIONS_LONGHAUL", "OFFER_MAX_CONNECTIONS_LONGHAUL", 2)
+
+# Duration minutes (total itinerary across slices)
+OFFER_MAX_DURATION_MINUTES_SHORTHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_SHORTHAUL", "OFFER_MAX_DURATION_MINUTES_SHORTHAUL", 720)   # 12h
+OFFER_MAX_DURATION_MINUTES_LONGHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_LONGHAUL", "OFFER_MAX_DURATION_MINUTES_LONGHAUL", 1200)     # 20h
+
+# Inner "quality band" under cap (keep filler out). Set to 1.0 to disable band filtering.
+QUALITY_PRICE_BAND_SHORTHAUL = _get_float("QUALITY_PRICE_BAND_SHORTHAUL", "QUALITY_PRICE_BAND_SHORTHAUL", 0.85)
+QUALITY_PRICE_BAND_LONGHAUL = _get_float("QUALITY_PRICE_BAND_LONGHAUL", "QUALITY_PRICE_BAND_LONGHAUL", 0.95)
+
 
 # ==================== THEMES ====================
 
@@ -144,9 +152,9 @@ MASTER_THEMES = [
     "unexpected_value",
 ]
 
-SPARSE_THEMES = {"northern_lights"}  # kept from baseline (can relax origin constraints if needed)
+SPARSE_THEMES = {"northern_lights"}  # kept from baseline
 
-# Pools (these are NOT “today hacks”; they’re building blocks for every theme policy)
+# Pools
 SW_ENGLAND_DEFAULT = ["BRS", "EXT", "NQY", "SOU", "CWL", "BOH"]
 LONDON_LCC = ["STN", "LTN", "LGW"]
 LONDON_FULL = ["LHR", "LGW", "STN", "LTN", "LCY", "SEN"]
@@ -155,7 +163,6 @@ NORTH = ["MAN", "LBA", "NCL", "LPL"]
 SCOTLAND = ["EDI", "GLA"]
 NI = ["BFS", "BHD"]
 
-# Optional “hub” lists remain available but are no longer theme-special-cased as the sole logic
 ADVENTURE_HUBS = ["LGW", "LHR", "STN", "LTN", "MAN", "BHX"]
 
 ORIGIN_CITY_FALLBACK = {
@@ -217,23 +224,17 @@ def _sw_england_origins_from_env() -> List[str]:
 
 
 def _det_hash_score(seed: str, item: str) -> int:
-    """Deterministic pseudo-random score (higher is better)."""
     h = hashlib.sha256(f"{seed}|{item}".encode("utf-8")).hexdigest()
     return int(h[:10], 16)
 
 
 def _weighted_pick_unique(seed: str, pools: List[Tuple[List[str], int]], k: int) -> List[str]:
-    """
-    Deterministic weighted picking without replacement.
-    Build candidate list with weights, score deterministically, pick top K unique.
-    """
     candidates: List[Tuple[int, str]] = []
     for origins, w in pools:
         w_int = max(0, int(w))
         for o in _dedupe_keep_order(origins):
             if w_int <= 0:
                 continue
-            # weight influences ranking by repeating score bands (not true randomness; stable)
             score = _det_hash_score(seed, o) + (w_int * 1_000_000)
             candidates.append((score, o))
 
@@ -254,11 +255,6 @@ def required_unique_origins() -> int:
 
 
 def effective_routes_per_run() -> int:
-    """
-    Self-consistency guardrail:
-    - to reach DUFFEL_MAX_INSERTS under per-origin caps, you need at least required_origins routes/origins.
-    - but never exceed DUFFEL_MAX_SEARCHES_PER_RUN.
-    """
     req = required_unique_origins()
     eff = max(DUFFEL_ROUTES_PER_RUN, req)
     eff = min(eff, max(1, DUFFEL_MAX_SEARCHES_PER_RUN))
@@ -266,17 +262,9 @@ def effective_routes_per_run() -> int:
 
 
 def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
-    """
-    Theme-aware origin planning (whole-system, not theme hacks).
-    - Uses SW England as a meaningful audience anchor where appropriate (e.g. surf),
-      but includes controlled fallback share to high-connectivity airports to avoid wasted searches.
-    - Deterministic rotation by date + run slot + theme.
-    """
     sw = _dedupe_keep_order(_sw_england_origins_from_env())
     seed = f"{dt.datetime.utcnow().date().isoformat()}|{RUN_SLOT}|{theme_today}|ORIGIN_PLAN"
 
-    # Theme -> pool weights (audience fit + network reality)
-    # Weights are not absolutes; they shape the 5+ origin set.
     if theme_today == "surf":
         pools = [(sw, 80), (LONDON_LCC, 20)]
     elif theme_today == "snow":
@@ -288,10 +276,8 @@ def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
     elif theme_today == "city_breaks" or theme_today == "culture_history":
         pools = [(LONDON_LCC + MIDLANDS, 45), (NORTH + SCOTLAND, 35), (sw, 20)]
     elif theme_today == "northern_lights":
-        # Sparse theme; include higher-connectivity airports to reduce 0-offer likelihood
         pools = [(LONDON_FULL + NORTH + SCOTLAND + MIDLANDS, 80), (sw, 20)]
     elif theme_today == "adventure":
-        # Use broader network but keep SW in mix; not a “hub-only today” hack
         pools = [(LONDON_FULL + MIDLANDS + NORTH, 60), (sw, 40)]
     elif theme_today == "long_haul":
         pools = [(LONDON_FULL, 65), (NORTH + MIDLANDS + SCOTLAND, 35)]
@@ -302,9 +288,7 @@ def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
 
     plan = _weighted_pick_unique(seed, pools, plan_n)
 
-    # Absolute safety: ensure at least 5 if possible (your operational need for 50@10/origin)
     if len(plan) < min(5, plan_n):
-        # Add deterministic extras from a broad fallback
         broad = _dedupe_keep_order(sw + LONDON_LCC + MIDLANDS + NORTH + SCOTLAND + NI)
         extra_seed = seed + "|FILL"
         extras = _weighted_pick_unique(extra_seed, [(broad, 1)], plan_n)
@@ -653,9 +637,8 @@ def main() -> int:
     req_origins = required_unique_origins()
     eff_routes = effective_routes_per_run()
 
-    # Math / capacity guardrail (this is the “stop chasing ghosts” log)
     theoretical_max_by_routes = DUFFEL_MAX_INSERTS_PER_ROUTE * eff_routes
-    theoretical_max_by_origins = DUFFEL_MAX_INSERTS_PER_ORIGIN * eff_routes  # since Rule B targets 1 origin per route first
+    theoretical_max_by_origins = DUFFEL_MAX_INSERTS_PER_ORIGIN * eff_routes
     theoretical_max = min(DUFFEL_MAX_INSERTS, theoretical_max_by_routes, theoretical_max_by_origins)
 
     if eff_routes != DUFFEL_ROUTES_PER_RUN:
@@ -668,10 +651,12 @@ def main() -> int:
         f"MAX_SEARCHES={DUFFEL_MAX_SEARCHES_PER_RUN} | ROUTES_PER_RUN(env)={DUFFEL_ROUTES_PER_RUN} | ROUTES_PER_RUN(effective)={eff_routes}")
     log(f"CAPACITY_NOTE: theoretical_max_inserts_this_run <= {theoretical_max} (based on caps + effective routes)")
     log(f"PRICE_GATE: fallback={PRICE_GATE_FALLBACK_BEHAVIOR} | mult={PRICE_GATE_MULTIPLIER} | mincap={PRICE_GATE_MIN_CAP_GBP}")
+    log(f"HYGIENE: enabled={HYGIENE_ENABLED} | conn_short={OFFER_MAX_CONNECTIONS_SHORTHAUL} conn_long={OFFER_MAX_CONNECTIONS_LONGHAUL} | "
+        f"dur_short={OFFER_MAX_DURATION_MINUTES_SHORTHAUL} dur_long={OFFER_MAX_DURATION_MINUTES_LONGHAUL} | "
+        f"band_short={QUALITY_PRICE_BAND_SHORTHAUL} band_long={QUALITY_PRICE_BAND_LONGHAUL}")
     log(f"INVENTORY_WINDOW_DAYS={INVENTORY_MIN_DAYS}-{INVENTORY_MAX_DAYS} | ZERO_OFFER_RETRY_ENABLED={ZERO_OFFER_RETRY_ENABLED} retry_window_max={ZERO_OFFER_RETRY_MAX_DAYS}")
 
     explore_run = should_do_explore_this_run(theme_today)
-    # Keep 90/10 idea but ensure we don’t violate “need enough origins”:
     theme_quota = eff_routes if not explore_run else max(0, eff_routes - 1)
     explore_quota = 0 if not explore_run else 1
     log(f"🧠 Strategy: 90/10 | explore_run={explore_run} | theme_quota={theme_quota} | explore_quota={explore_quota} | MOD={FEEDER_EXPLORE_RUN_MOD}")
@@ -713,7 +698,6 @@ def main() -> int:
     theme_dest_configs = unique_dest_configs(theme_routes)
     explore_dest_configs = unique_dest_configs(explore_routes)
 
-    # Planned origins must support max inserts:
     plan_n = max(5, req_origins, eff_routes)
     planned_origins = origin_plan_for_theme(theme_today, plan_n)
     log(f"🧭 Planned origins for run ({len(planned_origins)}; required={plan_n}): {planned_origins}")
@@ -739,7 +723,6 @@ def main() -> int:
         picked: List[Tuple[str, str, Dict[str, Any]]] = []
         used_dests: Set[str] = set()
 
-        # Pass 1: one route per origin
         for origin in planned_origins:
             if len(picked) >= quota:
                 break
@@ -754,7 +737,6 @@ def main() -> int:
                 used_dests.add(dest)
                 break
 
-        # Pass 2: fill remaining (still origin-looped)
         safety = 0
         while len(picked) < quota and safety < 5000:
             safety += 1
@@ -788,7 +770,6 @@ def main() -> int:
         rotated = explore_dest_configs[offset:] + explore_dest_configs[:offset]
         selected_routes.extend(select_routes_rule_b(rotated, 1))
 
-    # Hard cap by MAX_SEARCHES_PER_RUN
     if len(selected_routes) > DUFFEL_MAX_SEARCHES_PER_RUN:
         selected_routes = selected_routes[:DUFFEL_MAX_SEARCHES_PER_RUN]
 
@@ -799,6 +780,23 @@ def main() -> int:
     searches_done = 0
     all_deals: List[Dict[str, Any]] = []
     inserted_by_origin: Dict[str, int] = {}
+
+    def is_longhaul_theme(deal_theme: str) -> bool:
+        t = str(deal_theme or "").strip()
+        return t in {"long_haul", "adventure"}
+
+    def hygiene_limits_for_theme(deal_theme: str) -> Tuple[int, int, float]:
+        if is_longhaul_theme(deal_theme):
+            return (
+                max(0, int(OFFER_MAX_CONNECTIONS_LONGHAUL)),
+                max(0, int(OFFER_MAX_DURATION_MINUTES_LONGHAUL)),
+                float(QUALITY_PRICE_BAND_LONGHAUL),
+            )
+        return (
+            max(0, int(OFFER_MAX_CONNECTIONS_SHORTHAUL)),
+            max(0, int(OFFER_MAX_DURATION_MINUTES_SHORTHAUL)),
+            float(QUALITY_PRICE_BAND_SHORTHAUL),
+        )
 
     def run_search(origin: str, destination: str, dep_date: dt.date, ret_date: dt.date, cfg: Dict[str, Any], cap_gbp: Optional[float]) -> Tuple[int, List[Dict[str, Any]]]:
         nonlocal searches_done, all_deals, inserted_by_origin
@@ -827,6 +825,9 @@ def main() -> int:
             log("Duffel[PRIMARY]: offers_returned=0")
             return 0, []
 
+        deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
+        max_conn_hard, max_dur_hard, band = hygiene_limits_for_theme(deal_theme)
+
         gbp_offers: List[Dict[str, Any]] = []
         rejected_non_gbp = 0
         for off in offers:
@@ -835,21 +836,54 @@ def main() -> int:
                 continue
             gbp_offers.append(off)
 
-        rejected_price = 0
+        rejected_price_hard = 0
         if PRICE_GATE_ENABLED and cap_gbp is not None:
             in_cap: List[Dict[str, Any]] = []
             for off in gbp_offers:
                 if offer_price_gbp(off) <= cap_gbp:
                     in_cap.append(off)
                 else:
-                    rejected_price += 1
+                    rejected_price_hard += 1
             gbp_offers = in_cap
+
+        # HYGIENE: connections/duration hard filters
+        rejected_hygiene_conn = 0
+        rejected_hygiene_dur = 0
+        if HYGIENE_ENABLED and gbp_offers:
+            kept: List[Dict[str, Any]] = []
+            for off in gbp_offers:
+                conn = offer_connections_safe(off)
+                dur = offer_duration_minutes_safe(off)
+                if conn > max_conn_hard:
+                    rejected_hygiene_conn += 1
+                    continue
+                if dur > max_dur_hard:
+                    rejected_hygiene_dur += 1
+                    continue
+                kept.append(off)
+            gbp_offers = kept
+
+        # HYGIENE: inner quality band under cap (prevents near-cap filler)
+        rejected_band = 0
+        band_cap: Optional[float] = None
+        if HYGIENE_ENABLED and PRICE_GATE_ENABLED and cap_gbp is not None and gbp_offers:
+            if band > 0 and band < 1.0:
+                band_cap = float(cap_gbp) * float(band)
+                kept2: List[Dict[str, Any]] = []
+                for off in gbp_offers:
+                    if offer_price_gbp(off) <= band_cap:
+                        kept2.append(off)
+                    else:
+                        rejected_band += 1
+                gbp_offers = kept2
 
         if not gbp_offers:
             cap_str = f"{int(cap_gbp)}" if cap_gbp is not None else "NONE"
+            band_str = f"{int(band_cap)}" if band_cap is not None else ("NONE" if cap_gbp is None else "1.0x")
             log(
-                f"Duffel[PRIMARY]: offers_returned={offers_returned} gbp_offers=0 cap_gbp={cap_str} "
-                f"rejected_price={rejected_price} rejected_non_gbp={rejected_non_gbp} inserted=0"
+                f"Duffel[PRIMARY]: offers_returned={offers_returned} gbp_offers=0 cap_gbp={cap_str} band_cap={band_str} "
+                f"rej_non_gbp={rejected_non_gbp} rej_price={rejected_price_hard} rej_conn={rejected_hygiene_conn} "
+                f"rej_dur={rejected_hygiene_dur} rej_band={rejected_band} inserted=0"
             )
             return offers_returned, []
 
@@ -866,8 +900,6 @@ def main() -> int:
         inserted_here = 0
         processed = 0
         deals_out: List[Dict[str, Any]] = []
-
-        deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
 
         for off in ranked:
             if inserted_here >= take_n:
@@ -910,9 +942,11 @@ def main() -> int:
         inserted_by_origin[origin] = inserted_by_origin.get(origin, 0) + inserted_here
 
         cap_str = f"{int(cap_gbp)}" if cap_gbp is not None else "NONE"
+        band_str = f"{int(band_cap)}" if band_cap is not None else ("NONE" if cap_gbp is None else "1.0x")
         log(
-            f"Duffel[PRIMARY]: offers_returned={offers_returned} gbp_ranked={len(ranked)} processed={processed} cap_gbp={cap_str} "
-            f"rejected_price={rejected_price} rejected_non_gbp={rejected_non_gbp} "
+            f"Duffel[PRIMARY]: offers_returned={offers_returned} gbp_ranked={len(ranked)} processed={processed} "
+            f"cap_gbp={cap_str} band_cap={band_str} rej_non_gbp={rejected_non_gbp} rej_price={rejected_price_hard} "
+            f"rej_conn={rejected_hygiene_conn} rej_dur={rejected_hygiene_dur} rej_band={rejected_band} "
             f"inserted={inserted_here} origin_total={inserted_by_origin[origin]}/{DUFFEL_MAX_INSERTS_PER_ORIGIN} "
             f"running_total={len(all_deals) + len(deals_out)}/{DUFFEL_MAX_INSERTS}"
         )

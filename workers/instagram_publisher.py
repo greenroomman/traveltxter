@@ -1,27 +1,5 @@
-#!/usr/bin/env python3
 # workers/instagram_publisher.py
-"""
-TravelTxter — Instagram Publisher (FULL REPLACEMENT — V4.6.2)
-
-LOCKED PURPOSE:
-- Publish RAW_DEALS rows where status == READY_TO_PUBLISH
-- Enforce THEME-OF-THE-DAY gate
-- ALWAYS prioritise NEWEST eligible deal (ingested_at_utc DESC, then row DESC)
-- Publish via Instagram Graph API
-- Update status -> POSTED_INSTAGRAM
-- On image fetch failure: re-queue -> READY_TO_POST
-
-LOCKED INSTAGRAM OUTPUT:
-Country [country flag]
-To: <City>
-From: <City>
-Price: £<xxx>
-Out: YYYY-MM-DD
-Return: YYYY-MM-DD
-
-[PHRASE]
-Link in bio…
-"""
+# FULL REPLACEMENT (V4.7) — phrase_used preferred, phrase_bank fallback
 
 from __future__ import annotations
 
@@ -130,10 +108,7 @@ def candidate_url_variants(raw_url: str) -> List[str]:
     base = env("PUBLIC_BASE_URL", "https://greenroomman.pythonanywhere.com").rstrip("/")
 
     if not u.startswith("http://") and not u.startswith("https://"):
-        if u.startswith("/"):
-            variants.append(base + u)
-        else:
-            variants.append(base + "/" + u)
+        variants.append(base + (u if u.startswith("/") else "/" + u))
     else:
         variants.append(u)
 
@@ -199,7 +174,7 @@ def ig_publish_container(ig_user_id: str, token: str, creation_id: str) -> str:
     return str(j["id"])
 
 
-def _phrase_from_row(row: Dict[str, str]) -> str:
+def phrase_from_row(row: Dict[str, str]) -> str:
     p = (row.get("phrase_used") or "").strip()
     if p:
         return p
@@ -214,7 +189,7 @@ def build_caption(row: Dict[str, str]) -> str:
     price = (row.get("price_gbp") or "").strip().replace("£", "").strip()
     out_date = (row.get("outbound_date") or "").strip()
     ret_date = (row.get("return_date") or "").strip()
-    phrase = _phrase_from_row(row)
+    phrase = phrase_from_row(row)
 
     first_line = country if country else (row.get("destination_iata") or "").strip()
     if flag:
@@ -265,7 +240,8 @@ def main() -> int:
         "deal_theme",
         "theme",
         "ingested_at_utc",
-        "phrase_used",  # NEW PRIMARY
+        "phrase_used",
+        "phrase_bank",
         "posted_instagram_at",
         "publish_error",
         "publish_error_at",

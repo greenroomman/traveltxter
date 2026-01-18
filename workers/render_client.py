@@ -2,14 +2,15 @@
 """
 workers/render_client.py
 
-Render Client — V4.6.2 HOTFIX
+Render Client — V4.6.3 STATUS PROMOTION HOTFIX
 FULL REPLACEMENT (per protocol)
 
-FIX:
-- Send the LOCKED renderer payload (FROM/TO/OUT/IN/PRICE) instead of only row_number
-- Robust field extraction from RAW_DEALS using tolerant header matching
-- Date normalisation to ddmmyy
-- Price normalisation to £xxx (rounded up)
+What this fixes:
+- Keeps the renderer payload contract EXACTLY the same (FROM/TO/OUT/IN/PRICE)
+- Keeps PythonAnywhere renderer untouched
+- After successful render + graphic_url write:
+  - Promote status READY_TO_POST -> READY_TO_PUBLISH
+  - (If already READY_TO_PUBLISH, leave as-is)
 
 LOCKED BEHAVIOUR:
 - Google Sheets is the single source of truth
@@ -37,16 +38,32 @@ except Exception:
 
 # ==================== ENV ====================
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
-RENDER_URL = os.getenv("RENDER_URL")
-RENDER_MAX_ROWS = int(os.getenv("RENDER_MAX_ROWS", "1") or "1")
-RUN_SLOT = os.getenv("RUN_SLOT", "UNKNOWN")
+SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or "").strip()
+RAW_DEALS_TAB = (os.getenv("RAW_DEALS_TAB", "RAW_DEALS") or "RAW_DEALS").strip()
 
+RENDER_URL = (os.getenv("RENDER_URL") or "").strip()
+
+def _get_int_env(name: str, default: int) -> int:
+    v = (os.getenv(name) or "").strip()
+    if not v:
+        return int(default)
+    try:
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+RENDER_MAX_ROWS = _get_int_env("RENDER_MAX_ROWS", 1)
+RUN_SLOT = (os.getenv("RUN_SLOT", "UNKNOWN") or "UNKNOWN").strip()
+
+# Rows eligible for rendering (we keep READY_TO_POST included for compatibility)
 ELIGIBLE_STATUSES = {
     "READY_TO_PUBLISH",
     "READY_TO_POST",
 }
+
+# Promotion rule (the missing hop in your cascade)
+PROMOTE_FROM = "READY_TO_POST"
+PROMOTE_TO = "READY_TO_PUBLISH"
 
 
 # ==================== LOGGING ====================
@@ -66,7 +83,7 @@ def parse_sa_json(raw: str) -> dict:
 
 
 def gs_client():
-    raw = os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
+    raw = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON")
     info = parse_sa_json(raw)
@@ -94,10 +111,6 @@ def norm_header(s: str) -> str:
 
 
 def get_first_value(row: list, idx_norm: dict, *candidates: str) -> str:
-    """
-    Return the first non-empty cell value for any header candidate.
-    candidates are raw header names; we normalise for matching.
-    """
     for c in candidates:
         key = norm_header(c)
         if key in idx_norm:
@@ -108,23 +121,13 @@ def get_first_value(row: list, idx_norm: dict, *candidates: str) -> str:
 
 
 def normalise_date_to_ddmmyy(raw: str) -> str:
-    """
-    Accepts:
-    - ddmmyy
-    - dd/mm/yyyy or dd-mm-yyyy
-    - yyyy-mm-dd
-    - ISO timestamps
-    Outputs: ddmmyy (e.g., 260226)
-    """
     s = (raw or "").strip()
     if not s:
         return ""
 
-    # already ddmmyy
     if re.fullmatch(r"\d{6}", s):
         return s
 
-    # dd/mm/yyyy or dd-mm-yyyy or dd.mm.yyyy
     m = re.fullmatch(r"(\d{1,2})[\/\-\.\s](\d{1,2})[\/\-\.\s](\d{2,4})", s)
     if m:
         d = int(m.group(1))
@@ -138,7 +141,6 @@ def normalise_date_to_ddmmyy(raw: str) -> str:
         except Exception:
             return ""
 
-    # yyyy-mm-dd
     m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
     if m:
         y = int(m.group(1))
@@ -150,7 +152,6 @@ def normalise_date_to_ddmmyy(raw: str) -> str:
         except Exception:
             return ""
 
-    # dateutil fallback if available
     if date_parser:
         try:
             dt_obj = date_parser.parse(s).date()
@@ -162,15 +163,10 @@ def normalise_date_to_ddmmyy(raw: str) -> str:
 
 
 def normalise_price_to_pounds_rounded(raw: str) -> str:
-    """
-    Accepts: '123', '123.45', '£123', 'GBP 123.45', etc.
-    Outputs: '£123' with rounding UP to whole pounds.
-    """
     s = (raw or "").strip()
     if not s:
         return ""
 
-    # extract first number-like token
     m = re.search(r"(\d+(?:\.\d+)?)", s.replace(",", ""))
     if not m:
         return ""
@@ -184,15 +180,6 @@ def normalise_price_to_pounds_rounded(raw: str) -> str:
 
 
 def build_render_payload(row: list, idx_norm: dict) -> dict:
-    """
-    Build payload exactly as locked contract:
-    FROM, TO, OUT, IN, PRICE
-    Values must be:
-    - FROM/TO = city name strings (preferred)
-    - OUT/IN = ddmmyy
-    - PRICE = £xxx (rounded up)
-    """
-    # Cities: tolerate multiple header variants.
     from_city = get_first_value(
         row, idx_norm,
         "from_city", "origin_city", "origin_city_name", "origin", "from", "departure_city"
@@ -202,7 +189,6 @@ def build_render_payload(row: list, idx_norm: dict) -> dict:
         "to_city", "destination_city", "destination_city_name", "destination", "to", "arrival_city"
     )
 
-    # Dates: tolerate multiple header variants.
     out_raw = get_first_value(
         row, idx_norm,
         "out_date", "depart_date", "departure_date", "outbound_date", "depart", "out"
@@ -212,7 +198,6 @@ def build_render_payload(row: list, idx_norm: dict) -> dict:
         "in_date", "return_date", "inbound_date", "return", "in"
     )
 
-    # Price: tolerate multiple header variants.
     price_raw = get_first_value(
         row, idx_norm,
         "price", "price_gbp", "total_price_gbp", "gbp_price", "price_total", "price_total_gbp"
@@ -222,14 +207,13 @@ def build_render_payload(row: list, idx_norm: dict) -> dict:
     in_ddmmyy = normalise_date_to_ddmmyy(in_raw)
     price_fmt = normalise_price_to_pounds_rounded(price_raw)
 
-    payload = {
+    return {
         "FROM": from_city,
         "TO": to_city,
         "OUT": out_ddmmyy,
         "IN": in_ddmmyy,
         "PRICE": price_fmt,
     }
-    return payload
 
 
 def payload_is_complete(p: dict) -> bool:
@@ -244,7 +228,7 @@ def main():
     log("=" * 60)
 
     if not SPREADSHEET_ID or not RENDER_URL:
-        raise RuntimeError("Missing SPREADSHEET_ID or RENDER_URL")
+        raise RuntimeError("Missing SPREADSHEET_ID/SHEET_ID or RENDER_URL")
 
     gc = gs_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -253,20 +237,22 @@ def main():
     headers = ws.row_values(1)
     rows = ws.get_all_values()[1:]
 
-    # Normalised header index for tolerant matching
     idx_norm = {norm_header(h): i for i, h in enumerate(headers)}
 
-    # Required baseline columns for locked behaviour
+    # Required baseline columns
     for col in ("status", "ingested_at_utc", "graphic_url"):
         if norm_header(col) not in idx_norm:
             raise RuntimeError(f"Missing required column: {col}")
 
-    eligible = []
+    status_col = idx_norm[norm_header("status")] + 1
+    ingested_col = idx_norm[norm_header("ingested_at_utc")] + 1
+    graphic_col = idx_norm[norm_header("graphic_url")] + 1
 
+    eligible = []
     for i, row in enumerate(rows, start=2):
-        status = (row[idx_norm[norm_header("status")]] or "").strip()
-        graphic_url = (row[idx_norm[norm_header("graphic_url")]] or "").strip()
-        ingested = (row[idx_norm[norm_header("ingested_at_utc")]] or "").strip()
+        status = (row[status_col - 1] or "").strip()
+        graphic_url = (row[graphic_col - 1] or "").strip()
+        ingested = (row[ingested_col - 1] or "").strip()
 
         if status not in ELIGIBLE_STATUSES:
             continue
@@ -292,11 +278,9 @@ def main():
         row_num = item["row_num"]
         log(f"🖼️ Rendering row {row_num}")
 
-        # Pull the row (already loaded), build payload from RAW_DEALS
-        row = rows[row_num - 2]  # because rows excludes header and is 0-based
+        row = rows[row_num - 2]
         payload = build_render_payload(row, idx_norm)
 
-        # Forensic-safe payload logging (no secrets)
         log(
             "Render payload: "
             f"FROM='{payload.get('FROM')}' "
@@ -310,12 +294,7 @@ def main():
             log(f"❌ Skipping row {row_num}: payload incomplete (missing city/date/price fields)")
             continue
 
-        # LOCKED CONTRACT: send exactly these keys
-        r = requests.post(
-            RENDER_URL,
-            json=payload,
-            timeout=60,
-        )
+        r = requests.post(RENDER_URL, json=payload, timeout=60)
 
         if r.status_code != 200:
             log(f"❌ Render failed row {row_num}: HTTP {r.status_code}")
@@ -330,10 +309,20 @@ def main():
             log(f"❌ No graphic_url returned for row {row_num}")
             continue
 
-        cell = gspread.utils.rowcol_to_a1(row_num, idx_norm[norm_header("graphic_url")] + 1)
-        ws.update([[graphic_url]], cell)
+        # 1) Write graphic_url (existing behavior)
+        graphic_cell = gspread.utils.rowcol_to_a1(row_num, graphic_col)
+        ws.update([[graphic_url]], graphic_cell)
+        log(f"✅ Wrote graphic_url for row {row_num}")
 
-        log(f"✅ Rendered row {row_num}")
+        # 2) Promote status READY_TO_POST -> READY_TO_PUBLISH (missing hop)
+        current_status = (row[status_col - 1] or "").strip()
+        if current_status == PROMOTE_FROM:
+            status_cell = gspread.utils.rowcol_to_a1(row_num, status_col)
+            ws.update([[PROMOTE_TO]], status_cell)
+            log(f"✅ Promoted status {PROMOTE_FROM} -> {PROMOTE_TO} for row {row_num}")
+        else:
+            log(f"ℹ️ Status not promoted (current_status='{current_status}') for row {row_num}")
+
         time.sleep(1)
 
     log("Render cycle complete.")

@@ -2,20 +2,21 @@
 """
 workers/pipeline_worker.py
 
-TravelTxter Pipeline Worker (FEEDER) — V4.6
-PHASE 1 PRICE GATE ONLY (ingestion-side filtering)
+TravelTxter Pipeline Worker (FEEDER) — V4.7.3
+SAFE-FIELD RANKING: "best N offers out of many" (deterministic, no schema changes)
 
 LOCKED PRINCIPLES
 - Sheets is the single source of truth. Worker is stateless and deterministic.
 - Theme-of-day drives supply (90%) with deterministic explore (10%).
 - RAW_DEALS_VIEW is read-only (no writes).
-- We do not "fix" junk downstream: prevent junk entering RAW_DEALS.
+- Prevent junk entering RAW_DEALS (ingestion-side discipline).
 
 WHAT THIS FILE GUARANTEES
 - Inserts rows into RAW_DEALS with status=NEW.
 - Always writes `ingested_at_utc` (and `created_utc` if header exists).
 - Phase 1 price gate uses ZONE_THEME_BENCHMARKS to compute a cap in GBP.
-- Ingests up to DUFFEL_OFFERS_PER_SEARCH per Duffel search (bounded by DUFFEL_MAX_INSERTS).
+- Does NOT waste Duffel searches on benchmark-miss routes when fallback=BLOCK.
+- "Best N out of 1200": ranks offers safely using fields if present.
 
 DO NOT PASTE YAML INTO THIS FILE.
 """
@@ -60,11 +61,14 @@ DUFFEL_ROUTES_PER_RUN = int(os.getenv("DUFFEL_ROUTES_PER_RUN", "3") or "3")
 # Per-search ingestion bound (still limited by remaining total inserts)
 DUFFEL_OFFERS_PER_SEARCH = int(os.getenv("DUFFEL_OFFERS_PER_SEARCH", "50") or "50")
 
+# Flood governors (env-only)
+DUFFEL_MAX_INSERTS_PER_ROUTE = int(os.getenv("DUFFEL_MAX_INSERTS_PER_ROUTE", "10") or "10")
+DUFFEL_MAX_INSERTS_PER_ORIGIN = int(os.getenv("DUFFEL_MAX_INSERTS_PER_ORIGIN", "10") or "10")
+
 # Origin logic flags
 FEEDER_OPEN_ORIGINS = (os.getenv("FEEDER_OPEN_ORIGINS", "false").strip().lower() == "true")
 STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lower() == "true")
 
-# IMPORTANT: CONFIG origin override only if true
 RESPECT_CONFIG_ORIGIN = (os.getenv("RESPECT_CONFIG_ORIGIN", "false").strip().lower() == "true")
 
 # Date defaults
@@ -82,9 +86,10 @@ FEEDER_SLEEP_SECONDS = float(os.getenv("FEEDER_SLEEP_SECONDS", "0") or "0")
 PRICE_GATE_ENABLED = (os.getenv("PRICE_GATE_ENABLED", "true").strip().lower() == "true")
 PRICE_GATE_MULTIPLIER = float(os.getenv("PRICE_GATE_MULTIPLIER", "1.5") or "1.5")
 PRICE_GATE_MIN_CAP_GBP = float(os.getenv("PRICE_GATE_MIN_CAP_GBP", "80") or "80")
-PRICE_GATE_FALLBACK_BEHAVIOR = (os.getenv("PRICE_GATE_FALLBACK_BEHAVIOR", "ALLOW").strip().upper() or "ALLOW")
+
+PRICE_GATE_FALLBACK_BEHAVIOR = (os.getenv("PRICE_GATE_FALLBACK_BEHAVIOR", "BLOCK").strip().upper() or "BLOCK")
 # ALLOW -> no cap if benchmark missing (logged)
-# BLOCK -> skip route if benchmark missing
+# BLOCK -> skip route if benchmark missing (pre-check; avoids Duffel call)
 
 
 # ==================== THEMES (LOCKED LIST) ====================
@@ -108,10 +113,10 @@ SPARSE_THEMES = {"northern_lights"}
 SNOW_THEMES = {"snow", "northern_lights"}
 LONG_HAUL_THEMES = {"long_haul", "luxury_value"}
 
-SHORT_HAUL_PRIMARY = ["BRS", "MAN", "LGW", "LTN", "STN", "SOU"]
-SHORT_HAUL_FALLBACK = ["LHR", "CWL", "BHX"]
-SNOW_POOL = ["BRS", "LGW", "STN", "LTN", "BHX"]
-LONG_HAUL_POOL = ["LHR", "LGW", "SEN", "EXT"]
+SHORT_HAUL_PRIMARY = ["BRS", "LTN", "STN", "BHX", "SOU"]
+SHORT_HAUL_FALLBACK = ["BOH", "NQY", "EXT", "CWL", "LCY"]
+SNOW_POOL = ["BRS", "LGW", "STN", "LTN" "BHX"]
+LONG_HAUL_POOL = ["LHR", "LGW" "EXT" "LCY", "MAN"]
 
 ORIGIN_CITY_FALLBACK = {
     "LHR": "London",
@@ -121,6 +126,7 @@ ORIGIN_CITY_FALLBACK = {
     "LCY": "London",
     "SEN": "London",
     "MAN": "Manchester",
+    "BOH": "Bournemouth",
     "BHX": "Birmingham",
     "BRS": "Bristol",
     "EXT": "Exeter",
@@ -183,7 +189,6 @@ def origin_plan_for_theme(theme_today: str, routes_per_run: int) -> List[str]:
         picks = _deterministic_pick(SNOW_POOL, seed, routes_per_run)
         return picks[:routes_per_run]
 
-    # default shorthaul
     prim_n = 2 if routes_per_run >= 3 else 1
     fb_n = max(0, routes_per_run - prim_n)
     prim = _deterministic_pick(SHORT_HAUL_PRIMARY, seed + "|P", prim_n)
@@ -404,6 +409,68 @@ def offer_price_gbp(offer: Dict[str, Any]) -> float:
         return 0.0
 
 
+def offer_connections_safe(offer: Dict[str, Any]) -> int:
+    """
+    Safe connection count:
+    - If slices/segments exist, connections = segments_total - 1 (min 0)
+    - Else fallback to large number so direct flights rank higher when info exists.
+    """
+    try:
+        slices = offer.get("slices") or []
+        seg_total = 0
+        for s in slices:
+            segs = s.get("segments") or []
+            seg_total += len(segs)
+        if seg_total <= 0:
+            return 99
+        return max(0, seg_total - 2)  # 2 slices baseline (out+in): each has at least 1 segment
+    except Exception:
+        return 99
+
+
+def offer_duration_minutes_safe(offer: Dict[str, Any]) -> int:
+    """
+    Safe duration:
+    - Duffel commonly exposes ISO 8601 durations per slice (e.g. 'PT5H20M')
+    - If present, parse to minutes and sum.
+    - If not present, return large number so shorter ranks higher where available.
+    """
+    def parse_iso_dur(s: str) -> int:
+        # Very small parser: PT#H#M
+        s = str(s or "").strip().upper()
+        if not s.startswith("PT"):
+            return 0
+        s = s[2:]
+        h = 0
+        m = 0
+        num = ""
+        for ch in s:
+            if ch.isdigit():
+                num += ch
+            elif ch == "H":
+                h = int(num or "0")
+                num = ""
+            elif ch == "M":
+                m = int(num or "0")
+                num = ""
+            else:
+                num = ""
+        return h * 60 + m
+
+    try:
+        slices = offer.get("slices") or []
+        total = 0
+        found = False
+        for sl in slices:
+            dur = sl.get("duration")
+            if dur:
+                found = True
+                total += parse_iso_dur(dur)
+        return total if found and total > 0 else 999999
+    except Exception:
+        return 999999
+
+
 # ==================== ENRICH DEAL ====================
 
 def enrich_deal(deal: Dict[str, Any], themes_dict: Dict[str, List[Dict[str, Any]]], signals: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -470,7 +537,6 @@ def pick_origin_for_dest(
     allowed_pairs: Set[Tuple[str, str]],
     preferred_origin: str = "",
 ) -> Optional[str]:
-    # CONFIG origin override ONLY if explicitly enabled
     if preferred_origin and RESPECT_CONFIG_ORIGIN:
         o = _clean_iata(preferred_origin)
         if not allowed_pairs or (o, dest) in allowed_pairs:
@@ -481,6 +547,17 @@ def pick_origin_for_dest(
         if not allowed_pairs or (oo, dest) in allowed_pairs:
             return oo
     return None
+
+
+def _dedupe_keep_order(seq: List[str]) -> List[str]:
+    out: List[str] = []
+    for x in seq:
+        xx = _clean_iata(x)
+        if not xx:
+            continue
+        if xx not in out:
+            out.append(xx)
+    return out
 
 
 def select_routes_from_dest_configs(
@@ -511,19 +588,15 @@ def select_routes_from_dest_configs(
 
         candidate_try_order: List[str] = []
 
-        # 1) Planned origin first
         if planned_origin:
             candidate_try_order.append(planned_origin)
 
-        # 2) Reverse capability injection
         if open_origins:
-            rev = dest_to_origins.get(destination, [])[:]
-            rev = _dedupe_keep_order(rev)
+            rev = _dedupe_keep_order(dest_to_origins.get(destination, [])[:])
             for o in rev:
                 if o not in candidate_try_order:
                     candidate_try_order.append(o)
 
-        # 3) Fallback pool
         for o in full_origin_pool:
             if o not in candidate_try_order:
                 candidate_try_order.append(o)
@@ -642,6 +715,7 @@ def main() -> int:
 
     searches_done = 0
     all_deals: List[Dict[str, Any]] = []
+    inserted_by_origin: Dict[str, int] = {}
 
     for origin, destination, cfg in selected_routes:
         if searches_done >= DUFFEL_MAX_SEARCHES_PER_RUN:
@@ -649,7 +723,11 @@ def main() -> int:
         if len(all_deals) >= DUFFEL_MAX_INSERTS:
             break
 
-        # Deterministic date pick per route
+        if inserted_by_origin.get(origin, 0) >= DUFFEL_MAX_INSERTS_PER_ORIGIN:
+            log(f"⏭️  ORIGIN_CAP skip: {origin} already inserted {inserted_by_origin[origin]}/{DUFFEL_MAX_INSERTS_PER_ORIGIN}")
+            continue
+
+        # deterministic dates per route
         days_min = int(cfg.get("days_ahead_min") or DEFAULT_DAYS_AHEAD_MIN)
         days_max = int(cfg.get("days_ahead_max") or DEFAULT_DAYS_AHEAD_MAX)
         trip_len = int(cfg.get("trip_length_days") or DEFAULT_TRIP_LENGTH_DAYS)
@@ -662,6 +740,17 @@ def main() -> int:
         ret_date = dep_date + dt.timedelta(days=trip_len)
 
         deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
+
+        # ================= PRE-CHECK PRICE GATE =================
+        cap_gbp: Optional[float] = None
+        if PRICE_GATE_ENABLED and benchmarks:
+            cap_gbp = compute_ingest_cap_gbp(benchmarks, deal_theme, origin, destination)
+
+        if PRICE_GATE_ENABLED and cap_gbp is None:
+            if PRICE_GATE_FALLBACK_BEHAVIOR == "BLOCK":
+                log(f"⛔ BENCHMARK_MISS (pre-check) {origin}->{destination} theme={deal_theme} | fallback=BLOCK => search_skipped")
+                continue
+            log(f"⚠️ BENCHMARK_MISS (pre-check) {origin}->{destination} theme={deal_theme} | fallback=ALLOW (no cap)")
 
         payload = {
             "data": {
@@ -690,44 +779,59 @@ def main() -> int:
             log("Duffel[PRIMARY]: offers_returned=0")
             continue
 
-        cap_gbp: Optional[float] = None
-        if PRICE_GATE_ENABLED and benchmarks:
-            cap_gbp = compute_ingest_cap_gbp(benchmarks, deal_theme, origin, destination)
-
-        if PRICE_GATE_ENABLED and cap_gbp is None:
-            if PRICE_GATE_FALLBACK_BEHAVIOR == "BLOCK":
-                log(f"Duffel[PRIMARY]: BENCHMARK_MISS {origin}->{destination} theme={deal_theme} | fallback=BLOCK => inserted=0")
+        # ================= SAFE-FIELD FILTER + RANK =================
+        gbp_offers: List[Dict[str, Any]] = []
+        rejected_non_gbp = 0
+        for off in offers:
+            if offer_price_gbp(off) <= 0:
+                rejected_non_gbp += 1
                 continue
-            log(f"Duffel[PRIMARY]: BENCHMARK_MISS {origin}->{destination} theme={deal_theme} | fallback=ALLOW (no cap)")
+            gbp_offers.append(off)
 
-        offers_sorted = sorted(offers, key=lambda o: offer_price_gbp(o) if offer_price_gbp(o) > 0 else 1e18)
+        rejected_price = 0
+        if PRICE_GATE_ENABLED and cap_gbp is not None:
+            in_cap: List[Dict[str, Any]] = []
+            for off in gbp_offers:
+                if offer_price_gbp(off) <= cap_gbp:
+                    in_cap.append(off)
+                else:
+                    rejected_price += 1
+            gbp_offers = in_cap
+
+        # If everything is filtered out by cap, insert nothing.
+        if not gbp_offers:
+            cap_str = f"{int(cap_gbp)}" if cap_gbp is not None else "NONE"
+            log(
+                f"Duffel[PRIMARY]: offers_returned={offers_returned} gbp_offers=0 cap_gbp={cap_str} "
+                f"rejected_price={rejected_price} rejected_non_gbp={rejected_non_gbp} inserted=0"
+            )
+            continue
+
+        # Rank: price asc, connections asc, duration asc
+        def rank_key(off: Dict[str, Any]) -> Tuple[float, int, int]:
+            return (
+                offer_price_gbp(off),
+                offer_connections_safe(off),
+                offer_duration_minutes_safe(off),
+            )
+
+        ranked = sorted(gbp_offers, key=rank_key)
 
         remaining_total = max(0, DUFFEL_MAX_INSERTS - len(all_deals))
-        per_route_take = min(DUFFEL_OFFERS_PER_SEARCH, remaining_total)
-
-        processed = 0
-        rejected_price = 0
-        rejected_non_gbp = 0
-        inserted_here = 0
+        remaining_origin = max(0, DUFFEL_MAX_INSERTS_PER_ORIGIN - inserted_by_origin.get(origin, 0))
+        take_n = min(DUFFEL_MAX_INSERTS_PER_ROUTE, DUFFEL_OFFERS_PER_SEARCH, remaining_total, remaining_origin)
 
         now_iso = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-        for off in offers_sorted:
-            if inserted_here >= per_route_take:
-                break
-            if len(all_deals) >= DUFFEL_MAX_INSERTS:
-                break
+        inserted_here = 0
+        processed = 0
 
+        for off in ranked:
+            if inserted_here >= take_n:
+                break
             processed += 1
+
             price = offer_price_gbp(off)
-            if price <= 0:
-                rejected_non_gbp += 1
-                continue
-
-            if PRICE_GATE_ENABLED and cap_gbp is not None and price > cap_gbp:
-                rejected_price += 1
-                continue
-
             off_id = str(off.get("id") or "")
             deal_id_seed = f"{origin}->{destination}|{dep_date.isoformat()}|{ret_date.isoformat()}|{price:.2f}|{off_id}"
             deal_id = hashlib.sha256(deal_id_seed.encode("utf-8")).hexdigest()[:24]
@@ -747,10 +851,8 @@ def main() -> int:
                 "destination_country": "",
             }
 
-            # REQUIRED for ai_scorer freshness gate
             if "ingested_at_utc" in raw_header_set:
                 deal["ingested_at_utc"] = now_iso
-            # Helpful for other views/tools
             if "created_utc" in raw_header_set:
                 deal["created_utc"] = now_iso
             if "created_at" in raw_header_set:
@@ -763,11 +865,14 @@ def main() -> int:
             all_deals.append(deal)
             inserted_here += 1
 
+        inserted_by_origin[origin] = inserted_by_origin.get(origin, 0) + inserted_here
+
         cap_str = f"{int(cap_gbp)}" if cap_gbp is not None else "NONE"
         log(
-            f"Duffel[PRIMARY]: offers_returned={offers_returned} processed={processed} cap_gbp={cap_str} "
+            f"Duffel[PRIMARY]: offers_returned={offers_returned} gbp_ranked={len(ranked)} processed={processed} cap_gbp={cap_str} "
             f"rejected_price={rejected_price} rejected_non_gbp={rejected_non_gbp} "
-            f"inserted={inserted_here} running_total={len(all_deals)}/{DUFFEL_MAX_INSERTS}"
+            f"inserted={inserted_here} origin_total={inserted_by_origin[origin]}/{DUFFEL_MAX_INSERTS_PER_ORIGIN} "
+            f"running_total={len(all_deals)}/{DUFFEL_MAX_INSERTS}"
         )
 
         if FEEDER_SLEEP_SECONDS > 0:

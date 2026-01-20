@@ -21,6 +21,9 @@ RAW_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
 VIEW_TAB = os.getenv("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
 PHRASE_TAB = os.getenv("PHRASE_BANK_TAB", "PHRASE_BANK")
 
+CAPABILITY_TAB = os.getenv("CAPABILITY_TAB", "ROUTE_CAPABILITY_MAP")
+SIGNALS_TAB = os.getenv("SIGNALS_TAB", os.getenv("CONFIG_SIGNALS_TAB", "CONFIG_SIGNALS"))
+
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID")
 SA_JSON = os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
 
@@ -119,6 +122,51 @@ def _float_or_none(v):
         return None
 
 
+
+def _clean_iata(x):
+    return _norm(x).upper()[:3]
+
+
+def _load_route_maps(sh):
+    """Best-effort: returns (dest_city_map, dest_country_map)."""
+    try:
+        ws = sh.worksheet(CAPABILITY_TAB)
+        rows = ws.get_all_records()
+    except Exception as e:
+        _log(f"ROUTE_CAPABILITY_MAP not readable: {e}")
+        return {}, {}
+
+    dest_city_map = {}
+    dest_country_map = {}
+    for r in rows:
+        d = _clean_iata(r.get("destination_iata"))
+        if not d:
+            continue
+        dc = _norm(r.get("destination_city"))
+        dcty = _norm(r.get("destination_country"))
+        if dc and d not in dest_city_map:
+            dest_city_map[d] = dc
+        if dcty and d not in dest_country_map:
+            dest_country_map[d] = dcty
+    return dest_city_map, dest_country_map
+
+
+def _load_signals(sh):
+    """Best-effort: returns dict dest_iata -> row."""
+    try:
+        ws = sh.worksheet(SIGNALS_TAB)
+        rows = ws.get_all_records()
+    except Exception as e:
+        _log(f"CONFIG_SIGNALS not readable: {e}")
+        return {}
+
+    out = {}
+    for r in rows:
+        key = _clean_iata(r.get("destination_iata") or r.get("iata_hint") or r.get("iata"))
+        if key:
+            out[key] = r
+    return out
+
 def main():
     if not SPREADSHEET_ID:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
@@ -128,6 +176,10 @@ def main():
 
     ws_raw = sh.worksheet(RAW_TAB)
     ws_view = sh.worksheet(VIEW_TAB)
+
+    # Route enrichment sources (best-effort; scorer must never crash if tabs are missing)
+    dest_city_map, dest_country_map = _load_route_maps(sh)
+    signals = _load_signals(sh)
 
     # Load phrase bank (optional; system must not break if unavailable)
     try:
@@ -171,11 +223,13 @@ def main():
     # Map deal_id -> RAW_DEALS row number and ingested_at
     deal_row = {}
     deal_ingested = {}
+    deal_raw_record = {}
     for idx, r in enumerate(raw_rows, start=2):
         did = _norm(r.get("deal_id"))
         if did:
             deal_row[did] = idx
             deal_ingested[did] = r.get("ingested_at_utc")
+            deal_raw_record[did] = r
 
     # Build candidate list from VIEW rows with status=NEW
     candidates = []
@@ -290,6 +344,21 @@ def main():
         updates.append(Cell(rownum, col["status"], "READY_TO_POST"))
         updates.append(Cell(rownum, col[PHRASE_USED_COL], phrase))
         updates.append(Cell(rownum, col[PHRASE_BANK_COL], phrase))
+
+        # Backfill destination city/country at promotion time (prevents render TO='' failures)
+        rawrec = deal_raw_record.get(did, {})
+        dest_city_col = col.get("destination_city")
+        dest_country_col = col.get("destination_country")
+
+        if dest_city_col and not _norm(rawrec.get("destination_city")):
+            city = dest_city_map.get(dest) or _norm(signals.get(dest, {}).get("destination_city"))
+            if city:
+                updates.append(Cell(rownum, dest_city_col, city))
+
+        if dest_country_col and not _norm(rawrec.get("destination_country")):
+            country = dest_country_map.get(dest) or _norm(signals.get(dest, {}).get("destination_country"))
+            if country:
+                updates.append(Cell(rownum, dest_country_col, country))
 
         promoted += 1
         _log(

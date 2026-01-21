@@ -206,7 +206,7 @@ def in_free_window(now):
 
 def build_vip_message(row):
     country = get_first(row, ["destination_country"])
-    city = get_first(row, ["destination_city"]).upper()
+    city = get_first(row, ["destination_city"])
     origin = get_first(row, ["origin_city"])
     price = normalize_price_gbp(get_first(row, ["price_gbp", "price"]))
     outbound = get_first(row, ["outbound_date", "dep_date", "out_date"])
@@ -230,7 +230,7 @@ def build_vip_message(row):
 
 def build_free_message(row):
     country = get_first(row, ["destination_country"])
-    city = get_first(row, ["destination_city"]).upper()
+    city = get_first(row, ["destination_city"])
     origin = get_first(row, ["origin_city"])
     price = normalize_price_gbp(get_first(row, ["price_gbp", "price"]))
     outbound = get_first(row, ["outbound_date", "dep_date", "out_date"])

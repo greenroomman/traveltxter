@@ -1,55 +1,117 @@
-={"fatigue_penalty"; ARRAYFORMULA(
-LET(
-  rd_hdrs, RAW_DEALS!$1:$1,
-  rd_body, RAW_DEALS!$A$2:$ZZ,
+name: TravelTxter Pipeline
 
-  col_id, MATCH("deal_id", rd_hdrs, 0),
-  ids, INDEX(rd_body, , col_id),
+on:
+  schedule:
+    # AM run — Instagram + VIP
+    - cron: "30 7 * * *"   # 07:30 UTC
+    # PM run — Instagram + VIP + (FREE if 24h elapsed)
+    - cron: "30 18 * * *"  # 18:30 UTC
+  workflow_dispatch:
 
-  col_dest, MATCH("destination_iata", rd_hdrs, 0),
-  dest, INDEX(rd_body, , col_dest),
+concurrency:
+  group: traveltxter-pipeline
+  cancel-in-progress: false
 
-  col_stops, MATCH("stops", rd_hdrs, 0),
-  stops_raw, INDEX(rd_body, , col_stops),
-  stops, MAX(0, IFERROR(VALUE(stops_raw), 0)),
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
 
-  col_theme, IFERROR(MATCH("deal_theme", rd_hdrs, 0), IFERROR(MATCH("theme", rd_hdrs, 0), 0)),
-  theme_raw, IF(col_theme=0, "", INDEX(rd_body, , col_theme)),
-  theme, LOWER(theme_raw),
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-  rows, ROW(dest),
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-  count_back,
-    COUNTIFS(
-      dest, dest,
-      rows, "<="&rows,
-      rows, ">"&rows-100
-    ),
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
 
-  base_repeat_pen,
-    IFS(
-      count_back > 15, 30,
-      count_back > 10, 15,
-      count_back > 5,  5,
-      TRUE, 0
-    ),
+      # ---------------- FEEDER ----------------
+      - name: Run Feeder
+        env:
+          RUN_SLOT: ${{ github.event.schedule }}
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+        run: |
+          python workers/pipeline_worker.py
 
-  is_adv, (theme="adventure") + (theme="long_haul") > 0,
+      # ---------------- SCORER ----------------
+      - name: Run Scorer
+        env:
+          RUN_SLOT: ${{ github.event.schedule }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+        run: |
+          python workers/ai_scorer.py
 
-  stop_pen_gen,
-    IF(stops<=0, 0,
-      IF(stops=1, 10,
-        IF(stops=2, 25, 45)
-      )
-    ),
+      # ---------------- RENDER ----------------
+      - name: Run Renderer
+        env:
+          RUN_SLOT: ${{ github.event.schedule }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+        run: |
+          python workers/render_client.py
 
-  stop_pen_adv,
-    IF(stops<=0, 0,
-      IF(stops=1, 0,
-        IF(stops=2, 10, 25)
-      )
-    ),
+      # ---------------- LINK ROUTER (VIP BOOKING LINK) ----------------
+      - name: Run Link Router
+        env:
+          RUN_SLOT: ${{ github.event.schedule }}
 
-  IF(ids="", , base_repeat_pen + IF(is_adv, stop_pen_adv, stop_pen_gen))
-))}
+          # Duffel (VIP direct links / sessions)
+          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
 
+          # Redirect base (must be a real URL)
+          REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
+
+          # Sheets
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+
+          # Optional: Skyscanner fallback if your link_router uses it
+          # SKYSCANNER_API_KEY: ${{ secrets.SKYSCANNER_API_KEY }}
+        run: |
+          python workers/link_router.py
+
+      # ---------------- INSTAGRAM ----------------
+      - name: Publish to Instagram
+        env:
+          RUN_SLOT: ${{ github.event.schedule }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+        run: |
+          python workers/instagram_publisher.py
+
+      # ---------------- TELEGRAM ----------------
+      - name: Publish to Telegram
+        env:
+          RUN_SLOT: ${{ github.event.schedule }}
+
+          # Sheets
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+
+          # Telegram
+          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+
+          # Stripe links for Free upsell
+          STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
+          STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
+        run: |
+          python workers/telegram_publisher.py

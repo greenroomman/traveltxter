@@ -2,9 +2,9 @@ name: TravelTxter Pipeline
 
 on:
   schedule:
-    # AM run — VIP only
+    # AM run — Instagram + VIP
     - cron: "30 7 * * *"   # 07:30 UTC
-    # PM run — VIP + FREE (FREE only if 24h elapsed)
+    # PM run — Instagram + VIP + (FREE if 24h elapsed)
     - cron: "30 18 * * *"  # 18:30 UTC
   workflow_dispatch:
 
@@ -15,6 +15,7 @@ concurrency:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,6 +29,7 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      # ---------------- FEEDER ----------------
       - name: Run Feeder
         env:
           RUN_SLOT: ${{ github.event.schedule }}
@@ -38,6 +40,7 @@ jobs:
         run: |
           python workers/pipeline_worker.py
 
+      # ---------------- SCORER ----------------
       - name: Run Scorer
         env:
           RUN_SLOT: ${{ github.event.schedule }}
@@ -47,6 +50,7 @@ jobs:
         run: |
           python workers/ai_scorer.py
 
+      # ---------------- RENDER ----------------
       - name: Run Renderer
         env:
           RUN_SLOT: ${{ github.event.schedule }}
@@ -57,6 +61,19 @@ jobs:
         run: |
           python workers/render_client.py
 
+      # ---------------- INSTAGRAM ----------------
+      - name: Publish to Instagram
+        env:
+          RUN_SLOT: ${{ github.event.schedule }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+        run: |
+          python workers/instagram_publisher.py
+
+      # ---------------- TELEGRAM ----------------
       - name: Publish to Telegram
         env:
           RUN_SLOT: ${{ github.event.schedule }}

@@ -164,6 +164,8 @@ SCOTLAND = ["EDI", "GLA"]
 NI = ["BFS", "BHD"]
 
 ADVENTURE_HUBS = ["LGW", "LHR", "STN", "LTN", "MAN", "BHX"]
+LONGHAUL_PRIMARY_HUBS = ["LHR", "LGW"]
+LONGHAUL_SECONDARY_HUBS = ["MAN"]  # realistic UK long-haul feeder
 
 ORIGIN_CITY_FALLBACK = {
     "LHR": "London", "LGW": "London", "STN": "London", "LTN": "London", "LCY": "London", "SEN": "London",
@@ -280,7 +282,9 @@ def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
     elif theme_today == "adventure":
         pools = [(LONDON_FULL + MIDLANDS + NORTH, 60), (sw, 40)]
     elif theme_today == "long_haul":
-        pools = [(LONDON_FULL, 65), (NORTH + MIDLANDS + SCOTLAND, 35)]
+        # Long-haul is hub-led: avoid wasting searches on low-liquidity regional origins for true long-haul markets.
+        # Use realistic hubs first (LHR/LGW), then MAN as secondary.
+        pools = [(LONGHAUL_PRIMARY_HUBS, 80), (LONGHAUL_SECONDARY_HUBS, 20)]
     elif theme_today == "luxury_value" or theme_today == "unexpected_value":
         pools = [(LONDON_FULL + MIDLANDS, 50), (NORTH + SCOTLAND, 30), (sw, 20)]
     else:
@@ -304,11 +308,6 @@ def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
 def resolve_origin_city(iata: str, origin_city_map: Dict[str, str]) -> str:
     i = _clean_iata(iata)
     return (origin_city_map.get(i) or ORIGIN_CITY_FALLBACK.get(i) or "").strip()
-
-
-def resolve_origin_country(iata: str, origin_country_map: Dict[str, str]) -> str:
-    i = _clean_iata(iata)
-    return (origin_country_map.get(i) or "United Kingdom").strip()
 
 
 # ==================== GOOGLE SHEETS ====================
@@ -373,65 +372,21 @@ def load_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str, str]], Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str], Dict[Tuple[str, str], Dict[str, str]]]:
-    """    ROUTE_CAPABILITY_MAP is the network truth source.
-
-    Returns:
-      - allowed_pairs: set((origin_iata, destination_iata)) for BOTH direct and indirect (hub) capability rows.
-      - origin_city_map: origin_iata -> origin_city
-      - origin_country_map: origin_iata -> origin_country (optional)
-      - dest_city_map: destination_iata -> destination_city
-      - dest_country_map: destination_iata -> destination_country
-      - route_meta_map: (origin_iata, destination_iata) -> {connection_type, via_hub}
-
-    This enables:
-      - deterministic enrichment (city/country)
-      - safe use of "hub" capability rows (via_hub) while keeping Duffel responsible for routing.
-    """
+def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str, str]], Dict[str, str]]:
     ws = sheet.worksheet(CAPABILITY_TAB)
     rows = ws.get_all_records()
 
     allowed: Set[Tuple[str, str]] = set()
     origin_city_map: Dict[str, str] = {}
-    origin_country_map: Dict[str, str] = {}
-    dest_city_map: Dict[str, str] = {}
-    dest_country_map: Dict[str, str] = {}
-    route_meta_map: Dict[Tuple[str, str], Dict[str, str]] = {}
 
     for r in rows:
         o = _clean_iata(r.get("origin_iata"))
         d = _clean_iata(r.get("destination_iata"))
-
         oc = str(r.get("origin_city", "")).strip()
-        ocn = str(r.get("origin_country", "")).strip()
-
-        dc = str(r.get("destination_city", "")).strip()
-        dcty = str(r.get("destination_country", "")).strip()
-
-        ctype = str(r.get("connection_type", "")).strip()
-        via = _clean_iata(r.get("via_hub")) if str(r.get("via_hub") or "").strip() else ""
-
         if o and d:
             allowed.add((o, d))
-
             if oc and o not in origin_city_map:
                 origin_city_map[o] = oc
-            if ocn and o not in origin_country_map:
-                origin_country_map[o] = ocn
-
-            # Destination lookups are by IATA, not (origin,dest).
-            if dc and d not in dest_city_map:
-                dest_city_map[d] = dc
-            if dcty and d not in dest_country_map:
-                dest_country_map[d] = dcty
-
-            meta: Dict[str, str] = {}
-            if ctype:
-                meta["connection_type"] = ctype
-            if via:
-                meta["via_hub"] = via
-            if meta:
-                route_meta_map[(o, d)] = meta
 
     if not allowed:
         msg = f"{CAPABILITY_TAB} is empty or missing required headers"
@@ -439,7 +394,7 @@ def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str
             raise RuntimeError(msg)
         log(f"⚠️ {msg} — continuing WITHOUT capability filtering.")
 
-    return allowed, origin_city_map, origin_country_map, dest_city_map, dest_country_map, route_meta_map
+    return allowed, origin_city_map
 
 
 # ==================== BENCHMARKS ====================
@@ -610,7 +565,7 @@ def offer_duration_minutes_safe(offer: Dict[str, Any]) -> int:
 
 # ==================== ENRICH ====================
 
-def enrich_deal(deal: Dict[str, Any], themes_dict: Dict[str, List[Dict[str, Any]]], signals: Dict[str, Dict[str, Any]], dest_city_map: Dict[str, str], dest_country_map: Dict[str, str]) -> Dict[str, Any]:
+def enrich_deal(deal: Dict[str, Any], themes_dict: Dict[str, List[Dict[str, Any]]], signals: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     dest = _clean_iata(deal.get("destination_iata", ""))
     theme = str(deal.get("deal_theme") or deal.get("theme") or "").strip()
 
@@ -622,13 +577,6 @@ def enrich_deal(deal: Dict[str, Any], themes_dict: Dict[str, List[Dict[str, Any]
                 if d.get("destination_country"):
                     deal["destination_country"] = d["destination_country"]
                 break
-
-    # Capability-map fallback (global): if THEME+SIGNALS don't populate city/country, use ROUTE_CAPABILITY_MAP.
-    if dest:
-        if not deal.get("destination_city") and dest in dest_city_map:
-            deal["destination_city"] = dest_city_map[dest]
-        if not deal.get("destination_country") and dest in dest_country_map:
-            deal["destination_country"] = dest_country_map[dest]
 
     if dest and dest in signals:
         s = signals[dest]
@@ -735,7 +683,7 @@ def main() -> int:
     signals = load_signals(sh)
     if not signals:
         log(f"⚠️ CONFIG_SIGNALS loaded 0 rows — check IATA key column (destination_iata vs iata_hint) in '{SIGNALS_TAB}'.")
-    allowed_pairs, origin_city_map, origin_country_map, dest_city_map, dest_country_map, route_meta_map = load_route_capability_map(sh)
+    allowed_pairs, origin_city_map = load_route_capability_map(sh)
 
     benchmarks: List[Dict[str, Any]] = []
     if PRICE_GATE_ENABLED:
@@ -769,6 +717,35 @@ def main() -> int:
 
     # -------- RULE B SELECTION (one per origin first) --------
 
+    # Anchor-origins guarantee: prevent low-liquidity origins consuming the whole quota
+    # (Observed failure mode: quota fills on EXT/CWL/LPL before STN/LGW are reached).
+    THEME_ANCHOR_ORIGINS = {
+        # Short-haul city deals: ensure at least one London LCC origin is considered first
+        'city_breaks': ['LGW', 'STN', 'LTN'],
+        'culture_history': ['LGW', 'STN', 'LTN'],
+        # Winter sun often strongest from major hubs (MAN/London)
+        'winter_sun': ['MAN', 'LGW', 'STN', 'LTN'],
+        # Long haul: full-service hubs
+        'long_haul': ['LHR', 'LGW', 'MAN'],
+        # Snow: hubs + Scotland
+        'snow': ['LGW', 'MAN', 'EDI', 'GLA', 'STN', 'LTN'],
+        # Surf: SW-first is intentional (but still allow London fallback)
+        'surf': ['BRS', 'NQY', 'EXT', 'LGW', 'STN', 'LTN'],
+    }
+
+    def selection_origins_for_theme(theme_key: str) -> List[str]:
+        anchors = THEME_ANCHOR_ORIGINS.get(theme_key, [])
+        # Keep order: anchors first (if planned), then the rest
+        ordered: List[str] = []
+        for a in anchors:
+            if a in planned_origins and a not in ordered:
+                ordered.append(a)
+        for o in planned_origins:
+            if o not in ordered:
+                ordered.append(o)
+        return ordered
+
+
     def route_precheck_ok(origin: str, dest: str, deal_theme: str) -> bool:
         if allowed_pairs and (origin, dest) not in allowed_pairs:
             return False
@@ -787,7 +764,9 @@ def main() -> int:
         picked: List[Tuple[str, str, Dict[str, Any]]] = []
         used_dests: Set[str] = set()
 
-        for origin in planned_origins:
+        sel_origins = selection_origins_for_theme(theme_today)
+
+        for origin in sel_origins:
             if len(picked) >= quota:
                 break
             for cfg in dest_configs:
@@ -805,7 +784,7 @@ def main() -> int:
         while len(picked) < quota and safety < 5000:
             safety += 1
             progressed = False
-            for origin in planned_origins:
+            for origin in sel_origins:
                 if len(picked) >= quota:
                     break
                 for cfg in dest_configs:
@@ -981,7 +960,6 @@ def main() -> int:
                 "price_gbp": int(math.ceil(price)),
                 "origin_iata": origin,
                 "origin_city": resolve_origin_city(origin, origin_city_map),
-                "origin_country": resolve_origin_country(origin, origin_country_map),
                 "destination_iata": destination,
                 "outbound_date": dep_date.strftime("%Y-%m-%d"),
                 "return_date": ret_date.strftime("%Y-%m-%d"),
@@ -1000,20 +978,7 @@ def main() -> int:
             if "timestamp" in raw_header_set:
                 deal["timestamp"] = now_iso
 
-            deal = enrich_deal(deal, themes_dict, signals, dest_city_map, dest_country_map)
-
-            # Route metadata (optional columns): connection_type / via_hub
-            meta = route_meta_map.get((origin, destination), {}) if 'route_meta_map' in locals() else {}
-            if meta:
-                if "connection_type" in raw_header_set and meta.get("connection_type"):
-                    deal["connection_type"] = meta.get("connection_type")
-                if "via_hub" in raw_header_set and meta.get("via_hub"):
-                    deal["via_hub"] = meta.get("via_hub")
-
-            # If RAW_DEALS does not have origin_country column, do not force it.
-            if "origin_country" not in raw_header_set:
-                deal.pop("origin_country", None)
-
+            deal = enrich_deal(deal, themes_dict, signals)
             deals_out.append(deal)
             inserted_here += 1
 

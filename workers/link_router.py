@@ -1,37 +1,33 @@
 #!/usr/bin/env python3
 # workers/link_router.py
 """
-TravelTxter Link Router – V4.7.1 (Duffel Links optional + Google Flights default fallback)
+TravelTxter Link Router – V4.7.2 (TravelUp (CJ) primary rail + Google Flights fallback + Duffel Links last resort)
 
 Purpose:
 - Populate booking_link_vip for selected rows (READY_* only)
-- Primary (optional): Duffel Links (if account has access)
-- Default fallback: Google Flights deep links (no affiliate approval required)
-- Optional fallback: Skyscanner deep links (if you ever get approved later)
-- Last resort: Homepage link with query params (not recommended)
+- PRIMARY: TravelUp via CJ deep link wrapper (URL-only rail, monetised)
+- FALLBACK: Google Flights deep links (best trust/UX, non-monetised)
+- LAST RESORT: Duffel Links (NOT monetised for you; keep as emergency only)
 
-Why Google Flights default:
-- Highest trust + best UX
-- No approval / traffic requirements
-- Works cleanly inside Telegram/Instagram
-
-Eligibility:
-- status in {"READY_TO_POST", "READY_TO_PUBLISH"}
-- booking_link_vip is blank
-- origin_iata, destination_iata, outbound_date, return_date present
+Rail doctrine (locked):
+- Third-party rails must NEVER be surfaced in user-facing copy.
+- Rails may appear ONLY inside booking_link_vip URL.
+- No CJ scripts / banner code / impression tags are used here.
 
 Notes:
 - This file only writes to RAW_DEALS.booking_link_vip
-- It is deterministic and stateless: same row inputs -> same link outputs
+- Stateless + deterministic: same row inputs -> same link outputs.
 """
 
 from __future__ import annotations
 
 import os
 import json
+import re
+import unicodedata
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
 import requests
 import gspread
@@ -44,21 +40,33 @@ RAW_DEALS_TAB = (os.environ.get("RAW_DEALS_TAB", "RAW_DEALS") or "RAW_DEALS").st
 SPREADSHEET_ID = (os.environ.get("SPREADSHEET_ID") or os.environ.get("SHEET_ID") or "").strip()
 GCP_SA_JSON_ONE_LINE = (os.environ.get("GCP_SA_JSON_ONE_LINE") or os.environ.get("GCP_SA_JSON") or "").strip()
 
+# Duffel (LAST RESORT ONLY)
 DUFFEL_API_KEY = (os.environ.get("DUFFEL_API_KEY") or "").strip()
 DUFFEL_API_BASE = (os.environ.get("DUFFEL_API_BASE") or "https://api.duffel.com").strip().rstrip("/")
 DUFFEL_VERSION = (os.environ.get("DUFFEL_VERSION") or "v2").strip() or "v2"
-
-# Set to true ONLY if your Duffel account has Links access (otherwise you’ll see 403)
+# Default false: you do NOT earn from Duffel Links, so keep it off unless you explicitly want it.
 DUFFEL_LINKS_ENABLED = (os.environ.get("DUFFEL_LINKS_ENABLED") or "false").strip().lower() == "true"
 
 REDIRECT_BASE_URL = (os.environ.get("REDIRECT_BASE_URL") or "").strip()
 DEFAULT_HOME_BASE = "http://www.traveltxter.com/"
 
-# Fallback strategy: "google" (default), "skyscanner", or "homepage"
-# Owner intent: choose the path that works without third-party approvals.
+# Fallback strategy AFTER TravelUp: google (default), skyscanner, homepage
 FALLBACK_STRATEGY = (os.environ.get("FALLBACK_STRATEGY") or "google").strip().lower()
 
 MAX_ROWS_PER_RUN = int((os.environ.get("LINK_ROUTER_MAX_ROWS_PER_RUN", "20") or "20").strip() or "20")
+
+# TravelUp (CJ) rail (PRIMARY)
+TRAVELUP_ENABLED = (os.environ.get("TRAVELUP_ENABLED") or "true").strip().lower() == "true"
+TRAVELUP_BASE = (os.environ.get("TRAVELUP_BASE") or "https://www.travelup.com").strip().rstrip("/")
+TRAVELUP_LOCALE_PATH = (os.environ.get("TRAVELUP_LOCALE_PATH") or "/en-gb/flight-offers").strip().strip("/")
+# Confirmed in your CJ UI (dpbolvw + publisher 101634441 + deep link id 15510915)
+TRAVELUP_CJ_CLICK_BASE = (
+    os.environ.get("TRAVELUP_CJ_CLICK_BASE")
+    or "https://www.dpbolvw.net/click-101634441-15510915?url="
+).strip()
+# sid tracking: deal_id (default), none, static
+TRAVELUP_SID_MODE = (os.environ.get("TRAVELUP_SID_MODE") or "deal_id").strip().lower()
+TRAVELUP_SID_STATIC = (os.environ.get("TRAVELUP_SID_STATIC") or "traveltxter").strip()
 
 
 # -------------------- LOGGING --------------------
@@ -80,6 +88,9 @@ REQUIRED_COLUMNS = [
     "price_gbp",
     "booking_link_vip",
 ]
+
+# destination_city is OPTIONAL (but required for TravelUp link generation)
+OPTIONAL_COLUMNS = ["destination_city"]
 
 ELIGIBLE_STATUSES = {"READY_TO_POST", "READY_TO_PUBLISH"}
 
@@ -157,7 +168,115 @@ def _batch_write(ws, updates: List[Tuple[int, Dict[str, Any]]], cm: Dict[str, in
     return len(cells)
 
 
-# -------------------- DUFFEL LINKS (SESSIONS) --------------------
+# -------------------- TRAVELUP (CJ) – PRIMARY --------------------
+
+def _slugify_city(city: str) -> str:
+    """
+    Conservative slugify for TravelUp destination pages:
+    - lowercase
+    - remove diacritics
+    - remove punctuation
+    - spaces -> hyphens
+    """
+    city = _s(city).lower()
+    if not city:
+        return ""
+
+    city = unicodedata.normalize("NFKD", city)
+    city = "".join(ch for ch in city if not unicodedata.combining(ch))
+    city = re.sub(r"[^\w\s-]", "", city, flags=re.UNICODE)  # drop punctuation
+    city = city.replace("_", " ")
+    city = re.sub(r"\s+", " ", city).strip()
+    city = city.replace(" ", "-")
+    city = re.sub(r"-{2,}", "-", city).strip("-")
+    return city
+
+
+def _travelup_destination_url(dest_iata: str, destination_city: str) -> str:
+    """
+    https://www.travelup.com/en-gb/flight-offers/{city-slug}-{iata}
+    """
+    iata = _s(dest_iata).lower()
+    slug = _slugify_city(destination_city)
+    if not (iata and slug):
+        return ""
+    return f"{TRAVELUP_BASE}/{TRAVELUP_LOCALE_PATH}/{slug}-{iata}"
+
+
+def _travelup_wrap_cj(url_to_wrap: str, deal_id: str) -> str:
+    """Wrap a TravelUp URL using CJ click base. Adds sid if configured."""
+    if not url_to_wrap:
+        return ""
+    encoded = quote(url_to_wrap, safe="")
+    out = f"{TRAVELUP_CJ_CLICK_BASE}{encoded}"
+
+    if TRAVELUP_SID_MODE == "none":
+        return out
+
+    if TRAVELUP_SID_MODE == "static":
+        sid_val = TRAVELUP_SID_STATIC
+    else:
+        sid_val = deal_id
+
+    if sid_val:
+        joiner = "&" if "?" in out else "?"
+        out = f"{out}{joiner}sid={quote(_s(sid_val), safe='')}"
+    return out
+
+
+def _create_travelup_link(dest_iata: str, destination_city: str, deal_id: str) -> str:
+    """Return CJ-wrapped TravelUp destination URL, or "" if cannot safely build."""
+    if not TRAVELUP_ENABLED:
+        return ""
+    dest_url = _travelup_destination_url(dest_iata, destination_city)
+    if not dest_url:
+        return ""
+    return _travelup_wrap_cj(dest_url, deal_id)
+
+
+# -------------------- FALLBACK LINKS (NON-MONETISED) --------------------
+
+def _create_skyscanner_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str) -> str:
+    out_compact = out_iso.replace("-", "")
+    in_compact = in_iso.replace("-", "")
+    origin = origin_iata.upper()
+    dest = dest_iata.upper()
+    return f"https://www.skyscanner.net/transport/flights/{origin}/{dest}/{out_compact}/{in_compact}/"
+
+
+def _create_google_flights_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str) -> str:
+    origin = origin_iata.upper()
+    dest = dest_iata.upper()
+    query = f"flights from {origin} to {dest} on {out_iso} return {in_iso}"
+    encoded_query = urlencode({"q": query})
+    return f"https://www.google.com/travel/flights?{encoded_query}"
+
+
+def _create_homepage_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
+    base = (REDIRECT_BASE_URL or DEFAULT_HOME_BASE).strip().rstrip()
+    params = {
+        "deal_id": _s(deal_id),
+        "from": _s(origin_iata).upper(),
+        "to": _s(dest_iata).upper(),
+        "out": _s(out_iso),
+        "in": _s(in_iso),
+        "price": _s(price_gbp).replace("£", "").strip(),
+        "src": "vip_fallback",
+    }
+    qs = urlencode({k: v for k, v in params.items() if v})
+    return f"{base}&{qs}" if "?" in base else f"{base}?{qs}"
+
+
+def _create_fallback_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
+    if FALLBACK_STRATEGY == "skyscanner":
+        return _create_skyscanner_link(origin_iata, dest_iata, out_iso, in_iso)
+    if FALLBACK_STRATEGY == "homepage":
+        return _create_homepage_link(deal_id, origin_iata, dest_iata, out_iso, in_iso, price_gbp)
+    # default
+    return _create_google_flights_link(origin_iata, dest_iata, out_iso, in_iso)
+
+
+# -------------------- DUFFEL LINKS (LAST RESORT) --------------------
 
 def _duffel_headers() -> Dict[str, str]:
     return {
@@ -182,13 +301,7 @@ def _make_outcome_urls(base: str, deal_id: str) -> Dict[str, str]:
 
 
 def _create_duffel_links_session(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, deal_id: str) -> Optional[str]:
-    """
-    Creates a Duffel Links session and returns the session URL.
-    Returns None if Duffel Links not available (403) or any error.
-    """
     if not (DUFFEL_LINKS_ENABLED and DUFFEL_API_KEY):
-        return None
-    if not (origin_iata and dest_iata and out_iso and in_iso and deal_id):
         return None
 
     base = _ensure_base_url()
@@ -221,7 +334,6 @@ def _create_duffel_links_session(origin_iata: str, dest_iata: str, out_iso: str,
 
     if r.status_code == 403:
         _log("⚠️ Duffel Links not available (403). Account may not have access to this feature.")
-        _log("   Consider: (1) Contact help@duffel.com to enable, or (2) Set DUFFEL_LINKS_ENABLED=false")
         return None
 
     if not (200 <= r.status_code < 300):
@@ -231,71 +343,9 @@ def _create_duffel_links_session(origin_iata: str, dest_iata: str, out_iso: str,
 
     try:
         data = r.json() or {}
-        session_url = (data.get("data") or {}).get("url")
-        if session_url:
-            return session_url
+        return (data.get("data") or {}).get("url") or None
     except Exception:
-        pass
-
-    _log("⚠️ Duffel Links session response missing data.url")
-    return None
-
-
-# -------------------- FALLBACK LINKS --------------------
-
-def _create_skyscanner_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str) -> str:
-    """
-    Skyscanner deep link to flight search results.
-    NOTE: useful only if you later get affiliate access; otherwise this is just convenience.
-    """
-    out_compact = out_iso.replace("-", "")
-    in_compact = in_iso.replace("-", "")
-    origin = origin_iata.upper()
-    dest = dest_iata.upper()
-    return f"https://www.skyscanner.net/transport/flights/{origin}/{dest}/{out_compact}/{in_compact}/"
-
-
-def _create_google_flights_link(origin_iata: str, dest_iata: str, out_iso: str, in_iso: str) -> str:
-    """
-    Google Flights deep link to a prefilled search query.
-    Works without affiliate approvals; best trust/UX for Telegram/Instagram.
-    """
-    origin = origin_iata.upper()
-    dest = dest_iata.upper()
-    query = f"flights from {origin} to {dest} on {out_iso} return {in_iso}"
-    encoded_query = urlencode({"q": query})
-    return f"https://www.google.com/travel/flights?{encoded_query}"
-
-
-def _create_homepage_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
-    """
-    Last resort only: homepage with query params.
-    """
-    base = (REDIRECT_BASE_URL or DEFAULT_HOME_BASE).strip().rstrip()
-    params = {
-        "deal_id": _s(deal_id),
-        "from": _s(origin_iata).upper(),
-        "to": _s(dest_iata).upper(),
-        "out": _s(out_iso),
-        "in": _s(in_iso),
-        "price": _s(price_gbp).replace("£", "").strip(),
-        "src": "vip_fallback",
-    }
-    qs = urlencode({k: v for k, v in params.items() if v})
-    return f"{base}&{qs}" if "?" in base else f"{base}?{qs}"
-
-
-def _create_fallback_link(deal_id: str, origin_iata: str, dest_iata: str, out_iso: str, in_iso: str, price_gbp: str) -> str:
-    """
-    Create fallback booking link based on FALLBACK_STRATEGY.
-    Supported: google (default), skyscanner, homepage.
-    """
-    if FALLBACK_STRATEGY == "skyscanner":
-        return _create_skyscanner_link(origin_iata, dest_iata, out_iso, in_iso)
-    if FALLBACK_STRATEGY == "homepage":
-        return _create_homepage_link(deal_id, origin_iata, dest_iata, out_iso, in_iso, price_gbp)
-    # Default: Google Flights
-    return _create_google_flights_link(origin_iata, dest_iata, out_iso, in_iso)
+        return None
 
 
 # -------------------- MAIN --------------------
@@ -305,13 +355,13 @@ def main() -> int:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
 
     _log("============================================================")
-    _log("🚀 TravelTxter Link Router V4.7.1 (Duffel Links optional + Fallback)")
+    _log("🚀 TravelTxter Link Router V4.7.2 (TravelUp primary + fallback + Duffel last resort)")
     _log("============================================================")
     _log(f"RAW_DEALS_TAB={RAW_DEALS_TAB}")
-    _log(f"DUFFEL_API_BASE={DUFFEL_API_BASE} DUFFEL_VERSION={DUFFEL_VERSION}")
-    _log(f"DUFFEL_API_KEY={'set' if DUFFEL_API_KEY else 'missing'}")
-    _log(f"DUFFEL_LINKS_ENABLED={DUFFEL_LINKS_ENABLED}")
+    _log(f"TRAVELUP_ENABLED={TRAVELUP_ENABLED}")
+    _log(f"TRAVELUP_CJ_CLICK_BASE={'set' if TRAVELUP_CJ_CLICK_BASE else 'missing'}")
     _log(f"FALLBACK_STRATEGY={FALLBACK_STRATEGY}")
+    _log(f"DUFFEL_LINKS_ENABLED={DUFFEL_LINKS_ENABLED} (last resort)")
     _log(f"MAX_ROWS_PER_RUN={MAX_ROWS_PER_RUN}")
 
     gc = _gs_client()
@@ -321,13 +371,16 @@ def main() -> int:
     headers = _headers(ws)
     _validate_headers(headers)
     cm = _colmap(headers)
+    has_destination_city = "destination_city" in cm
 
     records = ws.get_all_records()
     updates: List[Tuple[int, Dict[str, Any]]] = []
 
     attempted = 0
-    duffel_ok = 0
+    used_travelup = 0
     used_fallback = 0
+    used_duffel_last_resort = 0
+    travelup_skipped_no_city = 0
 
     for i, r in enumerate(records, start=2):
         if len(updates) >= MAX_ROWS_PER_RUN:
@@ -337,8 +390,7 @@ def main() -> int:
         if status not in ELIGIBLE_STATUSES:
             continue
 
-        current_link = _s(r.get("booking_link_vip"))
-        if current_link:
+        if _s(r.get("booking_link_vip")):
             continue
 
         deal_id = _s(r.get("deal_id"))
@@ -353,34 +405,46 @@ def main() -> int:
 
         attempted += 1
 
-        link = _create_duffel_links_session(o, d, out_iso, in_iso, deal_id)
+        # 1) PRIMARY: TravelUp (CJ) – requires destination_city
+        destination_city = _s(r.get("destination_city")) if has_destination_city else ""
+        link = ""
+        if TRAVELUP_ENABLED:
+            if destination_city:
+                link = _create_travelup_link(d, destination_city, deal_id)
+                if link:
+                    used_travelup += 1
+                    _log(f"💷 TravelUp (CJ): {deal_id} | {o}→{d} | {destination_city}")
+            else:
+                travelup_skipped_no_city += 1
 
-        if link:
-            duffel_ok += 1
-            _log(f"✅ Duffel Links: {deal_id} | {o}→{d}")
-        else:
+        # 2) FALLBACK: Google / Skyscanner / Homepage
+        if not link:
             link = _create_fallback_link(deal_id, o, d, out_iso, in_iso, price)
             used_fallback += 1
             _log(f"🔗 Fallback ({FALLBACK_STRATEGY}): {deal_id} | {o}→{d}")
 
-        updates.append((i, {"booking_link_vip": link}))
+        # 3) LAST RESORT: Duffel Links (only if enabled AND fallback somehow failed)
+        if not link:
+            dl = _create_duffel_links_session(o, d, out_iso, in_iso, deal_id)
+            if dl:
+                link = dl
+                used_duffel_last_resort += 1
+                _log(f"🆘 Duffel Links (last resort): {deal_id} | {o}→{d}")
+
+        if link:
+            updates.append((i, {"booking_link_vip": link}))
 
     written_cells = _batch_write(ws, updates, cm)
 
     _log(f"Attempted link generations: {attempted}")
     _log(f"booking_link_vip populated for: {len(updates)} rows")
-    _log(f"Duffel Links created: {duffel_ok}")
+    _log(f"TravelUp (CJ) links used: {used_travelup}")
     _log(f"Fallback links used: {used_fallback} (strategy: {FALLBACK_STRATEGY})")
+    if TRAVELUP_ENABLED and not has_destination_city:
+        _log("⚠️ destination_city column not found in RAW_DEALS – TravelUp link generation will be skipped.")
+    _log(f"TravelUp skipped due to missing destination_city: {travelup_skipped_no_city}")
+    _log(f"Duffel Links last-resort used: {used_duffel_last_resort}")
     _log(f"Cells written (batch): {written_cells}")
-
-    if duffel_ok == 0 and attempted > 0 and DUFFEL_LINKS_ENABLED:
-        _log("")
-        _log("⚠️  NOTICE: Duffel Links is enabled but no links were created.")
-        _log("   This likely means your Duffel account doesn't have access to Links.")
-        _log("   Options:")
-        _log("   1. Contact help@duffel.com to enable Duffel Links on your account")
-        _log("   2. Set DUFFEL_LINKS_ENABLED=false to skip trying")
-        _log(f"   3. Current fallback ({FALLBACK_STRATEGY}) is working and users can book")
 
     return 0
 

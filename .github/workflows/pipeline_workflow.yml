@@ -16,6 +16,78 @@ jobs:
   pipeline:
     runs-on: ubuntu-latest
 
+    # ✅ IMPORTANT: Map GitHub Variables -> runtime env ONCE here (applies to all steps)
+    env:
+      # Shared runtime context
+      RUN_SLOT: ${{ github.event.schedule }}
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+      RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+      GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+
+      # Duffel / Feeder knobs (repo Variables)
+      DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
+      DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
+      DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+      DUFFEL_MAX_INSERTS_PER_ORIGIN: ${{ vars.DUFFEL_MAX_INSERTS_PER_ORIGIN }}
+      DUFFEL_MAX_INSERTS_PER_ROUTE: ${{ vars.DUFFEL_MAX_INSERTS_PER_ROUTE }}
+      DUFFEL_SEARCH_DEDUPE_HOURS: ${{ vars.DUFFEL_SEARCH_DEDUPE_HOURS }}
+      FEEDER_SLEEP_SECONDS: ${{ vars.FEEDER_SLEEP_SECONDS }}
+      FEEDER_OPEN_ORIGINS: ${{ vars.FEEDER_OPEN_ORIGINS }}
+
+      # Price gate / hygiene / retry knobs (repo Variables)
+      PRICE_GATE_FALLBACK_BEHAVIOR: ${{ vars.PRICE_GATE_FALLBACK_BEHAVIOR }}
+      PRICE_GATE_MULTIPLIER: ${{ vars.PRICE_GATE_MULTIPLIER }}
+      PRICE_GATE_MIN_CAP_GBP: ${{ vars.PRICE_GATE_MIN_CAP_GBP }}
+      ZERO_OFFER_RETRY_ENABLED: ${{ vars.ZERO_OFFER_RETRY_ENABLED }}
+      ZERO_OFFER_RETRY_MAX_DAYS: ${{ vars.ZERO_OFFER_RETRY_MAX_DAYS }}
+      HYGIENE_ENABLED: ${{ vars.HYGIENE_ENABLED }}
+      OFFER_MAX_CONNECTIONS_SHORTHAUL: ${{ vars.OFFER_MAX_CONNECTIONS_SHORTHAUL }}
+      OFFER_MAX_CONNECTIONS_LONGHAUL: ${{ vars.OFFER_MAX_CONNECTIONS_LONGHAUL }}
+      OFFER_MAX_DURATION_MINUTES_SHORTHAUL: ${{ vars.OFFER_MAX_DURATION_MINUTES_SHORTHAUL }}
+      OFFER_MAX_DURATION_MINUTES_LONGHAUL: ${{ vars.OFFER_MAX_DURATION_MINUTES_LONGHAUL }}
+      QUALITY_PRICE_BAND_SHORTHAUL: ${{ vars.QUALITY_PRICE_BAND_SHORTHAUL }}
+      QUALITY_PRICE_BAND_LONGHAUL: ${{ vars.QUALITY_PRICE_BAND_LONGHAUL }}
+
+      # Origin pool knobs (repo Variables)
+      SW_ENGLAND_ORIGINS: ${{ vars.SW_ENGLAND_ORIGINS }}
+      ORIGINS_DEFAULT: ${{ vars.ORIGINS_DEFAULT }}
+      ORIGINS_LONG_HAUL: ${{ vars.ORIGINS_LONG_HAUL }}
+      ORIGINS_LUXURY_VALUE: ${{ vars.ORIGINS_LUXURY_VALUE }}
+      ORIGINS_WINTER_SUN: ${{ vars.ORIGINS_WINTER_SUN }}
+      ORIGINS_SUMMER_SUN: ${{ vars.ORIGINS_SUMMER_SUN }}
+      ORIGINS_BEACH_BREAK: ${{ vars.ORIGINS_BEACH_BREAK }}
+      ORIGINS_SNOW: ${{ vars.ORIGINS_SNOW }}
+      ORIGINS_NORTHERN_LIGHTS: ${{ vars.ORIGINS_NORTHERN_LIGHTS }}
+      ORIGINS_SURF: ${{ vars.ORIGINS_SURF }}
+      ORIGINS_ADVENTURE: ${{ vars.ORIGINS_ADVENTURE }}
+      ORIGINS_CITY_BREAKS: ${{ vars.ORIGINS_CITY_BREAKS }}
+      ORIGINS_CULTURE_HISTORY: ${{ vars.ORIGINS_CULTURE_HISTORY }}
+      ORIGINS_UNEXPECTED_VALUE: ${{ vars.ORIGINS_UNEXPECTED_VALUE }}
+
+      # Other operational knobs
+      MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS }}
+      WINNERS_PER_RUN: ${{ vars.WINNERS_PER_RUN }}
+      RENDER_MAX_ROWS: ${{ vars.RENDER_MAX_ROWS }}
+
+      # Static config tab names (repo Variables)
+      FEEDER_CONFIG_TAB: ${{ vars.FEEDER_CONFIG_TAB }}
+      FEEDER_LOG_TAB: ${{ vars.FEEDER_LOG_TAB }}
+      THEMES_TAB: ${{ vars.THEMES_TAB }}
+      PHRASES_TAB: ${{ vars.PHRASES_TAB }}
+
+      # Secrets (kept as secrets)
+      DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+      RENDER_URL: ${{ secrets.RENDER_URL }}
+      IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+      REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+      TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+      TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+      STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
+      STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -32,80 +104,35 @@ jobs:
 
       # ---------------- FEEDER ----------------
       - name: Run Feeder
-        env:
-          RUN_SLOT: ${{ github.event.schedule }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
         run: |
           python workers/pipeline_worker.py
 
       - name: Wait for ingest age gate
-        env:
-          MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS }}
         run: |
           echo "Sleeping for ${MIN_INGEST_AGE_SECONDS:-30}s to satisfy MIN_INGEST_AGE_SECONDS"
           sleep ${MIN_INGEST_AGE_SECONDS:-30}
 
-
       # ---------------- SCORER ----------------
       - name: Run Scorer
-        env:
-          RUN_SLOT: ${{ github.event.schedule }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
         run: |
           python workers/ai_scorer.py
 
       # ---------------- RENDER ----------------
       - name: Run Renderer
-        env:
-          RUN_SLOT: ${{ github.event.schedule }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          RENDER_URL: ${{ secrets.RENDER_URL }}
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
         run: |
           python workers/render_client.py
 
       # ---------------- LINK ROUTER ----------------
       - name: Run Link Router
-        env:
-          RUN_SLOT: ${{ github.event.schedule }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
         run: |
           python workers/link_router.py
 
       # ---------------- INSTAGRAM ----------------
       - name: Run Instagram Publisher
-        env:
-          RUN_SLOT: ${{ github.event.schedule }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
         run: |
           python workers/instagram_publisher.py
 
       # ---------------- TELEGRAM ----------------
       - name: Run Telegram Publisher
-        env:
-          RUN_SLOT: ${{ github.event.schedule }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
-          TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
-          STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
-          STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
         run: |
           python workers/telegram_publisher.py

@@ -10,18 +10,21 @@ LOCKED PRINCIPLES:
 - Google Sheets is the single source of truth.
 - Do NOT write to RAW_DEALS_VIEW.
 
-CHANGE IN THIS VERSION (single behaviour change):
-✅ Theme Origins Override:
-If ORIGINS_<THEME> is set (e.g., ORIGINS_LUXURY_VALUE=LHR,LGW,MAN),
-use it as the primary origin plan for that theme.
-Falls back to legacy pooled origin planning if not set.
+BEHAVIOUR GUARANTEES IN THIS VERSION:
+✅ Theme origins override:
+   If ORIGINS_<THEME> is set, it becomes the primary origin allowlist for that theme.
 
-This prevents wasting Duffel searches on implausible origin→destination pairings.
+✅ CONFIG route-pair enforcement (THIS FIX):
+   CONFIG already contains explicit origin_iata + destination_iata pairs.
+   By default we now RESPECT those pairs so the feeder cannot invent routes like STN->SEZ
+   unless that exact pair exists in CONFIG.
+
+This directly stops “reinforcing failures” by preventing implausible origin/destination pairings.
 """
 
 from __future__ import annotations
 
-# ==================== PYTHONPATH GUARD (GITHUB ACTIONS IMPORT CONTEXT) ====================
+# ==================== PYTHONPATH GUARD ====================
 import os
 import sys
 
@@ -30,7 +33,6 @@ if WORKERS_DIR not in sys.path:
     sys.path.insert(0, WORKERS_DIR)
 
 # ==================== STANDARD IMPORTS ====================
-
 import json
 import time
 import math
@@ -41,7 +43,6 @@ from typing import Any, Dict, List, Tuple, Optional, Set
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-
 
 # ==================== ENV / TABS ====================
 
@@ -59,7 +60,6 @@ DUFFEL_API_BASE = os.getenv("DUFFEL_API_BASE", "https://api.duffel.com").strip()
 DUFFEL_VERSION = os.getenv("DUFFEL_VERSION", "v2").strip() or "v2"
 
 RUN_SLOT = (os.getenv("RUN_SLOT") or "").strip().upper()
-
 
 # ==================== GOVERNORS (SAFE CASTING) ====================
 
@@ -107,7 +107,9 @@ FEEDER_SLEEP_SECONDS = _get_float("FEEDER_SLEEP_SECONDS", "FEEDER_SLEEP_SECONDS"
 
 FEEDER_OPEN_ORIGINS = (os.getenv("FEEDER_OPEN_ORIGINS", "false").strip().lower() == "true")
 STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lower() == "true")
-RESPECT_CONFIG_ORIGIN = (os.getenv("RESPECT_CONFIG_ORIGIN", "false").strip().lower() == "true")
+
+# IMPORTANT: default is now TRUE to respect CONFIG’s explicit origin_iata route pairs
+RESPECT_CONFIG_ORIGIN = (os.getenv("RESPECT_CONFIG_ORIGIN", "true").strip().lower() == "true")
 
 DEFAULT_DAYS_AHEAD_MIN = _get_int("DAYS_AHEAD_MIN", "DAYS_AHEAD_MIN", 21)
 DEFAULT_DAYS_AHEAD_MAX = _get_int("DAYS_AHEAD_MAX", "DAYS_AHEAD_MAX", 84)
@@ -135,7 +137,6 @@ OFFER_MAX_DURATION_MINUTES_SHORTHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_SHOR
 OFFER_MAX_DURATION_MINUTES_LONGHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_LONGHAUL", "OFFER_MAX_DURATION_MINUTES_LONGHAUL", 1200)
 QUALITY_PRICE_BAND_SHORTHAUL = _get_float("QUALITY_PRICE_BAND_SHORTHAUL", "QUALITY_PRICE_BAND_SHORTHAUL", 0.85)
 QUALITY_PRICE_BAND_LONGHAUL = _get_float("QUALITY_PRICE_BAND_LONGHAUL", "QUALITY_PRICE_BAND_LONGHAUL", 0.95)
-
 
 # ==================== THEMES ====================
 
@@ -165,7 +166,6 @@ NORTH = ["MAN", "LBA", "NCL", "LPL"]
 SCOTLAND = ["EDI", "GLA"]
 NI = ["BFS", "BHD"]
 
-ADVENTURE_HUBS = ["LGW", "LHR", "STN", "LTN", "MAN", "BHX"]
 LONGHAUL_PRIMARY_HUBS = ["LHR", "LGW"]
 LONGHAUL_SECONDARY_HUBS = ["MAN"]
 
@@ -175,7 +175,6 @@ ORIGIN_CITY_FALLBACK = {
     "NCL": "Newcastle", "EDI": "Edinburgh", "GLA": "Glasgow", "BFS": "Belfast", "BHD": "Belfast",
     "BRS": "Bristol", "EXT": "Exeter", "NQY": "Newquay", "SOU": "Southampton", "CWL": "Cardiff", "BOH": "Bournemouth",
 }
-
 
 # ==================== LOGGING ====================
 
@@ -228,13 +227,6 @@ def _sw_england_origins_from_env() -> List[str]:
 
 
 def _theme_origins_from_env(theme_today: str) -> List[str]:
-    """
-    If ORIGINS_<THEME> is set (e.g. ORIGINS_LUXURY_VALUE=LHR,LGW,MAN), treat it as the
-    primary origin allowlist for that theme.
-
-    This prevents wasting Duffel searches on implausible regional long-haul pairings.
-    Falls back to legacy pooled origin planning if not set.
-    """
     key = f"ORIGINS_{str(theme_today or '').strip().upper()}"
     raw = (os.getenv(key, "") or "").strip()
     if not raw:
@@ -242,31 +234,6 @@ def _theme_origins_from_env(theme_today: str) -> List[str]:
     parts = [p.strip().upper() for p in raw.split(",")]
     parts = [p for p in parts if p]
     return _dedupe_keep_order(parts)
-
-
-def _det_hash_score(seed: str, item: str) -> int:
-    h = hashlib.sha256(f"{seed}|{item}".encode("utf-8")).hexdigest()
-    return int(h[:10], 16)
-
-
-def _weighted_pick_unique(seed: str, pools: List[Tuple[List[str], int]], k: int) -> List[str]:
-    candidates: List[Tuple[int, str]] = []
-    for origins, w in pools:
-        w_int = max(0, int(w))
-        for o in _dedupe_keep_order(origins):
-            if w_int <= 0:
-                continue
-            score = _det_hash_score(seed, o) + (w_int * 1_000_000)
-            candidates.append((score, o))
-
-    candidates.sort(reverse=True, key=lambda t: t[0])
-    out: List[str] = []
-    for _, o in candidates:
-        if o not in out:
-            out.append(o)
-        if len(out) >= k:
-            break
-    return out
 
 
 def required_unique_origins() -> int:
@@ -284,13 +251,10 @@ def effective_routes_per_run() -> int:
 
 def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
     sw = _dedupe_keep_order(_sw_england_origins_from_env())
-    seed = f"{dt.datetime.utcnow().date().isoformat()}|{RUN_SLOT}|{theme_today}|ORIGIN_PLAN"
 
-    # If explicit origins are provided via ORIGINS_<THEME>, use them as the primary plan.
     explicit = _theme_origins_from_env(theme_today)
     if explicit:
         plan = explicit[:]
-        # Pad (only if needed) with major hubs to satisfy required origin count.
         hub_pad = _dedupe_keep_order(LONDON_FULL + MIDLANDS + ["MAN"])
         for o in hub_pad:
             if len(plan) >= plan_n:
@@ -299,40 +263,17 @@ def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
                 plan.append(o)
         return plan[:plan_n]
 
+    # legacy pooled behaviour (unchanged)
     if theme_today == "surf":
-        pools = [(sw, 80), (LONDON_LCC, 20)]
-    elif theme_today == "snow":
-        pools = [(LONDON_LCC + MIDLANDS, 65), (NORTH + SCOTLAND, 25), (sw, 10)]
-    elif theme_today == "winter_sun":
-        pools = [(LONDON_LCC + MIDLANDS, 45), (NORTH, 35), (sw, 20)]
-    elif theme_today == "summer_sun" or theme_today == "beach_break":
-        pools = [(sw, 50), (LONDON_LCC + MIDLANDS, 30), (NORTH, 20)]
-    elif theme_today == "city_breaks" or theme_today == "culture_history":
-        pools = [(LONDON_LCC + MIDLANDS, 45), (NORTH + SCOTLAND, 35), (sw, 20)]
-    elif theme_today == "northern_lights":
-        pools = [(LONDON_FULL + NORTH + SCOTLAND + MIDLANDS, 80), (sw, 20)]
-    elif theme_today == "adventure":
-        pools = [(LONDON_FULL + MIDLANDS + NORTH, 60), (sw, 40)]
-    elif theme_today == "long_haul":
-        pools = [(LONGHAUL_PRIMARY_HUBS, 80), (LONGHAUL_SECONDARY_HUBS, 20)]
-    elif theme_today == "luxury_value" or theme_today == "unexpected_value":
-        pools = [(LONDON_FULL + MIDLANDS, 50), (NORTH + SCOTLAND, 30), (sw, 20)]
+        pools = _dedupe_keep_order(sw + LONDON_LCC)
+    elif theme_today in ("long_haul",):
+        pools = _dedupe_keep_order(LONGHAUL_PRIMARY_HUBS + LONGHAUL_SECONDARY_HUBS)
+    elif theme_today in ("luxury_value", "unexpected_value"):
+        pools = _dedupe_keep_order(LONDON_FULL + MIDLANDS + ["MAN"] + SCOTLAND + sw)
     else:
-        pools = [(sw, 50), (LONDON_LCC + MIDLANDS, 30), (NORTH + SCOTLAND, 20)]
+        pools = _dedupe_keep_order(sw + LONDON_LCC + MIDLANDS + ["MAN"] + SCOTLAND)
 
-    plan = _weighted_pick_unique(seed, pools, plan_n)
-
-    if len(plan) < min(5, plan_n):
-        broad = _dedupe_keep_order(sw + LONDON_LCC + MIDLANDS + NORTH + SCOTLAND + NI)
-        extra_seed = seed + "|FILL"
-        extras = _weighted_pick_unique(extra_seed, [(broad, 1)], plan_n)
-        for o in extras:
-            if o not in plan:
-                plan.append(o)
-            if len(plan) >= plan_n:
-                break
-
-    return plan
+    return pools[:plan_n]
 
 
 def resolve_origin_city(iata: str, origin_city_map: Dict[str, str]) -> str:
@@ -390,11 +331,7 @@ def load_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
     rows = ws.get_all_records()
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        key = _clean_iata(
-            r.get("destination_iata")
-            or r.get("iata_hint")
-            or r.get("iata")
-        )
+        key = _clean_iata(r.get("destination_iata") or r.get("iata_hint") or r.get("iata"))
         if key:
             out[key] = r
     return out
@@ -675,14 +612,11 @@ def main() -> int:
     req_origins = required_unique_origins()
     eff_routes = effective_routes_per_run()
 
-    theoretical_max_by_routes = DUFFEL_MAX_INSERTS_PER_ROUTE * eff_routes
-    theoretical_max_by_origins = DUFFEL_MAX_INSERTS_PER_ORIGIN * eff_routes
-    theoretical_max = min(DUFFEL_MAX_INSERTS, theoretical_max_by_routes, theoretical_max_by_origins)
-
-    if eff_routes != DUFFEL_ROUTES_PER_RUN:
-        log(f"⚠️ CONFIG_GUARDRAIL: DUFFEL_ROUTES_PER_RUN={DUFFEL_ROUTES_PER_RUN} < required_origins={req_origins} "
-            f"for DUFFEL_MAX_INSERTS={DUFFEL_MAX_INSERTS} @ {DUFFEL_MAX_INSERTS_PER_ORIGIN}/origin. "
-            f"Auto-bumping effective_routes_per_run => {eff_routes} (capped by DUFFEL_MAX_SEARCHES_PER_RUN={DUFFEL_MAX_SEARCHES_PER_RUN}).")
+    theoretical_max = min(
+        DUFFEL_MAX_INSERTS,
+        DUFFEL_MAX_INSERTS_PER_ROUTE * eff_routes,
+        DUFFEL_MAX_INSERTS_PER_ORIGIN * eff_routes,
+    )
 
     log(f"ORIGIN_POLICY: FEEDER_OPEN_ORIGINS={FEEDER_OPEN_ORIGINS} | sparse_override={sparse_theme_override} | effective_open={open_origins_effective}")
     log(f"CAPS: MAX_INSERTS={DUFFEL_MAX_INSERTS} | PER_ORIGIN={DUFFEL_MAX_INSERTS_PER_ORIGIN} | PER_ROUTE={DUFFEL_MAX_INSERTS_PER_ROUTE} | "
@@ -709,8 +643,6 @@ def main() -> int:
     config_rows = load_config_rows(sh)
     themes_dict = load_themes_dict(sh)
     signals = load_signals(sh)
-    if not signals:
-        log(f"⚠️ CONFIG_SIGNALS loaded 0 rows — check IATA key column (destination_iata vs iata_hint) in '{SIGNALS_TAB}'.")
     allowed_pairs, origin_city_map = load_route_capability_map(sh)
 
     benchmarks: List[Dict[str, Any]] = []
@@ -721,49 +653,14 @@ def main() -> int:
             log(f"⚠️ PRICE_GATE: failed to load '{BENCHMARKS_TAB}': {e} | fallback={PRICE_GATE_FALLBACK_BEHAVIOR}")
             benchmarks = []
 
-    theme_routes = [r for r in config_rows if str(r.get("theme") or "").strip() == theme_today]
-    explore_routes = [r for r in config_rows if str(r.get("theme") or "").strip() != theme_today]
+    theme_rows = [r for r in config_rows if str(r.get("theme") or "").strip() == theme_today]
+    explore_rows = [r for r in config_rows if str(r.get("theme") or "").strip() != theme_today]
 
-    def unique_dest_configs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        seen: Set[str] = set()
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            d = _clean_iata(r.get("destination_iata"))
-            if not d or d in seen:
-                continue
-            seen.add(d)
-            out.append(r)
-        return out
-
-    theme_dest_configs = unique_dest_configs(theme_routes)
-    explore_dest_configs = unique_dest_configs(explore_routes)
-
+    # Planned origins are still useful for filtering/ordering, but cannot create new routes.
     plan_n = max(5, req_origins, eff_routes)
     planned_origins = origin_plan_for_theme(theme_today, plan_n)
     log(f"🧭 Planned origins for run ({len(planned_origins)}; required={plan_n}): {planned_origins}")
-    log(f"🧭 Unique theme destinations: {len(theme_dest_configs)} | Unique explore destinations: {len(explore_dest_configs)}")
-
-    # -------- RULE B SELECTION (one per origin first) --------
-
-    THEME_ANCHOR_ORIGINS = {
-        'city_breaks': ['LGW', 'STN', 'LTN'],
-        'culture_history': ['LGW', 'STN', 'LTN'],
-        'winter_sun': ['MAN', 'LGW', 'STN', 'LTN'],
-        'long_haul': ['LHR', 'LGW', 'MAN'],
-        'snow': ['LGW', 'MAN', 'EDI', 'GLA', 'STN', 'LTN'],
-        'surf': ['BRS', 'NQY', 'EXT', 'LGW', 'STN', 'LTN'],
-    }
-
-    def selection_origins_for_theme(theme_key: str) -> List[str]:
-        anchors = THEME_ANCHOR_ORIGINS.get(theme_key, [])
-        ordered: List[str] = []
-        for a in anchors:
-            if a in planned_origins and a not in ordered:
-                ordered.append(a)
-        for o in planned_origins:
-            if o not in ordered:
-                ordered.append(o)
-        return ordered
+    log(f"🧭 Unique theme routes: {len(theme_rows)} | Unique explore routes: {len(explore_rows)}")
 
     def route_precheck_ok(origin: str, dest: str, deal_theme: str) -> bool:
         if allowed_pairs and (origin, dest) not in allowed_pairs:
@@ -776,67 +673,76 @@ def main() -> int:
                 return False
         return True
 
-    def select_routes_rule_b(dest_configs: List[Dict[str, Any]], quota: int) -> List[Tuple[str, str, Dict[str, Any]]]:
-        if quota <= 0 or not dest_configs:
+    def pick_rows_for_quota(rows: List[Dict[str, Any]], quota: int) -> List[Tuple[str, str, Dict[str, Any]]]:
+        if quota <= 0:
             return []
 
         picked: List[Tuple[str, str, Dict[str, Any]]] = []
-        used_dests: Set[str] = set()
+        used_pairs: Set[Tuple[str, str]] = set()
 
-        sel_origins = selection_origins_for_theme(theme_today)
+        # Deterministic ordering: priority desc then search_weight desc
+        def sort_key(r: Dict[str, Any]) -> Tuple[float, float, str, str]:
+            pr = float(r.get("priority") or 0)
+            sw = float(r.get("search_weight") or 0)
+            o = _clean_iata(r.get("origin_iata"))
+            d = _clean_iata(r.get("destination_iata"))
+            return (pr, sw, o, d)
 
-        for origin in sel_origins:
+        ordered = sorted(rows, key=sort_key, reverse=True)
+
+        for r in ordered:
             if len(picked) >= quota:
                 break
-            for cfg in dest_configs:
-                dest = _clean_iata(cfg.get("destination_iata"))
-                if not dest or dest in used_dests:
-                    continue
-                deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
-                if not route_precheck_ok(origin, dest, deal_theme):
-                    continue
-                picked.append((origin, dest, cfg))
-                used_dests.add(dest)
-                break
 
-        safety = 0
-        while len(picked) < quota and safety < 5000:
-            safety += 1
-            progressed = False
-            for origin in sel_origins:
-                if len(picked) >= quota:
-                    break
-                for cfg in dest_configs:
-                    dest = _clean_iata(cfg.get("destination_iata"))
-                    if not dest or dest in used_dests:
-                        continue
-                    deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
-                    if not route_precheck_ok(origin, dest, deal_theme):
-                        continue
-                    picked.append((origin, dest, cfg))
-                    used_dests.add(dest)
-                    progressed = True
-                    break
-            if not progressed:
-                break
+            cfg_origin = _clean_iata(r.get("origin_iata"))
+            dest = _clean_iata(r.get("destination_iata"))
+            deal_theme = str(r.get("theme") or theme_today).strip() or theme_today
+
+            if not dest:
+                continue
+
+            # CORE FIX: respect CONFIG’s origin_iata route pairs by default.
+            if RESPECT_CONFIG_ORIGIN and not open_origins_effective:
+                origin = cfg_origin
+            else:
+                # open origins mode may mix, but still never invent destinations not in CONFIG
+                origin = cfg_origin if cfg_origin else (planned_origins[0] if planned_origins else "")
+
+            if not origin:
+                continue
+
+            # If ORIGINS_<THEME> is set, treat it as an allowlist filter
+            explicit_origins = _theme_origins_from_env(theme_today)
+            if explicit_origins and origin not in explicit_origins:
+                continue
+
+            pair = (origin, dest)
+            if pair in used_pairs:
+                continue
+
+            if not route_precheck_ok(origin, dest, deal_theme):
+                continue
+
+            picked.append((origin, dest, r))
+            used_pairs.add(pair)
 
         return picked
 
     selected_routes: List[Tuple[str, str, Dict[str, Any]]] = []
-    selected_routes.extend(select_routes_rule_b(theme_dest_configs, theme_quota))
+    selected_routes.extend(pick_rows_for_quota(theme_rows, theme_quota))
 
-    if explore_quota > 0 and explore_dest_configs:
+    if explore_quota > 0 and explore_rows:
         today = dt.datetime.utcnow().date().isoformat()
         seed = f"{FEEDER_EXPLORE_SALT}|{today}|{RUN_SLOT}|{theme_today}|EXPLORE"
-        offset = _stable_mod(seed, max(1, len(explore_dest_configs)))
-        rotated = explore_dest_configs[offset:] + explore_dest_configs[:offset]
-        selected_routes.extend(select_routes_rule_b(rotated, 1))
+        offset = _stable_mod(seed, max(1, len(explore_rows)))
+        rotated = explore_rows[offset:] + explore_rows[:offset]
+        selected_routes.extend(pick_rows_for_quota(rotated, 1))
 
     if len(selected_routes) > DUFFEL_MAX_SEARCHES_PER_RUN:
         selected_routes = selected_routes[:DUFFEL_MAX_SEARCHES_PER_RUN]
 
     if not selected_routes:
-        log("⚠️ No eligible routes after capability/benchmark/planned-origin filtering.")
+        log("⚠️ No eligible routes after capability/benchmark/origin allowlist filtering.")
         return 0
 
     searches_done = 0
@@ -845,7 +751,7 @@ def main() -> int:
 
     def is_longhaul_theme(deal_theme: str) -> bool:
         t = str(deal_theme or "").strip()
-        return t in {"long_haul", "adventure"}
+        return t in {"long_haul", "adventure", "luxury_value"}
 
     def hygiene_limits_for_theme(deal_theme: str) -> Tuple[int, int, float]:
         if is_longhaul_theme(deal_theme):

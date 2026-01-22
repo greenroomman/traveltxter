@@ -133,7 +133,7 @@ def main():
             continue
 
         row = {headers[j]: r[j] for j in range(len(headers))}
-        
+
         country = row.get("destination_country", "")
         city = row.get("destination_city", "")
         origin = row.get("origin_city", "")
@@ -142,22 +142,26 @@ def main():
         return_date = row.get("return_date", "")
         phrase = phrase_from_row(row)
         image_url = row.get("graphic_url", "")
-        
-        # Get country flag
+
+        # Get country flag (flags or globe only)
         flag = get_country_flag(country)
-        
-        # Build caption exactly as schematic
+
+        # Build caption (UPDATED COPY ONLY)
+        # - human tone
+        # - feature -> benefit
+        # - explains VIP-first timing without hype
         caption = "\n".join([
             f"{country} {flag}",
-            f"To: {city}",
-            f"From: {origin}",
-            f"Price: £{price}",
+            "",
+            f"London to {city} from £{price}",
             f"Out: {outbound}",
             f"Return: {return_date}",
             "",
             phrase,
             "",
-            "Link in bio...",
+            "VIP members saw this first. We post here later, and the free channel gets it after that.",
+            "",
+            "Link in bio.",
         ]).strip()
 
         # Create Instagram media
@@ -191,7 +195,7 @@ def main():
         # Update status
         ws.update_cell(i, h["status"] + 1, "POSTED_INSTAGRAM")
         ws.update_cell(i, h["posted_instagram_at"] + 1, dt.datetime.utcnow().isoformat() + "Z")
-        
+
         print(f"✅ Published to Instagram: {city} £{price}")
         return 0
 

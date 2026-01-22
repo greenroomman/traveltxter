@@ -11,10 +11,8 @@ LOCKED PRINCIPLES:
 - Do NOT write to RAW_DEALS_VIEW.
 
 This change adds ONE thing:
-✅ "HYGIENE GATE" to prevent obviously doomed offers entering RAW_DEALS:
-- Hard cap on connections (short-haul vs long-haul)
-- Hard cap on total itinerary duration minutes (short-haul vs long-haul)
-- Inner "quality band" under the benchmark cap (short-haul vs long-haul)
+✅ "THEME ORIGINS OVERRIDE" — if ORIGINS_<THEME> env var is present, use it to plan origins.
+This makes your existing GitHub Variables (ORIGINS_LUXURY_VALUE, ORIGINS_SURF, etc.) actually control origin planning.
 
 Everything else is unchanged.
 """
@@ -22,9 +20,6 @@ Everything else is unchanged.
 from __future__ import annotations
 
 # ==================== PYTHONPATH GUARD (GITHUB ACTIONS IMPORT CONTEXT) ====================
-# When GitHub Actions runs: python workers/pipeline_worker.py
-# Python does NOT treat workers/ as a package. If any sibling imports exist (utils.py etc),
-# this guard makes them resolvable deterministically.
 import os
 import sys
 
@@ -130,19 +125,12 @@ PRICE_GATE_FALLBACK_BEHAVIOR = (os.getenv("PRICE_GATE_FALLBACK_BEHAVIOR", "BLOCK
 ZERO_OFFER_RETRY_ENABLED = (os.getenv("ZERO_OFFER_RETRY_ENABLED", "true").strip().lower() == "true")
 ZERO_OFFER_RETRY_MAX_DAYS = _get_int("ZERO_OFFER_RETRY_MAX_DAYS", "ZERO_OFFER_RETRY_MAX_DAYS", 60)
 
-# ==================== HYGIENE GATE (NEW) ====================
-# Goal: prevent obviously doomed offers entering RAW_DEALS (connections/duration/near-cap filler).
+# ==================== HYGIENE GATE ====================
 HYGIENE_ENABLED = (os.getenv("HYGIENE_ENABLED", "true").strip().lower() == "true")
-
-# Connections: short-haul vs long-haul
 OFFER_MAX_CONNECTIONS_SHORTHAUL = _get_int("OFFER_MAX_CONNECTIONS_SHORTHAUL", "OFFER_MAX_CONNECTIONS_SHORTHAUL", 1)
 OFFER_MAX_CONNECTIONS_LONGHAUL = _get_int("OFFER_MAX_CONNECTIONS_LONGHAUL", "OFFER_MAX_CONNECTIONS_LONGHAUL", 2)
-
-# Duration minutes (total itinerary across slices)
-OFFER_MAX_DURATION_MINUTES_SHORTHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_SHORTHAUL", "OFFER_MAX_DURATION_MINUTES_SHORTHAUL", 720)   # 12h
-OFFER_MAX_DURATION_MINUTES_LONGHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_LONGHAUL", "OFFER_MAX_DURATION_MINUTES_LONGHAUL", 1200)     # 20h
-
-# Inner "quality band" under cap (keep filler out). Set to 1.0 to disable band filtering.
+OFFER_MAX_DURATION_MINUTES_SHORTHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_SHORTHAUL", "OFFER_MAX_DURATION_MINUTES_SHORTHAUL", 720)
+OFFER_MAX_DURATION_MINUTES_LONGHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_LONGHAUL", "OFFER_MAX_DURATION_MINUTES_LONGHAUL", 1200)
 QUALITY_PRICE_BAND_SHORTHAUL = _get_float("QUALITY_PRICE_BAND_SHORTHAUL", "QUALITY_PRICE_BAND_SHORTHAUL", 0.85)
 QUALITY_PRICE_BAND_LONGHAUL = _get_float("QUALITY_PRICE_BAND_LONGHAUL", "QUALITY_PRICE_BAND_LONGHAUL", 0.95)
 
@@ -164,7 +152,7 @@ MASTER_THEMES = [
     "unexpected_value",
 ]
 
-SPARSE_THEMES = {"northern_lights"}  # kept from baseline
+SPARSE_THEMES = {"northern_lights"}
 
 # Pools
 SW_ENGLAND_DEFAULT = ["BRS", "EXT", "NQY", "SOU", "CWL", "BOH"]
@@ -177,7 +165,7 @@ NI = ["BFS", "BHD"]
 
 ADVENTURE_HUBS = ["LGW", "LHR", "STN", "LTN", "MAN", "BHX"]
 LONGHAUL_PRIMARY_HUBS = ["LHR", "LGW"]
-LONGHAUL_SECONDARY_HUBS = ["MAN"]  # realistic UK long-haul feeder
+LONGHAUL_SECONDARY_HUBS = ["MAN"]
 
 ORIGIN_CITY_FALLBACK = {
     "LHR": "London", "LGW": "London", "STN": "London", "LTN": "London", "LCY": "London", "SEN": "London",
@@ -237,6 +225,17 @@ def _sw_england_origins_from_env() -> List[str]:
     return parts or SW_ENGLAND_DEFAULT[:]
 
 
+# ✅ NEW: theme origins from env: ORIGINS_<THEME>
+def _theme_origins_from_env(theme_today: str) -> List[str]:
+    key = f"ORIGINS_{str(theme_today).strip().upper()}"
+    raw = (os.getenv(key, "") or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip().upper() for p in raw.split(",")]
+    parts = [p for p in parts if p]
+    return _dedupe_keep_order(parts)
+
+
 def _det_hash_score(seed: str, item: str) -> int:
     h = hashlib.sha256(f"{seed}|{item}".encode("utf-8")).hexdigest()
     return int(h[:10], 16)
@@ -276,6 +275,19 @@ def effective_routes_per_run() -> int:
 
 
 def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
+    # ✅ NEW: if ORIGINS_<THEME> provided, use it (and pad only from LONDON hubs if needed)
+    theme_env_origins = _theme_origins_from_env(theme_today)
+    if theme_env_origins:
+        plan = theme_env_origins[:]
+        # keep behaviour deterministic: ensure at least plan_n by padding with London hubs then MAN/BHX/EDI
+        pad = _dedupe_keep_order(LONDON_FULL + ["MAN", "BHX", "EDI"])
+        for o in pad:
+            if len(plan) >= plan_n:
+                break
+            if o not in plan:
+                plan.append(o)
+        return plan[:plan_n]
+
     sw = _dedupe_keep_order(_sw_england_origins_from_env())
     seed = f"{dt.datetime.utcnow().date().isoformat()}|{RUN_SLOT}|{theme_today}|ORIGIN_PLAN"
 
@@ -294,8 +306,6 @@ def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
     elif theme_today == "adventure":
         pools = [(LONDON_FULL + MIDLANDS + NORTH, 60), (sw, 40)]
     elif theme_today == "long_haul":
-        # Long-haul is hub-led: avoid wasting searches on low-liquidity regional origins for true long-haul markets.
-        # Use realistic hubs first (LHR/LGW), then MAN as secondary.
         pools = [(LONGHAUL_PRIMARY_HUBS, 80), (LONGHAUL_SECONDARY_HUBS, 20)]
     elif theme_today == "luxury_value" or theme_today == "unexpected_value":
         pools = [(LONDON_FULL + MIDLANDS, 50), (NORTH + SCOTLAND, 30), (sw, 20)]
@@ -372,8 +382,6 @@ def load_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
     rows = ws.get_all_records()
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        # V4.6 compat: some Sheets exports name the IATA column `iata_hint`.
-        # Accept both without changing tabs/headers.
         key = _clean_iata(
             r.get("destination_iata")
             or r.get("iata_hint")
@@ -729,25 +737,17 @@ def main() -> int:
 
     # -------- RULE B SELECTION (one per origin first) --------
 
-    # Anchor-origins guarantee: prevent low-liquidity origins consuming the whole quota
-    # (Observed failure mode: quota fills on EXT/CWL/LPL before STN/LGW are reached).
     THEME_ANCHOR_ORIGINS = {
-        # Short-haul city deals: ensure at least one London LCC origin is considered first
         'city_breaks': ['LGW', 'STN', 'LTN'],
         'culture_history': ['LGW', 'STN', 'LTN'],
-        # Winter sun often strongest from major hubs (MAN/London)
         'winter_sun': ['MAN', 'LGW', 'STN', 'LTN'],
-        # Long haul: full-service hubs
         'long_haul': ['LHR', 'LGW', 'MAN'],
-        # Snow: hubs + Scotland
         'snow': ['LGW', 'MAN', 'EDI', 'GLA', 'STN', 'LTN'],
-        # Surf: SW-first is intentional (but still allow London fallback)
         'surf': ['BRS', 'NQY', 'EXT', 'LGW', 'STN', 'LTN'],
     }
 
     def selection_origins_for_theme(theme_key: str) -> List[str]:
         anchors = THEME_ANCHOR_ORIGINS.get(theme_key, [])
-        # Keep order: anchors first (if planned), then the rest
         ordered: List[str] = []
         for a in anchors:
             if a in planned_origins and a not in ordered:
@@ -756,7 +756,6 @@ def main() -> int:
             if o not in ordered:
                 ordered.append(o)
         return ordered
-
 
     def route_precheck_ok(origin: str, dest: str, deal_theme: str) -> bool:
         if allowed_pairs and (origin, dest) not in allowed_pairs:
@@ -901,7 +900,6 @@ def main() -> int:
                     rejected_price_hard += 1
             gbp_offers = in_cap
 
-        # HYGIENE: connections/duration hard filters
         rejected_hygiene_conn = 0
         rejected_hygiene_dur = 0
         if HYGIENE_ENABLED and gbp_offers:
@@ -918,7 +916,6 @@ def main() -> int:
                 kept.append(off)
             gbp_offers = kept
 
-        # HYGIENE: inner quality band under cap (prevents near-cap filler)
         rejected_band = 0
         band_cap: Optional[float] = None
         if HYGIENE_ENABLED and PRICE_GATE_ENABLED and cap_gbp is not None and gbp_offers:

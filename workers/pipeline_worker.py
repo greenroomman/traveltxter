@@ -10,175 +10,207 @@ LOCKED PRINCIPLES:
 - Google Sheets is the single source of truth.
 - Do NOT write to RAW_DEALS_VIEW.
 
-This change adds ONE thing:
-✅ "HYGIENE GATE" to prevent obviously doomed offers entering RAW_DEALS:
-- Hard cap on connections (short-haul vs long-haul)
-- Hard cap on duration (short-haul vs long-haul)
-- Optional "band" cap relative to a computed cap_gbp for the route
+CHANGE IN THIS VERSION (single behaviour change):
+✅ Theme Origins Override:
+If ORIGINS_<THEME> is set (e.g., ORIGINS_LUXURY_VALUE=LHR,LGW,MAN),
+use it as the primary origin plan for that theme.
+Falls back to legacy pooled origin planning if not set.
 
-Also includes:
-- 90/10 theme/explore strategy
-- Anchored origin planning by theme
-- Windowing & trip length constraints
-- Price gate by theme/zone benchmark caps
-- Dedupe within time window
-- Optional zero-offer retry window
-
-NOTE: Brand & sustainability: minimize wasted searches by keeping origins realistic and by gating low-quality offers.
-
+This prevents wasting Duffel searches on implausible origin→destination pairings.
 """
 
 from __future__ import annotations
 
-import datetime as dt
-import json
+# ==================== PYTHONPATH GUARD (GITHUB ACTIONS IMPORT CONTEXT) ====================
 import os
-import random
-import re
 import sys
+
+WORKERS_DIR = os.path.dirname(os.path.abspath(__file__))
+if WORKERS_DIR not in sys.path:
+    sys.path.insert(0, WORKERS_DIR)
+
+# ==================== STANDARD IMPORTS ====================
+
+import json
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+import math
+import hashlib
+import datetime as dt
+from typing import Any, Dict, List, Tuple, Optional, Set
 
-import gspread
 import requests
+import gspread
+from google.oauth2.service_account import Credentials
 
 
-# ==================== CONSTANTS / DEFAULTS ====================
+# ==================== ENV / TABS ====================
 
-# Stable “run slot” to introduce deterministic variety in daily runs
-RUN_SLOT = os.getenv("RUN_SLOT", "AM").strip().upper()  # AM/PM or arbitrary label
+RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS").strip() or "RAW_DEALS"
+CONFIG_TAB = os.getenv("FEEDER_CONFIG_TAB", os.getenv("CONFIG_TAB", "CONFIG")).strip() or "CONFIG"
+THEMES_TAB = os.getenv("THEMES_TAB", "THEMES").strip() or "THEMES"
+SIGNALS_TAB = os.getenv("SIGNALS_TAB", os.getenv("CONFIG_SIGNALS_TAB", "CONFIG_SIGNALS")).strip() or "CONFIG_SIGNALS"
+CAPABILITY_TAB = os.getenv("CAPABILITY_TAB", "ROUTE_CAPABILITY_MAP").strip() or "ROUTE_CAPABILITY_MAP"
+BENCHMARKS_TAB = os.getenv("BENCHMARKS_TAB", "ZONE_THEME_BENCHMARKS").strip() or "ZONE_THEME_BENCHMARKS"
 
-# Tabs
-RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS").strip()
-THEMES_TAB = os.getenv("THEMES_TAB", "THEMES").strip()
-CONFIG_TAB = os.getenv("FEEDER_CONFIG_TAB", "CONFIG").strip()
-FEEDER_LOG_TAB = os.getenv("FEEDER_LOG_TAB", "FEEDER_LOG").strip()
+SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or "").strip()
 
-# Theme selection
-THEME_DEFAULT = os.getenv("THEME", "DEFAULT").strip().lower()
+DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY", "").strip()
+DUFFEL_API_BASE = os.getenv("DUFFEL_API_BASE", "https://api.duffel.com").strip()
+DUFFEL_VERSION = os.getenv("DUFFEL_VERSION", "v2").strip() or "v2"
 
-# Duffel caps / budgets
-DUFFEL_MAX_INSERTS = int(float(os.getenv("DUFFEL_MAX_INSERTS", "3")))
-DUFFEL_MAX_INSERTS_PER_ORIGIN = int(float(os.getenv("DUFFEL_MAX_INSERTS_PER_ORIGIN", "10")))
-DUFFEL_MAX_INSERTS_PER_ROUTE = int(float(os.getenv("DUFFEL_MAX_INSERTS_PER_ROUTE", "10")))
-DUFFEL_MAX_SEARCHES_PER_RUN = int(float(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "4")))
-DUFFEL_ROUTES_PER_RUN = int(float(os.getenv("DUFFEL_ROUTES_PER_RUN", "3")))
-DUFFEL_SEARCH_DEDUPE_HOURS = int(float(os.getenv("DUFFEL_SEARCH_DEDUPE_HOURS", "4")))
+RUN_SLOT = (os.getenv("RUN_SLOT") or "").strip().upper()
 
-# Feeder caps (legacy aliases; keep contract)
-FEEDER_MAX_INSERTS = int(float(os.getenv("FEEDER_MAX_INSERTS", str(DUFFEL_MAX_INSERTS))))
-FEEDER_MAX_SEARCHES = int(float(os.getenv("FEEDER_MAX_SEARCHES", str(DUFFEL_MAX_SEARCHES_PER_RUN))))
 
-# Hygiene gate
-HYGIENE_ENABLED = (os.getenv("HYGIENE_ENABLED", "true").strip().lower() == "true")
-HYGIENE_CONN_SHORT = int(float(os.getenv("HYGIENE_CONN_SHORT", "1")))
-HYGIENE_CONN_LONG = int(float(os.getenv("HYGIENE_CONN_LONG", "2")))
-HYGIENE_DUR_SHORT = int(float(os.getenv("HYGIENE_DUR_SHORT", "720")))   # minutes
-HYGIENE_DUR_LONG = int(float(os.getenv("HYGIENE_DUR_LONG", "1200")))    # minutes
-HYGIENE_BAND_SHORT = float(os.getenv("HYGIENE_BAND_SHORT", "0.85"))
-HYGIENE_BAND_LONG = float(os.getenv("HYGIENE_BAND_LONG", "0.95"))
+# ==================== GOVERNORS (SAFE CASTING) ====================
 
-# Inventory window defaults (days out)
-INVENTORY_MIN_DAYS_OUT = int(float(os.getenv("WINDOW_DEFAULT_MIN_DAYS_OUT", "21")))
-INVENTORY_MAX_DAYS_OUT = int(float(os.getenv("WINDOW_DEFAULT_MAX_DAYS_OUT", "84")))
+def _get_int(primary: str, fallback: str, default: int) -> int:
+    v = (os.getenv(primary) or "").strip()
+    if v:
+        try:
+            return int(float(v))
+        except Exception:
+            pass
+    v2 = (os.getenv(fallback) or "").strip()
+    if v2:
+        try:
+            return int(float(v2))
+        except Exception:
+            pass
+    return int(default)
 
-# Zero-offer retry (optional)
-ZERO_OFFER_RETRY_ENABLED = (os.getenv("ZERO_OFFER_RETRY_ENABLED", "true").strip().lower() == "true")
-ZERO_OFFER_RETRY_WINDOW_MAX = int(float(os.getenv("ZERO_OFFER_RETRY_WINDOW_MAX", "60")))
 
-# Origin policy
+def _get_float(primary: str, fallback: str, default: float) -> float:
+    v = (os.getenv(primary) or "").strip()
+    if v:
+        try:
+            return float(v)
+        except Exception:
+            pass
+    v2 = (os.getenv(fallback) or "").strip()
+    if v2:
+        try:
+            return float(v2)
+        except Exception:
+            pass
+    return float(default)
+
+
+DUFFEL_MAX_INSERTS = _get_int("DUFFEL_MAX_INSERTS", "FEEDER_MAX_INSERTS", 3)
+DUFFEL_MAX_SEARCHES_PER_RUN = _get_int("DUFFEL_MAX_SEARCHES_PER_RUN", "FEEDER_MAX_SEARCHES", 4)
+DUFFEL_ROUTES_PER_RUN = _get_int("DUFFEL_ROUTES_PER_RUN", "FEEDER_ROUTES_PER_RUN", 3)
+
+DUFFEL_OFFERS_PER_SEARCH = _get_int("DUFFEL_OFFERS_PER_SEARCH", "OFFERS_PER_SEARCH", 50)
+DUFFEL_MAX_INSERTS_PER_ROUTE = _get_int("DUFFEL_MAX_INSERTS_PER_ROUTE", "MAX_INSERTS_PER_ROUTE", 10)
+DUFFEL_MAX_INSERTS_PER_ORIGIN = _get_int("DUFFEL_MAX_INSERTS_PER_ORIGIN", "MAX_INSERTS_PER_ORIGIN", 10)
+
+FEEDER_SLEEP_SECONDS = _get_float("FEEDER_SLEEP_SECONDS", "FEEDER_SLEEP_SECONDS", 0.0)
+
 FEEDER_OPEN_ORIGINS = (os.getenv("FEEDER_OPEN_ORIGINS", "false").strip().lower() == "true")
+STRICT_CAPABILITY_MAP = (os.getenv("STRICT_CAPABILITY_MAP", "true").strip().lower() == "true")
+RESPECT_CONFIG_ORIGIN = (os.getenv("RESPECT_CONFIG_ORIGIN", "false").strip().lower() == "true")
 
-# Timing / ingest age
-MIN_INGEST_AGE_SECONDS = int(float(os.getenv("MIN_INGEST_AGE_SECONDS", "90")))
+DEFAULT_DAYS_AHEAD_MIN = _get_int("DAYS_AHEAD_MIN", "DAYS_AHEAD_MIN", 21)
+DEFAULT_DAYS_AHEAD_MAX = _get_int("DAYS_AHEAD_MAX", "DAYS_AHEAD_MAX", 84)
+DEFAULT_TRIP_LENGTH_DAYS = _get_int("TRIP_LENGTH_DAYS", "TRIP_LENGTH_DAYS", 5)
 
-# Sleep between calls
-FEEDER_SLEEP_SECONDS = float(os.getenv("FEEDER_SLEEP_SECONDS", "0.1"))
+INVENTORY_MIN_DAYS = _get_int("INVENTORY_MIN_DAYS", "INVENTORY_MIN_DAYS", 21)
+INVENTORY_MAX_DAYS = _get_int("INVENTORY_MAX_DAYS", "INVENTORY_MAX_DAYS", 84)
 
-# Price gate
-PRICE_GATE_FALLBACK_BEHAVIOR = os.getenv("PRICE_GATE_FALLBACK_BEHAVIOR", "BLOCK").strip().upper()
-PRICE_GATE_MULT = float(os.getenv("PRICE_GATE_MULT", "1.0"))
-PRICE_GATE_MINCAP_GBP = float(os.getenv("PRICE_GATE_MINCAP_GBP", "80.0"))
+FEEDER_EXPLORE_RUN_MOD = _get_int("FEEDER_EXPLORE_RUN_MOD", "FEEDER_EXPLORE_RUN_MOD", 10)
+FEEDER_EXPLORE_SALT = (os.getenv("FEEDER_EXPLORE_SALT", "traveltxter") or "traveltxter").strip()
 
-# Strategy: 90/10
-FEEDER_EXPLORE_RUN_MOD = int(float(os.getenv("FEEDER_EXPLORE_RUN_MOD", "10")))
-FEEDER_EXPLORE_SALT = os.getenv("FEEDER_EXPLORE_SALT", "V451").strip()
-PLANNER_MAX_DESTS_PER_THEME = int(float(os.getenv("PLANNER_MAX_DESTS_PER_THEME", "6")))
+PRICE_GATE_ENABLED = (os.getenv("PRICE_GATE_ENABLED", "true").strip().lower() == "true")
+PRICE_GATE_MULTIPLIER = _get_float("PRICE_GATE_MULTIPLIER", "PRICE_GATE_MULTIPLIER", 1.0)
+PRICE_GATE_MIN_CAP_GBP = _get_float("PRICE_GATE_MIN_CAP_GBP", "PRICE_GATE_MIN_CAP_GBP", 80.0)
+PRICE_GATE_FALLBACK_BEHAVIOR = (os.getenv("PRICE_GATE_FALLBACK_BEHAVIOR", "BLOCK").strip().upper() or "BLOCK")
 
-# Misc
-DEST_REPEAT_PENALTY = int(float(os.getenv("DEST_REPEAT_PENALTY", "80")))
-VARIETY_LOOKBACK_HOURS = int(float(os.getenv("VARIETY_LOOKBACK_HOURS", "120")))
+ZERO_OFFER_RETRY_ENABLED = (os.getenv("ZERO_OFFER_RETRY_ENABLED", "true").strip().lower() == "true")
+ZERO_OFFER_RETRY_MAX_DAYS = _get_int("ZERO_OFFER_RETRY_MAX_DAYS", "ZERO_OFFER_RETRY_MAX_DAYS", 60)
+
+# ==================== HYGIENE GATE ====================
+HYGIENE_ENABLED = (os.getenv("HYGIENE_ENABLED", "true").strip().lower() == "true")
+OFFER_MAX_CONNECTIONS_SHORTHAUL = _get_int("OFFER_MAX_CONNECTIONS_SHORTHAUL", "OFFER_MAX_CONNECTIONS_SHORTHAUL", 1)
+OFFER_MAX_CONNECTIONS_LONGHAUL = _get_int("OFFER_MAX_CONNECTIONS_LONGHAUL", "OFFER_MAX_CONNECTIONS_LONGHAUL", 2)
+OFFER_MAX_DURATION_MINUTES_SHORTHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_SHORTHAUL", "OFFER_MAX_DURATION_MINUTES_SHORTHAUL", 720)
+OFFER_MAX_DURATION_MINUTES_LONGHAUL = _get_int("OFFER_MAX_DURATION_MINUTES_LONGHAUL", "OFFER_MAX_DURATION_MINUTES_LONGHAUL", 1200)
+QUALITY_PRICE_BAND_SHORTHAUL = _get_float("QUALITY_PRICE_BAND_SHORTHAUL", "QUALITY_PRICE_BAND_SHORTHAUL", 0.85)
+QUALITY_PRICE_BAND_LONGHAUL = _get_float("QUALITY_PRICE_BAND_LONGHAUL", "QUALITY_PRICE_BAND_LONGHAUL", 0.95)
 
 
-# ==================== ORIGIN POOLS (legacy) ====================
+# ==================== THEMES ====================
 
+MASTER_THEMES = [
+    "winter_sun",
+    "summer_sun",
+    "beach_break",
+    "snow",
+    "northern_lights",
+    "surf",
+    "adventure",
+    "city_breaks",
+    "culture_history",
+    "long_haul",
+    "luxury_value",
+    "unexpected_value",
+]
+
+SPARSE_THEMES = {"northern_lights"}
+
+# Pools
 SW_ENGLAND_DEFAULT = ["BRS", "EXT", "NQY", "SOU", "CWL", "BOH"]
-
-LONDON_FULL = ["LHR", "LGW", "LCY", "STN", "LTN"]
-LONDON_LCC = ["LGW", "STN", "LTN"]
+LONDON_LCC = ["STN", "LTN", "LGW"]
+LONDON_FULL = ["LHR", "LGW", "STN", "LTN", "LCY", "SEN"]
 MIDLANDS = ["BHX", "EMA"]
-NORTH = ["MAN", "LPL", "LBA"]
-SCOTLAND = ["GLA", "EDI"]
-NI = ["BFS"]
+NORTH = ["MAN", "LBA", "NCL", "LPL"]
+SCOTLAND = ["EDI", "GLA"]
+NI = ["BFS", "BHD"]
 
+ADVENTURE_HUBS = ["LGW", "LHR", "STN", "LTN", "MAN", "BHX"]
 LONGHAUL_PRIMARY_HUBS = ["LHR", "LGW"]
 LONGHAUL_SECONDARY_HUBS = ["MAN"]
 
 ORIGIN_CITY_FALLBACK = {
-    "LHR": "London",
-    "LGW": "London",
-    "STN": "London",
-    "LTN": "London",
-    "LCY": "London",
-    "MAN": "Manchester",
-    "BRS": "Bristol",
-    "EXT": "Exeter",
-    "NQY": "Newquay",
-    "SOU": "Southampton",
-    "CWL": "Cardiff",
-    "BOH": "Bournemouth",
-    "BHX": "Birmingham",
-    "EMA": "East Midlands",
-    "LPL": "Liverpool",
-    "LBA": "Leeds",
-    "GLA": "Glasgow",
-    "EDI": "Edinburgh",
-    "BFS": "Belfast",
+    "LHR": "London", "LGW": "London", "STN": "London", "LTN": "London", "LCY": "London", "SEN": "London",
+    "MAN": "Manchester", "BHX": "Birmingham", "EMA": "East Midlands", "LPL": "Liverpool", "LBA": "Leeds",
+    "NCL": "Newcastle", "EDI": "Edinburgh", "GLA": "Glasgow", "BFS": "Belfast", "BHD": "Belfast",
+    "BRS": "Bristol", "EXT": "Exeter", "NQY": "Newquay", "SOU": "Southampton", "CWL": "Cardiff", "BOH": "Bournemouth",
 }
 
 
-# ==================== UTILS ====================
+# ==================== LOGGING ====================
 
 def log(msg: str) -> None:
-    print(f"{dt.datetime.utcnow().isoformat(timespec='seconds')}Z | {msg}", flush=True)
+    ts = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    print(f"{ts} | {msg}", flush=True)
 
 
 def _clean_iata(x: Any) -> str:
-    s = (str(x) if x is not None else "").strip().upper()
-    s = re.sub(r"[^A-Z]", "", s)
-    return s[:3]
+    return str(x or "").strip().upper()[:3]
 
 
-def _dedupe_keep_order(items: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for x in items:
-        if x in seen:
+def _dedupe_keep_order(seq: List[str]) -> List[str]:
+    out: List[str] = []
+    for x in seq:
+        xx = _clean_iata(x)
+        if not xx:
             continue
-        seen.add(x)
-        out.append(x)
+        if xx not in out:
+            out.append(xx)
     return out
 
 
 def _stable_mod(key: str, mod: int) -> int:
-    h = 0
-    for ch in key:
-        h = (h * 131 + ord(ch)) % 2_147_483_647
-    return h % max(1, mod)
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % max(1, mod)
 
 
-def explore_run_today(theme_today: str) -> bool:
+def theme_of_day_utc() -> str:
+    today = dt.datetime.utcnow().date()
+    doy = int(today.strftime("%j"))
+    return MASTER_THEMES[doy % len(MASTER_THEMES)]
+
+
+def should_do_explore_this_run(theme_today: str) -> bool:
     today = dt.datetime.utcnow().date().isoformat()
     gh_run_id = (os.getenv("GITHUB_RUN_ID") or "").strip()
     gh_run_attempt = (os.getenv("GITHUB_RUN_ATTEMPT") or "").strip()
@@ -196,12 +228,14 @@ def _sw_england_origins_from_env() -> List[str]:
 
 
 def _theme_origins_from_env(theme_today: str) -> List[str]:
-    """Return ORIGINS_<THEME> if defined, else [].
-
-    Contract: environment variables already exist (ORIGINS_LUXURY_VALUE, ORIGINS_SURF, etc.).
-    We treat these as the primary, explicit origin allowlists to avoid unrealistic origin->destination searches.
     """
-    key = f"ORIGINS_{(theme_today or '').strip().upper()}"
+    If ORIGINS_<THEME> is set (e.g. ORIGINS_LUXURY_VALUE=LHR,LGW,MAN), treat it as the
+    primary origin allowlist for that theme.
+
+    This prevents wasting Duffel searches on implausible regional long-haul pairings.
+    Falls back to legacy pooled origin planning if not set.
+    """
+    key = f"ORIGINS_{str(theme_today or '').strip().upper()}"
     raw = (os.getenv(key, "") or "").strip()
     if not raw:
         return []
@@ -211,48 +245,59 @@ def _theme_origins_from_env(theme_today: str) -> List[str]:
 
 
 def _det_hash_score(seed: str, item: str) -> int:
-    s = f"{seed}|{item}"
-    h = 0
-    for ch in s:
-        h = (h * 131 + ord(ch)) % 2_147_483_647
-    return h
+    h = hashlib.sha256(f"{seed}|{item}".encode("utf-8")).hexdigest()
+    return int(h[:10], 16)
 
 
-def _weighted_pick_unique(seed: str, pools: List[Tuple[List[str], int]], n: int) -> List[str]:
-    # Build weighted list deterministically by hashing
+def _weighted_pick_unique(seed: str, pools: List[Tuple[List[str], int]], k: int) -> List[str]:
     candidates: List[Tuple[int, str]] = []
-    for items, weight in pools:
-        items = _dedupe_keep_order([_clean_iata(x) for x in items if _clean_iata(x)])
-        for it in items:
-            score = _det_hash_score(seed, it)
-            # Apply weight by “replicating” score scale
-            candidates.append((score // max(1, int(100 / max(1, weight))), it))
-    candidates.sort(key=lambda x: x[0])
+    for origins, w in pools:
+        w_int = max(0, int(w))
+        for o in _dedupe_keep_order(origins):
+            if w_int <= 0:
+                continue
+            score = _det_hash_score(seed, o) + (w_int * 1_000_000)
+            candidates.append((score, o))
+
+    candidates.sort(reverse=True, key=lambda t: t[0])
     out: List[str] = []
-    for _, it in candidates:
-        if it not in out:
-            out.append(it)
-        if len(out) >= n:
+    for _, o in candidates:
+        if o not in out:
+            out.append(o)
+        if len(out) >= k:
             break
     return out
 
 
-# ==================== ORIGIN PLANNING ====================
+def required_unique_origins() -> int:
+    if DUFFEL_MAX_INSERTS_PER_ORIGIN <= 0:
+        return 1
+    return int(math.ceil(DUFFEL_MAX_INSERTS / float(DUFFEL_MAX_INSERTS_PER_ORIGIN)))
+
+
+def effective_routes_per_run() -> int:
+    req = required_unique_origins()
+    eff = max(DUFFEL_ROUTES_PER_RUN, req)
+    eff = min(eff, max(1, DUFFEL_MAX_SEARCHES_PER_RUN))
+    return eff
+
 
 def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
     sw = _dedupe_keep_order(_sw_england_origins_from_env())
     seed = f"{dt.datetime.utcnow().date().isoformat()}|{RUN_SLOT}|{theme_today}|ORIGIN_PLAN"
 
+    # If explicit origins are provided via ORIGINS_<THEME>, use them as the primary plan.
     explicit = _theme_origins_from_env(theme_today)
     if explicit:
-        pools = [(explicit, 100)]
-        plan = _weighted_pick_unique(seed + "|EXPLICIT", pools, plan_n)
-        if len(plan) < plan_n:
-            # Fill remainder using the legacy weighted pools for diversity.
-            # This preserves existing behavior but prevents searches on implausible origins.
-            legacy_seed = seed + "|LEGACY_FILL"
-        else:
-            return plan
+        plan = explicit[:]
+        # Pad (only if needed) with major hubs to satisfy required origin count.
+        hub_pad = _dedupe_keep_order(LONDON_FULL + MIDLANDS + ["MAN"])
+        for o in hub_pad:
+            if len(plan) >= plan_n:
+                break
+            if o not in plan:
+                plan.append(o)
+        return plan[:plan_n]
 
     if theme_today == "surf":
         pools = [(sw, 80), (LONDON_LCC, 20)]
@@ -269,27 +314,13 @@ def origin_plan_for_theme(theme_today: str, plan_n: int) -> List[str]:
     elif theme_today == "adventure":
         pools = [(LONDON_FULL + MIDLANDS + NORTH, 60), (sw, 40)]
     elif theme_today == "long_haul":
-        # Long-haul is hub-led: avoid wasting searches on low-liquidity regional origins for true long-haul markets.
-        # Use realistic hubs first (LHR/LGW), then MAN as secondary.
         pools = [(LONGHAUL_PRIMARY_HUBS, 80), (LONGHAUL_SECONDARY_HUBS, 20)]
     elif theme_today == "luxury_value" or theme_today == "unexpected_value":
         pools = [(LONDON_FULL + MIDLANDS, 50), (NORTH + SCOTLAND, 30), (sw, 20)]
     else:
         pools = [(sw, 50), (LONDON_LCC + MIDLANDS, 30), (NORTH + SCOTLAND, 20)]
 
-    legacy_seed_use = locals().get("legacy_seed", seed)
-    legacy_plan = _weighted_pick_unique(legacy_seed_use, pools, plan_n)
-
-    # If explicit origins were provided, keep them as the front of the plan and fill the remainder.
-    if "plan" in locals():
-        for o in legacy_plan:
-            if o not in plan:
-                plan.append(o)
-            if len(plan) >= plan_n:
-                break
-    else:
-        plan = legacy_plan
-
+    plan = _weighted_pick_unique(seed, pools, plan_n)
 
     if len(plan) < min(5, plan_n):
         broad = _dedupe_keep_order(sw + LONDON_LCC + MIDLANDS + NORTH + SCOTLAND + NI)
@@ -322,92 +353,162 @@ def _parse_sa_json(raw: str) -> Dict[str, Any]:
 def gs_client() -> gspread.Client:
     raw = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
     if not raw:
-        raise RuntimeError("Missing GCP_SA_JSON or GCP_SA_JSON_ONE_LINE")
-    sa = _parse_sa_json(raw)
-    return gspread.service_account_from_dict(sa)
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+    info = _parse_sa_json(raw)
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+    )
+    return gspread.authorize(creds)
 
 
-def ws_by_title(gc: gspread.Client, title: str) -> gspread.Worksheet:
-    sh_id = (os.getenv("SHEET_ID") or os.getenv("SPREADSHEET_ID") or "").strip()
-    if not sh_id:
-        raise RuntimeError("Missing SHEET_ID/SPREADSHEET_ID")
-    sh = gc.open_by_key(sh_id)
-    return sh.worksheet(title)
-
-
-def ws_rows(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
-    vals = ws.get_all_values()
-    if not vals or len(vals) < 2:
-        return []
-    header = [h.strip() for h in vals[0]]
+def load_config_rows(sheet: gspread.Spreadsheet) -> List[Dict[str, Any]]:
+    ws = sheet.worksheet(CONFIG_TAB)
+    rows = ws.get_all_records()
     out: List[Dict[str, Any]] = []
-    for row in vals[1:]:
-        d: Dict[str, Any] = {}
-        for i, h in enumerate(header):
-            d[h] = row[i] if i < len(row) else ""
-        out.append(d)
-    return out
-
-
-def ws_append_rows(ws: gspread.Worksheet, rows: List[List[Any]]) -> None:
-    if not rows:
-        return
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
-
-
-def ws_clear(ws: gspread.Worksheet) -> None:
-    ws.clear()
-
-
-def ws_set_header(ws: gspread.Worksheet, header: List[str]) -> None:
-    if not header:
-        return
-    ws.update([header], "A1")
-
-
-# ==================== CONFIG / THEMES ====================
-
-def load_theme_routes(ws_themes: gspread.Worksheet) -> List[Dict[str, Any]]:
-    routes = ws_rows(ws_themes)
-    out: List[Dict[str, Any]] = []
-    for r in routes:
-        theme = (r.get("theme") or "").strip().lower()
-        if not theme:
-            continue
-        origin_iata = _clean_iata(r.get("origin_iata"))
-        dest_iata = _clean_iata(r.get("destination_iata"))
-        if not origin_iata or not dest_iata:
-            continue
-        out.append({
-            "theme": theme,
-            "origin_iata": origin_iata,
-            "destination_iata": dest_iata,
-            "zone": (r.get("zone") or "").strip().lower(),
-            "notes": (r.get("notes") or "").strip(),
-        })
-    return out
-
-
-def load_config(ws_config: gspread.Worksheet) -> Dict[str, str]:
-    rows = ws_rows(ws_config)
-    # Expect a simple key/value sheet: key | value (or similar)
-    out: Dict[str, str] = {}
     for r in rows:
-        k = (r.get("key") or r.get("Key") or r.get("CONFIG_KEY") or "").strip()
-        v = (r.get("value") or r.get("Value") or r.get("CONFIG_VALUE") or "").strip()
-        if k:
-            out[k] = v
+        enabled = str(r.get("enabled", "")).strip().lower()
+        if enabled in ("true", "yes", "1", "y"):
+            out.append(r)
     return out
+
+
+def load_themes_dict(sheet: gspread.Spreadsheet) -> Dict[str, List[Dict[str, Any]]]:
+    ws = sheet.worksheet(THEMES_TAB)
+    rows = ws.get_all_records()
+    themes: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        t = str(r.get("theme", "")).strip()
+        if not t:
+            continue
+        themes.setdefault(t, []).append(r)
+    return themes
+
+
+def load_signals(sheet: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
+    ws = sheet.worksheet(SIGNALS_TAB)
+    rows = ws.get_all_records()
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        key = _clean_iata(
+            r.get("destination_iata")
+            or r.get("iata_hint")
+            or r.get("iata")
+        )
+        if key:
+            out[key] = r
+    return out
+
+
+def load_route_capability_map(sheet: gspread.Spreadsheet) -> Tuple[Set[Tuple[str, str]], Dict[str, str]]:
+    ws = sheet.worksheet(CAPABILITY_TAB)
+    rows = ws.get_all_records()
+
+    allowed: Set[Tuple[str, str]] = set()
+    origin_city_map: Dict[str, str] = {}
+
+    for r in rows:
+        o = _clean_iata(r.get("origin_iata"))
+        d = _clean_iata(r.get("destination_iata"))
+        oc = str(r.get("origin_city", "")).strip()
+        if o and d:
+            allowed.add((o, d))
+            if oc and o not in origin_city_map:
+                origin_city_map[o] = oc
+
+    if not allowed:
+        msg = f"{CAPABILITY_TAB} is empty or missing required headers"
+        if STRICT_CAPABILITY_MAP:
+            raise RuntimeError(msg)
+        log(f"⚠️ {msg} — continuing WITHOUT capability filtering.")
+
+    return allowed, origin_city_map
+
+
+# ==================== BENCHMARKS ====================
+
+def _to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def _split_examples(x: Any) -> List[str]:
+    s = str(x or "").strip()
+    if not s:
+        return []
+    parts = [p.strip().upper() for p in s.split(",")]
+    return [p for p in parts if p]
+
+
+def load_zone_theme_benchmarks(sheet: gspread.Spreadsheet) -> List[Dict[str, Any]]:
+    ws = sheet.worksheet(BENCHMARKS_TAB)
+    rows = ws.get_all_records()
+    out: List[Dict[str, Any]] = []
+
+    for r in rows:
+        theme = str(r.get("theme") or "").strip()
+        origin = _clean_iata(r.get("origin_iata") or "")
+        examples = _split_examples(r.get("destination_examples") or "")
+
+        max_price = _to_float(r.get("max_price"))
+        error_price = _to_float(r.get("error_price")) or 0.0
+
+        if not theme or not origin or max_price is None:
+            continue
+
+        out.append(
+            {
+                "theme": theme,
+                "origin_iata": origin,
+                "destination_examples": examples,
+                "max_price": float(max_price),
+                "error_price": float(error_price),
+            }
+        )
+    return out
+
+
+def compute_ingest_cap_gbp(benchmarks: List[Dict[str, Any]], theme: str, origin: str, destination: str) -> Optional[float]:
+    t = str(theme or "").strip()
+    o = _clean_iata(origin)
+    d = _clean_iata(destination)
+
+    best: Optional[Dict[str, Any]] = None
+    fallback: Optional[Dict[str, Any]] = None
+
+    for r in benchmarks:
+        if str(r.get("theme", "")).strip() != t:
+            continue
+        if _clean_iata(r.get("origin_iata")) != o:
+            continue
+        if fallback is None:
+            fallback = r
+
+        examples = r.get("destination_examples") or []
+        if examples and d in examples:
+            best = r
+            break
+
+    chosen = best if best is not None else fallback
+    if not chosen:
+        return None
+
+    base = float(chosen.get("max_price") or 0.0) + float(chosen.get("error_price") or 0.0)
+    if base <= 0:
+        return None
+
+    cap = max(float(PRICE_GATE_MIN_CAP_GBP), base * float(PRICE_GATE_MULTIPLIER))
+    return float(cap)
 
 
 # ==================== DUFFEL ====================
-
-DUFFEL_API_KEY = (os.getenv("DUFFEL_API_KEY") or "").strip()
-DUFFEL_API_URL = "https://api.duffel.com/air/offer_requests"
-
-DUFFEL_VERSION = os.getenv("DUFFEL_VERSION", "v2").strip()  # keep compat
-DUFFEL_TIMEOUT = int(float(os.getenv("DUFFEL_TIMEOUT", "30")))
-
 
 def duffel_headers() -> Dict[str, str]:
     if not DUFFEL_API_KEY:
@@ -416,183 +517,143 @@ def duffel_headers() -> Dict[str, str]:
         "Authorization": f"Bearer {DUFFEL_API_KEY}",
         "Duffel-Version": DUFFEL_VERSION,
         "Content-Type": "application/json",
-        "Accept": "application/json",
     }
 
 
-def _iso(d: dt.date) -> str:
-    return d.isoformat()
+def duffel_search_offer_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{DUFFEL_API_BASE}/air/offer_requests"
+    r = requests.post(url, headers=duffel_headers(), json=payload, timeout=90)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Duffel offer_requests failed: {r.status_code} {r.text[:500]}")
+    return r.json()
 
 
-def _today_utc() -> dt.date:
-    return dt.datetime.utcnow().date()
-
-
-def _date_in_range(min_days: int, max_days: int, seed: str) -> dt.date:
-    # deterministic day selection within [min_days, max_days]
-    span = max(0, max_days - min_days)
-    off = _stable_mod(seed, max(1, span + 1))
-    return _today_utc() + dt.timedelta(days=min_days + off)
-
-
-def _pick_trip_len(theme_today: str, seed: str) -> int:
-    # Theme-specific min/max trip length vars (keep contract)
-    t = theme_today.strip().upper()
-    min_k = f"TRIP_{t}_MIN_DAYS"
-    max_k = f"TRIP_{t}_MAX_DAYS"
+def offer_price_gbp(offer: Dict[str, Any]) -> float:
+    cur = str(offer.get("total_currency") or "").strip().upper()
+    if cur != "GBP":
+        return 0.0
     try:
-        min_days = int(float(os.getenv(min_k, os.getenv("TRIP_DEFAULT_MIN_DAYS", "4"))))
-        max_days = int(float(os.getenv(max_k, os.getenv("TRIP_DEFAULT_MAX_DAYS", "10"))))
+        return float(offer.get("total_amount"))
     except Exception:
-        min_days, max_days = 4, 10
-    if max_days < min_days:
-        max_days = min_days
-    span = max_days - min_days
-    return min_days + _stable_mod(seed + "|TRIPLEN", span + 1)
+        return 0.0
 
 
-def _pick_window(theme_today: str) -> Tuple[int, int]:
-    t = theme_today.strip().upper()
-    min_k = f"WINDOW_{t}_MIN_DAYS_OUT"
-    max_k = f"WINDOW_{t}_MAX_DAYS_OUT"
+def offer_connections_safe(offer: Dict[str, Any]) -> int:
     try:
-        mn = int(float(os.getenv(min_k, str(INVENTORY_MIN_DAYS_OUT))))
-        mx = int(float(os.getenv(max_k, str(INVENTORY_MAX_DAYS_OUT))))
+        slices = offer.get("slices") or []
+        if not slices:
+            return 99
+        if len(slices) >= 2:
+            out_segs = len((slices[0] or {}).get("segments") or [])
+            in_segs = len((slices[1] or {}).get("segments") or [])
+            if out_segs <= 0 or in_segs <= 0:
+                return 99
+            return max(0, (out_segs - 1)) + max(0, (in_segs - 1))
+        seg_total = 0
+        for s in slices:
+            seg_total += len((s or {}).get("segments") or [])
+        return max(0, seg_total - 1) if seg_total > 0 else 99
     except Exception:
-        mn, mx = INVENTORY_MIN_DAYS_OUT, INVENTORY_MAX_DAYS_OUT
+        return 99
+
+
+def offer_duration_minutes_safe(offer: Dict[str, Any]) -> int:
+    def parse_iso_dur(s: str) -> int:
+        s = str(s or "").strip().upper()
+        if not s.startswith("PT"):
+            return 0
+        s = s[2:]
+        h = 0
+        m = 0
+        num = ""
+        for ch in s:
+            if ch.isdigit():
+                num += ch
+            elif ch == "H":
+                h = int(num or "0"); num = ""
+            elif ch == "M":
+                m = int(num or "0"); num = ""
+            else:
+                num = ""
+        return h * 60 + m
+
+    try:
+        slices = offer.get("slices") or []
+        total = 0
+        found = False
+        for sl in slices:
+            dur = (sl or {}).get("duration")
+            if dur:
+                found = True
+                total += parse_iso_dur(dur)
+        return total if found and total > 0 else 999999
+    except Exception:
+        return 999999
+
+
+# ==================== ENRICH ====================
+
+def enrich_deal(deal: Dict[str, Any], themes_dict: Dict[str, List[Dict[str, Any]]], signals: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    dest = _clean_iata(deal.get("destination_iata", ""))
+    theme = str(deal.get("deal_theme") or deal.get("theme") or "").strip()
+
+    if theme and theme in themes_dict:
+        for d in themes_dict[theme]:
+            if _clean_iata(d.get("destination_iata")) == dest:
+                if d.get("destination_city"):
+                    deal["destination_city"] = d["destination_city"]
+                if d.get("destination_country"):
+                    deal["destination_country"] = d["destination_country"]
+                break
+
+    if dest and dest in signals:
+        s = signals[dest]
+        if not deal.get("destination_city") and s.get("destination_city"):
+            deal["destination_city"] = s["destination_city"]
+        if not deal.get("destination_country") and s.get("destination_country"):
+            deal["destination_country"] = s["destination_country"]
+
+    return deal
+
+
+# ==================== WRITE RAW_DEALS ====================
+
+def append_rows_header_mapped(ws, deals: List[Dict[str, Any]]) -> int:
+    if not deals:
+        return 0
+    headers = ws.row_values(1)
+    if not headers:
+        raise RuntimeError("RAW_DEALS header row is empty")
+
+    rows: List[List[Any]] = []
+    for d in deals:
+        row: List[Any] = []
+        for h in headers:
+            key = str(h).strip()
+            row.append(d.get(key, ""))
+        rows.append(row)
+
+    ws.append_rows(rows, value_input_option="RAW")
+    return len(rows)
+
+
+# ==================== DATE PICKING ====================
+
+def clamp_window(days_min: int, days_max: int) -> Tuple[int, int]:
+    mn = max(int(days_min), int(INVENTORY_MIN_DAYS))
+    mx = min(int(days_max), int(INVENTORY_MAX_DAYS))
     if mx < mn:
-        mx = mn
+        return int(days_min), int(days_max)
     return mn, mx
 
 
-def _theme_max_stops(theme_today: str) -> int:
-    t = theme_today.strip().upper()
-    key = f"MAX_STOPS_{t}"
-    return int(float(os.getenv(key, os.getenv("MAX_STOPS_DEFAULT", "1"))))
-
-
-def create_offer_request(origin_iata: str, dest_iata: str, depart: dt.date, ret: dt.date, max_stops: int) -> Dict[str, Any]:
-    payload = {
-        "data": {
-            "slices": [
-                {"origin": origin_iata, "destination": dest_iata, "departure_date": _iso(depart)},
-                {"origin": dest_iata, "destination": origin_iata, "departure_date": _iso(ret)},
-            ],
-            "passengers": [{"type": "adult"}],
-            "cabin_class": "economy",
-            "max_connections": max_stops,
-        }
-    }
-    resp = requests.post(DUFFEL_API_URL, headers=duffel_headers(), json=payload, timeout=DUFFEL_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_offers(offer_request_id: str) -> List[Dict[str, Any]]:
-    url = f"https://api.duffel.com/air/offer_requests/{offer_request_id}/offers"
-    resp = requests.get(url, headers=duffel_headers(), timeout=DUFFEL_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("data") or []
-
-
-# ==================== OFFER PROCESSING / GATES ====================
-
-def _money_to_gbp(offer: Dict[str, Any]) -> Optional[float]:
-    tot = offer.get("total_amount")
-    cur = (offer.get("total_currency") or "").upper()
-    try:
-        val = float(tot)
-    except Exception:
-        return None
-    if cur == "GBP":
-        return val
-    # If non-GBP, skip (consistent with your logs)
-    return None
-
-
-def _offer_connections(offer: Dict[str, Any]) -> int:
-    # connections = segments - 1 per slice; take max over slices
-    mx = 0
-    for sl in offer.get("slices") or []:
-        segs = sl.get("segments") or []
-        mx = max(mx, max(0, len(segs) - 1))
-    return mx
-
-
-def _offer_duration_minutes(offer: Dict[str, Any]) -> int:
-    # Duffel slice duration is seconds as string in some payloads; fallback to sum segments
-    mx = 0
-    for sl in offer.get("slices") or []:
-        dur = sl.get("duration")
-        if dur:
-            try:
-                mx = max(mx, int(float(dur)) // 60)
-                continue
-            except Exception:
-                pass
-        # fallback
-        total = 0
-        for seg in sl.get("segments") or []:
-            sd = seg.get("duration")
-            try:
-                total += int(float(sd)) // 60
-            except Exception:
-                pass
-        mx = max(mx, total)
-    return mx
-
-
-def _is_longhaul(dest_iata: str) -> bool:
-    # simple heuristic: long-haul destinations are typically outside Europe/N. Africa; but we keep it conservative.
-    # We do NOT change schema. This is only for hygiene thresholds.
-    # If you have a more reliable mapping elsewhere, it should remain there.
-    return dest_iata in {"HND", "NRT", "JFK", "EWR", "LAX", "SFO", "SEA", "BKK", "SIN", "SYD", "MEL", "AKL", "DXB", "DOH", "AUH", "MLE", "SEZ", "CPT", "JNB"}
-
-
-def hygiene_gate_ok(offer: Dict[str, Any], dest_iata: str, cap_gbp: float) -> Tuple[bool, Dict[str, Any]]:
-    if not HYGIENE_ENABLED:
-        return True, {"rej_conn": 0, "rej_dur": 0, "rej_band": 0, "band_cap": "1.0x"}
-
-    conn = _offer_connections(offer)
-    dur = _offer_duration_minutes(offer)
-    longhaul = _is_longhaul(dest_iata)
-
-    max_conn = HYGIENE_CONN_LONG if longhaul else HYGIENE_CONN_SHORT
-    max_dur = HYGIENE_DUR_LONG if longhaul else HYGIENE_DUR_SHORT
-    band = HYGIENE_BAND_LONG if longhaul else HYGIENE_BAND_SHORT
-
-    if conn > max_conn:
-        return False, {"rej_conn": 1, "rej_dur": 0, "rej_band": 0, "band_cap": f"{band:.2f}"}
-    if dur > max_dur:
-        return False, {"rej_conn": 0, "rej_dur": 1, "rej_band": 0, "band_cap": f"{band:.2f}"}
-
-    # band cap: only apply if cap_gbp is meaningful (>0)
-    if cap_gbp and cap_gbp > 0:
-        band_cap = cap_gbp * band
-        gbp = _money_to_gbp(offer)
-        if gbp is not None and gbp > band_cap:
-            return False, {"rej_conn": 0, "rej_dur": 0, "rej_band": 1, "band_cap": f"{band:.2f}"}
-        return True, {"rej_conn": 0, "rej_dur": 0, "rej_band": 0, "band_cap": band_cap}
-    return True, {"rej_conn": 0, "rej_dur": 0, "rej_band": 0, "band_cap": "n/a"}
-
-
-def _cap_for_route(theme_today: str, zone: str, dest_iata: str) -> float:
-    # Keep existing simple cap logic: fallback to global min cap if missing
-    # (Actual ZONE_THEME_BENCHMARKS may be used elsewhere; this function preserves contract)
-    # For this locked build, we use a conservative cap with multiplier.
-    base = 360.0 if theme_today in {"luxury_value", "long_haul"} else 250.0
-    cap = max(PRICE_GATE_MINCAP_GBP, base * PRICE_GATE_MULT)
-    return cap
-
-
-def _price_gate_ok(gbp: float, cap_gbp: float) -> bool:
-    return gbp <= cap_gbp
-
-
-def _sleep() -> None:
-    if FEEDER_SLEEP_SECONDS > 0:
-        time.sleep(FEEDER_SLEEP_SECONDS)
+def pick_dates(seed: str, days_min: int, days_max: int, trip_len: int) -> Tuple[dt.date, dt.date]:
+    hsh = int(hashlib.md5(seed.encode("utf-8")).hexdigest()[:8], 16)
+    span = max(1, (days_max - days_min + 1))
+    dep_offset = days_min + (hsh % span)
+    dep_date = dt.datetime.utcnow().date() + dt.timedelta(days=dep_offset)
+    ret_date = dep_date + dt.timedelta(days=int(trip_len))
+    return dep_date, ret_date
 
 
 # ==================== MAIN ====================
@@ -602,40 +663,69 @@ def main() -> int:
     log("TRAVELTXTTER PIPELINE WORKER (FEEDER) START")
     log("=" * 80)
 
-    theme_today = THEME_DEFAULT.lower()
+    if not SPREADSHEET_ID:
+        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
+
+    theme_today = theme_of_day_utc()
     log(f"🎯 Theme of the day (UTC): {theme_today}")
 
-    sparse_override = False
-    effective_open = FEEDER_OPEN_ORIGINS or sparse_override
-    log(f"ORIGIN_POLICY: FEEDER_OPEN_ORIGINS={FEEDER_OPEN_ORIGINS} | sparse_override={sparse_override} | effective_open={effective_open}")
+    sparse_theme_override = theme_today in SPARSE_THEMES
+    open_origins_effective = bool(FEEDER_OPEN_ORIGINS or sparse_theme_override)
 
-    max_inserts = DUFFEL_MAX_INSERTS
-    per_origin = DUFFEL_MAX_INSERTS_PER_ORIGIN
-    per_route = DUFFEL_MAX_INSERTS_PER_ROUTE
-    max_searches = DUFFEL_MAX_SEARCHES_PER_RUN
-    eff_routes = max(1, DUFFEL_ROUTES_PER_RUN)
-    log(f"CAPS: MAX_INSERTS={max_inserts} | PER_ORIGIN={per_origin} | PER_ROUTE={per_route} | MAX_SEARCHES={max_searches} | ROUTES_PER_RUN(env)={DUFFEL_ROUTES_PER_RUN} | ROUTES_PER_RUN(effective)={eff_routes}")
-    log(f"CAPACITY_NOTE: theoretical_max_inserts_this_run <= {max_inserts} (based on caps + effective routes)")
+    req_origins = required_unique_origins()
+    eff_routes = effective_routes_per_run()
 
-    log(f"PRICE_GATE: fallback={PRICE_GATE_FALLBACK_BEHAVIOR} | mult={PRICE_GATE_MULT} | mincap={PRICE_GATE_MINCAP_GBP}")
-    log(f"HYGIENE: enabled={HYGIENE_ENABLED} | conn_short={HYGIENE_CONN_SHORT} conn_long={HYGIENE_CONN_LONG} | dur_short={HYGIENE_DUR_SHORT} dur_long={HYGIENE_DUR_LONG} | band_short={HYGIENE_BAND_SHORT} band_long={HYGIENE_BAND_LONG}")
-    log(f"INVENTORY_WINDOW_DAYS={INVENTORY_MIN_DAYS_OUT}-{INVENTORY_MAX_DAYS_OUT} | ZERO_OFFER_RETRY_ENABLED={ZERO_OFFER_RETRY_ENABLED} retry_window_max={ZERO_OFFER_RETRY_WINDOW_MAX}")
+    theoretical_max_by_routes = DUFFEL_MAX_INSERTS_PER_ROUTE * eff_routes
+    theoretical_max_by_origins = DUFFEL_MAX_INSERTS_PER_ORIGIN * eff_routes
+    theoretical_max = min(DUFFEL_MAX_INSERTS, theoretical_max_by_routes, theoretical_max_by_origins)
 
-    explore_run = explore_run_today(theme_today)
+    if eff_routes != DUFFEL_ROUTES_PER_RUN:
+        log(f"⚠️ CONFIG_GUARDRAIL: DUFFEL_ROUTES_PER_RUN={DUFFEL_ROUTES_PER_RUN} < required_origins={req_origins} "
+            f"for DUFFEL_MAX_INSERTS={DUFFEL_MAX_INSERTS} @ {DUFFEL_MAX_INSERTS_PER_ORIGIN}/origin. "
+            f"Auto-bumping effective_routes_per_run => {eff_routes} (capped by DUFFEL_MAX_SEARCHES_PER_RUN={DUFFEL_MAX_SEARCHES_PER_RUN}).")
+
+    log(f"ORIGIN_POLICY: FEEDER_OPEN_ORIGINS={FEEDER_OPEN_ORIGINS} | sparse_override={sparse_theme_override} | effective_open={open_origins_effective}")
+    log(f"CAPS: MAX_INSERTS={DUFFEL_MAX_INSERTS} | PER_ORIGIN={DUFFEL_MAX_INSERTS_PER_ORIGIN} | PER_ROUTE={DUFFEL_MAX_INSERTS_PER_ROUTE} | "
+        f"MAX_SEARCHES={DUFFEL_MAX_SEARCHES_PER_RUN} | ROUTES_PER_RUN(env)={DUFFEL_ROUTES_PER_RUN} | ROUTES_PER_RUN(effective)={eff_routes}")
+    log(f"CAPACITY_NOTE: theoretical_max_inserts_this_run <= {theoretical_max} (based on caps + effective routes)")
+    log(f"PRICE_GATE: fallback={PRICE_GATE_FALLBACK_BEHAVIOR} | mult={PRICE_GATE_MULTIPLIER} | mincap={PRICE_GATE_MIN_CAP_GBP}")
+    log(f"HYGIENE: enabled={HYGIENE_ENABLED} | conn_short={OFFER_MAX_CONNECTIONS_SHORTHAUL} conn_long={OFFER_MAX_CONNECTIONS_LONGHAUL} | "
+        f"dur_short={OFFER_MAX_DURATION_MINUTES_SHORTHAUL} dur_long={OFFER_MAX_DURATION_MINUTES_LONGHAUL} | "
+        f"band_short={QUALITY_PRICE_BAND_SHORTHAUL} band_long={QUALITY_PRICE_BAND_LONGHAUL}")
+    log(f"INVENTORY_WINDOW_DAYS={INVENTORY_MIN_DAYS}-{INVENTORY_MAX_DAYS} | ZERO_OFFER_RETRY_ENABLED={ZERO_OFFER_RETRY_ENABLED} retry_window_max={ZERO_OFFER_RETRY_MAX_DAYS}")
+
+    explore_run = should_do_explore_this_run(theme_today)
     theme_quota = eff_routes if not explore_run else max(0, eff_routes - 1)
     explore_quota = 0 if not explore_run else 1
     log(f"🧠 Strategy: 90/10 | explore_run={explore_run} | theme_quota={theme_quota} | explore_quota={explore_quota} | MOD={FEEDER_EXPLORE_RUN_MOD}")
 
     gc = gs_client()
-    ws_raw = ws_by_title(gc, RAW_DEALS_TAB)
-    ws_themes = ws_by_title(gc, THEMES_TAB)
+    sh = gc.open_by_key(SPREADSHEET_ID)
 
-    theme_routes_all = load_theme_routes(ws_themes)
-    theme_routes = [r for r in theme_routes_all if r["theme"] == theme_today]
-    explore_routes = [r for r in theme_routes_all if r["theme"] != theme_today]
+    ws_raw = sh.worksheet(RAW_DEALS_TAB)
+    raw_headers = ws_raw.row_values(1)
+    raw_header_set = {str(h).strip() for h in raw_headers if h}
+
+    config_rows = load_config_rows(sh)
+    themes_dict = load_themes_dict(sh)
+    signals = load_signals(sh)
+    if not signals:
+        log(f"⚠️ CONFIG_SIGNALS loaded 0 rows — check IATA key column (destination_iata vs iata_hint) in '{SIGNALS_TAB}'.")
+    allowed_pairs, origin_city_map = load_route_capability_map(sh)
+
+    benchmarks: List[Dict[str, Any]] = []
+    if PRICE_GATE_ENABLED:
+        try:
+            benchmarks = load_zone_theme_benchmarks(sh)
+        except Exception as e:
+            log(f"⚠️ PRICE_GATE: failed to load '{BENCHMARKS_TAB}': {e} | fallback={PRICE_GATE_FALLBACK_BEHAVIOR}")
+            benchmarks = []
+
+    theme_routes = [r for r in config_rows if str(r.get("theme") or "").strip() == theme_today]
+    explore_routes = [r for r in config_rows if str(r.get("theme") or "").strip() != theme_today]
 
     def unique_dest_configs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        seen = set()
+        seen: Set[str] = set()
         out: List[Dict[str, Any]] = []
         for r in rows:
             d = _clean_iata(r.get("destination_iata"))
@@ -648,166 +738,348 @@ def main() -> int:
     theme_dest_configs = unique_dest_configs(theme_routes)
     explore_dest_configs = unique_dest_configs(explore_routes)
 
-    req_origins = 5
     plan_n = max(5, req_origins, eff_routes)
     planned_origins = origin_plan_for_theme(theme_today, plan_n)
     log(f"🧭 Planned origins for run ({len(planned_origins)}; required={plan_n}): {planned_origins}")
     log(f"🧭 Unique theme destinations: {len(theme_dest_configs)} | Unique explore destinations: {len(explore_dest_configs)}")
 
+    # -------- RULE B SELECTION (one per origin first) --------
+
+    THEME_ANCHOR_ORIGINS = {
+        'city_breaks': ['LGW', 'STN', 'LTN'],
+        'culture_history': ['LGW', 'STN', 'LTN'],
+        'winter_sun': ['MAN', 'LGW', 'STN', 'LTN'],
+        'long_haul': ['LHR', 'LGW', 'MAN'],
+        'snow': ['LGW', 'MAN', 'EDI', 'GLA', 'STN', 'LTN'],
+        'surf': ['BRS', 'NQY', 'EXT', 'LGW', 'STN', 'LTN'],
+    }
+
+    def selection_origins_for_theme(theme_key: str) -> List[str]:
+        anchors = THEME_ANCHOR_ORIGINS.get(theme_key, [])
+        ordered: List[str] = []
+        for a in anchors:
+            if a in planned_origins and a not in ordered:
+                ordered.append(a)
+        for o in planned_origins:
+            if o not in ordered:
+                ordered.append(o)
+        return ordered
+
+    def route_precheck_ok(origin: str, dest: str, deal_theme: str) -> bool:
+        if allowed_pairs and (origin, dest) not in allowed_pairs:
+            return False
+        if PRICE_GATE_ENABLED:
+            if not benchmarks:
+                return PRICE_GATE_FALLBACK_BEHAVIOR != "BLOCK"
+            cap = compute_ingest_cap_gbp(benchmarks, deal_theme, origin, dest)
+            if cap is None and PRICE_GATE_FALLBACK_BEHAVIOR == "BLOCK":
+                return False
+        return True
+
+    def select_routes_rule_b(dest_configs: List[Dict[str, Any]], quota: int) -> List[Tuple[str, str, Dict[str, Any]]]:
+        if quota <= 0 or not dest_configs:
+            return []
+
+        picked: List[Tuple[str, str, Dict[str, Any]]] = []
+        used_dests: Set[str] = set()
+
+        sel_origins = selection_origins_for_theme(theme_today)
+
+        for origin in sel_origins:
+            if len(picked) >= quota:
+                break
+            for cfg in dest_configs:
+                dest = _clean_iata(cfg.get("destination_iata"))
+                if not dest or dest in used_dests:
+                    continue
+                deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
+                if not route_precheck_ok(origin, dest, deal_theme):
+                    continue
+                picked.append((origin, dest, cfg))
+                used_dests.add(dest)
+                break
+
+        safety = 0
+        while len(picked) < quota and safety < 5000:
+            safety += 1
+            progressed = False
+            for origin in sel_origins:
+                if len(picked) >= quota:
+                    break
+                for cfg in dest_configs:
+                    dest = _clean_iata(cfg.get("destination_iata"))
+                    if not dest or dest in used_dests:
+                        continue
+                    deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
+                    if not route_precheck_ok(origin, dest, deal_theme):
+                        continue
+                    picked.append((origin, dest, cfg))
+                    used_dests.add(dest)
+                    progressed = True
+                    break
+            if not progressed:
+                break
+
+        return picked
+
+    selected_routes: List[Tuple[str, str, Dict[str, Any]]] = []
+    selected_routes.extend(select_routes_rule_b(theme_dest_configs, theme_quota))
+
+    if explore_quota > 0 and explore_dest_configs:
+        today = dt.datetime.utcnow().date().isoformat()
+        seed = f"{FEEDER_EXPLORE_SALT}|{today}|{RUN_SLOT}|{theme_today}|EXPLORE"
+        offset = _stable_mod(seed, max(1, len(explore_dest_configs)))
+        rotated = explore_dest_configs[offset:] + explore_dest_configs[:offset]
+        selected_routes.extend(select_routes_rule_b(rotated, 1))
+
+    if len(selected_routes) > DUFFEL_MAX_SEARCHES_PER_RUN:
+        selected_routes = selected_routes[:DUFFEL_MAX_SEARCHES_PER_RUN]
+
+    if not selected_routes:
+        log("⚠️ No eligible routes after capability/benchmark/planned-origin filtering.")
+        return 0
+
     searches_done = 0
-    inserted_total = 0
-    rows_to_insert: List[List[Any]] = []
+    all_deals: List[Dict[str, Any]] = []
+    inserted_by_origin: Dict[str, int] = {}
 
-    # Minimal header expectation in RAW_DEALS (do NOT rename)
-    header = ws_raw.row_values(1)
-    if not header:
-        raise RuntimeError("RAW_DEALS header row missing")
-    header_lc = [h.strip().lower() for h in header]
+    def is_longhaul_theme(deal_theme: str) -> bool:
+        t = str(deal_theme or "").strip()
+        return t in {"long_haul", "adventure"}
 
-    def idx(col: str) -> int:
-        try:
-            return header_lc.index(col.lower())
-        except ValueError:
-            return -1
-
-    # Required columns (best-effort; do not alter schema)
-    c_origin = idx("origin_iata")
-    c_dest = idx("destination_iata")
-    c_out = idx("depart_date")
-    c_back = idx("return_date")
-    c_price = idx("price_gbp")
-    c_theme = idx("theme")
-    c_status = idx("status")
-    c_created = idx("created_utc")
-
-    # Run selection: one per origin first, then fill
-    def pick_dest_for_origin(o: str, i: int) -> Optional[Dict[str, Any]]:
-        if theme_dest_configs:
-            return theme_dest_configs[i % len(theme_dest_configs)]
-        return None
-
-    for i, origin_iata in enumerate(planned_origins[:eff_routes]):
-        if searches_done >= max_searches:
-            break
-        dest_cfg = pick_dest_for_origin(origin_iata, i)
-        if not dest_cfg:
-            continue
-        dest_iata = _clean_iata(dest_cfg["destination_iata"])
-        zone = (dest_cfg.get("zone") or "").strip().lower()
-        cap_gbp = _cap_for_route(theme_today, zone, dest_iata)
-
-        mn, mx = _pick_window(theme_today)
-        trip_len = _pick_trip_len(theme_today, f"{origin_iata}-{dest_iata}-{i}")
-        depart = _date_in_range(mn, mx, f"{origin_iata}|{dest_iata}|OUT|{i}")
-        ret = depart + dt.timedelta(days=trip_len)
-
-        max_stops = _theme_max_stops(theme_today)
-
-        log(f"Duffel[PRIMARY]: Searching {origin_iata}->{dest_iata} {depart}/{ret}")
-        try:
-            r = create_offer_request(origin_iata, dest_iata, depart, ret, max_stops=max_stops)
-            offer_request_id = (r.get("data") or {}).get("id") or ""
-            offers = get_offers(offer_request_id) if offer_request_id else []
-        except Exception as e:
-            log(f"❌ Duffel error for {origin_iata}->{dest_iata}: {e}")
-            _sleep()
-            searches_done += 1
-            continue
-
-        offers_returned = len(offers)
-        gbp_ranked = 0
-        processed = 0
-        rej_non_gbp = 0
-        rej_price = 0
-        rej_conn = 0
-        rej_dur = 0
-        rej_band = 0
-        inserted = 0
-        band_cap = "1.0x"
-
-        for off in offers:
-            gbp = _money_to_gbp(off)
-            if gbp is None:
-                rej_non_gbp += 1
-                continue
-            gbp_ranked += 1
-            processed += 1
-
-            if not _price_gate_ok(gbp, cap_gbp):
-                rej_price += 1
-                continue
-
-            ok, rej_meta = hygiene_gate_ok(off, dest_iata, cap_gbp)
-            band_cap = rej_meta.get("band_cap", band_cap)
-            if not ok:
-                rej_conn += int(rej_meta.get("rej_conn", 0))
-                rej_dur += int(rej_meta.get("rej_dur", 0))
-                rej_band += int(rej_meta.get("rej_band", 0))
-                continue
-
-            # Passed gates: build a RAW_DEALS row in existing schema
-            row = [""] * len(header)
-            now_utc = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-            if c_origin >= 0:
-                row[c_origin] = origin_iata
-            if c_dest >= 0:
-                row[c_dest] = dest_iata
-            if c_out >= 0:
-                row[c_out] = depart.isoformat()
-            if c_back >= 0:
-                row[c_back] = ret.isoformat()
-            if c_price >= 0:
-                row[c_price] = f"{gbp:.2f}"
-            if c_theme >= 0:
-                row[c_theme] = theme_today
-            if c_status >= 0:
-                row[c_status] = "NEW"
-            if c_created >= 0:
-                row[c_created] = now_utc
-
-            rows_to_insert.append(row)
-            inserted += 1
-            inserted_total += 1
-
-            if inserted_total >= max_inserts:
-                break
-            if inserted >= per_route:
-                break
-
-        log(
-            f"Duffel[PRIMARY]: offers_returned={offers_returned} "
-            f"{'gbp_ranked='+str(gbp_ranked) if offers_returned else ''} "
-            f"processed={processed} cap_gbp={int(cap_gbp)} band_cap={band_cap} "
-            f"rej_non_gbp={rej_non_gbp} rej_price={rej_price} rej_conn={rej_conn} rej_dur={rej_dur} rej_band={rej_band} "
-            f"inserted={inserted}"
+    def hygiene_limits_for_theme(deal_theme: str) -> Tuple[int, int, float]:
+        if is_longhaul_theme(deal_theme):
+            return (
+                max(0, int(OFFER_MAX_CONNECTIONS_LONGHAUL)),
+                max(0, int(OFFER_MAX_DURATION_MINUTES_LONGHAUL)),
+                float(QUALITY_PRICE_BAND_LONGHAUL),
+            )
+        return (
+            max(0, int(OFFER_MAX_CONNECTIONS_SHORTHAUL)),
+            max(0, int(OFFER_MAX_DURATION_MINUTES_SHORTHAUL)),
+            float(QUALITY_PRICE_BAND_SHORTHAUL),
         )
 
-        searches_done += 1
-        _sleep()
+    def run_search(origin: str, destination: str, dep_date: dt.date, ret_date: dt.date, cfg: Dict[str, Any], cap_gbp: Optional[float]) -> Tuple[int, List[Dict[str, Any]]]:
+        nonlocal searches_done, all_deals, inserted_by_origin
 
-        if inserted_total >= max_inserts:
+        max_conn = int(cfg.get("max_connections") or 0)
+        payload = {
+            "data": {
+                "slices": [
+                    {"origin": origin, "destination": destination, "departure_date": dep_date.isoformat()},
+                    {"origin": destination, "destination": origin, "departure_date": ret_date.isoformat()},
+                ],
+                "passengers": [{"type": "adult"}],
+                "cabin_class": (cfg.get("cabin_class") or "economy"),
+                "max_connections": max_conn,
+                "return_offers": True,
+            }
+        }
+
+        log(f"Duffel[PRIMARY]: Searching {origin}->{destination} {dep_date.isoformat()}/{ret_date.isoformat()}")
+        resp = duffel_search_offer_request(payload)
+        searches_done += 1
+
+        offers = (resp.get("data") or {}).get("offers") or []
+        offers_returned = len(offers)
+        if offers_returned == 0:
+            log("Duffel[PRIMARY]: offers_returned=0")
+            return 0, []
+
+        deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
+        max_conn_hard, max_dur_hard, band = hygiene_limits_for_theme(deal_theme)
+
+        gbp_offers: List[Dict[str, Any]] = []
+        rejected_non_gbp = 0
+        for off in offers:
+            if offer_price_gbp(off) <= 0:
+                rejected_non_gbp += 1
+                continue
+            gbp_offers.append(off)
+
+        rejected_price_hard = 0
+        if PRICE_GATE_ENABLED and cap_gbp is not None:
+            in_cap: List[Dict[str, Any]] = []
+            for off in gbp_offers:
+                if offer_price_gbp(off) <= cap_gbp:
+                    in_cap.append(off)
+                else:
+                    rejected_price_hard += 1
+            gbp_offers = in_cap
+
+        rejected_hygiene_conn = 0
+        rejected_hygiene_dur = 0
+        if HYGIENE_ENABLED and gbp_offers:
+            kept: List[Dict[str, Any]] = []
+            for off in gbp_offers:
+                conn = offer_connections_safe(off)
+                dur = offer_duration_minutes_safe(off)
+                if conn > max_conn_hard:
+                    rejected_hygiene_conn += 1
+                    continue
+                if dur > max_dur_hard:
+                    rejected_hygiene_dur += 1
+                    continue
+                kept.append(off)
+            gbp_offers = kept
+
+        rejected_band = 0
+        band_cap: Optional[float] = None
+        if HYGIENE_ENABLED and PRICE_GATE_ENABLED and cap_gbp is not None and gbp_offers:
+            if band > 0 and band < 1.0:
+                band_cap = float(cap_gbp) * float(band)
+                kept2: List[Dict[str, Any]] = []
+                for off in gbp_offers:
+                    if offer_price_gbp(off) <= band_cap:
+                        kept2.append(off)
+                    else:
+                        rejected_band += 1
+                gbp_offers = kept2
+
+        if not gbp_offers:
+            cap_str = f"{int(cap_gbp)}" if cap_gbp is not None else "NONE"
+            band_str = f"{int(band_cap)}" if band_cap is not None else ("NONE" if cap_gbp is None else "1.0x")
+            log(
+                f"Duffel[PRIMARY]: offers_returned={offers_returned} gbp_offers=0 cap_gbp={cap_str} band_cap={band_str} "
+                f"rej_non_gbp={rejected_non_gbp} rej_price={rejected_price_hard} rej_conn={rejected_hygiene_conn} "
+                f"rej_dur={rejected_hygiene_dur} rej_band={rejected_band} inserted=0"
+            )
+            return offers_returned, []
+
+        def rank_key(off: Dict[str, Any]) -> Tuple[float, int, int]:
+            return (offer_price_gbp(off), offer_connections_safe(off), offer_duration_minutes_safe(off))
+
+        ranked = sorted(gbp_offers, key=rank_key)
+
+        remaining_total = max(0, DUFFEL_MAX_INSERTS - len(all_deals))
+        remaining_origin = max(0, DUFFEL_MAX_INSERTS_PER_ORIGIN - inserted_by_origin.get(origin, 0))
+        take_n = min(DUFFEL_MAX_INSERTS_PER_ROUTE, DUFFEL_OFFERS_PER_SEARCH, remaining_total, remaining_origin)
+
+        now_iso = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        inserted_here = 0
+        processed = 0
+        deals_out: List[Dict[str, Any]] = []
+
+        for off in ranked:
+            if inserted_here >= take_n:
+                break
+            processed += 1
+
+            price = offer_price_gbp(off)
+            off_id = str(off.get("id") or "")
+            deal_id_seed = f"{origin}->{destination}|{dep_date.isoformat()}|{ret_date.isoformat()}|{price:.2f}|{off_id}"
+            deal_id = hashlib.sha256(deal_id_seed.encode("utf-8")).hexdigest()[:24]
+
+            deal: Dict[str, Any] = {
+                "status": "NEW",
+                "deal_id": deal_id,
+                "price_gbp": int(math.ceil(price)),
+                "origin_iata": origin,
+                "origin_city": resolve_origin_city(origin, origin_city_map),
+                "destination_iata": destination,
+                "outbound_date": dep_date.strftime("%Y-%m-%d"),
+                "return_date": ret_date.strftime("%Y-%m-%d"),
+                "deal_theme": deal_theme,
+                "theme": deal_theme,
+                "destination_city": "",
+                "destination_country": "",
+            }
+
+            if "ingested_at_utc" in raw_header_set:
+                deal["ingested_at_utc"] = now_iso
+            if "created_utc" in raw_header_set:
+                deal["created_utc"] = now_iso
+            if "created_at" in raw_header_set:
+                deal["created_at"] = now_iso
+            if "timestamp" in raw_header_set:
+                deal["timestamp"] = now_iso
+
+            deal = enrich_deal(deal, themes_dict, signals)
+            deals_out.append(deal)
+            inserted_here += 1
+
+        inserted_by_origin[origin] = inserted_by_origin.get(origin, 0) + inserted_here
+
+        cap_str = f"{int(cap_gbp)}" if cap_gbp is not None else "NONE"
+        band_str = f"{int(band_cap)}" if band_cap is not None else ("NONE" if cap_gbp is None else "1.0x")
+        log(
+            f"Duffel[PRIMARY]: offers_returned={offers_returned} gbp_ranked={len(ranked)} processed={processed} "
+            f"cap_gbp={cap_str} band_cap={band_str} rej_non_gbp={rejected_non_gbp} rej_price={rejected_price_hard} "
+            f"rej_conn={rejected_hygiene_conn} rej_dur={rejected_hygiene_dur} rej_band={rejected_band} "
+            f"inserted={inserted_here} origin_total={inserted_by_origin[origin]}/{DUFFEL_MAX_INSERTS_PER_ORIGIN} "
+            f"running_total={len(all_deals) + len(deals_out)}/{DUFFEL_MAX_INSERTS}"
+        )
+
+        return offers_returned, deals_out
+
+    for origin, destination, cfg in selected_routes:
+        if searches_done >= DUFFEL_MAX_SEARCHES_PER_RUN:
+            break
+        if len(all_deals) >= DUFFEL_MAX_INSERTS:
             break
 
-    log(f"✓ Searches completed: {searches_done}")
-    log(f"✓ Deals collected: {inserted_total} (cap {max_inserts})")
+        if inserted_by_origin.get(origin, 0) >= DUFFEL_MAX_INSERTS_PER_ORIGIN:
+            log(f"⏭️  ORIGIN_CAP skip: {origin} already inserted {inserted_by_origin[origin]}/{DUFFEL_MAX_INSERTS_PER_ORIGIN}")
+            continue
 
-    if inserted_total <= 0:
+        days_min = int(cfg.get("days_ahead_min") or DEFAULT_DAYS_AHEAD_MIN)
+        days_max = int(cfg.get("days_ahead_max") or DEFAULT_DAYS_AHEAD_MAX)
+        trip_len = int(cfg.get("trip_length_days") or DEFAULT_TRIP_LENGTH_DAYS)
+        days_min, days_max = clamp_window(days_min, days_max)
+
+        seed = f"{dt.datetime.utcnow().date().isoformat()}|{origin}|{destination}|{trip_len}|{RUN_SLOT}"
+        dep_date, ret_date = pick_dates(seed, days_min, days_max, trip_len)
+
+        deal_theme = str(cfg.get("theme") or theme_today).strip() or theme_today
+
+        cap_gbp: Optional[float] = None
+        if PRICE_GATE_ENABLED and benchmarks:
+            cap_gbp = compute_ingest_cap_gbp(benchmarks, deal_theme, origin, destination)
+
+        if PRICE_GATE_ENABLED and cap_gbp is None:
+            if PRICE_GATE_FALLBACK_BEHAVIOR == "BLOCK":
+                log(f"⛔ BENCHMARK_MISS (pre-check) {origin}->{destination} theme={deal_theme} | fallback=BLOCK => search_skipped")
+                continue
+            log(f"⚠️ BENCHMARK_MISS (pre-check) {origin}->{destination} theme={deal_theme} | fallback=ALLOW (no cap)")
+
+        try:
+            offers_returned, deals_out = run_search(origin, destination, dep_date, ret_date, cfg, cap_gbp)
+        except Exception as e:
+            log(f"❌ Duffel[PRIMARY] error: {e}")
+            continue
+
+        if deals_out:
+            all_deals.extend(deals_out)
+        else:
+            if ZERO_OFFER_RETRY_ENABLED and offers_returned == 0 and searches_done < DUFFEL_MAX_SEARCHES_PER_RUN and len(all_deals) < DUFFEL_MAX_INSERTS:
+                retry_max = min(ZERO_OFFER_RETRY_MAX_DAYS, INVENTORY_MAX_DAYS)
+                retry_min = INVENTORY_MIN_DAYS
+                if retry_max >= retry_min:
+                    retry_seed = seed + "|retry"
+                    dep2, ret2 = pick_dates(retry_seed, retry_min, retry_max, trip_len)
+                    log(f"🔄 ZERO_OFFER_RETRY: {origin}->{destination} using {retry_min}-{retry_max}d window => {dep2.isoformat()}/{ret2.isoformat()}")
+                    try:
+                        _, deals_out2 = run_search(origin, destination, dep2, ret2, cfg, cap_gbp)
+                        if deals_out2:
+                            all_deals.extend(deals_out2)
+                    except Exception as e:
+                        log(f"❌ Duffel[PRIMARY] retry error: {e}")
+
+        if FEEDER_SLEEP_SECONDS > 0:
+            time.sleep(FEEDER_SLEEP_SECONDS)
+
+    log(f"✓ Searches completed: {searches_done}")
+    log(f"✓ Deals collected: {len(all_deals)} (cap {DUFFEL_MAX_INSERTS})")
+
+    if not all_deals:
         log("⚠️ No deals passed gates for this run.")
         return 0
 
-    try:
-        ws_append_rows(ws_raw, rows_to_insert)
-    except Exception as e:
-        log(f"❌ Failed inserting rows into {RAW_DEALS_TAB}: {e}")
-        return 2
-
-    log(f"✅ Inserted {inserted_total} rows into {RAW_DEALS_TAB}")
+    inserted = append_rows_header_mapped(ws_raw, all_deals)
+    log(f"✅ Inserted {inserted} rows into {RAW_DEALS_TAB}")
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        raise
+    raise SystemExit(main())

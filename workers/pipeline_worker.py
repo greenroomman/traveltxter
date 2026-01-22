@@ -14,12 +14,15 @@ BEHAVIOUR GUARANTEES IN THIS VERSION:
 ✅ Theme origins override:
    If ORIGINS_<THEME> is set, it becomes the primary origin allowlist for that theme.
 
-✅ CONFIG route-pair enforcement (THIS FIX):
+✅ CONFIG route-pair enforcement:
    CONFIG already contains explicit origin_iata + destination_iata pairs.
    By default we now RESPECT those pairs so the feeder cannot invent routes like STN->SEZ
    unless that exact pair exists in CONFIG.
 
-This directly stops “reinforcing failures” by preventing implausible origin/destination pairings.
+✅ NEW (this fix):
+   If ORIGINS_<THEME> is set AND FEEDER_OPEN_ORIGINS is False (and no sparse override),
+   then planned origins = exactly the explicit list (no padding with extra hubs/LCC).
+   This prevents “planned origin noise” in logs and removes any chance of fallback pairing drift.
 """
 
 from __future__ import annotations
@@ -657,8 +660,15 @@ def main() -> int:
     explore_rows = [r for r in config_rows if str(r.get("theme") or "").strip() != theme_today]
 
     # Planned origins are still useful for filtering/ordering, but cannot create new routes.
-    plan_n = max(5, req_origins, eff_routes)
-    planned_origins = origin_plan_for_theme(theme_today, plan_n)
+    # FIX: if explicit ORIGINS_<THEME> is set AND origins are NOT open, do not pad the plan.
+    explicit_origins_now = _theme_origins_from_env(theme_today)
+    if explicit_origins_now and not open_origins_effective:
+        planned_origins = explicit_origins_now[:]
+        plan_n = len(planned_origins)
+    else:
+        plan_n = max(5, req_origins, eff_routes)
+        planned_origins = origin_plan_for_theme(theme_today, plan_n)
+
     log(f"🧭 Planned origins for run ({len(planned_origins)}; required={plan_n}): {planned_origins}")
     log(f"🧭 Unique theme routes: {len(theme_rows)} | Unique explore routes: {len(explore_rows)}")
 

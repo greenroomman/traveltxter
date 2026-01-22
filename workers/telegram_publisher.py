@@ -205,6 +205,7 @@ def in_free_window(now):
 # ------------------ message builders ------------------
 
 def build_vip_message(row):
+    # NOTE: Only copy changed (logic unchanged). Flags/globe remain.
     country = get_first(row, ["destination_country"])
     city = get_first(row, ["destination_city"])
     origin = get_first(row, ["origin_city"])
@@ -223,12 +224,15 @@ def build_vip_message(row):
         f"OUT:  {outbound}",
         f"BACK: {back}",
         phrase,
-        f'<a href="{booking_link}">BOOKING LINK</a>',
+        "If you’ve had this place on your radar, this is one of those prices that’s worth a proper look. Routing and dates were both sensible when we checked.",
+        f'<a href="{booking_link}">Booking link</a>',
+        "Shared with VIP first, as always.",
     ]).strip()
 
     return msg
 
 def build_free_message(row):
+    # NOTE: Only copy changed (logic unchanged). Keeps 24h VIP-first positioning.
     country = get_first(row, ["destination_country"])
     city = get_first(row, ["destination_city"])
     origin = get_first(row, ["origin_city"])
@@ -252,8 +256,9 @@ def build_free_message(row):
         f"OUT:  {outbound}",
         f"BACK: {back}",
         phrase,
-        "Join TravelTxter for early access as VIP members saw this 24 hours ago. We provide direct booking links for exclusive mistake fares. Subscription are only £3 p/m or £30 p/a",
-        f'<a href="{monthly}">Upgrade now (Monthly)</a> | <a href="{yearly}">Upgrade now (Yearly)</a>',
+        "VIP members saw this yesterday. We share deals with them first so they get a bit of breathing room to decide, rather than rushing it.",
+        "If you’d like that early access, VIP is £3 per month or £30 per year.",
+        f'<a href="{monthly}">Monthly</a> | <a href="{yearly}">Yearly</a>',
     ]).strip()
 
     return msg

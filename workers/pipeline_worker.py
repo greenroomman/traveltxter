@@ -8,7 +8,7 @@ import random
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 
-from utils import (
+from workers.utils import (
     load_config,
     log,
     today_utc,

@@ -3,9 +3,9 @@ name: TravelTxter Pipeline
 on:
   schedule:
     # AM run — Instagram + VIP
-    - cron: "30 7 * * *"   # 07:30 UTC
+    - cron: "30 6 * * *"   # 06:30 UTC
     # PM run — Instagram + VIP + (FREE if 24h elapsed)
-    - cron: "30 18 * * *"  # 18:30 UTC
+    - cron: "30 16 * * *"  # 16:30 UTC
   workflow_dispatch:
 
 concurrency:

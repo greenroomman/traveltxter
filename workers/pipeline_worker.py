@@ -1,7 +1,7 @@
 # ======================================================================
 # TRAVELTXTTER — PIPELINE WORKER (FEEDER)
 # FULL FILE REPLACEMENT — V4.7.x
-# FIX: add required departure_date to Duffel offer_requests
+# FIX: write origin/destination city+country from RCM at insert time
 # ======================================================================
 
 import os
@@ -28,9 +28,11 @@ RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
 CONFIG_TAB = os.getenv("CONFIG_TAB", "CONFIG")
 RCM_TAB = os.getenv("RCM_TAB", "ROUTE_CAPABILITY_MAP")
 
-MAX_SEARCHES_PER_RUN = int(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "4"))
+MAX_SEARCHES_PER_RUN = int(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "12"))
+FEEDER_SLEEP_SECONDS = float(os.getenv("FEEDER_SLEEP_SECONDS", "0.1"))
 
-UTC_NOW = dt.datetime.utcnow().date()
+UTC_NOW_DT = dt.datetime.utcnow()
+UTC_TODAY = UTC_NOW_DT.date()
 
 
 # ----------------------------------------------------------------------
@@ -50,9 +52,7 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    info = json.loads(
-        os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
-    )
+    info = json.loads(os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON"))
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
@@ -72,21 +72,16 @@ def safe_float(v) -> Optional[float]:
 
 
 # ----------------------------------------------------------------------
-# DATE GENERATION (CRITICAL FIX)
+# DATE GENERATION (DUFFEL-VALID, <= 84 DAYS)
 # ----------------------------------------------------------------------
 
 def build_dates(cfg: Dict) -> Tuple[str, str]:
-    """
-    Duffel REQUIRES departure_date at request time.
-    Priority:
-    1) CONFIG days_ahead_min / days_ahead_max
-    2) Safe rolling window fallback
-    """
     min_days = int(cfg.get("days_ahead_min") or 14)
-    max_days = int(cfg.get("days_ahead_max") or 60)
+    max_days = min(int(cfg.get("days_ahead_max") or 84), 84)
     trip_len = int(cfg.get("trip_length_days") or 5)
 
-    outbound = UTC_NOW + dt.timedelta(days=min_days)
+    # deterministic: earliest valid date
+    outbound = UTC_TODAY + dt.timedelta(days=min_days)
     inbound = outbound + dt.timedelta(days=trip_len)
 
     return outbound.isoformat(), inbound.isoformat()
@@ -106,16 +101,8 @@ def duffel_search(origin: str, dest: str, cabin: str, out_date: str, ret_date: s
     payload = {
         "data": {
             "slices": [
-                {
-                    "origin": origin,
-                    "destination": dest,
-                    "departure_date": out_date,
-                },
-                {
-                    "origin": dest,
-                    "destination": origin,
-                    "departure_date": ret_date,
-                },
+                {"origin": origin, "destination": dest, "departure_date": out_date},
+                {"origin": dest, "destination": origin, "departure_date": ret_date},
             ],
             "passengers": [{"type": "adult"}],
             "cabin_class": cabin or "economy",
@@ -177,19 +164,22 @@ def main():
     config = [r for r in ws_cfg.get_all_records() if is_true(r.get("active_in_feeder"))]
     log(f"✅ CONFIG loaded: {len(config)} rows")
 
+    # Build RCM lookup keyed by (origin_iata, destination_iata)
+    rcm_rows = ws_rcm.get_all_records()
     rcm = {
         (r.get("origin_iata"), r.get("destination_iata")): r
-        for r in ws_rcm.get_all_records()
+        for r in rcm_rows
         if is_true(r.get("enabled"))
     }
     log(f"✅ RCM loaded: {len(rcm)} enabled routes")
 
+    # Daily theme
     themes = sorted({
         (r.get("theme_of_day") or r.get("theme"))
         for r in config
         if (r.get("theme_of_day") or r.get("theme"))
     })
-    theme = themes[UTC_NOW.timetuple().tm_yday % len(themes)]
+    theme = themes[UTC_TODAY.timetuple().tm_yday % len(themes)]
     log(f"🎯 Theme of the day (UTC): {theme}")
 
     headers = ws_raw.row_values(1)
@@ -206,16 +196,15 @@ def main():
 
         origin = cfg.get("origin_iata")
         dest = cfg.get("destination_iata")
-        if (origin, dest) not in rcm:
+        key = (origin, dest)
+        if key not in rcm:
             continue
 
         out_date, ret_date = build_dates(cfg)
         searches += 1
 
-        offers = duffel_search(
-            origin, dest, cfg.get("cabin_class"), out_date, ret_date
-        )
-        time.sleep(0.2)
+        offers = duffel_search(origin, dest, cfg.get("cabin_class"), out_date, ret_date)
+        time.sleep(FEEDER_SLEEP_SECONDS)
 
         for offer in offers:
             deal_id = offer.get("id")
@@ -224,6 +213,13 @@ def main():
 
             if not deal_id or not price or not out_s or not ret_s:
                 continue
+
+            # ---- RCM ENRICHMENT (THE FIX) ----
+            r = rcm.get(key, {})
+            origin_city = r.get("origin_city", "")
+            origin_country = r.get("origin_country", "")
+            dest_city = r.get("destination_city", "")
+            dest_country = r.get("destination_country", "")
 
             row = [""] * len(headers)
             def put(k, v):
@@ -234,10 +230,14 @@ def main():
             put("deal_id", deal_id)
             put("price_gbp", price)
             put("origin_iata", origin)
+            put("origin_city", origin_city)
+            put("origin_country", origin_country)
             put("destination_iata", dest)
+            put("destination_city", dest_city)
+            put("destination_country", dest_country)
             put("outbound_date", out_s)
             put("return_date", ret_s)
-            put("ingested_at_utc", dt.datetime.utcnow().isoformat() + "Z")
+            put("ingested_at_utc", UTC_NOW_DT.isoformat() + "Z")
             put("theme", theme)
 
             inserts.append(row)

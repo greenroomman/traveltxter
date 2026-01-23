@@ -1,7 +1,13 @@
 # ======================================================================
 # TRAVELTXTTER — PIPELINE WORKER (FEEDER)
-# FULL FILE REPLACEMENT — V4.7.x
-# FIX: write origin/destination city+country from RCM at insert time
+# FINAL NORMALISER — V4.7.x
+#
+# LOCKED BEHAVIOUR:
+# - CONFIG is the brain
+# - RCM provides geography (must exist)
+# - Duffel dates required, <= 84 days
+# - Core fields must exist or row is not inserted
+# - Offer-derived fields ALWAYS written with safe placeholders
 # ======================================================================
 
 import os
@@ -31,8 +37,8 @@ RCM_TAB = os.getenv("RCM_TAB", "ROUTE_CAPABILITY_MAP")
 MAX_SEARCHES_PER_RUN = int(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "12"))
 FEEDER_SLEEP_SECONDS = float(os.getenv("FEEDER_SLEEP_SECONDS", "0.1"))
 
-UTC_NOW_DT = dt.datetime.utcnow()
-UTC_TODAY = UTC_NOW_DT.date()
+UTC_NOW = dt.datetime.utcnow()
+UTC_TODAY = UTC_NOW.date()
 
 
 # ----------------------------------------------------------------------
@@ -64,15 +70,15 @@ def get_gspread_client():
 def is_true(v) -> bool:
     return str(v).strip().upper() == "TRUE"
 
-def safe_float(v) -> Optional[float]:
+def safe_float(v) -> float:
     try:
         return float(str(v).replace(",", ""))
     except Exception:
-        return None
+        return 0.0
 
 
 # ----------------------------------------------------------------------
-# DATE GENERATION (DUFFEL-VALID, <= 84 DAYS)
+# DATE GENERATION (DUFFEL VALID)
 # ----------------------------------------------------------------------
 
 def build_dates(cfg: Dict) -> Tuple[str, str]:
@@ -80,7 +86,6 @@ def build_dates(cfg: Dict) -> Tuple[str, str]:
     max_days = min(int(cfg.get("days_ahead_max") or 84), 84)
     trip_len = int(cfg.get("trip_length_days") or 5)
 
-    # deterministic: earliest valid date
     outbound = UTC_TODAY + dt.timedelta(days=min_days)
     inbound = outbound + dt.timedelta(days=trip_len)
 
@@ -91,7 +96,7 @@ def build_dates(cfg: Dict) -> Tuple[str, str]:
 # DUFFEL SEARCH
 # ----------------------------------------------------------------------
 
-def duffel_search(origin: str, dest: str, cabin: str, out_date: str, ret_date: str):
+def duffel_search(origin, dest, cabin, out_date, ret_date):
     headers = {
         "Authorization": f"Bearer {DUFFEL_API_KEY}",
         "Duffel-Version": DUFFEL_VERSION,
@@ -118,7 +123,7 @@ def duffel_search(origin: str, dest: str, cabin: str, out_date: str, ret_date: s
 
 
 # ----------------------------------------------------------------------
-# OFFER DATE EXTRACTION (POST-SEARCH)
+# OFFER NORMALISATION
 # ----------------------------------------------------------------------
 
 def extract_date(seg: Dict) -> Optional[str]:
@@ -144,7 +149,31 @@ def offer_dates(offer: Dict) -> Tuple[str, str]:
         if segs:
             ret = extract_date(segs[0])
 
-    return (out or "", ret or "")
+    return out or "", ret or ""
+
+def normalise_offer(offer: Dict) -> Dict:
+    slices = offer.get("slices") or []
+    segs_out = slices[0].get("segments") if slices else []
+    segs_in = slices[1].get("segments") if len(slices) > 1 else []
+
+    stops = max(len(segs_out) - 1, 0)
+
+    carriers = sorted(
+        {s.get("marketing_carrier", {}).get("iata_code") for s in (segs_out + segs_in) if s.get("marketing_carrier")}
+    )
+
+    return {
+        "stops": stops,
+        "bags_incl": int(offer.get("included_checked_bags", 0) or 0),
+        "cabin_class": offer.get("cabin_class") or "na",
+        "connection_type": "direct" if stops == 0 else "indirect",
+        "outbound_duration_minutes": int(offer.get("total_duration_minutes") or 0),
+        "inbound_duration_minutes": 0,
+        "total_duration_hours": round((offer.get("total_duration_minutes") or 0) / 60, 2),
+        "via_hub": segs_out[0].get("destination", {}).get("iata_code") if stops else "na",
+        "carriers": ",".join(carriers) if carriers else "na",
+        "currency": offer.get("total_currency") or "GBP",
+    }
 
 
 # ----------------------------------------------------------------------
@@ -164,7 +193,6 @@ def main():
     config = [r for r in ws_cfg.get_all_records() if is_true(r.get("active_in_feeder"))]
     log(f"✅ CONFIG loaded: {len(config)} rows")
 
-    # Build RCM lookup keyed by (origin_iata, destination_iata)
     rcm_rows = ws_rcm.get_all_records()
     rcm = {
         (r.get("origin_iata"), r.get("destination_iata")): r
@@ -173,7 +201,6 @@ def main():
     }
     log(f"✅ RCM loaded: {len(rcm)} enabled routes")
 
-    # Daily theme
     themes = sorted({
         (r.get("theme_of_day") or r.get("theme"))
         for r in config
@@ -190,15 +217,24 @@ def main():
         if searches >= MAX_SEARCHES_PER_RUN:
             break
 
-        cfg_theme = cfg.get("theme_of_day") or cfg.get("theme")
-        if cfg_theme != theme:
+        if (cfg.get("theme_of_day") or cfg.get("theme")) != theme:
             continue
 
         origin = cfg.get("origin_iata")
         dest = cfg.get("destination_iata")
         key = (origin, dest)
+
         if key not in rcm:
             continue
+
+        geo = rcm[key]
+        if not all([
+            geo.get("origin_city"),
+            geo.get("origin_country"),
+            geo.get("destination_city"),
+            geo.get("destination_country"),
+        ]):
+            continue  # core geography must exist
 
         out_date, ret_date = build_dates(cfg)
         searches += 1
@@ -211,34 +247,35 @@ def main():
             price = safe_float(offer.get("total_amount"))
             out_s, ret_s = offer_dates(offer)
 
-            if not deal_id or not price or not out_s or not ret_s:
+            if not all([deal_id, price, out_s, ret_s]):
                 continue
 
-            # ---- RCM ENRICHMENT (THE FIX) ----
-            r = rcm.get(key, {})
-            origin_city = r.get("origin_city", "")
-            origin_country = r.get("origin_country", "")
-            dest_city = r.get("destination_city", "")
-            dest_country = r.get("destination_country", "")
+            norm = normalise_offer(offer)
 
             row = [""] * len(headers)
             def put(k, v):
                 if k in headers:
                     row[headers.index(k)] = v
 
+            # core
             put("status", "NEW")
             put("deal_id", deal_id)
             put("price_gbp", price)
             put("origin_iata", origin)
-            put("origin_city", origin_city)
-            put("origin_country", origin_country)
+            put("origin_city", geo.get("origin_city"))
+            put("origin_country", geo.get("origin_country"))
             put("destination_iata", dest)
-            put("destination_city", dest_city)
-            put("destination_country", dest_country)
+            put("destination_city", geo.get("destination_city"))
+            put("destination_country", geo.get("destination_country"))
             put("outbound_date", out_s)
             put("return_date", ret_s)
-            put("ingested_at_utc", UTC_NOW_DT.isoformat() + "Z")
+            put("deal_theme", theme)
             put("theme", theme)
+            put("ingested_at_utc", UTC_NOW.isoformat() + "Z")
+
+            # offer-derived (always written)
+            for k, v in norm.items():
+                put(k, v)
 
             inserts.append(row)
             break

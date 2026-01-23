@@ -1,14 +1,14 @@
 # ======================================================================
 # TRAVELTXTTER — PIPELINE WORKER (FEEDER)
 # FULL FILE REPLACEMENT — V4.7.x
-# FIX: replace oauth2client with google-auth (GitHub runner compatible)
+# FIX: add required departure_date to Duffel offer_requests
 # ======================================================================
 
 import os
 import json
 import time
 import datetime as dt
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
 
 import requests
 import gspread
@@ -29,7 +29,8 @@ CONFIG_TAB = os.getenv("CONFIG_TAB", "CONFIG")
 RCM_TAB = os.getenv("RCM_TAB", "ROUTE_CAPABILITY_MAP")
 
 MAX_SEARCHES_PER_RUN = int(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "4"))
-UTC_NOW = dt.datetime.utcnow()
+
+UTC_NOW = dt.datetime.utcnow().date()
 
 
 # ----------------------------------------------------------------------
@@ -41,7 +42,7 @@ def log(msg: str):
 
 
 # ----------------------------------------------------------------------
-# GOOGLE SHEETS AUTH (google-auth)
+# GOOGLE SHEETS AUTH
 # ----------------------------------------------------------------------
 
 def get_gspread_client():
@@ -49,10 +50,9 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    if os.getenv("GCP_SA_JSON_ONE_LINE"):
-        info = json.loads(os.getenv("GCP_SA_JSON_ONE_LINE"))
-    else:
-        info = json.loads(os.getenv("GCP_SA_JSON"))
+    info = json.loads(
+        os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
+    )
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
@@ -72,7 +72,66 @@ def safe_float(v) -> Optional[float]:
 
 
 # ----------------------------------------------------------------------
-# DUFFEL DATE EXTRACTION (ROBUST)
+# DATE GENERATION (CRITICAL FIX)
+# ----------------------------------------------------------------------
+
+def build_dates(cfg: Dict) -> Tuple[str, str]:
+    """
+    Duffel REQUIRES departure_date at request time.
+    Priority:
+    1) CONFIG days_ahead_min / days_ahead_max
+    2) Safe rolling window fallback
+    """
+    min_days = int(cfg.get("days_ahead_min") or 14)
+    max_days = int(cfg.get("days_ahead_max") or 60)
+    trip_len = int(cfg.get("trip_length_days") or 5)
+
+    outbound = UTC_NOW + dt.timedelta(days=min_days)
+    inbound = outbound + dt.timedelta(days=trip_len)
+
+    return outbound.isoformat(), inbound.isoformat()
+
+
+# ----------------------------------------------------------------------
+# DUFFEL SEARCH
+# ----------------------------------------------------------------------
+
+def duffel_search(origin: str, dest: str, cabin: str, out_date: str, ret_date: str):
+    headers = {
+        "Authorization": f"Bearer {DUFFEL_API_KEY}",
+        "Duffel-Version": DUFFEL_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "data": {
+            "slices": [
+                {
+                    "origin": origin,
+                    "destination": dest,
+                    "departure_date": out_date,
+                },
+                {
+                    "origin": dest,
+                    "destination": origin,
+                    "departure_date": ret_date,
+                },
+            ],
+            "passengers": [{"type": "adult"}],
+            "cabin_class": cabin or "economy",
+        }
+    }
+
+    r = requests.post(DUFFEL_API_URL, headers=headers, json=payload, timeout=30)
+    if r.status_code >= 300:
+        log(f"❌ Duffel error {r.status_code}: {r.text[:200]}")
+        return []
+
+    return (r.json().get("data") or {}).get("offers") or []
+
+
+# ----------------------------------------------------------------------
+# OFFER DATE EXTRACTION (POST-SEARCH)
 # ----------------------------------------------------------------------
 
 def extract_date(seg: Dict) -> Optional[str]:
@@ -102,36 +161,6 @@ def offer_dates(offer: Dict) -> Tuple[str, str]:
 
 
 # ----------------------------------------------------------------------
-# DUFFEL SEARCH
-# ----------------------------------------------------------------------
-
-def duffel_search(origin: str, dest: str, cabin: str):
-    headers = {
-        "Authorization": f"Bearer {DUFFEL_API_KEY}",
-        "Duffel-Version": DUFFEL_VERSION,
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "data": {
-            "slices": [
-                {"origin": origin, "destination": dest},
-                {"origin": dest, "destination": origin},
-            ],
-            "passengers": [{"type": "adult"}],
-            "cabin_class": cabin or "economy",
-        }
-    }
-
-    r = requests.post(DUFFEL_API_URL, headers=headers, json=payload, timeout=30)
-    if r.status_code >= 300:
-        log(f"❌ Duffel error {r.status_code}: {r.text[:200]}")
-        return []
-
-    return (r.json().get("data") or {}).get("offers") or []
-
-
-# ----------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------
 
@@ -155,7 +184,6 @@ def main():
     }
     log(f"✅ RCM loaded: {len(rcm)} enabled routes")
 
-    # theme pool
     themes = sorted({
         (r.get("theme_of_day") or r.get("theme"))
         for r in config
@@ -181,8 +209,12 @@ def main():
         if (origin, dest) not in rcm:
             continue
 
+        out_date, ret_date = build_dates(cfg)
         searches += 1
-        offers = duffel_search(origin, dest, cfg.get("cabin_class"))
+
+        offers = duffel_search(
+            origin, dest, cfg.get("cabin_class"), out_date, ret_date
+        )
         time.sleep(0.2)
 
         for offer in offers:
@@ -205,7 +237,7 @@ def main():
             put("destination_iata", dest)
             put("outbound_date", out_s)
             put("return_date", ret_s)
-            put("ingested_at_utc", UTC_NOW.isoformat() + "Z")
+            put("ingested_at_utc", dt.datetime.utcnow().isoformat() + "Z")
             put("theme", theme)
 
             inserts.append(row)

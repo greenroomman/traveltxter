@@ -2,7 +2,10 @@ name: TravelTxter Pipeline
 
 on:
   schedule:
-    - cron: "30 7,16 * * *"   # 07:30 & 16:30 UTC
+    # AM run — Instagram + VIP
+    - cron: "30 7 * * *"   # 07:30 UTC
+    # PM run — Instagram + VIP + (FREE if 24h elapsed)
+    - cron: "30 16 * * *"  # 16:30 UTC
   workflow_dispatch:
 
 concurrency:
@@ -10,42 +13,265 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-
-  feeder:
+  pipeline:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Feeder
-        run: python workers/pipeline_worker.py
 
-  scorer:
-    needs: feeder
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Scorer
-        run: python workers/ai_scorer.py
+    # ✅ IMPORTANT: Map GitHub Variables -> runtime env ONCE here (applies to all steps)
+    env:
+      # ---------------- Shared runtime context ----------------
+      RUN_SLOT: ${{ github.event.schedule }}
 
-  renderer:
-    needs: scorer
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Renderer
-        run: python workers/render_client.py
+      # Spreadsheet identity (support both names for legacy code)
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+      SHEET_ID: ${{ secrets.SHEET_ID }}
 
-  telegram:
-    needs: renderer
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Telegram Publisher
-        run: python workers/telegram_publisher.py
+      # Service account JSON (support both names)
+      GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+      GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
 
-  instagram:
-    needs: renderer
-    runs-on: ubuntu-latest
+      # ---------------- Tab names (Secrets + Vars compatibility) ----------------
+      # If you store tab names as secrets, they’ll be available.
+      # If you store tab names as vars, they’ll also be available.
+      RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+      FEEDER_LOG_TAB: ${{ secrets.FEEDER_LOG_TAB }}
+      INSTA_FEED_TAB: ${{ secrets.INSTA_FEED_TAB }}
+      SUBSCRIBERS_TAB: ${{ secrets.SUBSCRIBERS_TAB }}
+
+      FEEDER_CONFIG_TAB: ${{ vars.FEEDER_CONFIG_TAB }}
+      THEMES_TAB: ${{ vars.THEMES_TAB }}
+      PHRASES_TAB: ${{ vars.PHRASES_TAB }}
+
+      # ---------------- API keys / tokens (Secrets) ----------------
+      DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+
+      RENDER_URL: ${{ secrets.RENDER_URL }}
+      REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
+
+      IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+      META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+      FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+      TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+      TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+
+      STRIPE_API_KEY: ${{ secrets.STRIPE_API_KEY }}
+      STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+      STRIPE_LINK: ${{ secrets.STRIPE_LINK }}
+      STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
+      STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
+
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      # ---------------- OpenAI model names (Vars + Secrets compatibility) ----------------
+      OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+      OPENAI_MODEL_PLANNER: ${{ vars.OPENAI_MODEL_PLANNER }}
+
+      # ---------------- Duffel budget governance (Vars) ----------------
+      DUFFEL_BUDGET_GBP: ${{ vars.DUFFEL_BUDGET_GBP }}
+      DUFFEL_EXCESS_SEARCH_USD: ${{ vars.DUFFEL_EXCESS_SEARCH_USD }}
+      DUFFEL_FREE_SEARCHES_PER_ORDER: ${{ vars.DUFFEL_FREE_SEARCHES_PER_ORDER }}
+      DUFFEL_ORDERS_THIS_MONTH: ${{ vars.DUFFEL_ORDERS_THIS_MONTH }}
+      USD_TO_GBP: ${{ vars.USD_TO_GBP }}
+
+      # Duffel operational caps (Vars)
+      DUFFEL_LINKS_ENABLED: ${{ vars.DUFFEL_LINKS_ENABLED }}
+      DUFFEL_LINKS_MAX_PER_RUN: ${{ vars.DUFFEL_LINKS_MAX_PER_RUN }}
+      DUFFEL_LINKS_MAX_PRICE_GBP: ${{ vars.DUFFEL_LINKS_MAX_PRICE_GBP }}
+
+      DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
+      DUFFEL_MAX_INSERTS_PER_ORIGIN: ${{ vars.DUFFEL_MAX_INSERTS_PER_ORIGIN }}
+      DUFFEL_MAX_INSERTS_PER_ROUTE: ${{ vars.DUFFEL_MAX_INSERTS_PER_ROUTE }}
+      DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
+      DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+      DUFFEL_SEARCH_DEDUPE_HOURS: ${{ vars.DUFFEL_SEARCH_DEDUPE_HOURS }}
+
+      # Legacy feeder caps (Vars)
+      FEEDER_MAX_INSERTS: ${{ vars.FEEDER_MAX_INSERTS }}
+      FEEDER_MAX_SEARCHES: ${{ vars.FEEDER_MAX_SEARCHES }}
+      FEEDER_SLEEP_SECONDS: ${{ vars.FEEDER_SLEEP_SECONDS }}
+      FEEDER_OPEN_ORIGINS: ${{ vars.FEEDER_OPEN_ORIGINS }}
+      FEEDER_EXPLORE_RUN_MOD: ${{ vars.FEEDER_EXPLORE_RUN_MOD }}
+      FEEDER_EXPLORE_RUN_MOD_SALT: ${{ vars.FEEDER_EXPLORE_RUN_MOD_SALT }}
+      MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS }}
+
+      # ---------------- Quality + retry knobs (Vars) ----------------
+      ZERO_OFFER_RETRY_ENABLED: ${{ vars.ZERO_OFFER_RETRY_ENABLED }}
+      PRICE_GATE_FALLBACK_BEHAVIOR: ${{ vars.PRICE_GATE_FALLBACK_BEHAVIOR }}
+      FALLBACK_STRATEGY: ${{ vars.FALLBACK_STRATEGY }}
+
+      # ---------------- Scoring knobs (Vars) ----------------
+      SCORE_WEIGHTS: ${{ vars.SCORE_WEIGHTS }}
+      DEST_REPEAT_PENALTY: ${{ vars.DEST_REPEAT_PENALTY }}
+      VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
+      WINNERS_PER_RUN: ${{ vars.WINNERS_PER_RUN }}
+
+      # ---------------- Planner knobs (Vars) ----------------
+      PLANNER_MAX_DESTS_PER_THEME: ${{ vars.PLANNER_MAX_DESTS_PER_THEME }}
+
+      # ---------------- Renderer knobs (Vars) ----------------
+      RENDER_MAX_ROWS: ${{ vars.RENDER_MAX_ROWS }}
+
+      # ---------------- Instagram Graph API (Vars) ----------------
+      GRAPH_API_VERSION: ${{ vars.GRAPH_API_VERSION }}
+
+      # ---------------- Origins by theme (Vars) ----------------
+      SW_ENGLAND_ORIGINS: ${{ vars.SW_ENGLAND_ORIGINS }}
+      ORIGINS_DEFAULT: ${{ vars.ORIGINS_DEFAULT }}
+      ORIGINS_LONG_HAUL: ${{ vars.ORIGINS_LONG_HAUL }}
+      ORIGINS_LUXURY_VALUE: ${{ vars.ORIGINS_LUXURY_VALUE }}
+      ORIGINS_WINTER_SUN: ${{ vars.ORIGINS_WINTER_SUN }}
+      ORIGINS_SUMMER_SUN: ${{ vars.ORIGINS_SUMMER_SUN }}
+      ORIGINS_BEACH_BREAK: ${{ vars.ORIGINS_BEACH_BREAK }}
+      ORIGINS_SNOW: ${{ vars.ORIGINS_SNOW }}
+      ORIGINS_NORTHERN_LIGHTS: ${{ vars.ORIGINS_NORTHERN_LIGHTS }}
+      ORIGINS_SURF: ${{ vars.ORIGINS_SURF }}
+      ORIGINS_ADVENTURE: ${{ vars.ORIGINS_ADVENTURE }}
+      ORIGINS_CITY_BREAKS: ${{ vars.ORIGINS_CITY_BREAKS }}
+      ORIGINS_CULTURE_HISTORY: ${{ vars.ORIGINS_CULTURE_HISTORY }}
+      ORIGINS_UNEXPECTED_VALUE: ${{ vars.ORIGINS_UNEXPECTED_VALUE }}
+
+      # ---------------- Stops by theme (Vars) ----------------
+      MAX_STOPS_DEFAULT: ${{ vars.MAX_STOPS_DEFAULT }}
+      MAX_STOPS_LONG_HAUL: ${{ vars.MAX_STOPS_LONG_HAUL }}
+      MAX_STOPS_LUXURY_VALUE: ${{ vars.MAX_STOPS_LUXURY_VALUE }}
+      MAX_STOPS_WINTER_SUN: ${{ vars.MAX_STOPS_WINTER_SUN }}
+      MAX_STOPS_SUMMER_SUN: ${{ vars.MAX_STOPS_SUMMER_SUN }}
+      MAX_STOPS_BEACH_BREAK: ${{ vars.MAX_STOPS_BEACH_BREAK }}
+      MAX_STOPS_SNOW: ${{ vars.MAX_STOPS_SNOW }}
+      MAX_STOPS_NORTHERN_LIGHTS: ${{ vars.MAX_STOPS_NORTHERN_LIGHTS }}
+      MAX_STOPS_SURF: ${{ vars.MAX_STOPS_SURF }}
+      MAX_STOPS_ADVENTURE: ${{ vars.MAX_STOPS_ADVENTURE }}
+      MAX_STOPS_CITY_BREAKS: ${{ vars.MAX_STOPS_CITY_BREAKS }}
+      MAX_STOPS_CULTURE_HISTORY: ${{ vars.MAX_STOPS_CULTURE_HISTORY }}
+      MAX_STOPS_UNEXPECTED_VALUE: ${{ vars.MAX_STOPS_UNEXPECTED_VALUE }}
+
+      # ---------------- Seasonality months (Vars) ----------------
+      SEASON_ADVENTURE_MONTHS: ${{ vars.SEASON_ADVENTURE_MONTHS }}
+      SEASON_BEACH_BREAK_MONTHS: ${{ vars.SEASON_BEACH_BREAK_MONTHS }}
+      SEASON_CITY_BREAKS_MONTHS: ${{ vars.SEASON_CITY_BREAKS_MONTHS }}
+      SEASON_CULTURE_HISTORY_MONTHS: ${{ vars.SEASON_CULTURE_HISTORY_MONTHS }}
+      SEASON_LONG_HAUL_MONTHS: ${{ vars.SEASON_LONG_HAUL_MONTHS }}
+      SEASON_LUXURY_VALUE_MONTHS: ${{ vars.SEASON_LUXURY_VALUE_MONTHS }}
+      SEASON_NORTHERN_LIGHTS_MONTHS: ${{ vars.SEASON_NORTHERN_LIGHTS_MONTHS }}
+      SEASON_SNOW_MONTHS: ${{ vars.SEASON_SNOW_MONTHS }}
+      SEASON_SNOW_SHOULDER_MONTHS: ${{ vars.SEASON_SNOW_SHOULDER_MONTHS }}
+      SEASON_SUMMER_SUN_MONTHS: ${{ vars.SEASON_SUMMER_SUN_MONTHS }}
+      SEASON_SUMMER_SUN_SHOULDER_MONTHS: ${{ vars.SEASON_SUMMER_SUN_SHOULDER_MONTHS }}
+      SEASON_SURF_MONTHS: ${{ vars.SEASON_SURF_MONTHS }}
+      SEASON_UNEXPECTED_VALUE_MONTHS: ${{ vars.SEASON_UNEXPECTED_VALUE_MONTHS }}
+      SEASON_WINTER_SUN_MONTHS: ${{ vars.SEASON_WINTER_SUN_MONTHS }}
+      SEASON_WINTER_SUN_SHOULDER_MONTHS: ${{ vars.SEASON_WINTER_SUN_SHOULDER_MONTHS }}
+
+      # ---------------- Trip length ranges (Vars) ----------------
+      TRIP_DEFAULT_MIN: ${{ vars.TRIP_DEFAULT_MIN }}
+      TRIP_DEFAULT_MAX: ${{ vars.TRIP_DEFAULT_MAX }}
+      TRIP_ADVENTURE_MIN: ${{ vars.TRIP_ADVENTURE_MIN }}
+      TRIP_ADVENTURE_MAX: ${{ vars.TRIP_ADVENTURE_MAX }}
+      TRIP_BEACH_BREAK_MIN: ${{ vars.TRIP_BEACH_BREAK_MIN }}
+      TRIP_BEACH_BREAK_MAX: ${{ vars.TRIP_BEACH_BREAK_MAX }}
+      TRIP_CITY_BREAKS_MIN: ${{ vars.TRIP_CITY_BREAKS_MIN }}
+      TRIP_CITY_BREAKS_MAX: ${{ vars.TRIP_CITY_BREAKS_MAX }}
+      TRIP_CULTURE_HISTORY_MIN: ${{ vars.TRIP_CULTURE_HISTORY_MIN }}
+      TRIP_CULTURE_HISTORY_MAX: ${{ vars.TRIP_CULTURE_HISTORY_MAX }}
+      TRIP_LONG_HAUL_MIN: ${{ vars.TRIP_LONG_HAUL_MIN }}
+      TRIP_LONG_HAUL_MAX: ${{ vars.TRIP_LONG_HAUL_MAX }}
+      TRIP_LUXURY_VALUE_MIN: ${{ vars.TRIP_LUXURY_VALUE_MIN }}
+      TRIP_LUXURY_VALUE_MAX: ${{ vars.TRIP_LUXURY_VALUE_MAX }}
+      TRIP_NORTHERN_LIGHTS_MIN: ${{ vars.TRIP_NORTHERN_LIGHTS_MIN }}
+      TRIP_NORTHERN_LIGHTS_MAX: ${{ vars.TRIP_NORTHERN_LIGHTS_MAX }}
+      TRIP_SNOW_MIN: ${{ vars.TRIP_SNOW_MIN }}
+      TRIP_SNOW_MAX: ${{ vars.TRIP_SNOW_MAX }}
+      TRIP_SUMMER_SUN_MIN: ${{ vars.TRIP_SUMMER_SUN_MIN }}
+      TRIP_SUMMER_SUN_MAX: ${{ vars.TRIP_SUMMER_SUN_MAX }}
+      TRIP_SURF_MIN: ${{ vars.TRIP_SURF_MIN }}
+      TRIP_SURF_MAX: ${{ vars.TRIP_SURF_MAX }}
+      TRIP_UNEXPECTED_VALUE_MIN: ${{ vars.TRIP_UNEXPECTED_VALUE_MIN }}
+      TRIP_UNEXPECTED_VALUE_MAX: ${{ vars.TRIP_UNEXPECTED_VALUE_MAX }}
+      TRIP_WINTER_SUN_MIN: ${{ vars.TRIP_WINTER_SUN_MIN }}
+      TRIP_WINTER_SUN_MAX: ${{ vars.TRIP_WINTER_SUN_MAX }}
+
+      # ---------------- Booking window ranges (Vars) ----------------
+      WINDOW_DEFAULT_MIN: ${{ vars.WINDOW_DEFAULT_MIN }}
+      WINDOW_DEFAULT_MAX: ${{ vars.WINDOW_DEFAULT_MAX }}
+      WINDOW_ADVENTURE_MIN: ${{ vars.WINDOW_ADVENTURE_MIN }}
+      WINDOW_ADVENTURE_MAX: ${{ vars.WINDOW_ADVENTURE_MAX }}
+      WINDOW_BEACH_BREAK_MIN: ${{ vars.WINDOW_BEACH_BREAK_MIN }}
+      WINDOW_BEACH_BREAK_MAX: ${{ vars.WINDOW_BEACH_BREAK_MAX }}
+      WINDOW_CITY_BREAKS_MIN: ${{ vars.WINDOW_CITY_BREAKS_MIN }}
+      WINDOW_CITY_BREAKS_MAX: ${{ vars.WINDOW_CITY_BREAKS_MAX }}
+      WINDOW_CULTURE_HISTORY_MIN: ${{ vars.WINDOW_CULTURE_HISTORY_MIN }}
+      WINDOW_CULTURE_HISTORY_MAX: ${{ vars.WINDOW_CULTURE_HISTORY_MAX }}
+      WINDOW_LONG_HAUL_MIN: ${{ vars.WINDOW_LONG_HAUL_MIN }}
+      WINDOW_LONG_HAUL_MAX: ${{ vars.WINDOW_LONG_HAUL_MAX }}
+      WINDOW_LUXURY_VALUE_MIN: ${{ vars.WINDOW_LUXURY_VALUE_MIN }}
+      WINDOW_LUXURY_VALUE_MAX: ${{ vars.WINDOW_LUXURY_VALUE_MAX }}
+      WINDOW_NORTHERN_LIGHTS_MIN: ${{ vars.WINDOW_NORTHERN_LIGHTS_MIN }}
+      WINDOW_NORTHERN_LIGHTS_MAX: ${{ vars.WINDOW_NORTHERN_LIGHTS_MAX }}
+      WINDOW_SNOW_MIN: ${{ vars.WINDOW_SNOW_MIN }}
+      WINDOW_SNOW_MAX: ${{ vars.WINDOW_SNOW_MAX }}
+      WINDOW_SUMMER_SUN_MIN: ${{ vars.WINDOW_SUMMER_SUN_MIN }}
+      WINDOW_SUMMER_SUN_MAX: ${{ vars.WINDOW_SUMMER_SUN_MAX }}
+      WINDOW_SURF_MIN: ${{ vars.WINDOW_SURF_MIN }}
+      WINDOW_SURF_MAX: ${{ vars.WINDOW_SURF_MAX }}
+      WINDOW_UNEXPECTED_VALUE_MIN: ${{ vars.WINDOW_UNEXPECTED_VALUE_MIN }}
+      WINDOW_UNEXPECTED_VALUE_MAX: ${{ vars.WINDOW_UNEXPECTED_VALUE_MAX }}
+      WINDOW_WINTER_SUN_MIN: ${{ vars.WINDOW_WINTER_SUN_MIN }}
+      WINDOW_WINTER_SUN_MAX: ${{ vars.WINDOW_WINTER_SUN_MAX }}
+
+      # ---------------- Misc / legacy ----------------
+      THEME: ${{ vars.THEME }}
+      STRIPE_MONTHLY_LINK: ${{ vars.STRIPE_MONTHLY_LINK }}
+      STRIPE_YEARLY_LINK: ${{ vars.STRIPE_YEARLY_LINK }}
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Instagram Publisher
-        run: python workers/instagram_publisher.py
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---------------- FEEDER ----------------
+      - name: Run Feeder
+        run: |
+          python workers/pipeline_worker.py
+
+      - name: Wait for ingest age gate
+        run: |
+          echo "Sleeping for ${MIN_INGEST_AGE_SECONDS:-30}s to satisfy MIN_INGEST_AGE_SECONDS"
+          sleep ${MIN_INGEST_AGE_SECONDS:-30}
+
+      # ---------------- SCORER ----------------
+      - name: Run Scorer
+        run: |
+          python workers/ai_scorer.py
+
+      # ---------------- RENDER ----------------
+      - name: Run Renderer
+        run: |
+          python workers/render_client.py
+
+      # ---------------- LINK ROUTER ----------------
+      - name: Run Link Router
+        run: |
+          python workers/link_router.py
+
+      # ---------------- INSTAGRAM ----------------
+      - name: Run Instagram Publisher
+        run: |
+          python workers/instagram_publisher.py
+
+      # ---------------- TELEGRAM ----------------
+      - name: Run Telegram Publisher
+        run: |
+          python workers/telegram_publisher.py
+

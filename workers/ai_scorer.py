@@ -1,93 +1,76 @@
-# workers/pipeline_worker.py
-# FULL FILE REPLACEMENT
+# workers/ai_scorer.py
+# V4.7.3 — scorer: NEW -> (READY_TO_POST for winners) else -> SCORED
+# Contract:
+# - RAW_DEALS is canonical (writes happen here only)
+# - RAW_DEALS_VIEW is read-only (intelligence / formulas)
+# - Phrase selection happens ONCE at promotion time
+# - Publishers never select language
+# - Full-file replacement only
 #
-# TravelTxter Feeder (CONFIG-only brain)
-# - Reads: CONFIG (merged), ROUTE_CAPABILITY_MAP (enrichment/gating)
-# - Writes: RAW_DEALS using EXACT RD schema headers (writes by header name)
-# - Inserts ONLY real Duffel offers (never inserts stub rows)
-#
-# REQUIRED ENV:
-#   SPREADSHEET_ID (or SHEET_ID), GCP_SA_JSON_ONE_LINE (or GCP_SA_JSON), DUFFEL_API_KEY
-#
-# OPTIONAL ENV:
-#   RAW_DEALS_TAB=RAW_DEALS
-#   CONFIG_TAB=CONFIG
-#   RCM_TAB=ROUTE_CAPABILITY_MAP
-#   DUFFEL_ROUTES_PER_RUN=6
-#   DUFFEL_MAX_SEARCHES_PER_RUN=12
-#   DUFFEL_MAX_INSERTS=20
-#   FEEDER_SLEEP_SECONDS=0.15
-#   DATE_JITTER_DAYS=2
-#   CABIN_CLASS=economy
-#   CURRENCY=GBP
-#   ORIGINS_DEFAULT="LHR,LGW,MAN,BRS,STN"
-#   ORIGINS_<THEME>="..."
-#   THEME="" (optional override; MUST match CONFIG theme/theme_of_day values; case-insensitive)
+# Hardening changes in this version:
+# 1) RAW_DEALS_VIEW read no longer uses get_all_records() (which hard-crashes on duplicate headers).
+#    Instead, we read values + map only required columns, ignoring duplicate header collisions safely.
+# 2) Phrase theme selection falls back: dynamic_theme (VIEW) -> deal_theme (RAW) -> theme (RAW)
+#    so a broken RDV dynamic_theme doesn't break phrase selection.
 
 import os
 import json
-import time
 import hashlib
-import datetime as dt
-from typing import Any, Dict, List, Tuple, Optional, Set
+from datetime import datetime, timezone, timedelta
 
-import requests
 import gspread
+from gspread.cell import Cell
 from google.oauth2.service_account import Credentials
 
 
-# ------------------ env helpers ------------------
+RAW_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
+VIEW_TAB = os.getenv("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
+PHRASE_TAB = os.getenv("PHRASE_BANK_TAB", "PHRASE_BANK")
 
-def env(k: str, d: str = "") -> str:
-    return (os.getenv(k, d) or "").strip()
+CAPABILITY_TAB = os.getenv("CAPABILITY_TAB", "ROUTE_CAPABILITY_MAP")
+SIGNALS_TAB = os.getenv("SIGNALS_TAB", os.getenv("CONFIG_SIGNALS_TAB", "CONFIG_SIGNALS"))
 
-def env_int(k: str, d: int) -> int:
-    try:
-        return int(env(k, str(d)))
-    except Exception:
-        return d
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID")
+SA_JSON = os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
 
-def env_float(k: str, d: float) -> float:
-    try:
-        return float(env(k, str(d)))
-    except Exception:
-        return d
+MIN_INGEST_AGE_SECONDS = int(os.getenv("MIN_INGEST_AGE_SECONDS", "90"))
+WINNERS_PER_RUN = int(os.getenv("WINNERS_PER_RUN", "1"))
 
-def must_env(k: str) -> str:
-    v = env(k)
-    if not v:
-        raise RuntimeError(f"Missing required env var: {k}")
-    return v
+# Optional freshness window: only consider NEW rows ingested within this many hours.
+# Set 0 or blank to disable.
+ELIGIBLE_WINDOW_HOURS = int(os.getenv("ELIGIBLE_WINDOW_HOURS", "72"))
 
-def truthy(v: Any) -> bool:
-    if v is None:
-        return False
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    return s in ("true", "1", "yes", "y", "t")
+# Optional winner threshold (only applied if worthiness_score exists)
+MIN_WORTHINESS_SCORE = float(os.getenv("MIN_WORTHINESS_SCORE", "0"))
 
-def now_utc_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-def log(msg: str) -> None:
-    print(f"{dt.datetime.utcnow().isoformat()}Z | {msg}", flush=True)
-
-def norm_theme(x: Any) -> str:
-    return str(x or "").strip().lower()
+PHRASE_USED_COL = "phrase_used"
+PHRASE_BANK_COL = "phrase_bank"
 
 
-# ------------------ sheets auth ------------------
+# View columns we actually need (minimizes coupling to RDV header chaos)
+VIEW_REQUIRED_COLS = (
+    "status",
+    "deal_id",
+    "destination_iata",
+    "dynamic_theme",
+    "hard_reject",
+    "worthiness_score",
+)
 
-def sa_creds():
-    raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
-    if not raw:
+
+def _log(msg):
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"{ts} | {msg}", flush=True)
+
+
+def _sa_creds():
+    if not SA_JSON:
         raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+    raw = SA_JSON.strip()
     try:
         info = json.loads(raw)
     except json.JSONDecodeError:
         info = json.loads(raw.replace("\\n", "\n"))
-
     return Credentials.from_service_account_info(
         info,
         scopes=[
@@ -96,551 +79,401 @@ def sa_creds():
         ],
     )
 
-def open_sheet():
-    gc = gspread.authorize(sa_creds())
-    sid = env("SPREADSHEET_ID") or env("SHEET_ID")
-    if not sid:
-        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
-    return gc.open_by_key(sid)
+
+def _norm(s):
+    """Return a trimmed string for any input type (int-safe)."""
+    if s is None:
+        return ""
+    if isinstance(s, str):
+        return s.strip()
+    return str(s).strip()
 
 
-# ------------------ Duffel API (v2) ------------------
+def _norm_theme(s):
+    return _norm(s).lower().replace(" ", "_")
 
-DUFFEL_BASE = "https://api.duffel.com"
 
-def duffel_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {must_env('DUFFEL_API_KEY')}",
-        "Duffel-Version": "v2",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+def _norm_iata(s):
+    return _norm(s).upper()
 
-def duffel_create_offer_request(origin: str, dest: str, out_date: str, ret_date: str,
-                               max_connections: int, cabin_class: str, currency: str) -> Optional[Dict[str, Any]]:
-    payload = {
-        "data": {
-            "slices": [
-                {"origin": origin, "destination": dest, "departure_date": out_date},
-                {"origin": dest, "destination": origin, "departure_date": ret_date},
-            ],
-            "passengers": [{"type": "adult"}],
-            "cabin_class": cabin_class,
-            "max_connections": max_connections,
-            "return_offers": True,
-            "currency": currency,
-        }
-    }
-    r = requests.post(
-        f"{DUFFEL_BASE}/air/offer_requests",
-        headers=duffel_headers(),
-        data=json.dumps(payload),
-        timeout=60,
-    )
-    if not r.ok:
+
+def _truthy(v):
+    return _norm(v).upper() in ("TRUE", "YES", "Y", "1", "APPROVED")
+
+
+def _stable_pick(key, items):
+    if not items:
+        return ""
+    h = hashlib.md5(key.encode("utf-8")).hexdigest()
+    idx = int(h[:8], 16) % len(items)
+    return items[idx]
+
+
+def _parse_iso_utc(ts_raw):
+    """
+    Accepts '2026-01-01T12:34:56Z' or without 'Z'.
+    Returns aware UTC datetime or None.
+    """
+    s = _norm(ts_raw)
+    if not s:
         return None
-    return r.json().get("data")
-
-def duffel_list_offers(offer_request_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-    r = requests.get(
-        f"{DUFFEL_BASE}/air/offers",
-        headers=duffel_headers(),
-        params={"offer_request_id": offer_request_id, "limit": limit},
-        timeout=60,
-    )
-    if not r.ok:
-        return []
-    return (r.json().get("data") or [])
-
-def pick_cheapest_offer(offers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not offers:
-        return None
-
-    def to_float(o: Dict[str, Any]) -> float:
-        try:
-            return float(o.get("total_amount"))
-        except Exception:
-            return 1e18
-
-    offers_sorted = sorted(offers, key=to_float)
-    return offers_sorted[0] if offers_sorted else None
-
-def offer_stops(offer: Dict[str, Any]) -> int:
-    slices = offer.get("slices") or []
-    segs = 0
-    for s in slices:
-        segs += len(s.get("segments") or [])
-    return max(0, segs - len(slices))
-
-def offer_dates(offer: Dict[str, Any]) -> Tuple[str, str]:
-    slices = offer.get("slices") or []
-    if len(slices) < 2:
-        return "", ""
-    out = (slices[0].get("departure_date") or "").strip()
-    ret = (slices[1].get("departure_date") or "").strip()
-    return out, ret
-
-def offer_durations_minutes(offer: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    slices = offer.get("slices") or []
-    out_m = None
-    in_m = None
     try:
-        if len(slices) >= 1:
-            out_m = int(slices[0].get("duration") or 0)
-        if len(slices) >= 2:
-            in_m = int(slices[1].get("duration") or 0)
+        if s.endswith("Z"):
+            s = s[:-1]
+        dt = datetime.fromisoformat(s)
+        # assume UTC if naive
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
-        out_m, in_m = None, None
-    tot = (out_m + in_m) if (out_m is not None and in_m is not None) else None
-    return out_m, in_m, tot
-
-def offer_carriers(offer: Dict[str, Any]) -> str:
-    carriers: List[str] = []
-    for sl in (offer.get("slices") or []):
-        for seg in (sl.get("segments") or []):
-            mk = seg.get("marketing_carrier") or {}
-            name = (mk.get("name") or "").strip()
-            iata = (mk.get("iata_code") or "").strip()
-            label = name or iata
-            if label and label not in carriers:
-                carriers.append(label)
-    return ", ".join(carriers)
+        return None
 
 
-# ------------------ deterministic dates ------------------
-
-def stable_int(s: str) -> int:
-    h = hashlib.md5(s.encode("utf-8")).hexdigest()
-    return int(h[:8], 16)
-
-def select_dates(origin: str, dest: str, days_min: int, days_max: int, trip_len: int) -> Tuple[dt.date, dt.date]:
-    today = dt.datetime.utcnow().date()
-    span = max(0, days_max - days_min)
-    seed = f"{origin}-{dest}-{today.isoformat()}"
-    offset = days_min + (stable_int(seed) % (span + 1 if span > 0 else 1))
-    out = today + dt.timedelta(days=offset)
-    ret = out + dt.timedelta(days=max(1, trip_len))
-    return out, ret
+def _float_or_none(v):
+    s = _norm(v)
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
-# ------------------ read CONFIG & RCM ------------------
+def _clean_iata(x):
+    return _norm(x).upper()[:3]
 
-def load_config(sh) -> List[Dict[str, Any]]:
-    tab = env("CONFIG_TAB", "CONFIG")
-    ws = sh.worksheet(tab)
-    rows = ws.get_all_records()
-    active = [r for r in rows if truthy(r.get("active_in_feeder"))]
-    log(f"✅ CONFIG loaded: {len(active)} active rows (of {len(rows)} total)")
 
-    out: List[Dict[str, Any]] = []
-    for r in active:
-        o = (r.get("origin_iata") or "").strip().upper()
-        d = (r.get("destination_iata") or "").strip().upper()
-        if not o or not d:
+def _load_route_maps(sh):
+    """Best-effort: returns (dest_city_map, dest_country_map)."""
+    try:
+        ws = sh.worksheet(CAPABILITY_TAB)
+        rows = ws.get_all_records()
+    except Exception as e:
+        _log(f"ROUTE_CAPABILITY_MAP not readable: {e}")
+        return {}, {}
+
+    dest_city_map = {}
+    dest_country_map = {}
+    for r in rows:
+        d = _clean_iata(r.get("destination_iata"))
+        if not d:
             continue
-        out.append({**r, "origin_iata": o, "destination_iata": d})
+        dc = _norm(r.get("destination_city"))
+        dcty = _norm(r.get("destination_country"))
+        if dc and d not in dest_city_map:
+            dest_city_map[d] = dc
+        if dcty and d not in dest_country_map:
+            dest_country_map[d] = dcty
+    return dest_city_map, dest_country_map
+
+
+def _load_signals(sh):
+    """
+    Best-effort: returns dict dest_iata -> row.
+
+    RESILIENT: Tries CONFIG_SIGNALS first, then CONFIG (for post-merge compatibility).
+    Never crashes if tabs are missing.
+    """
+    # Try CONFIG_SIGNALS (legacy)
+    try:
+        ws = sh.worksheet(SIGNALS_TAB)
+        rows = ws.get_all_records()
+        _log(f"✅ Loaded enrichment from {SIGNALS_TAB}")
+    except Exception:
+        # Fall back to CONFIG (after merge)
+        try:
+            config_tab = os.getenv("CONFIG_TAB", "CONFIG")
+            ws = sh.worksheet(config_tab)
+            rows = ws.get_all_records()
+            _log(f"✅ Loaded enrichment from {config_tab} (CONFIG_SIGNALS not found)")
+        except Exception as e:
+            _log(f"⚠️ No enrichment tabs available ({SIGNALS_TAB} or CONFIG): {e}")
+            return {}
+
+    out = {}
+    for r in rows:
+        key = _clean_iata(r.get("destination_iata") or r.get("iata_hint") or r.get("iata"))
+        if key:
+            out[key] = r
     return out
 
-def load_rcm(sh) -> Dict[Tuple[str, str], Dict[str, str]]:
-    tab = env("RCM_TAB", "ROUTE_CAPABILITY_MAP")
-    ws = sh.worksheet(tab)
-    rows = ws.get_all_records()
 
-    enabled = [r for r in rows if truthy(r.get("enabled")) or str(r.get("enabled") or "").strip().upper() == "TRUE"]
-    log(f"✅ ROUTE_CAPABILITY_MAP loaded: {len(enabled)} enabled routes")
+def _ws_headers(ws):
+    return [h.strip() for h in ws.row_values(1)]
 
-    m: Dict[Tuple[str, str], Dict[str, str]] = {}
-    for r in enabled:
-        o = (r.get("origin_iata") or "").strip().upper()
-        d = (r.get("destination_iata") or "").strip().upper()
-        if not o or not d:
+
+def _safe_view_rows(ws_view):
+    """
+    Read RAW_DEALS_VIEW without get_all_records(), to avoid:
+      gspread.exceptions.GSpreadException: the header row in the worksheet is not unique
+
+    We only map the required columns. If duplicate headers exist, we keep the FIRST occurrence.
+    """
+    values = ws_view.get_all_values()
+    if not values or len(values) < 2:
+        return []
+
+    headers = [h.strip() for h in values[0]]
+    first_idx = {}
+    dupes = set()
+
+    for i, h in enumerate(headers):
+        if not h:
             continue
-        m[(o, d)] = {
-            "origin_city": (r.get("origin_city") or "").strip(),
-            "origin_country": (r.get("origin_country") or "").strip(),
-            "destination_city": (r.get("destination_city") or "").strip(),
-            "destination_country": (r.get("destination_country") or "").strip(),
-        }
-    return m
+        if h in first_idx:
+            dupes.add(h)
+            continue
+        first_idx[h] = i
 
-def origins_for_theme(theme: str) -> List[str]:
-    v = env(f"ORIGINS_{theme.upper()}", "")
-    if not v:
-        v = env("ORIGINS_DEFAULT", "LHR,LGW,MAN,BRS,STN")
-    origins = [x.strip().upper() for x in v.split(",") if x.strip()]
-    return origins or ["LHR", "LGW", "MAN", "BRS", "STN"]
+    if dupes:
+        _log(
+            "⚠️ RAW_DEALS_VIEW has duplicate headers (scorer will ignore duplicates, using first occurrence): "
+            + ", ".join(sorted(dupes)[:30])
+            + (" ..." if len(dupes) > 30 else "")
+        )
 
+    missing = [c for c in VIEW_REQUIRED_COLS if c not in first_idx]
+    if missing:
+        _log(f"⚠️ RAW_DEALS_VIEW missing required columns for scoring: {missing}. Treating as empty.")
+        return []
 
-# ------------------ Theme of the day (correct) ------------------
+    rows = []
+    for row in values[1:]:
+        # pad to header length
+        if len(row) < len(headers):
+            row = row + [""] * (len(headers) - len(row))
 
-def theme_pool_from_config(config_rows: List[Dict[str, Any]]) -> Tuple[Dict[str, int], str]:
-    """
-    Returns (pool_counts, mode) where mode is 'theme_of_day' or 'theme'.
-    pool_counts keys are normalized theme names; values are number of matching rows.
-    """
-    counts_tod: Dict[str, int] = {}
-    counts_theme: Dict[str, int] = {}
+        r = {}
+        for c in VIEW_REQUIRED_COLS:
+            r[c] = row[first_idx[c]] if first_idx.get(c) is not None else ""
+        rows.append(r)
 
-    for r in config_rows:
-        t1 = norm_theme(r.get("theme_of_day"))
-        t2 = norm_theme(r.get("theme"))
-        if t1:
-            counts_tod[t1] = counts_tod.get(t1, 0) + 1
-        if t2:
-            counts_theme[t2] = counts_theme.get(t2, 0) + 1
-
-    if counts_tod:
-        return counts_tod, "theme_of_day"
-    if counts_theme:
-        return counts_theme, "theme"
-    return {"default": len(config_rows)}, "fallback"
-
-def pick_theme_of_day(config_rows: List[Dict[str, Any]]) -> Tuple[str, str, Dict[str, int]]:
-    """
-    Returns (theme_today_norm, mode, pool_counts)
-    Rules:
-    - If THEME env is set, it must match available pool (case-insensitive); otherwise ignore it and rotate.
-    - Rotate deterministically by UTC date across the available pool.
-    - NEVER output a theme that doesn't exist in CONFIG pool.
-    """
-    pool_counts, mode = theme_pool_from_config(config_rows)
-    pool = sorted(pool_counts.keys())
-
-    # optional override
-    forced = norm_theme(env("THEME", ""))
-    if forced:
-        if forced in pool_counts:
-            return forced, mode, pool_counts
-        log(f"⚠️ THEME override '{env('THEME')}' not found in CONFIG pool. Ignoring override.")
-        # continue to rotation
-
-    today = dt.datetime.utcnow().date()
-    chosen = pool[today.toordinal() % len(pool)]
-    return chosen, mode, pool_counts
-
-def filter_rows_for_theme(config_rows: List[Dict[str, Any]], theme_today_norm: str, mode: str) -> List[Dict[str, Any]]:
-    key = "theme_of_day" if mode == "theme_of_day" else "theme"
-    rows = [r for r in config_rows if norm_theme(r.get(key)) == theme_today_norm]
     return rows
 
 
-# ------------------ RAW_DEALS write ------------------
-
-def get_headers(ws) -> List[str]:
-    return ws.row_values(1)
-
-def header_index(headers: List[str]) -> Dict[str, int]:
-    return {h: i for i, h in enumerate(headers)}
-
-def require_headers(idx: Dict[str, int], required: List[str], sheet_name: str):
-    for c in required:
-        if c not in idx:
-            raise RuntimeError(f"{sheet_name} missing required header: {c}")
-
-def fetch_existing_deal_ids(ws, idx: Dict[str, int], max_rows: int = 4000) -> Set[str]:
-    c = idx.get("deal_id")
-    if c is None:
-        return set()
-    vals = ws.col_values(c + 1)
-    vals = vals[1:max_rows]
-    return {v.strip() for v in vals if v and v.strip()}
-
-def append_row_by_headers(ws, headers: List[str], row_map: Dict[str, Any]):
-    idx = header_index(headers)
-    row = [""] * len(headers)
-    for k, v in row_map.items():
-        if k not in idx:
-            continue
-        row[idx[k]] = "" if v is None else str(v)
-    ws.append_row(row, value_input_option="RAW")
-
-
-# ------------------ Build RD row (exact schema-by-header safe) ------------------
-
-def build_rd_row(headers: List[str],
-                 offer: Dict[str, Any],
-                 origin_iata: str,
-                 dest_iata: str,
-                 deal_theme: str,
-                 enrich: Dict[str, str],
-                 cabin_class: str,
-                 currency: str) -> Dict[str, Any]:
-
-    out_date, ret_date = offer_dates(offer)
-    st = offer_stops(offer)
-
-    # price_gbp: store rounded integer string
-    price_val = ""
-    try:
-        price_val = str(int(round(float(offer.get("total_amount") or 0))))
-    except Exception:
-        price_val = ""
-
-    out_m, in_m, tot_m = offer_durations_minutes(offer)
-    total_hours = ""
-    if tot_m is not None:
-        try:
-            total_hours = f"{(tot_m / 60.0):.1f}"
-        except Exception:
-            total_hours = ""
-
-    connection_type = "direct" if st == 0 else ("1_stop" if st == 1 else "multi_stop")
-    carriers = offer_carriers(offer)
-
-    row: Dict[str, Any] = {h: "" for h in headers}
-
-    row.update({
-        "status": "NEW",
-        "deal_id": (offer.get("id") or "").strip(),
-        "price_gbp": price_val,
-        "origin_city": enrich.get("origin_city", ""),
-        "origin_iata": origin_iata,
-        "origin_country": enrich.get("origin_country", ""),
-        "destination_country": enrich.get("destination_country", ""),
-        "destination_city": enrich.get("destination_city", ""),
-        "destination_iata": dest_iata,
-        "outbound_date": out_date,
-        "return_date": ret_date,
-        "stops": str(st),
-        "deal_theme": deal_theme,
-        "theme": deal_theme,  # harmless if present; scorer/RDV can ignore
-        "ingested_at_utc": now_utc_iso(),
-        "created_utc": now_utc_iso(),
-        "cabin_class": cabin_class,
-        "currency": currency,
-        "connection_type": connection_type,
-        "carriers": carriers,
-        "outbound_duration_minutes": "" if out_m is None else str(out_m),
-        "inbound_duration_minutes": "" if in_m is None else str(in_m),
-        "total_duration_hours": total_hours,
-    })
-
-    return row
-
-
-# ------------------ Main ------------------
-
 def main():
-    log("==============================================================================")
-    log("TRAVELTXTTER PIPELINE WORKER (FEEDER) START")
-    log("==============================================================================")
+    if not SPREADSHEET_ID:
+        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
 
-    sh = open_sheet()
+    gc = gspread.authorize(_sa_creds())
+    sh = gc.open_by_key(SPREADSHEET_ID)
 
-    raw_tab = env("RAW_DEALS_TAB", "RAW_DEALS")
-    ws_raw = sh.worksheet(raw_tab)
+    ws_raw = sh.worksheet(RAW_TAB)
+    ws_view = sh.worksheet(VIEW_TAB)
 
-    headers = get_headers(ws_raw)
-    idx = header_index(headers)
+    # Route enrichment sources (best-effort; scorer must never crash if tabs are missing)
+    dest_city_map, dest_country_map = _load_route_maps(sh)
+    signals = _load_signals(sh)
 
-    require_headers(idx, [
-        "status", "deal_id", "price_gbp", "origin_city", "origin_iata",
-        "destination_country", "destination_city", "destination_iata",
-        "outbound_date", "return_date", "stops", "deal_theme",
-        "ingested_at_utc", "created_utc",
-    ], raw_tab)
+    # Load phrase bank (optional; system must not break if unavailable)
+    try:
+        ws_phrase = sh.worksheet(PHRASE_TAB)
+        phrase_rows = ws_phrase.get_all_records()
+    except Exception as e:
+        _log(f"PHRASE_BANK not readable: {e}")
+        phrase_rows = []
 
-    existing_ids = fetch_existing_deal_ids(ws_raw, idx)
+    # Build phrase index: (dest_iata, theme) -> [phrases...]
+    phrase_index = []
+    for r in phrase_rows:
+        theme = _norm_theme(r.get("theme"))
+        phrase = _norm(r.get("phrase"))
+        approved = _truthy(r.get("approved"))
 
-    config_rows = load_config(sh)
-    if not config_rows:
-        log("⚠️ No active CONFIG rows (active_in_feeder).")
-        return 0
+        dest = ""
+        cat = _norm(r.get("category")).lower()
+        if cat.startswith("dest:"):
+            dest = _norm_iata(cat.split("dest:", 1)[1])
 
-    rcm = load_rcm(sh)
+        if dest and theme and phrase and approved:
+            phrase_index.append({"dest": dest, "theme": theme, "phrase": phrase})
 
-    theme_today, mode, pool_counts = pick_theme_of_day(config_rows)
+    # SAFE read VIEW rows (prevents duplicate-header crash)
+    view_rows = _safe_view_rows(ws_view)
 
-    # Log pool for ops clarity
-    top_pool = ", ".join([f"{k}:{pool_counts[k]}" for k in sorted(pool_counts.keys())[:20]])
-    log(f"🧠 Theme pool mode: {mode} | pool_size={len(pool_counts)} | {top_pool}")
+    # RAW still uses get_all_records() (RAW headers must be unique for canonical writes)
+    raw_rows = ws_raw.get_all_records()
 
-    log(f"🎯 Theme of the day (UTC): {theme_today}")
+    headers = _ws_headers(ws_raw)
+    col = {h: i + 1 for i, h in enumerate(headers)}
 
-    todays = filter_rows_for_theme(config_rows, theme_today, mode)
+    # Hard requirements (fail fast with a clear message)
+    for required in ("status", "deal_id", "ingested_at_utc", PHRASE_USED_COL, PHRASE_BANK_COL):
+        if required not in col:
+            raise RuntimeError(f"Missing required RAW_DEALS column: {required}")
 
-    # If misconfigured (0 matches), do NOT die; fall back to largest pool theme.
-    if not todays:
-        fallback_theme = max(pool_counts.keys(), key=lambda k: pool_counts[k])
-        log(f"⚠️ No CONFIG rows match '{theme_today}' in {mode}. Falling back to '{fallback_theme}'.")
-        theme_today = fallback_theme
-        todays = filter_rows_for_theme(config_rows, theme_today, mode)
+    now = datetime.now(timezone.utc)
+    min_allowed_ts = None
+    if ELIGIBLE_WINDOW_HOURS and ELIGIBLE_WINDOW_HOURS > 0:
+        min_allowed_ts = now - timedelta(hours=ELIGIBLE_WINDOW_HOURS)
 
-    if not todays:
-        log("⚠️ Still no runnable CONFIG rows after fallback. Aborting.")
-        return 0
+    # Map deal_id -> RAW_DEALS row number and ingested_at
+    deal_row = {}
+    deal_ingested = {}
+    deal_raw_record = {}
+    for idx, r in enumerate(raw_rows, start=2):
+        did = _norm(r.get("deal_id"))
+        if did:
+            deal_row[did] = idx
+            deal_ingested[did] = r.get("ingested_at_utc")
+            deal_raw_record[did] = r
 
-    # Sort by priority/search_weight if present
-    def score_row(r: Dict[str, Any]) -> float:
-        try:
-            pr = float(r.get("priority") or 0)
-        except Exception:
-            pr = 0.0
-        try:
-            sw = float(r.get("search_weight") or 1)
-        except Exception:
-            sw = 1.0
-        return pr * sw
+    # Build candidate list from VIEW rows with status=NEW
+    candidates = []
+    skipped = {
+        "too_fresh": 0,
+        "no_ingest_ts": 0,
+        "too_old": 0,
+        "missing_raw_row": 0,
+    }
 
-    todays = sorted(todays, key=score_row, reverse=True)
-
-    routes_per_run = env_int("DUFFEL_ROUTES_PER_RUN", 6)
-    max_searches = env_int("DUFFEL_MAX_SEARCHES_PER_RUN", 12)
-    max_inserts = env_int("DUFFEL_MAX_INSERTS", 20)
-    sleep_s = env_float("FEEDER_SLEEP_SECONDS", 0.15)
-    jitter_days = env_int("DATE_JITTER_DAYS", 2)
-
-    cabin_class = env("CABIN_CLASS", "economy")
-    currency = env("CURRENCY", "GBP")
-
-    # Destination-first: pick distinct destinations from todays list
-    by_dest: Dict[str, List[Dict[str, Any]]] = {}
-    for r in todays:
-        by_dest.setdefault(r["destination_iata"], []).append(r)
-
-    dests = list(by_dest.keys())[:routes_per_run]
-    if not dests:
-        log("⚠️ No destinations selected.")
-        return 0
-
-    origins_pool = origins_for_theme(theme_today)
-
-    inserts = 0
-    searches = 0
-
-    for dest in dests:
-        cfg = by_dest[dest][0]
-        base_origin = (cfg.get("origin_iata") or "").strip().upper()
-
-        try:
-            days_min = int(cfg.get("days_ahead_min") or 21)
-        except Exception:
-            days_min = 21
-        try:
-            days_max = int(cfg.get("days_ahead_max") or 84)
-        except Exception:
-            days_max = 84
-        try:
-            trip_len = int(cfg.get("trip_length_days") or 5)
-        except Exception:
-            trip_len = 5
-        try:
-            max_conn = int(cfg.get("max_connections") or 1)
-        except Exception:
-            max_conn = 1
-
-        deal_theme = (cfg.get("theme") or cfg.get("theme_of_day") or theme_today or "default")
-        deal_theme = (deal_theme or "").strip() or theme_today
-
-        best_offer = None
-        best_origin = None
-
-        origins: List[str] = []
-        if base_origin:
-            origins.append(base_origin)
-        for o in origins_pool:
-            if o and o not in origins:
-                origins.append(o)
-
-        for origin in origins:
-            if searches >= max_searches:
-                break
-
-            # Only try if route exists in enabled RCM
-            if (origin, dest) not in rcm:
-                continue
-
-            out_base, ret_base = select_dates(origin, dest, days_min, days_max, trip_len)
-
-            for j in range(-jitter_days, jitter_days + 1):
-                if searches >= max_searches:
-                    break
-
-                out_d = out_base + dt.timedelta(days=j)
-                ret_d = ret_base + dt.timedelta(days=j)
-
-                searches += 1
-                req = duffel_create_offer_request(
-                    origin=origin,
-                    dest=dest,
-                    out_date=out_d.isoformat(),
-                    ret_date=ret_d.isoformat(),
-                    max_connections=max_conn,
-                    cabin_class=cabin_class,
-                    currency=currency,
-                )
-                time.sleep(sleep_s)
-
-                if not req:
-                    continue
-
-                offers = (req.get("offers") or [])
-                if not offers:
-                    orid = (req.get("id") or "").strip()
-                    if orid:
-                        offers = duffel_list_offers(orid, limit=50)
-
-                offer = pick_cheapest_offer(offers)
-                if not offer:
-                    continue
-
-                if offer_stops(offer) > max_conn:
-                    continue
-
-                # Must be a real deal: id + positive price + dates
-                deal_id = (offer.get("id") or "").strip()
-                out_s, ret_s = offer_dates(offer)
-                try:
-                    price_ok = float(offer.get("total_amount") or 0) > 0
-                except Exception:
-                    price_ok = False
-
-                if not deal_id or not out_s or not ret_s or not price_ok:
-                    continue
-
-                best_offer = offer
-                best_origin = origin
-                break
-
-            if best_offer:
-                break
-
-        if not best_offer or not best_origin:
+    for r in view_rows:
+        if _norm(r.get("status")) != "NEW":
             continue
 
-        deal_id = (best_offer.get("id") or "").strip()
-        if not deal_id or deal_id in existing_ids:
+        did = _norm(r.get("deal_id"))
+        if not did:
+            continue
+        if did not in deal_row:
+            skipped["missing_raw_row"] += 1
             continue
 
-        enrich = rcm.get((best_origin, dest), {})
-        log(f"🧩 CAPABILITY_ENRICH: {best_origin}->{dest} | {enrich.get('origin_city','')}, {enrich.get('origin_country','')} → {enrich.get('destination_city','')}, {enrich.get('destination_country','')}")
+        ts = _parse_iso_utc(deal_ingested.get(did))
+        if not ts:
+            skipped["no_ingest_ts"] += 1
+            continue
 
-        rd_row = build_rd_row(
-            headers=headers,
-            offer=best_offer,
-            origin_iata=best_origin,
-            dest_iata=dest,
-            deal_theme=str(deal_theme),
-            enrich=enrich,
-            cabin_class=cabin_class,
-            currency=currency,
+        if (now - ts).total_seconds() < MIN_INGEST_AGE_SECONDS:
+            skipped["too_fresh"] += 1
+            continue
+
+        if min_allowed_ts and ts < min_allowed_ts:
+            skipped["too_old"] += 1
+            continue
+
+        # Intelligence fields (best-effort; don't hard fail if missing)
+        hard_reject = _truthy(r.get("hard_reject"))
+        worth = _float_or_none(r.get("worthiness_score"))
+
+        # Theme fallback: VIEW.dynamic_theme -> RAW.deal_theme -> RAW.theme
+        rawrec = deal_raw_record.get(did, {})
+        theme_candidate = _norm(r.get("dynamic_theme"))
+        if not theme_candidate:
+            theme_candidate = _norm(rawrec.get("deal_theme")) or _norm(rawrec.get("theme"))
+
+        candidates.append(
+            {
+                "did": did,
+                "rownum": deal_row[did],
+                "dest": _norm_iata(r.get("destination_iata")),
+                "theme": _norm_theme(theme_candidate),
+                "hard_reject": hard_reject,
+                "worthiness": worth,
+            }
         )
 
-        # Final hard rule: never insert stubs
-        if not rd_row.get("deal_id") or not rd_row.get("price_gbp") or not rd_row.get("outbound_date") or not rd_row.get("return_date"):
-            continue
+    _log(
+        "Eligible NEW candidates: "
+        f"{len(candidates)} | skipped_too_fresh={skipped['too_fresh']} "
+        f"skipped_no_ingest_ts={skipped['no_ingest_ts']} skipped_too_old={skipped['too_old']} "
+        f"skipped_missing_raw_row={skipped['missing_raw_row']}"
+    )
 
-        append_row_by_headers(ws_raw, headers, rd_row)
-        existing_ids.add(deal_id)
-        inserts += 1
+    if not candidates:
+        _log("No eligible NEW rows")
+        return 0
 
-        log(f"✅ Inserted 1 rows into {raw_tab}: {best_origin}->{dest} £{rd_row.get('price_gbp')} OUT {rd_row.get('outbound_date')} BACK {rd_row.get('return_date')}")
+    # Decide winners:
+    # - never pick hard_reject
+    # - if worthiness exists, sort desc and apply optional threshold
+    eligible_for_winner = [c for c in candidates if not c["hard_reject"]]
 
-        if inserts >= max_inserts:
+    if not eligible_for_winner:
+        _log("All eligible candidates were hard_reject=TRUE; marking evaluated rows as SCORED only.")
+        eligible_for_winner = []
+
+    # Log intelligence availability
+    has_worthiness = sum(1 for c in eligible_for_winner if c["worthiness"] is not None)
+    _log(
+        f"Intelligence check: {has_worthiness}/{len(eligible_for_winner)} candidates have worthiness_score. "
+        f"{'✅ Using scores for ranking' if has_worthiness > 0 else '⚠️ Random ranking (no scores)'}"
+    )
+
+    # Sort winners by worthiness if available; else stable by deal_id hash
+    def _winner_sort_key(c):
+        # worthiness: higher first; None treated as very low
+        w = c["worthiness"]
+        if w is None:
+            w = -1e9
+        return (-w, c["did"])
+
+    eligible_for_winner.sort(key=_winner_sort_key)
+
+    winners = []
+    for c in eligible_for_winner:
+        if len(winners) >= WINNERS_PER_RUN:
             break
+        if c["worthiness"] is not None and c["worthiness"] < MIN_WORTHINESS_SCORE:
+            continue
+        winners.append(c)
 
-    if inserts == 0:
-        log("⚠️ No winners to insert")
+    winner_ids = {w["did"] for w in winners}
+
+    # Updates:
+    # 1) Mark all evaluated candidates as SCORED (except winners)
+    # 2) Promote winners to READY_TO_POST + lock phrase
+    updates = []
+
+    scored_count = 0
+    for c in candidates:
+        if c["did"] in winner_ids:
+            continue
+        updates.append(Cell(c["rownum"], col["status"], "SCORED"))
+        scored_count += 1
+
+    promoted = 0
+    for c in winners:
+        did = c["did"]
+        rownum = c["rownum"]
+        dest = c["dest"]
+        theme = c["theme"]
+
+        phrases = sorted([p["phrase"] for p in phrase_index if p["dest"] == dest and p["theme"] == theme])
+        phrase = _stable_pick(f"{did}|{dest}|{theme}", phrases)
+
+        updates.append(Cell(rownum, col["status"], "READY_TO_POST"))
+        updates.append(Cell(rownum, col[PHRASE_USED_COL], phrase))
+        updates.append(Cell(rownum, col[PHRASE_BANK_COL], phrase))
+
+        # SKIP destination backfill: feeder already populates these from ROUTE_CAPABILITY_MAP
+        # (Keeping this code commented for reference if needed in future)
+        #
+        # rawrec = deal_raw_record.get(did, {})
+        # dest_city_col = col.get("destination_city")
+        # dest_country_col = col.get("destination_country")
+        #
+        # if dest_city_col and not _norm(rawrec.get("destination_city")):
+        #     city = dest_city_map.get(dest) or _norm(signals.get(dest, {}).get("destination_city"))
+        #     if city:
+        #         updates.append(Cell(rownum, dest_city_col, city))
+        #
+        # if dest_country_col and not _norm(rawrec.get("destination_country")):
+        #     country = dest_country_map.get(dest) or _norm(signals.get(dest, {}).get("destination_country"))
+        #     if country:
+        #         updates.append(Cell(rownum, dest_country_col, country))
+
+        promoted += 1
+        _log(
+            f"Promoted {did} → READY_TO_POST | dest={dest} theme={theme} "
+            f"worthiness={c['worthiness'] if c['worthiness'] is not None else 'NA'} "
+            f"phrase={'YES' if phrase else 'NO'}"
+        )
+
+    _log(f"Marked SCORED (evaluated non-winners): {scored_count} | winners_promoted: {promoted}")
+
+    if updates:
+        ws_raw.update_cells(updates, value_input_option="RAW")
+
     return 0
 
 

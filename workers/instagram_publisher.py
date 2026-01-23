@@ -1,6 +1,12 @@
 # workers/instagram_publisher.py
-# V4.8 - CORRECTED to match exact schematic
-# Instagram posts with country flag, phrase_bank, and exact format
+# FULL FILE REPLACEMENT
+#
+# Notes (locked):
+# - DO NOT change how Instagram posts look (caption lines) or how graphics are used (image_url from graphic_url).
+# - Instagram is marketing-only: it MUST NOT write status.
+# - It SHOULD timestamp posted_instagram_at (Column AA) on successful publish.
+# - Trigger should be READY_TO_POST (approved deals).
+# - Idempotent: if posted_instagram_at already set, skip.
 
 import os
 import json
@@ -17,6 +23,8 @@ def env(k, d=""):
 
 def _sa_creds():
     raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
+    if not raw:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
     try:
         info = json.loads(raw)
     except json.JSONDecodeError:
@@ -125,11 +133,44 @@ def main():
     ws = sh.worksheet(env("RAW_DEALS_TAB", "RAW_DEALS"))
 
     values = ws.get_all_values()
+    if not values or len(values) < 2:
+        print("No rows found in RAW_DEALS")
+        return 0
+
     headers = values[0]
     h = {k: i for i, k in enumerate(headers)}
 
+    # Required headers (do not rename)
+    for col in [
+        "status",
+        "graphic_url",
+        "destination_country",
+        "destination_city",
+        "origin_city",
+        "price_gbp",
+        "outbound_date",
+        "return_date",
+        "posted_instagram_at",
+    ]:
+        if col not in h:
+            raise RuntimeError(f"RAW_DEALS missing required header: {col}")
+
+    ig_user_id = env("IG_USER_ID")
+    ig_access_token = env("IG_ACCESS_TOKEN")
+    graph_api_version = env("GRAPH_API_VERSION", "v20.0")
+
+    if not ig_user_id:
+        raise RuntimeError("Missing IG_USER_ID")
+    if not ig_access_token:
+        raise RuntimeError("Missing IG_ACCESS_TOKEN")
+
     for i, r in enumerate(values[1:], start=2):
-        if r[h["status"]] != "READY_TO_PUBLISH":
+        # Trigger: READY_TO_POST (approved deals)
+        if r[h["status"]] != "READY_TO_POST":
+            continue
+
+        # Idempotency: if already posted, skip
+        if r[h["posted_instagram_at"]].strip():
             continue
 
         row = {headers[j]: r[j] for j in range(len(headers))}
@@ -143,13 +184,14 @@ def main():
         phrase = phrase_from_row(row)
         image_url = row.get("graphic_url", "")
 
+        if not image_url:
+            print("⏭️ Skipping row: missing graphic_url")
+            continue
+
         # Get country flag (flags or globe only)
         flag = get_country_flag(country)
 
-        # Build caption (UPDATED COPY ONLY)
-        # - human tone
-        # - feature -> benefit
-        # - explains VIP-first timing without hype
+        # Build caption (DO NOT EDIT COPY OR STRUCTURE)
         caption = "\n".join([
             f"{country} {flag}",
             "",
@@ -166,11 +208,11 @@ def main():
 
         # Create Instagram media
         create = requests.post(
-            f"https://graph.facebook.com/v20.0/{env('IG_USER_ID')}/media",
+            f"https://graph.facebook.com/{graph_api_version}/{ig_user_id}/media",
             data={
                 "image_url": image_url,
                 "caption": caption,
-                "access_token": env("IG_ACCESS_TOKEN"),
+                "access_token": ig_access_token,
             },
         ).json()
 
@@ -182,26 +224,26 @@ def main():
 
         # Publish Instagram media
         pub = requests.post(
-            f"https://graph.facebook.com/v20.0/{env('IG_USER_ID')}/media_publish",
+            f"https://graph.facebook.com/{graph_api_version}/{ig_user_id}/media_publish",
             data={
                 "creation_id": cid,
-                "access_token": env("IG_ACCESS_TOKEN"),
+                "access_token": ig_access_token,
             },
         ).json()
 
         if "id" not in pub:
             raise RuntimeError(f"Instagram publish failed: {pub}")
 
-        # Update status
-        ws.update_cell(i, h["status"] + 1, "POSTED_INSTAGRAM")
+        # Marketing-only writeback: timestamp only (never touches status)
         ws.update_cell(i, h["posted_instagram_at"] + 1, dt.datetime.utcnow().isoformat() + "Z")
 
         print(f"✅ Published to Instagram: {city} £{price}")
         return 0
 
-    print("No deals with status READY_TO_PUBLISH found")
+    print("No deals with status READY_TO_POST found (or all already posted)")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

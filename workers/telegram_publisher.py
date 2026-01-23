@@ -144,7 +144,7 @@ def get_country_flag(country_name):
         "South Korea": "🇰🇷",
         "China": "🇨🇳",
         "Australia": "🇦🇺",
-        "New Zealand": "🇳🇿",
+        "New Zealand": "🇦🇺",
         "Brazil": "🇧🇷",
         "Argentina": "🇦🇷",
         "Colombia": "🇨🇴",
@@ -203,6 +203,7 @@ def in_free_window(now):
 
 
 # ------------------ message builders ------------------
+# DO NOT MODIFY OUTPUT COPY / CONTENT BELOW.
 
 def build_vip_message(row):
     # NOTE: Only copy changed (logic unchanged). Flags/globe remain.
@@ -302,7 +303,8 @@ def main():
     # --- STAGE 1: VIP (twice daily) ---
     if in_vip_window(now):
         for i, r in enumerate(values[1:], start=2):
-            if r[h["status"]] == "POSTED_INSTAGRAM":
+            # Canonical gate: VIP publishes when status is READY_TO_POST.
+            if r[h["status"]] == "READY_TO_POST":
                 row = {headers[j]: r[j] for j in range(len(headers))}
                 msg = build_vip_message(row)
 
@@ -338,8 +340,8 @@ def main():
                 msg = build_free_message(row)
                 tg_send(env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHANNEL"), msg, disable_preview=True)
 
-                # keep existing status if your lifecycle expects it; otherwise you can switch to POSTED_ALL later.
-                set_cell(ws, i, h["status"], "POSTED_TELEGRAM_FREE")
+                # Terminal state: completes the lifecycle cleanly (VIP then FREE).
+                set_cell(ws, i, h["status"], "POSTED_ALL")
                 if "posted_telegram_free_at" in h:
                     set_cell(ws, i, h["posted_telegram_free_at"], now.isoformat().replace("+00:00", "Z"))
 

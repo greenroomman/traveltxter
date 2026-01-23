@@ -1,5 +1,5 @@
 # workers/ai_scorer.py
-# V4.7.3 — scorer: NEW -> (READY_TO_POST for winners) else -> SCORED
+# V4.7.3+PRO — scorer: NEW -> (READY_TO_POST for winners) else -> SCORED
 # Contract:
 # - RAW_DEALS is canonical (writes happen here only)
 # - RAW_DEALS_VIEW is read-only (intelligence / formulas)
@@ -7,11 +7,11 @@
 # - Publishers never select language
 # - Full-file replacement only
 #
-# Hardening changes in this version:
-# 1) RAW_DEALS_VIEW read no longer uses get_all_records() (which hard-crashes on duplicate headers).
-#    Instead, we read values + map only required columns, ignoring duplicate header collisions safely.
-# 2) Phrase theme selection falls back: dynamic_theme (VIEW) -> deal_theme (RAW) -> theme (RAW)
-#    so a broken RDV dynamic_theme doesn't break phrase selection.
+# PRO additions (minimal, deterministic):
+# - Compute PRO_score from RDV identity signals (no price_value dependency)
+# - Weekly rarity gate (sheet-state only)
+# - Allow one PRO “rescue” promotion when gate is open (can override hard_reject)
+# - Optional: write worthiness_verdict/PROMO_HINT/PRO_score to RAW if columns exist
 
 import os
 import json
@@ -46,8 +46,27 @@ MIN_WORTHINESS_SCORE = float(os.getenv("MIN_WORTHINESS_SCORE", "0"))
 PHRASE_USED_COL = "phrase_used"
 PHRASE_BANK_COL = "phrase_bank"
 
+# -------------------------
+# PRO controls (safe defaults)
+# -------------------------
+PRO_ENABLED = os.getenv("PRO_ENABLED", "TRUE").strip().upper() in ("TRUE", "1", "YES", "Y", "ON")
+PRO_RARITY_DAYS = int(os.getenv("PRO_RARITY_DAYS", "7"))
+
+# Calibrated thresholds (Claude-style defaults)
+THETA_PRO_REVIEW = float(os.getenv("THETA_PRO_REVIEW", "50.0"))
+THETA_PRO_PRIORITY = float(os.getenv("THETA_PRO_PRIORITY", "56.7"))
+
+# “Reasonableness” gate to prevent nonsense (only applied if price is present)
+# If blank/0 → disabled
+PRO_MAX_PRICE_GBP = float(os.getenv("PRO_MAX_PRICE_GBP", "0") or "0")
+
+# If you want PRO to “steal” a run only when VIP winner is weak, set e.g. 66.
+# If 0 → PRO can promote whenever gate open + threshold met.
+PRO_ONLY_IF_VIP_BELOW = float(os.getenv("PRO_ONLY_IF_VIP_BELOW", "0") or "0")
+
 
 # View columns we actually need (minimizes coupling to RDV header chaos)
+# NOTE: Expanded to support PRO_score.
 VIEW_REQUIRED_COLS = (
     "status",
     "deal_id",
@@ -55,6 +74,13 @@ VIEW_REQUIRED_COLS = (
     "dynamic_theme",
     "hard_reject",
     "worthiness_score",
+    # PRO signals (best-effort; missing columns will safely disable PRO path)
+    "theme_fit_score",
+    "novelty_score",
+    "timing_score",
+    "fatigue_penalty",
+    "stops",
+    "price_gbp",
 )
 
 
@@ -139,63 +165,18 @@ def _float_or_none(v):
         return None
 
 
+def _int_or_none(v):
+    s = _norm(v)
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except Exception:
+        return None
+
+
 def _clean_iata(x):
     return _norm(x).upper()[:3]
-
-
-def _load_route_maps(sh):
-    """Best-effort: returns (dest_city_map, dest_country_map)."""
-    try:
-        ws = sh.worksheet(CAPABILITY_TAB)
-        rows = ws.get_all_records()
-    except Exception as e:
-        _log(f"ROUTE_CAPABILITY_MAP not readable: {e}")
-        return {}, {}
-
-    dest_city_map = {}
-    dest_country_map = {}
-    for r in rows:
-        d = _clean_iata(r.get("destination_iata"))
-        if not d:
-            continue
-        dc = _norm(r.get("destination_city"))
-        dcty = _norm(r.get("destination_country"))
-        if dc and d not in dest_city_map:
-            dest_city_map[d] = dc
-        if dcty and d not in dest_country_map:
-            dest_country_map[d] = dcty
-    return dest_city_map, dest_country_map
-
-
-def _load_signals(sh):
-    """
-    Best-effort: returns dict dest_iata -> row.
-
-    RESILIENT: Tries CONFIG_SIGNALS first, then CONFIG (for post-merge compatibility).
-    Never crashes if tabs are missing.
-    """
-    # Try CONFIG_SIGNALS (legacy)
-    try:
-        ws = sh.worksheet(SIGNALS_TAB)
-        rows = ws.get_all_records()
-        _log(f"✅ Loaded enrichment from {SIGNALS_TAB}")
-    except Exception:
-        # Fall back to CONFIG (after merge)
-        try:
-            config_tab = os.getenv("CONFIG_TAB", "CONFIG")
-            ws = sh.worksheet(config_tab)
-            rows = ws.get_all_records()
-            _log(f"✅ Loaded enrichment from {config_tab} (CONFIG_SIGNALS not found)")
-        except Exception as e:
-            _log(f"⚠️ No enrichment tabs available ({SIGNALS_TAB} or CONFIG): {e}")
-            return {}
-
-    out = {}
-    for r in rows:
-        key = _clean_iata(r.get("destination_iata") or r.get("iata_hint") or r.get("iata"))
-        if key:
-            out[key] = r
-    return out
 
 
 def _ws_headers(ws):
@@ -232,23 +213,143 @@ def _safe_view_rows(ws_view):
             + (" ..." if len(dupes) > 30 else "")
         )
 
-    missing = [c for c in VIEW_REQUIRED_COLS if c not in first_idx]
-    if missing:
-        _log(f"⚠️ RAW_DEALS_VIEW missing required columns for scoring: {missing}. Treating as empty.")
+    # Hard requirement for scoring pipeline to run
+    must_have = ("status", "deal_id")
+    missing_must = [c for c in must_have if c not in first_idx]
+    if missing_must:
+        _log(f"⚠️ RAW_DEALS_VIEW missing required columns for scoring: {missing_must}. Treating as empty.")
         return []
+
+    # Soft requirements for VIP/PRO intelligence
+    # We'll map whatever exists; missing PRO cols will just disable PRO scoring
+    cols_to_map = [c for c in VIEW_REQUIRED_COLS if c in first_idx]
 
     rows = []
     for row in values[1:]:
-        # pad to header length
         if len(row) < len(headers):
             row = row + [""] * (len(headers) - len(row))
 
         r = {}
-        for c in VIEW_REQUIRED_COLS:
+        for c in cols_to_map:
             r[c] = row[first_idx[c]] if first_idx.get(c) is not None else ""
         rows.append(r)
 
     return rows
+
+
+# -------------------------
+# PRO scoring (calibrated, identity-first)
+# Uses only RDV columns; ignores price_value_score entirely.
+# -------------------------
+def _clip(x, lo=0.0, hi=100.0):
+    try:
+        if x is None:
+            return lo
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return lo
+
+
+def _theme_rarity_points(theme_norm):
+    # Points, not multipliers (keeps calibration stable)
+    t = _norm_theme(theme_norm)
+    if t == "long_haul":
+        return 25.0
+    if t == "city_breaks":
+        return 25.0
+    if t == "winter_sun":
+        return 20.0
+    if t == "luxury_value":
+        return 15.0
+    # volume themes get no boost
+    return 0.0
+
+
+def calculate_pro_score(theme_fit, novelty, stops, fatigue, theme_norm):
+    """
+    Claude-calibrated, percentile-friendly score.
+    Outputs ~[0..~60] on your observed distributions; thresholds live in env.
+    """
+    tf = _float_or_none(theme_fit)
+    nv = _float_or_none(novelty)
+    st = _int_or_none(stops)
+    ft = _float_or_none(fatigue)
+
+    # Normalise theme_fit [70..100] → [0..40]
+    if tf is None:
+        tf_part = 0.0
+    else:
+        tf_part = _clip((tf - 70.0) / 30.0 * 40.0, 0.0, 40.0)
+
+    # Normalise novelty [60..100] → [0..25]
+    if nv is None:
+        nv_part = 0.0
+    else:
+        nv_part = _clip((nv - 60.0) / 40.0 * 25.0, 0.0, 25.0)
+
+    # Nonstop bonus / connection kill-switch
+    if st is None:
+        conn_part = 0.0
+    elif st == 0:
+        conn_part = 10.0
+    elif st == 1:
+        conn_part = 0.0
+    else:
+        conn_part = -50.0
+
+    rarity_part = _theme_rarity_points(theme_norm)
+
+    # Fatigue penalty scaled down
+    if ft is None:
+        fat_part = 0.0
+    else:
+        fat_part = float(ft) * 0.5
+
+    score = tf_part + nv_part + conn_part + rarity_part - fat_part
+    return _clip(score, 0.0, 100.0)
+
+
+def _pro_verdict_for(score):
+    if score is None:
+        return ""
+    if score >= THETA_PRO_PRIORITY:
+        return "PRO_WORTHY_PRIORITY"
+    if score >= THETA_PRO_REVIEW:
+        return "PRO_WORTHY_REVIEW"
+    return ""
+
+
+def _pro_rarity_gate_open(raw_rows, raw_headers_map):
+    """
+    Sheet-state only: if any PRO_WORTHY_* has been posted in last PRO_RARITY_DAYS → gate closed.
+    Uses whatever columns exist; if required columns missing, default OPEN (fail-soft).
+    """
+    if PRO_RARITY_DAYS <= 0:
+        return True
+
+    col_verdict = raw_headers_map.get("worthiness_verdict")
+    col_status = raw_headers_map.get("status")
+    col_ts = raw_headers_map.get("ingested_at_utc")  # fallback timestamp
+
+    if not col_verdict or not col_status or not col_ts:
+        _log("⚠️ PRO rarity gate: missing RAW columns (worthiness_verdict/status/ingested_at_utc). Gate OPEN (fail-soft).")
+        return True
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=PRO_RARITY_DAYS)
+
+    # raw_rows here are dicts (from get_all_records)
+    for r in raw_rows:
+        v = _norm(r.get("worthiness_verdict"))
+        s = _norm(r.get("status"))
+        if not v.startswith("PRO_WORTHY_"):
+            continue
+        if not (s.startswith("POSTED_") or s == "POSTED_ALL"):
+            continue
+        ts = _parse_iso_utc(r.get("ingested_at_utc"))
+        if ts and ts >= cutoff:
+            return False
+    return True
 
 
 def main():
@@ -260,10 +361,6 @@ def main():
 
     ws_raw = sh.worksheet(RAW_TAB)
     ws_view = sh.worksheet(VIEW_TAB)
-
-    # Route enrichment sources (best-effort; scorer must never crash if tabs are missing)
-    dest_city_map, dest_country_map = _load_route_maps(sh)
-    signals = _load_signals(sh)
 
     # Load phrase bank (optional; system must not break if unavailable)
     try:
@@ -369,6 +466,13 @@ def main():
                 "theme": _norm_theme(theme_candidate),
                 "hard_reject": hard_reject,
                 "worthiness": worth,
+                # PRO signals (may be blank)
+                "theme_fit_score": r.get("theme_fit_score", ""),
+                "novelty_score": r.get("novelty_score", ""),
+                "timing_score": r.get("timing_score", ""),
+                "fatigue_penalty": r.get("fatigue_penalty", ""),
+                "stops": r.get("stops", ""),
+                "price_gbp": r.get("price_gbp", ""),
             }
         )
 
@@ -383,45 +487,111 @@ def main():
         _log("No eligible NEW rows")
         return 0
 
-    # Decide winners:
-    # - never pick hard_reject
-    # - if worthiness exists, sort desc and apply optional threshold
-    eligible_for_winner = [c for c in candidates if not c["hard_reject"]]
+    # -------------------------
+    # Winner selection
+    # -------------------------
 
-    if not eligible_for_winner:
-        _log("All eligible candidates were hard_reject=TRUE; marking evaluated rows as SCORED only.")
-        eligible_for_winner = []
+    # Existing VIP pool: never pick hard_reject
+    vip_pool = [c for c in candidates if not c["hard_reject"]]
+
+    # PRO pool: can include hard_reject (that's the whole point),
+    # but still needs enough identity signals to score.
+    pro_pool = list(candidates) if PRO_ENABLED else []
 
     # Log intelligence availability
-    has_worthiness = sum(1 for c in eligible_for_winner if c["worthiness"] is not None)
+    has_worthiness = sum(1 for c in vip_pool if c["worthiness"] is not None)
     _log(
-        f"Intelligence check: {has_worthiness}/{len(eligible_for_winner)} candidates have worthiness_score. "
+        f"Intelligence check: {has_worthiness}/{len(vip_pool)} VIP-eligible candidates have worthiness_score. "
         f"{'✅ Using scores for ranking' if has_worthiness > 0 else '⚠️ Random ranking (no scores)'}"
     )
 
-    # Sort winners by worthiness if available; else stable by deal_id hash
-    def _winner_sort_key(c):
-        # worthiness: higher first; None treated as very low
+    # VIP ranking (unchanged)
+    def _vip_sort_key(c):
         w = c["worthiness"]
         if w is None:
             w = -1e9
         return (-w, c["did"])
 
-    eligible_for_winner.sort(key=_winner_sort_key)
+    vip_pool.sort(key=_vip_sort_key)
+    vip_best = vip_pool[0] if vip_pool else None
 
+    # PRO scoring + ranking
+    pro_best = None
+    pro_best_score = None
+    pro_best_verdict = ""
+
+    if PRO_ENABLED and pro_pool:
+        # Gate open?
+        gate_open = _pro_rarity_gate_open(raw_rows, col)
+        _log(f"PRO gate: {'OPEN' if gate_open else 'CLOSED'} | rarity_days={PRO_RARITY_DAYS}")
+
+        if gate_open:
+            scored = []
+            for c in pro_pool:
+                # Optional “reasonableness” price cap
+                price = _float_or_none(c.get("price_gbp"))
+                if PRO_MAX_PRICE_GBP and PRO_MAX_PRICE_GBP > 0 and price is not None and price > PRO_MAX_PRICE_GBP:
+                    continue
+
+                ps = calculate_pro_score(
+                    c.get("theme_fit_score"),
+                    c.get("novelty_score"),
+                    c.get("stops"),
+                    c.get("fatigue_penalty"),
+                    c.get("theme"),
+                )
+                c["pro_score"] = ps
+                scored.append(c)
+
+            scored.sort(key=lambda x: (-x.get("pro_score", 0.0), x["did"]))
+            if scored:
+                pro_best = scored[0]
+                pro_best_score = pro_best.get("pro_score")
+                pro_best_verdict = _pro_verdict_for(pro_best_score or 0.0)
+
+                _log(
+                    f"Top PRO candidate: did={pro_best['did']} score={pro_best_score:.2f} "
+                    f"theme={pro_best['theme']} hard_reject={pro_best['hard_reject']}"
+                )
+
+    # Decide final winners list (still respects WINNERS_PER_RUN)
     winners = []
-    for c in eligible_for_winner:
-        if len(winners) >= WINNERS_PER_RUN:
-            break
-        if c["worthiness"] is not None and c["worthiness"] < MIN_WORTHINESS_SCORE:
-            continue
-        winners.append(c)
+
+    # Policy:
+    # - If PRO candidate clears threshold AND (optional) VIP best is weak → pick PRO
+    # - Else pick VIP as before
+    if WINNERS_PER_RUN != 1:
+        _log("⚠️ PRO logic is designed for WINNERS_PER_RUN=1. Continuing, but behavior may be surprising.")
+
+    choose_pro = False
+    if pro_best and pro_best_verdict:
+        if PRO_ONLY_IF_VIP_BELOW and PRO_ONLY_IF_VIP_BELOW > 0:
+            vip_w = vip_best["worthiness"] if vip_best and vip_best["worthiness"] is not None else -1e9
+            if vip_w < PRO_ONLY_IF_VIP_BELOW:
+                choose_pro = True
+        else:
+            choose_pro = True
+
+    if choose_pro and len(winners) < WINNERS_PER_RUN:
+        winners.append(pro_best)
+        _log(f"Winner selection: PRO ({pro_best_verdict}) promoted this run.")
+    else:
+        if vip_best:
+            # Apply existing MIN_WORTHINESS_SCORE filter
+            if vip_best["worthiness"] is None or vip_best["worthiness"] >= MIN_WORTHINESS_SCORE:
+                winners.append(vip_best)
+                _log("Winner selection: VIP promoted this run.")
+            else:
+                _log("Winner selection: VIP best below MIN_WORTHINESS_SCORE; no promotion.")
+        else:
+            _log("Winner selection: No VIP-eligible candidates (all hard_reject or empty). No promotion.")
 
     winner_ids = {w["did"] for w in winners}
 
     # Updates:
     # 1) Mark all evaluated candidates as SCORED (except winners)
     # 2) Promote winners to READY_TO_POST + lock phrase
+    # 3) Best-effort: write PRO fields if columns exist
     updates = []
 
     scored_count = 0
@@ -445,22 +615,18 @@ def main():
         updates.append(Cell(rownum, col[PHRASE_USED_COL], phrase))
         updates.append(Cell(rownum, col[PHRASE_BANK_COL], phrase))
 
-        # SKIP destination backfill: feeder already populates these from ROUTE_CAPABILITY_MAP
-        # (Keeping this code commented for reference if needed in future)
-        #
-        # rawrec = deal_raw_record.get(did, {})
-        # dest_city_col = col.get("destination_city")
-        # dest_country_col = col.get("destination_country")
-        #
-        # if dest_city_col and not _norm(rawrec.get("destination_city")):
-        #     city = dest_city_map.get(dest) or _norm(signals.get(dest, {}).get("destination_city"))
-        #     if city:
-        #         updates.append(Cell(rownum, dest_city_col, city))
-        #
-        # if dest_country_col and not _norm(rawrec.get("destination_country")):
-        #     country = dest_country_map.get(dest) or _norm(signals.get(dest, {}).get("destination_country"))
-        #     if country:
-        #         updates.append(Cell(rownum, dest_country_col, country))
+        # If this was a PRO winner, best-effort mark fields on RAW (only if columns exist)
+        if c is pro_best and pro_best_verdict:
+            pro_score_col = col.get("PRO_score") or col.get("pro_score")
+            verdict_col = col.get("worthiness_verdict")
+            promo_col = col.get("PROMO_HINT") or col.get("promo_hint")
+
+            if pro_score_col:
+                updates.append(Cell(rownum, pro_score_col, f"{pro_best_score:.2f}"))
+            if verdict_col:
+                updates.append(Cell(rownum, verdict_col, pro_best_verdict))
+            if promo_col:
+                updates.append(Cell(rownum, promo_col, "PRO_EDITORIAL"))
 
         promoted += 1
         _log(

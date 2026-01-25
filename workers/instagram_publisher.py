@@ -1,12 +1,14 @@
 # workers/instagram_publisher.py
 # FULL FILE REPLACEMENT
 #
-# Notes (locked):
+# Locked constraints (DO NOT VIOLATE):
 # - DO NOT change how Instagram posts look (caption lines) or how graphics are used (image_url from graphic_url).
 # - Instagram is marketing-only: it MUST NOT write status.
 # - It SHOULD timestamp posted_instagram_at (Column AA) on successful publish.
-# - Trigger should be READY_TO_POST (approved deals).
 # - Idempotent: if posted_instagram_at already set, skip.
+#
+# FIX (ONLY): consume deals that are READY_TO_PUBLISH (and keep READY_TO_POST tolerated for backward-compat).
+# This resolves the contract mismatch where the pipeline sets READY_TO_PUBLISH but the publisher only looked for READY_TO_POST.
 
 import os
 import json
@@ -129,7 +131,10 @@ def phrase_from_row(row):
 
 def main():
     gc = gspread.authorize(_sa_creds())
-    sh = gc.open_by_key(env("SPREADSHEET_ID") or env("SHEET_ID"))
+    sheet_id = env("SPREADSHEET_ID") or env("SHEET_ID")
+    if not sheet_id:
+        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
+    sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(env("RAW_DEALS_TAB", "RAW_DEALS"))
 
     values = ws.get_all_values()
@@ -164,9 +169,14 @@ def main():
     if not ig_access_token:
         raise RuntimeError("Missing IG_ACCESS_TOKEN")
 
+    # Trigger statuses:
+    # - Primary: READY_TO_PUBLISH (pipeline-ready for publishing)
+    # - Tolerated: READY_TO_POST (older contract); will still require graphic_url to proceed
+    trigger_statuses = {"READY_TO_PUBLISH", "READY_TO_POST"}
+
     for i, r in enumerate(values[1:], start=2):
-        # Trigger: READY_TO_POST (approved deals)
-        if r[h["status"]] != "READY_TO_POST":
+        # Trigger: READY_TO_PUBLISH (preferred) or READY_TO_POST (back-compat)
+        if r[h["status"]] not in trigger_statuses:
             continue
 
         # Idempotency: if already posted, skip
@@ -240,10 +250,9 @@ def main():
         print(f"✅ Published to Instagram: {city} £{price}")
         return 0
 
-    print("No deals with status READY_TO_POST found (or all already posted)")
+    print("No deals with status READY_TO_PUBLISH/READY_TO_POST found (or all already posted)")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

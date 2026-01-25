@@ -16,6 +16,9 @@
 # - No stub inserts: core fields must exist or skip insert
 # - CONFIG is brain for route pairs (origin_iata + destination_iata)
 # - RCM enabled routes gate + enrich geography
+#
+# TODAY'S CHANGE:
+# - Spreadsheet ID fallback updated to the new ID provided by you (only used if env vars are missing)
 
 from __future__ import annotations
 
@@ -39,6 +42,7 @@ from google.oauth2.service_account import Credentials
 def utc_now() -> dt.datetime:
     return dt.datetime.utcnow()
 
+
 def log(msg: str) -> None:
     print(f"{utc_now().isoformat()}Z | {msg}", flush=True)
 
@@ -51,11 +55,13 @@ def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else str(v)
 
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(float(_env(name, str(default)).strip() or default))
     except Exception:
         return default
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -63,17 +69,21 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+
 def _env_bool(name: str, default: bool = False) -> bool:
     v = _env(name, "")
     if v == "":
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
+
 def _csv_list(s: str) -> List[str]:
     return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
 
+
 def _is_true(v: Any) -> bool:
     return str(v).strip().upper() == "TRUE"
+
 
 def _safe_int(v: Any, default: int = 0) -> int:
     try:
@@ -81,11 +91,13 @@ def _safe_int(v: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         return float(str(v).strip().replace(",", ""))
     except Exception:
         return default
+
 
 def _today_utc() -> dt.date:
     return utc_now().date()
@@ -114,12 +126,14 @@ DUFFEL_API_KEY = _env("DUFFEL_API_KEY")
 DUFFEL_VERSION = "v2"
 DUFFEL_OFFER_REQUEST_URL = "https://api.duffel.com/air/offer_requests"
 
+
 def duffel_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {DUFFEL_API_KEY}",
         "Duffel-Version": DUFFEL_VERSION,
         "Content-Type": "application/json",
     }
+
 
 def duffel_create_offer_request(
     origin: str,
@@ -171,6 +185,7 @@ def _theme_pool_from_config(config_rows: List[Dict[str, Any]]) -> Tuple[str, Dic
     idx = _today_utc().timetuple().tm_yday % len(pool)
     return pool[idx], counts
 
+
 def _effective_theme_override(pool_counts: Dict[str, int]) -> Optional[str]:
     override = _env("THEME", "").strip()
     if not override:
@@ -192,6 +207,7 @@ def _effective_theme_override(pool_counts: Dict[str, int]) -> Optional[str]:
 def _theme_origins_from_env(theme: str) -> List[str]:
     key = f"ORIGINS_{theme.upper()}"
     return _csv_list(_env(key, ""))
+
 
 def _open_origins_effective() -> Tuple[bool, bool, bool]:
     # matches your logging shape
@@ -224,6 +240,7 @@ def _window_days_for_theme(theme: str, cfg_row: Dict[str, Any]) -> Tuple[int, in
         max_d = min_d
     return min_d, max_d
 
+
 def _trip_len_days_for_theme(theme: str, cfg_row: Dict[str, Any]) -> int:
     tl = _safe_int(cfg_row.get("trip_length_days"), 5)
     env_min = _env(f"TRIP_{theme.upper()}_MIN", "").strip()
@@ -236,6 +253,7 @@ def _trip_len_days_for_theme(theme: str, cfg_row: Dict[str, Any]) -> int:
             a, b = b, a
         tl = max(1, (a + b) // 2)
     return max(1, tl)
+
 
 def _candidate_outbounds(min_d: int, max_d: int, trip_len: int, n: int = 3) -> List[dt.date]:
     # deterministic spread across window: min, mid, max-trip
@@ -274,11 +292,13 @@ def _offer_total_amount_gbp(offer: Dict[str, Any]) -> Optional[float]:
         return None
     return amt
 
+
 def _slice_segments(offer: Dict[str, Any], slice_idx: int) -> List[Dict[str, Any]]:
     slices = offer.get("slices") or []
     if slice_idx >= len(slices):
         return []
     return slices[slice_idx].get("segments") or []
+
 
 def _extract_dates_from_offer(offer: Dict[str, Any]) -> Tuple[str, str]:
     slices = offer.get("slices") or []
@@ -299,6 +319,7 @@ def _extract_dates_from_offer(offer: Dict[str, Any]) -> Tuple[str, str]:
             inn = str(segs[0]["departing_at"])[:10]
     return out, inn
 
+
 def _duration_minutes_from_segments(segs: List[Dict[str, Any]]) -> int:
     # compute from timestamps if present
     try:
@@ -315,6 +336,7 @@ def _duration_minutes_from_segments(segs: List[Dict[str, Any]]) -> int:
     except Exception:
         return 0
 
+
 def _carriers_from_offer(offer: Dict[str, Any]) -> str:
     carriers = set()
     for seg in (_slice_segments(offer, 0) + _slice_segments(offer, 1)):
@@ -323,6 +345,7 @@ def _carriers_from_offer(offer: Dict[str, Any]) -> str:
             carriers.add(str(mc).upper())
     return ",".join(sorted(carriers)) if carriers else "na"
 
+
 def _via_hub_from_offer(offer: Dict[str, Any]) -> str:
     segs = _slice_segments(offer, 0)
     if len(segs) <= 1:
@@ -330,6 +353,7 @@ def _via_hub_from_offer(offer: Dict[str, Any]) -> str:
     # first connection point = destination of first segment
     hub = (segs[0].get("destination") or {}).get("iata_code")
     return str(hub).upper() if hub else "na"
+
 
 def _normalise_offer_fields(offer: Dict[str, Any]) -> Dict[str, Any]:
     segs_out = _slice_segments(offer, 0)
@@ -364,13 +388,16 @@ def _normalise_offer_fields(offer: Dict[str, Any]) -> Dict[str, Any]:
 def _build_header_index(headers: List[str]) -> Dict[str, int]:
     return {h: i for i, h in enumerate(headers)}
 
+
 def _row_put(row: List[Any], idx: Dict[str, int], key: str, val: Any) -> None:
     if key in idx:
         row[idx[key]] = val
 
+
 def _round_price_gbp(p: float) -> float:
     # keep as numeric; light rounding
     return float(math.ceil(p * 100) / 100.0)
+
 
 def _ingested_iso() -> str:
     return utc_now().replace(microsecond=0).isoformat() + "Z"
@@ -386,7 +413,10 @@ def main() -> int:
     log("================================================================================")
 
     # Tabs
-    SPREADSHEET_ID = _env("SPREADSHEET_ID") or _env("SHEET_ID")
+    # NOTE: Spreadsheet ID now falls back to your new ID only if env vars are missing.
+    DEFAULT_SPREADSHEET_ID = "1jXo86gFDfNbRNjDrUq_zFKqaQchUOg34UaIW54QAw1E"
+    SPREADSHEET_ID = (_env("SPREADSHEET_ID") or _env("SHEET_ID") or DEFAULT_SPREADSHEET_ID).strip()
+
     RAW_DEALS_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
     CONFIG_TAB = _env("FEEDER_CONFIG_TAB", _env("CONFIG_TAB", "CONFIG"))
     RCM_TAB = _env("RCM_TAB", "ROUTE_CAPABILITY_MAP")
@@ -412,7 +442,7 @@ def main() -> int:
     HYGIENE_DUR_LONG = _env_int("HYGIENE_DUR_LONG", 1200)
 
     # Price gate (kept light; we rank cheapest rather than hard-kill everything)
-    PRICE_GATE_BEHAVIOR = _env("PRICE_GATE_FALLBACK_BEHAVIOR", "BLOCK").upper().strip() or "BLOCK"
+    PRICE_GATE_BEHAVIOR = (_env("PRICE_GATE_FALLBACK_BEHAVIOR", "BLOCK").upper().strip() or "BLOCK")
     PRICE_MULT = _env_float("PRICE_GATE_MULT", 1.0)
     PRICE_MINCAP = _env_float("PRICE_GATE_MINCAP", 80.0)
 
@@ -504,10 +534,9 @@ def main() -> int:
     deals_out: List[List[Any]] = []
 
     searches_done = 0
-    deals_collected = 0
 
     def can_insert(origin: str, dest: str) -> bool:
-        if deals_collected + len(deals_out) >= DUFFEL_MAX_INSERTS:
+        if len(deals_out) >= DUFFEL_MAX_INSERTS:
             return False
         if inserted_by_origin.get(origin, 0) >= DUFFEL_MAX_INSERTS_PER_ORIGIN:
             return False
@@ -632,8 +661,6 @@ def main() -> int:
 
         ranked.sort(key=lambda x: x[0])
 
-        # Price gate: do NOT kill everything early; but keep behaviour compatibility.
-        # We cap at (mincap or cheapest*mult) if BLOCK; otherwise allow.
         gbp_ranked = len(ranked)
         if gbp_ranked == 0:
             cap_str = "na"
@@ -673,7 +700,6 @@ def main() -> int:
             if not deal_id or not out_date or not ret_date:
                 continue
 
-            # build row
             row = [""] * len(headers)
 
             # core
@@ -707,7 +733,12 @@ def main() -> int:
             _row_put(row, idx, "currency", norm.get("currency", "GBP"))
 
             # core guardrail check (no stubs)
-            core_required = ["deal_id", "price_gbp", "origin_iata", "destination_iata", "outbound_date", "return_date", "destination_city", "destination_country", "origin_city", "origin_country", "deal_theme"]
+            core_required = [
+                "deal_id", "price_gbp", "origin_iata", "destination_iata",
+                "outbound_date", "return_date",
+                "destination_city", "destination_country", "origin_city", "origin_country",
+                "deal_theme"
+            ]
             ok = True
             for k in core_required:
                 v = row[idx[k]] if k in idx else ""

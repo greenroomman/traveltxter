@@ -1,12 +1,28 @@
-name: TravelTxter Pipeline
+name: TravelTxter Pipeline (Manual TEST)
 
 on:
-  schedule:
-    # AM run — Instagram + VIP
-    - cron: "30 7 * * *"   # 07:30 UTC
-    # PM run — Instagram + VIP + (FREE if 24h elapsed)
-    - cron: "30 16 * * *"  # 16:30 UTC
   workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "Which run is this?"
+        required: true
+        default: "AM"
+        type: choice
+        options:
+          - AM
+          - PM
+
+# NOTE: schedule intentionally DISABLED for manual testing.
+# When you later re-enable scheduling, use:
+#   AM 06:00 UTC  -> cron: "0 6 * * *"
+#   PM 16:30 UTC  -> cron: "30 16 * * *"
+#
+# on:
+#   schedule:
+#     - cron: "0 6 * * *"
+#     - cron: "30 16 * * *"
+#   workflow_dispatch:
+#     inputs: ...
 
 concurrency:
   group: traveltxter-pipeline
@@ -16,10 +32,10 @@ jobs:
   pipeline:
     runs-on: ubuntu-latest
 
-    # ✅ IMPORTANT: Map GitHub Variables -> runtime env ONCE here (applies to all steps)
     env:
       # ---------------- Shared runtime context ----------------
-      RUN_SLOT: ${{ github.event.schedule }}
+      # Manual TEST: drive run behaviour explicitly
+      RUN_SLOT: ${{ github.event.inputs.run_slot }}
 
       # Spreadsheet identity (support both names for legacy code)
       SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -30,8 +46,6 @@ jobs:
       GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
 
       # ---------------- Tab names (Secrets + Vars compatibility) ----------------
-      # If you store tab names as secrets, they’ll be available.
-      # If you store tab names as vars, they’ll also be available.
       RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
       FEEDER_LOG_TAB: ${{ secrets.FEEDER_LOG_TAB }}
       INSTA_FEED_TAB: ${{ secrets.INSTA_FEED_TAB }}
@@ -117,7 +131,7 @@ jobs:
       # ---------------- Instagram Graph API (Vars) ----------------
       GRAPH_API_VERSION: ${{ vars.GRAPH_API_VERSION }}
 
-      # ---------------- Origins by theme (Vars) ----------------
+      # ---------------- Origins / Stops / Seasonality / Trip / Window (Vars) ----------------
       SW_ENGLAND_ORIGINS: ${{ vars.SW_ENGLAND_ORIGINS }}
       ORIGINS_DEFAULT: ${{ vars.ORIGINS_DEFAULT }}
       ORIGINS_LONG_HAUL: ${{ vars.ORIGINS_LONG_HAUL }}
@@ -133,7 +147,6 @@ jobs:
       ORIGINS_CULTURE_HISTORY: ${{ vars.ORIGINS_CULTURE_HISTORY }}
       ORIGINS_UNEXPECTED_VALUE: ${{ vars.ORIGINS_UNEXPECTED_VALUE }}
 
-      # ---------------- Stops by theme (Vars) ----------------
       MAX_STOPS_DEFAULT: ${{ vars.MAX_STOPS_DEFAULT }}
       MAX_STOPS_LONG_HAUL: ${{ vars.MAX_STOPS_LONG_HAUL }}
       MAX_STOPS_LUXURY_VALUE: ${{ vars.MAX_STOPS_LUXURY_VALUE }}
@@ -148,7 +161,6 @@ jobs:
       MAX_STOPS_CULTURE_HISTORY: ${{ vars.MAX_STOPS_CULTURE_HISTORY }}
       MAX_STOPS_UNEXPECTED_VALUE: ${{ vars.MAX_STOPS_UNEXPECTED_VALUE }}
 
-      # ---------------- Seasonality months (Vars) ----------------
       SEASON_ADVENTURE_MONTHS: ${{ vars.SEASON_ADVENTURE_MONTHS }}
       SEASON_BEACH_BREAK_MONTHS: ${{ vars.SEASON_BEACH_BREAK_MONTHS }}
       SEASON_CITY_BREAKS_MONTHS: ${{ vars.SEASON_CITY_BREAKS_MONTHS }}
@@ -165,7 +177,6 @@ jobs:
       SEASON_WINTER_SUN_MONTHS: ${{ vars.SEASON_WINTER_SUN_MONTHS }}
       SEASON_WINTER_SUN_SHOULDER_MONTHS: ${{ vars.SEASON_WINTER_SUN_SHOULDER_MONTHS }}
 
-      # ---------------- Trip length ranges (Vars) ----------------
       TRIP_DEFAULT_MIN: ${{ vars.TRIP_DEFAULT_MIN }}
       TRIP_DEFAULT_MAX: ${{ vars.TRIP_DEFAULT_MAX }}
       TRIP_ADVENTURE_MIN: ${{ vars.TRIP_ADVENTURE_MIN }}
@@ -193,7 +204,6 @@ jobs:
       TRIP_WINTER_SUN_MIN: ${{ vars.TRIP_WINTER_SUN_MIN }}
       TRIP_WINTER_SUN_MAX: ${{ vars.TRIP_WINTER_SUN_MAX }}
 
-      # ---------------- Booking window ranges (Vars) ----------------
       WINDOW_DEFAULT_MIN: ${{ vars.WINDOW_DEFAULT_MIN }}
       WINDOW_DEFAULT_MAX: ${{ vars.WINDOW_DEFAULT_MAX }}
       WINDOW_ADVENTURE_MIN: ${{ vars.WINDOW_ADVENTURE_MIN }}
@@ -266,12 +276,12 @@ jobs:
           python workers/link_router.py
 
       # ---------------- INSTAGRAM ----------------
-      - name: Run Instagram Publisher
+      - name: Run Instagram Publisher (AM only)
+        if: ${{ env.RUN_SLOT == 'AM' }}
         run: |
           python workers/instagram_publisher.py
 
       # ---------------- TELEGRAM ----------------
-      - name: Run Telegram Publisher
+      - name: Run Telegram Publisher (AM=VIPam, PM=VIPpm+FREE)
         run: |
           python workers/telegram_publisher.py
-

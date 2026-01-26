@@ -1,5 +1,17 @@
 # workers/instagram_publisher.py
-# RDV Gate Enforced — hardened truthy gate for instagram_ok (TRUE/1 supported)
+# FULL REPLACEMENT — RDV Gate Enforced, truthful logging via ig_gate_reason (optional), quiet mode supported
+#
+# LOCKED:
+# - Caption wording/structure unchanged
+# - Uses graphic_url
+# - Writes posted_instagram_at in RAW_DEALS only after successful publish
+# - Idempotent (won't repost if posted_instagram_at already set)
+# - Posts max 1 per run
+#
+# IMPROVEMENTS:
+# - If RDV has ig_gate_reason, logs that (not block_reason) to avoid "PASS but blocked" confusion
+# - Supports quiet mode via env IG_PUBLISHER_QUIET=true (logs only publish + already-posted + summary)
+# - instagram_ok supports TRUE/FALSE and 1/0
 
 import os
 import json
@@ -59,11 +71,6 @@ def get_country_flag(country):
 
 
 def _truthy_cell(v) -> bool:
-    """
-    RDV may output TRUE/FALSE or 1/0 (or blanks).
-    gspread returns strings; CSV exports may show numeric.
-    We accept common truthy tokens to avoid contract mismatch.
-    """
     if v is True:
         return True
     if v is False or v is None:
@@ -72,7 +79,13 @@ def _truthy_cell(v) -> bool:
     return s in {"TRUE", "1", "YES", "Y"}
 
 
+def _quiet_mode() -> bool:
+    return env("IG_PUBLISHER_QUIET", "").lower() in {"1", "true", "yes", "y"}
+
+
 def main():
+    quiet = _quiet_mode()
+
     gc = gspread.authorize(_sa_creds())
 
     sheet_id = env("SPREADSHEET_ID") or env("SHEET_ID")
@@ -105,12 +118,12 @@ def main():
         "return_date",
         "instagram_ok",
     ]
-
     for col in required:
         if col not in h:
             raise RuntimeError(f"RAW_DEALS_VIEW missing required header: {col}")
 
-    # ---- OPTIONAL HEADERS (SOFT) ----
+    # ---- OPTIONAL RDV HEADERS (SOFT) ----
+    has_ig_gate_reason = "ig_gate_reason" in h
     has_block_reason = "block_reason" in h
 
     ig_user_id = env("IG_USER_ID")
@@ -121,20 +134,28 @@ def main():
         raise RuntimeError("Missing Instagram credentials")
 
     raw_vals = ws_raw.get_all_values()
+    if len(raw_vals) < 2:
+        print("No rows in RAW_DEALS")
+        return 0
+
     raw_headers = raw_vals[0]
     raw_h = {k: i for i, k in enumerate(raw_headers)}
 
+    if "deal_id" not in raw_h:
+        raise RuntimeError("RAW_DEALS missing required column: deal_id")
     if "posted_instagram_at" not in raw_h:
         raise RuntimeError("RAW_DEALS missing required column: posted_instagram_at")
 
-    print("=" * 70)
-    print("📣 Instagram Publisher — RDV Gate Enforced")
-    print("SOURCE: RAW_DEALS_VIEW")
-    print("=" * 70)
+    if not quiet:
+        print("=" * 70)
+        print("📣 Instagram Publisher — RDV Gate Enforced")
+        print("SOURCE: RAW_DEALS_VIEW")
+        print("=" * 70)
 
     published = 0
     blocked = 0
     ready = 0
+    skipped_posted = 0
 
     for idx, r in enumerate(values[1:], start=2):
         if r[h["status"]] != "READY_TO_PUBLISH":
@@ -145,96 +166,107 @@ def main():
         instagram_ok_raw = r[h["instagram_ok"]]
         if not _truthy_cell(instagram_ok_raw):
             blocked += 1
-            if has_block_reason:
-                print(
-                    f"⛔ BLOCKED {r[h['deal_id']]} — "
-                    f"{r[h['destination_city']]} £{r[h['price_gbp']]} — "
-                    f"{r[h['block_reason']]}"
-                )
-            else:
-                print(
-                    f"⛔ BLOCKED {r[h['deal_id']]} — "
-                    f"{r[h['destination_city']]} £{r[h['price_gbp']]} — "
-                    f"instagram_ok={instagram_ok_raw}"
-                )
+            if quiet:
+                continue
+
+            # Prefer IG-specific gate reason; fallback to block_reason; else show instagram_ok raw
+            reason = None
+            if has_ig_gate_reason:
+                reason = (r[h["ig_gate_reason"]] or "").strip()
+            if not reason and has_block_reason:
+                reason = (r[h["block_reason"]] or "").strip()
+            if not reason:
+                reason = f"instagram_ok={instagram_ok_raw}"
+
+            print(
+                f"⛔ BLOCKED {r[h['deal_id']]} — "
+                f"{r[h['destination_city']]} £{r[h['price_gbp']]} — {reason}"
+            )
             continue
 
         deal_id = r[h["deal_id"]]
 
         # Idempotency check (RAW_DEALS)
         for raw_i, raw_r in enumerate(raw_vals[1:], start=2):
-            if raw_r[raw_h["deal_id"]] == deal_id:
-                if raw_r[raw_h["posted_instagram_at"]]:
+            if raw_r[raw_h["deal_id"]] != deal_id:
+                continue
+
+            if raw_r[raw_h["posted_instagram_at"]]:
+                skipped_posted += 1
+                if not quiet:
                     print(f"↩️  Skipping already posted: {deal_id}")
-                    break
-                else:
-                    # Publish
-                    country = r[h["destination_country"]]
-                    city = r[h["destination_city"]]
-                    price = r[h["price_gbp"]]
-                    outbound = r[h["outbound_date"]]
-                    ret = r[h["return_date"]]
-                    phrase = phrase_from_row(dict(zip(headers, r)))
-                    image_url = r[h["graphic_url"]]
+                break
 
-                    flag = get_country_flag(country)
+            # Publish
+            country = r[h["destination_country"]]
+            city = r[h["destination_city"]]
+            price = r[h["price_gbp"]]
+            outbound = r[h["outbound_date"]]
+            ret = r[h["return_date"]]
+            phrase = phrase_from_row(dict(zip(headers, r)))
+            image_url = r[h["graphic_url"]]
 
-                    # DO NOT CHANGE CAPTION STRUCTURE (LOCKED)
-                    caption = "\n".join([
-                        f"{country} {flag}",
-                        "",
-                        f"London to {city} from £{price}",
-                        f"Out: {outbound}",
-                        f"Return: {ret}",
-                        "",
-                        phrase,
-                        "",
-                        "VIP members saw this first. We post here later, and the free channel gets it after that.",
-                        "",
-                        "Link in bio.",
-                    ]).strip()
+            flag = get_country_flag(country)
 
-                    create = requests.post(
-                        f"https://graph.facebook.com/{api_ver}/{ig_user_id}/media",
-                        data={
-                            "image_url": image_url,
-                            "caption": caption,
-                            "access_token": ig_access_token,
-                        },
-                        timeout=30,
-                    ).json()
+            # DO NOT CHANGE CAPTION STRUCTURE (LOCKED)
+            caption = "\n".join([
+                f"{country} {flag}",
+                "",
+                f"London to {city} from £{price}",
+                f"Out: {outbound}",
+                f"Return: {ret}",
+                "",
+                phrase,
+                "",
+                "VIP members saw this first. We post here later, and the free channel gets it after that.",
+                "",
+                "Link in bio.",
+            ]).strip()
 
-                    cid = create.get("id")
-                    if not cid:
-                        raise RuntimeError(f"IG create failed: {create}")
+            create = requests.post(
+                f"https://graph.facebook.com/{api_ver}/{ig_user_id}/media",
+                data={
+                    "image_url": image_url,
+                    "caption": caption,
+                    "access_token": ig_access_token,
+                },
+                timeout=30,
+            ).json()
 
-                    time.sleep(2)
+            cid = create.get("id")
+            if not cid:
+                raise RuntimeError(f"IG create failed: {create}")
 
-                    pub = requests.post(
-                        f"https://graph.facebook.com/{api_ver}/{ig_user_id}/media_publish",
-                        data={
-                            "creation_id": cid,
-                            "access_token": ig_access_token,
-                        },
-                        timeout=30,
-                    ).json()
+            time.sleep(2)
 
-                    if "id" not in pub:
-                        raise RuntimeError(f"IG publish failed: {pub}")
+            pub = requests.post(
+                f"https://graph.facebook.com/{api_ver}/{ig_user_id}/media_publish",
+                data={
+                    "creation_id": cid,
+                    "access_token": ig_access_token,
+                },
+                timeout=30,
+            ).json()
 
-                    ws_raw.update_cell(
-                        raw_i,
-                        raw_h["posted_instagram_at"] + 1,
-                        dt.datetime.utcnow().isoformat() + "Z",
-                    )
+            if "id" not in pub:
+                raise RuntimeError(f"IG publish failed: {pub}")
 
-                    print(f"✅ Published {deal_id} — {city} £{price}")
-                    published += 1
-                    return 0  # one post per run
+            ws_raw.update_cell(
+                raw_i,
+                raw_h["posted_instagram_at"] + 1,
+                dt.datetime.utcnow().isoformat() + "Z",
+            )
 
+            print(f"✅ Published {deal_id} — {city} £{price}")
+            published += 1
+            return 0  # one post per run
+
+    # Summary (always)
     print("=" * 70)
     print(f"READY_TO_PUBLISH: {ready}")
-    print(f"BLOCKED BY GATE: {blocked}")
+    if not quiet:
+        print(f"BLOCKED BY GATE: {blocked}")
+    print(f"ALREADY_POSTED_SKIPS: {skipped_posted}")
     print(f"PUBLISHED THIS RUN: {published}")
     print("=" * 70)
 

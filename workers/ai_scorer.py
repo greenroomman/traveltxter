@@ -1,5 +1,7 @@
 # workers/ai_scorer.py
-# V4.7.3+PRO — scorer: NEW -> (READY_TO_POST for winners) else -> SCORED
+# V4.7.4 — scorer: NEW -> (READY_TO_POST for winners) else -> SCORED
+# FIX: Hard anti-clogging gates for VIP so boring / saturated routes don't leak into READY_TO_POST.
+#
 # Contract:
 # - RAW_DEALS is canonical (writes happen here only)
 # - RAW_DEALS_VIEW is read-only (intelligence / formulas)
@@ -7,11 +9,17 @@
 # - Publishers never select language
 # - Full-file replacement only
 #
-# PRO additions (minimal, deterministic):
-# - Compute PRO_score from RDV identity signals (no price_value dependency)
-# - Weekly rarity gate (sheet-state only)
-# - Allow one PRO “rescue” promotion when gate is open (can override hard_reject)
-# - Optional: write worthiness_verdict/PROMO_HINT/PRO_score to RAW if columns exist
+# VIP anti-clogging (NEW):
+# - HARD GATES (VIP only):
+#   * VIP_MIN_NOVELTY_SCORE (default 70)
+#   * VIP_MAX_FATIGUE_PENALTY (default 40)
+#   * VIP_MIN_THEME_FIT_SCORE (default 75)
+# - DESTINATION REPEAT BLOCK (VIP only):
+#   * VIP_DEST_REPEAT_HOURS (default: VARIETY_LOOKBACK_HOURS env or 120)
+#   * If destination_iata was POSTED_* recently -> block from VIP promotion
+# - If these signals are missing in RDV, we fail-closed for VIP (i.e., treat as 0 novelty/theme fit)
+#
+# PRO logic unchanged (identity-first rescue path)
 
 import os
 import json
@@ -47,26 +55,31 @@ PHRASE_USED_COL = "phrase_used"
 PHRASE_BANK_COL = "phrase_bank"
 
 # -------------------------
+# VIP anti-clogging controls (NEW)
+# -------------------------
+VIP_MIN_NOVELTY_SCORE = float(os.getenv("VIP_MIN_NOVELTY_SCORE", "70") or "70")
+VIP_MAX_FATIGUE_PENALTY = float(os.getenv("VIP_MAX_FATIGUE_PENALTY", "40") or "40")
+VIP_MIN_THEME_FIT_SCORE = float(os.getenv("VIP_MIN_THEME_FIT_SCORE", "75") or "75")
+
+# Destination repeat block window (VIP only). Defaults to VARIETY_LOOKBACK_HOURS or 120.
+VIP_DEST_REPEAT_HOURS = int(
+    os.getenv("VIP_DEST_REPEAT_HOURS", os.getenv("VARIETY_LOOKBACK_HOURS", "120")) or "120"
+)
+
+# -------------------------
 # PRO controls (safe defaults)
 # -------------------------
 PRO_ENABLED = os.getenv("PRO_ENABLED", "TRUE").strip().upper() in ("TRUE", "1", "YES", "Y", "ON")
 PRO_RARITY_DAYS = int(os.getenv("PRO_RARITY_DAYS", "7"))
 
-# Calibrated thresholds (Claude-style defaults)
 THETA_PRO_REVIEW = float(os.getenv("THETA_PRO_REVIEW", "50.0"))
 THETA_PRO_PRIORITY = float(os.getenv("THETA_PRO_PRIORITY", "56.7"))
 
-# “Reasonableness” gate to prevent nonsense (only applied if price is present)
-# If blank/0 → disabled
 PRO_MAX_PRICE_GBP = float(os.getenv("PRO_MAX_PRICE_GBP", "0") or "0")
-
-# If you want PRO to “steal” a run only when VIP winner is weak, set e.g. 66.
-# If 0 → PRO can promote whenever gate open + threshold met.
 PRO_ONLY_IF_VIP_BELOW = float(os.getenv("PRO_ONLY_IF_VIP_BELOW", "0") or "0")
 
 
 # View columns we actually need (minimizes coupling to RDV header chaos)
-# NOTE: Expanded to support PRO_score.
 VIEW_REQUIRED_COLS = (
     "status",
     "deal_id",
@@ -74,7 +87,7 @@ VIEW_REQUIRED_COLS = (
     "dynamic_theme",
     "hard_reject",
     "worthiness_score",
-    # PRO signals (best-effort; missing columns will safely disable PRO path)
+    # VIP/PRO signals
     "theme_fit_score",
     "novelty_score",
     "timing_score",
@@ -82,6 +95,9 @@ VIEW_REQUIRED_COLS = (
     "stops",
     "price_gbp",
 )
+
+# Optional: if RAW has destination_iata, we use it for repeat-block lookup when missing in RDV
+RAW_OPTIONAL_DEST_COLS = ("destination_iata", "dest_iata")
 
 
 def _log(msg):
@@ -107,7 +123,6 @@ def _sa_creds():
 
 
 def _norm(s):
-    """Return a trimmed string for any input type (int-safe)."""
     if s is None:
         return ""
     if isinstance(s, str):
@@ -120,7 +135,7 @@ def _norm_theme(s):
 
 
 def _norm_iata(s):
-    return _norm(s).upper()
+    return _norm(s).upper()[:3]
 
 
 def _truthy(v):
@@ -136,21 +151,16 @@ def _stable_pick(key, items):
 
 
 def _parse_iso_utc(ts_raw):
-    """
-    Accepts '2026-01-01T12:34:56Z' or without 'Z'.
-    Returns aware UTC datetime or None.
-    """
     s = _norm(ts_raw)
     if not s:
         return None
     try:
         if s.endswith("Z"):
             s = s[:-1]
-        dt = datetime.fromisoformat(s)
-        # assume UTC if naive
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        dtv = datetime.fromisoformat(s)
+        if dtv.tzinfo is None:
+            dtv = dtv.replace(tzinfo=timezone.utc)
+        return dtv.astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -175,19 +185,13 @@ def _int_or_none(v):
         return None
 
 
-def _clean_iata(x):
-    return _norm(x).upper()[:3]
-
-
 def _ws_headers(ws):
     return [h.strip() for h in ws.row_values(1)]
 
 
 def _safe_view_rows(ws_view):
     """
-    Read RAW_DEALS_VIEW without get_all_records(), to avoid:
-      gspread.exceptions.GSpreadException: the header row in the worksheet is not unique
-
+    Read RAW_DEALS_VIEW without get_all_records(), to avoid duplicate-header crash.
     We only map the required columns. If duplicate headers exist, we keep the FIRST occurrence.
     """
     values = ws_view.get_all_values()
@@ -213,15 +217,12 @@ def _safe_view_rows(ws_view):
             + (" ..." if len(dupes) > 30 else "")
         )
 
-    # Hard requirement for scoring pipeline to run
     must_have = ("status", "deal_id")
     missing_must = [c for c in must_have if c not in first_idx]
     if missing_must:
         _log(f"⚠️ RAW_DEALS_VIEW missing required columns for scoring: {missing_must}. Treating as empty.")
         return []
 
-    # Soft requirements for VIP/PRO intelligence
-    # We'll map whatever exists; missing PRO cols will just disable PRO scoring
     cols_to_map = [c for c in VIEW_REQUIRED_COLS if c in first_idx]
 
     rows = []
@@ -238,8 +239,7 @@ def _safe_view_rows(ws_view):
 
 
 # -------------------------
-# PRO scoring (calibrated, identity-first)
-# Uses only RDV columns; ignores price_value_score entirely.
+# PRO scoring (identity-first)
 # -------------------------
 def _clip(x, lo=0.0, hi=100.0):
     try:
@@ -251,7 +251,6 @@ def _clip(x, lo=0.0, hi=100.0):
 
 
 def _theme_rarity_points(theme_norm):
-    # Points, not multipliers (keeps calibration stable)
     t = _norm_theme(theme_norm)
     if t == "long_haul":
         return 25.0
@@ -261,33 +260,25 @@ def _theme_rarity_points(theme_norm):
         return 20.0
     if t == "luxury_value":
         return 15.0
-    # volume themes get no boost
     return 0.0
 
 
 def calculate_pro_score(theme_fit, novelty, stops, fatigue, theme_norm):
-    """
-    Claude-calibrated, percentile-friendly score.
-    Outputs ~[0..~60] on your observed distributions; thresholds live in env.
-    """
     tf = _float_or_none(theme_fit)
     nv = _float_or_none(novelty)
     st = _int_or_none(stops)
     ft = _float_or_none(fatigue)
 
-    # Normalise theme_fit [70..100] → [0..40]
     if tf is None:
         tf_part = 0.0
     else:
         tf_part = _clip((tf - 70.0) / 30.0 * 40.0, 0.0, 40.0)
 
-    # Normalise novelty [60..100] → [0..25]
     if nv is None:
         nv_part = 0.0
     else:
         nv_part = _clip((nv - 60.0) / 40.0 * 25.0, 0.0, 25.0)
 
-    # Nonstop bonus / connection kill-switch
     if st is None:
         conn_part = 0.0
     elif st == 0:
@@ -299,7 +290,6 @@ def calculate_pro_score(theme_fit, novelty, stops, fatigue, theme_norm):
 
     rarity_part = _theme_rarity_points(theme_norm)
 
-    # Fatigue penalty scaled down
     if ft is None:
         fat_part = 0.0
     else:
@@ -320,16 +310,12 @@ def _pro_verdict_for(score):
 
 
 def _pro_rarity_gate_open(raw_rows, raw_headers_map):
-    """
-    Sheet-state only: if any PRO_WORTHY_* has been posted in last PRO_RARITY_DAYS → gate closed.
-    Uses whatever columns exist; if required columns missing, default OPEN (fail-soft).
-    """
     if PRO_RARITY_DAYS <= 0:
         return True
 
     col_verdict = raw_headers_map.get("worthiness_verdict")
     col_status = raw_headers_map.get("status")
-    col_ts = raw_headers_map.get("ingested_at_utc")  # fallback timestamp
+    col_ts = raw_headers_map.get("ingested_at_utc")
 
     if not col_verdict or not col_status or not col_ts:
         _log("⚠️ PRO rarity gate: missing RAW columns (worthiness_verdict/status/ingested_at_utc). Gate OPEN (fail-soft).")
@@ -338,7 +324,6 @@ def _pro_rarity_gate_open(raw_rows, raw_headers_map):
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=PRO_RARITY_DAYS)
 
-    # raw_rows here are dicts (from get_all_records)
     for r in raw_rows:
         v = _norm(r.get("worthiness_verdict"))
         s = _norm(r.get("status"))
@@ -352,6 +337,72 @@ def _pro_rarity_gate_open(raw_rows, raw_headers_map):
     return True
 
 
+# -------------------------
+# VIP anti-clogging helpers (NEW)
+# -------------------------
+def _posted_destinations_recent(raw_rows, hours):
+    """
+    Build a set of destination IATA codes that have been posted recently.
+    Uses RAW status startswith POSTED_ / POSTED_ALL and ingested_at_utc as time proxy (deterministic, sheet-state only).
+    """
+    if hours <= 0:
+        return set()
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=hours)
+
+    recent = set()
+    for r in raw_rows:
+        s = _norm(r.get("status"))
+        if not (s.startswith("POSTED_") or s == "POSTED_ALL"):
+            continue
+
+        ts = _parse_iso_utc(r.get("ingested_at_utc"))
+        if not ts or ts < cutoff:
+            continue
+
+        dest = ""
+        for k in RAW_OPTIONAL_DEST_COLS:
+            if _norm(r.get(k)):
+                dest = _norm_iata(r.get(k))
+                break
+        if dest:
+            recent.add(dest)
+    return recent
+
+
+def _vip_gate_reasons(c, recent_posted_dests):
+    """
+    Return (blocked: bool, reasons: [str]).
+    Fail-closed for VIP when novelty/theme_fit missing (treated as 0).
+    """
+    reasons = []
+
+    nv = _float_or_none(c.get("novelty_score"))
+    tf = _float_or_none(c.get("theme_fit_score"))
+    ft = _float_or_none(c.get("fatigue_penalty"))
+
+    # Missing -> treat as 0 for novelty/theme_fit, and 0 for fatigue (i.e. doesn't block on fatigue if missing)
+    nv_val = nv if nv is not None else 0.0
+    tf_val = tf if tf is not None else 0.0
+    ft_val = ft if ft is not None else 0.0
+
+    if nv_val < VIP_MIN_NOVELTY_SCORE:
+        reasons.append(f"novelty<{VIP_MIN_NOVELTY_SCORE:g}")
+
+    if tf_val < VIP_MIN_THEME_FIT_SCORE:
+        reasons.append(f"theme_fit<{VIP_MIN_THEME_FIT_SCORE:g}")
+
+    if ft_val > VIP_MAX_FATIGUE_PENALTY:
+        reasons.append(f"fatigue>{VIP_MAX_FATIGUE_PENALTY:g}")
+
+    dest = _norm_iata(c.get("dest"))
+    if dest and dest in recent_posted_dests:
+        reasons.append(f"dest_repeat<{VIP_DEST_REPEAT_HOURS}h")
+
+    return (len(reasons) > 0), reasons
+
+
 def main():
     if not SPREADSHEET_ID:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
@@ -362,7 +413,7 @@ def main():
     ws_raw = sh.worksheet(RAW_TAB)
     ws_view = sh.worksheet(VIEW_TAB)
 
-    # Load phrase bank (optional; system must not break if unavailable)
+    # Phrase bank (optional)
     try:
         ws_phrase = sh.worksheet(PHRASE_TAB)
         phrase_rows = ws_phrase.get_all_records()
@@ -370,7 +421,6 @@ def main():
         _log(f"PHRASE_BANK not readable: {e}")
         phrase_rows = []
 
-    # Build phrase index: (dest_iata, theme) -> [phrases...]
     phrase_index = []
     for r in phrase_rows:
         theme = _norm_theme(r.get("theme"))
@@ -385,16 +435,15 @@ def main():
         if dest and theme and phrase and approved:
             phrase_index.append({"dest": dest, "theme": theme, "phrase": phrase})
 
-    # SAFE read VIEW rows (prevents duplicate-header crash)
+    # VIEW rows (safe)
     view_rows = _safe_view_rows(ws_view)
 
-    # RAW still uses get_all_records() (RAW headers must be unique for canonical writes)
+    # RAW rows (canonical)
     raw_rows = ws_raw.get_all_records()
-
     headers = _ws_headers(ws_raw)
     col = {h: i + 1 for i, h in enumerate(headers)}
 
-    # Hard requirements (fail fast with a clear message)
+    # Hard requirements
     for required in ("status", "deal_id", "ingested_at_utc", PHRASE_USED_COL, PHRASE_BANK_COL):
         if required not in col:
             raise RuntimeError(f"Missing required RAW_DEALS column: {required}")
@@ -404,7 +453,7 @@ def main():
     if ELIGIBLE_WINDOW_HOURS and ELIGIBLE_WINDOW_HOURS > 0:
         min_allowed_ts = now - timedelta(hours=ELIGIBLE_WINDOW_HOURS)
 
-    # Map deal_id -> RAW_DEALS row number and ingested_at
+    # deal_id -> RAW row number and ingested_at
     deal_row = {}
     deal_ingested = {}
     deal_raw_record = {}
@@ -415,7 +464,11 @@ def main():
             deal_ingested[did] = r.get("ingested_at_utc")
             deal_raw_record[did] = r
 
-    # Build candidate list from VIEW rows with status=NEW
+    # Recent posted destination set (VIP repeat block)
+    recent_posted_dests = _posted_destinations_recent(raw_rows, VIP_DEST_REPEAT_HOURS)
+    _log(f"VIP dest-repeat window: {VIP_DEST_REPEAT_HOURS}h | recent_posted_dests={len(recent_posted_dests)}")
+
+    # Candidates from VIEW where status=NEW
     candidates = []
     skipped = {
         "too_fresh": 0,
@@ -448,11 +501,9 @@ def main():
             skipped["too_old"] += 1
             continue
 
-        # Intelligence fields (best-effort; don't hard fail if missing)
         hard_reject = _truthy(r.get("hard_reject"))
         worth = _float_or_none(r.get("worthiness_score"))
 
-        # Theme fallback: VIEW.dynamic_theme -> RAW.deal_theme -> RAW.theme
         rawrec = deal_raw_record.get(did, {})
         theme_candidate = _norm(r.get("dynamic_theme"))
         if not theme_candidate:
@@ -466,7 +517,7 @@ def main():
                 "theme": _norm_theme(theme_candidate),
                 "hard_reject": hard_reject,
                 "worthiness": worth,
-                # PRO signals (may be blank)
+                # VIP/PRO signals
                 "theme_fit_score": r.get("theme_fit_score", ""),
                 "novelty_score": r.get("novelty_score", ""),
                 "timing_score": r.get("timing_score", ""),
@@ -491,21 +542,54 @@ def main():
     # Winner selection
     # -------------------------
 
-    # Existing VIP pool: never pick hard_reject
-    vip_pool = [c for c in candidates if not c["hard_reject"]]
+    # VIP pool baseline: never pick hard_reject
+    vip_pool_raw = [c for c in candidates if not c["hard_reject"]]
 
-    # PRO pool: can include hard_reject (that's the whole point),
-    # but still needs enough identity signals to score.
+    # Apply HARD VIP anti-clogging gates (NEW)
+    vip_pool = []
+    vip_blocked_counts = {
+        "hard_reject": 0,
+        "gated": 0,
+        "novelty": 0,
+        "theme_fit": 0,
+        "fatigue": 0,
+        "dest_repeat": 0,
+    }
+
+    for c in vip_pool_raw:
+        blocked, reasons = _vip_gate_reasons(c, recent_posted_dests)
+        if blocked:
+            vip_blocked_counts["gated"] += 1
+            for r in reasons:
+                if r.startswith("novelty<"):
+                    vip_blocked_counts["novelty"] += 1
+                elif r.startswith("theme_fit<"):
+                    vip_blocked_counts["theme_fit"] += 1
+                elif r.startswith("fatigue>"):
+                    vip_blocked_counts["fatigue"] += 1
+                elif r.startswith("dest_repeat<"):
+                    vip_blocked_counts["dest_repeat"] += 1
+            continue
+        vip_pool.append(c)
+
+    _log(
+        "VIP gates: "
+        f"eligible_after_gates={len(vip_pool)}/{len(vip_pool_raw)} "
+        f"blocked={vip_blocked_counts['gated']} "
+        f"(novelty={vip_blocked_counts['novelty']}, theme_fit={vip_blocked_counts['theme_fit']}, "
+        f"fatigue={vip_blocked_counts['fatigue']}, dest_repeat={vip_blocked_counts['dest_repeat']})"
+    )
+
+    # PRO pool unchanged (can include hard_reject)
     pro_pool = list(candidates) if PRO_ENABLED else []
 
-    # Log intelligence availability
     has_worthiness = sum(1 for c in vip_pool if c["worthiness"] is not None)
     _log(
         f"Intelligence check: {has_worthiness}/{len(vip_pool)} VIP-eligible candidates have worthiness_score. "
         f"{'✅ Using scores for ranking' if has_worthiness > 0 else '⚠️ Random ranking (no scores)'}"
     )
 
-    # VIP ranking (unchanged)
+    # VIP ranking (same sort key)
     def _vip_sort_key(c):
         w = c["worthiness"]
         if w is None:
@@ -515,20 +599,18 @@ def main():
     vip_pool.sort(key=_vip_sort_key)
     vip_best = vip_pool[0] if vip_pool else None
 
-    # PRO scoring + ranking
+    # PRO scoring + ranking (unchanged)
     pro_best = None
     pro_best_score = None
     pro_best_verdict = ""
 
     if PRO_ENABLED and pro_pool:
-        # Gate open?
         gate_open = _pro_rarity_gate_open(raw_rows, col)
         _log(f"PRO gate: {'OPEN' if gate_open else 'CLOSED'} | rarity_days={PRO_RARITY_DAYS}")
 
         if gate_open:
             scored = []
             for c in pro_pool:
-                # Optional “reasonableness” price cap
                 price = _float_or_none(c.get("price_gbp"))
                 if PRO_MAX_PRICE_GBP and PRO_MAX_PRICE_GBP > 0 and price is not None and price > PRO_MAX_PRICE_GBP:
                     continue
@@ -554,12 +636,8 @@ def main():
                     f"theme={pro_best['theme']} hard_reject={pro_best['hard_reject']}"
                 )
 
-    # Decide final winners list (still respects WINNERS_PER_RUN)
     winners = []
 
-    # Policy:
-    # - If PRO candidate clears threshold AND (optional) VIP best is weak → pick PRO
-    # - Else pick VIP as before
     if WINNERS_PER_RUN != 1:
         _log("⚠️ PRO logic is designed for WINNERS_PER_RUN=1. Continuing, but behavior may be surprising.")
 
@@ -577,14 +655,13 @@ def main():
         _log(f"Winner selection: PRO ({pro_best_verdict}) promoted this run.")
     else:
         if vip_best:
-            # Apply existing MIN_WORTHINESS_SCORE filter
             if vip_best["worthiness"] is None or vip_best["worthiness"] >= MIN_WORTHINESS_SCORE:
                 winners.append(vip_best)
                 _log("Winner selection: VIP promoted this run.")
             else:
                 _log("Winner selection: VIP best below MIN_WORTHINESS_SCORE; no promotion.")
         else:
-            _log("Winner selection: No VIP-eligible candidates (all hard_reject or empty). No promotion.")
+            _log("Winner selection: No VIP-eligible candidates after gates. No promotion.")
 
     winner_ids = {w["did"] for w in winners}
 
@@ -615,7 +692,6 @@ def main():
         updates.append(Cell(rownum, col[PHRASE_USED_COL], phrase))
         updates.append(Cell(rownum, col[PHRASE_BANK_COL], phrase))
 
-        # If this was a PRO winner, best-effort mark fields on RAW (only if columns exist)
         if c is pro_best and pro_best_verdict:
             pro_score_col = col.get("PRO_score") or col.get("pro_score")
             verdict_col = col.get("worthiness_verdict")

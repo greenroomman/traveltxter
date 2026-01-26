@@ -1,5 +1,5 @@
 # workers/instagram_publisher.py
-# FULL FILE REPLACEMENT
+# UPDATED VERSION - Publishing Gate Implementation
 #
 # Locked constraints (DO NOT VIOLATE):
 # - DO NOT change how Instagram posts look (caption lines) or how graphics are used (image_url from graphic_url).
@@ -7,8 +7,11 @@
 # - It SHOULD timestamp posted_instagram_at (Column AA) on successful publish.
 # - Idempotent: if posted_instagram_at already set, skip.
 #
-# FIX (ONLY): consume deals that are READY_TO_PUBLISH (and keep READY_TO_POST tolerated for backward-compat).
-# This resolves the contract mismatch where the pipeline sets READY_TO_PUBLISH but the publisher only looked for READY_TO_POST.
+# CHANGES FROM PREVIOUS VERSION:
+# - NOW READS FROM RAW_DEALS_VIEW (where instagram_ok gate lives)
+# - Filters on instagram_ok=TRUE (primary gate - prevents £400+ beach breaks)
+# - Logs blocked deals (monitoring/debugging)
+# - Still writes timestamp back to RAW_DEALS (source table)
 
 import os
 import json
@@ -135,18 +138,22 @@ def main():
     if not sheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
     sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(env("RAW_DEALS_TAB", "RAW_DEALS"))
+    
+    # CRITICAL CHANGE: Read from RAW_DEALS_VIEW (where instagram_ok gate lives)
+    ws_view = sh.worksheet("RAW_DEALS_VIEW")
+    ws_source = sh.worksheet("RAW_DEALS")  # Still need this for writing timestamps
 
-    values = ws.get_all_values()
+    values = ws_view.get_all_values()
     if not values or len(values) < 2:
-        print("No rows found in RAW_DEALS")
+        print("No rows found in RAW_DEALS_VIEW")
         return 0
 
     headers = values[0]
     h = {k: i for i, k in enumerate(headers)}
 
-    # Required headers (do not rename)
+    # Required headers (from RAW_DEALS_VIEW)
     for col in [
+        "deal_id",
         "status",
         "graphic_url",
         "destination_country",
@@ -156,9 +163,11 @@ def main():
         "outbound_date",
         "return_date",
         "posted_instagram_at",
+        "instagram_ok",  # NEW: Publishing gate
+        "block_reason",  # NEW: For logging
     ]:
         if col not in h:
-            raise RuntimeError(f"RAW_DEALS missing required header: {col}")
+            raise RuntimeError(f"RAW_DEALS_VIEW missing required header: {col}")
 
     ig_user_id = env("IG_USER_ID")
     ig_access_token = env("IG_ACCESS_TOKEN")
@@ -169,22 +178,53 @@ def main():
     if not ig_access_token:
         raise RuntimeError("Missing IG_ACCESS_TOKEN")
 
-    # Trigger statuses:
-    # - Primary: READY_TO_PUBLISH (pipeline-ready for publishing)
-    # - Tolerated: READY_TO_POST (older contract); will still require graphic_url to proceed
-    trigger_statuses = {"READY_TO_PUBLISH", "READY_TO_POST"}
+    # Collect stats for logging
+    total_ready = 0
+    total_passed_gate = 0
+    total_already_posted = 0
+    total_published = 0
+    blocked_deals = []
+
+    print("=" * 70)
+    print("📣 Instagram Publisher - Gate Enforcement Enabled")
+    print("=" * 70)
 
     for i, r in enumerate(values[1:], start=2):
-        # Trigger: READY_TO_PUBLISH (preferred) or READY_TO_POST (back-compat)
-        if r[h["status"]] not in trigger_statuses:
+        # First check: Must be READY_TO_PUBLISH
+        if r[h["status"]] != "READY_TO_PUBLISH":
             continue
+        
+        total_ready += 1
+        
+        row = {headers[j]: r[j] for j in range(len(headers))}
+        deal_id = row.get("deal_id", "unknown")
+        
+        # CRITICAL NEW CHECK: instagram_ok gate
+        instagram_ok = row.get("instagram_ok", "").strip().upper()
+        if instagram_ok != "TRUE":
+            # Deal blocked by gate - log it
+            block_reason = row.get("block_reason", "Unknown reason")
+            price = row.get("price_gbp", "?")
+            theme = row.get("theme", "unknown")
+            dest = row.get("destination_city", "unknown")
+            
+            blocked_deals.append({
+                "deal_id": deal_id,
+                "dest": dest,
+                "theme": theme,
+                "price": price,
+                "reason": block_reason,
+            })
+            continue
+        
+        total_passed_gate += 1
 
         # Idempotency: if already posted, skip
-        if r[h["posted_instagram_at"]].strip():
+        if row.get("posted_instagram_at", "").strip():
+            total_already_posted += 1
             continue
 
-        row = {headers[j]: r[j] for j in range(len(headers))}
-
+        # Extract deal details
         country = row.get("destination_country", "")
         city = row.get("destination_city", "")
         origin = row.get("origin_city", "")
@@ -195,13 +235,13 @@ def main():
         image_url = row.get("graphic_url", "")
 
         if not image_url:
-            print("⏭️ Skipping row: missing graphic_url")
+            print(f"⚠️  Skipping {deal_id}: missing graphic_url")
             continue
 
         # Get country flag (flags or globe only)
         flag = get_country_flag(country)
 
-        # Build caption (DO NOT EDIT COPY OR STRUCTURE)
+        # Build caption (DO NOT EDIT COPY OR STRUCTURE - LOCKED CONSTRAINT)
         caption = "\n".join([
             f"{country} {flag}",
             "",
@@ -217,40 +257,86 @@ def main():
         ]).strip()
 
         # Create Instagram media
-        create = requests.post(
-            f"https://graph.facebook.com/{graph_api_version}/{ig_user_id}/media",
-            data={
-                "image_url": image_url,
-                "caption": caption,
-                "access_token": ig_access_token,
-            },
-        ).json()
+        try:
+            create = requests.post(
+                f"https://graph.facebook.com/{graph_api_version}/{ig_user_id}/media",
+                data={
+                    "image_url": image_url,
+                    "caption": caption,
+                    "access_token": ig_access_token,
+                },
+            ).json()
 
-        cid = create.get("id")
-        if not cid:
-            raise RuntimeError(f"Instagram media creation failed: {create}")
+            cid = create.get("id")
+            if not cid:
+                raise RuntimeError(f"Instagram media creation failed: {create}")
 
-        time.sleep(2)
+            time.sleep(2)
 
-        # Publish Instagram media
-        pub = requests.post(
-            f"https://graph.facebook.com/{graph_api_version}/{ig_user_id}/media_publish",
-            data={
-                "creation_id": cid,
-                "access_token": ig_access_token,
-            },
-        ).json()
+            # Publish Instagram media
+            pub = requests.post(
+                f"https://graph.facebook.com/{graph_api_version}/{ig_user_id}/media_publish",
+                data={
+                    "creation_id": cid,
+                    "access_token": ig_access_token,
+                },
+            ).json()
 
-        if "id" not in pub:
-            raise RuntimeError(f"Instagram publish failed: {pub}")
+            if "id" not in pub:
+                raise RuntimeError(f"Instagram publish failed: {pub}")
 
-        # Marketing-only writeback: timestamp only (never touches status)
-        ws.update_cell(i, h["posted_instagram_at"] + 1, dt.datetime.utcnow().isoformat() + "Z")
+            # Marketing-only writeback: timestamp to RAW_DEALS (source table)
+            # We need to find the matching row in RAW_DEALS by deal_id
+            source_values = ws_source.get_all_values()
+            source_headers = source_values[0]
+            source_h = {k: i for i, k in enumerate(source_headers)}
+            
+            for source_i, source_r in enumerate(source_values[1:], start=2):
+                if source_r[source_h["deal_id"]] == deal_id:
+                    ws_source.update_cell(
+                        source_i, 
+                        source_h["posted_instagram_at"] + 1, 
+                        dt.datetime.utcnow().isoformat() + "Z"
+                    )
+                    break
 
-        print(f"✅ Published to Instagram: {city} £{price}")
-        return 0
+            print(f"✅ Published: {deal_id} - {city} £{price}")
+            total_published += 1
+            
+            # Only publish one deal per run (rate limiting)
+            break
 
-    print("No deals with status READY_TO_PUBLISH/READY_TO_POST found (or all already posted)")
+        except Exception as e:
+            print(f"❌ Failed to publish {deal_id}: {e}")
+            raise
+
+    # Summary logging
+    print("=" * 70)
+    print("📊 Publishing Summary")
+    print("=" * 70)
+    print(f"Deals READY_TO_PUBLISH: {total_ready}")
+    print(f"Passed instagram_ok gate: {total_passed_gate}")
+    print(f"Already posted (skipped): {total_already_posted}")
+    print(f"Published this run: {total_published}")
+    print(f"Blocked by gate: {len(blocked_deals)}")
+    
+    if blocked_deals:
+        print("\n⚠️  BLOCKED DEALS (instagram_ok=FALSE):")
+        for deal in blocked_deals[:10]:  # Show first 10
+            print(f"   - {deal['deal_id']}: {deal['dest']} {deal['theme']} £{deal['price']}")
+            print(f"     Reason: {deal['reason']}")
+        if len(blocked_deals) > 10:
+            print(f"   ... and {len(blocked_deals)-10} more")
+    
+    if total_published == 0:
+        print("\n⚠️  No deals published this run")
+        if total_passed_gate == 0:
+            print("   → No deals passed instagram_ok gate")
+        elif total_already_posted == total_passed_gate:
+            print("   → All deals already posted")
+    
+    print("=" * 70)
+    
     return 0
 
 

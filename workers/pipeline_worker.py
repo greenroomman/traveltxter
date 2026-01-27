@@ -1,22 +1,16 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8e (VARIETY GUARANTEE)
+# FULL FILE REPLACEMENT — FEEDER v4.8e (DIRECT SHORTHAUL ENFORCED)
 #
-# Purpose:
-# - Ensure feeder "looks beyond" top-ranked CONFIG rows by guaranteeing within-theme spread:
-#   * At least 1 AM slot_hint row (if available)
-#   * At least 1 PM slot_hint row (if available)
-# - Feeder still does NOT decide what is "good". Scorer remains the judge.
+# CHANGE (LOCKED PRODUCT RULE):
+# - ALL shorthaul must be DIRECT.
+#   Shorthaul is defined as CONFIG.is_long_haul != TRUE.
+#   Therefore:
+#     - For shorthaul rows, we force max_connections=0 on the Duffel request
+#     - We compute stops from the selected (cheapest) offer’s slice segments
+#     - If the selected offer is not direct (stops != 0), we skip inserting that deal
 #
-# What stays the same:
-# - Spreadsheet drives theme + allowable destinations (ZTB + CONFIG)
-# - Same caps: MAX_SEARCHES, DESTS_PER_RUN, ORIGINS_PER_DEST, etc.
-# - Same Duffel request shape; no carrier bias hard-filter unless CONFIG sets included_airlines.
-# - Writes ONLY to RAW_DEALS.
-#
-# Governance:
-# - No schema changes
-# - No tab renames
-# - No RDV writes
+# Also fixes data integrity:
+# - stops is no longer written as a proxy (max_conn); it is derived from the chosen offer.
 
 from __future__ import annotations
 
@@ -156,9 +150,9 @@ def _sha12(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
 
 
-def _deal_id(origin: str, dest: str, od: dt.date, rd: dt.date, price_gbp: float, cabin: str, max_conn: int) -> str:
+def _deal_id(origin: str, dest: str, od: dt.date, rd: dt.date, price_gbp: float, cabin: str, stops: int) -> str:
     price_i = int(math.ceil(float(price_gbp)))
-    base = f"{origin}|{dest}|{od.isoformat()}|{rd.isoformat()}|{price_i}|{cabin}|{max_conn}"
+    base = f"{origin}|{dest}|{od.isoformat()}|{rd.isoformat()}|{price_i}|{cabin}|{int(stops)}"
     return f"D{_sha12(base)}"
 
 
@@ -212,12 +206,37 @@ def _duffel_search(
         return None
 
 
-def _min_price_gbp(offers_json: Dict[str, Any]) -> Optional[float]:
+def _offer_stops(offer: Dict[str, Any]) -> Optional[int]:
+    """Return maximum number of connections across slices for this offer.
+    0 = direct on each slice. 1 = one connection on at least one slice, etc.
+    """
+    try:
+        slices = offer.get("slices") or []
+        if not slices:
+            return None
+        max_conn = 0
+        for s in slices:
+            segs = s.get("segments") or []
+            c = max(0, len(segs) - 1)
+            if c > max_conn:
+                max_conn = c
+        return max_conn
+    except Exception:
+        return None
+
+
+def _best_offer_gbp(offers_json: Dict[str, Any]) -> Optional[Tuple[float, int]]:
+    """Pick the cheapest GBP offer and return (price_gbp, stops).
+    If stops can't be determined, defaults to 99 to be safely non-direct.
+    """
     try:
         offers = offers_json.get("data", {}).get("offers") or []
         if not offers:
             return None
-        prices = []
+
+        best_price: Optional[float] = None
+        best_stops: int = 99
+
         for o in offers:
             total = o.get("total_amount")
             cur = o.get("total_currency")
@@ -225,12 +244,28 @@ def _min_price_gbp(offers_json: Dict[str, Any]) -> Optional[float]:
                 continue
             if cur and str(cur).upper() != "GBP":
                 continue
-            prices.append(float(total))
-        if not prices:
+
+            price = float(total)
+            stops = _offer_stops(o)
+            stops_i = int(stops) if stops is not None else 99
+
+            # Primary sort: lowest price. Secondary: fewer stops.
+            if best_price is None or price < best_price or (price == best_price and stops_i < best_stops):
+                best_price = price
+                best_stops = stops_i
+
+        if best_price is None:
             return None
-        return min(prices)
+
+        return (best_price, best_stops)
     except Exception:
         return None
+
+
+def _min_price_gbp(offers_json: Dict[str, Any]) -> Optional[float]:
+    """Back-compat: return only the best GBP price."""
+    best = _best_offer_gbp(offers_json)
+    return None if best is None else best[0]
 
 
 def _candidate_outbounds_seasonal(
@@ -350,7 +385,7 @@ def main() -> int:
     ws_rcm = sh.worksheet(RCM_TAB)
     ws_iata = sh.worksheet(IATA_TAB)
 
-    # Carrier bias: load+log only
+    # Carrier bias: load+log only (no hard filtering)
     bias_rows: List[Dict[str, Any]] = []
     try:
         ws_bias = sh.worksheet(CONFIG_CARRIER_BIAS_TAB)
@@ -405,7 +440,6 @@ def main() -> int:
         ztb_max_conn = _connections_from_tolerance(str(ztb_today.get("connection_tolerance") or "any"))
         theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
 
-    # Sort remains: (priority, search_weight, content_priority)
     theme_rows_all.sort(
         key=lambda r: (
             _safe_float(r.get("priority"), 0),
@@ -415,67 +449,13 @@ def main() -> int:
         reverse=True,
     )
 
-    # Diversity guarantees by slot_hint (AM/PM) — feeder is not deciding publish slot, only ensuring pool coverage.
-    am_rows = [r for r in theme_rows_all if cfg_slot(r) == "AM"]
-    pm_rows = [r for r in theme_rows_all if cfg_slot(r) == "PM"]
-    other_rows = [r for r in theme_rows_all if cfg_slot(r) not in ("AM", "PM")]
-
-    log(f"🧩 Slot split within theme={theme_today}: AM={len(am_rows)} | PM={len(pm_rows)} | other/blank={len(other_rows)}")
-
     DUFFEL_ROUTES_PER_RUN = max(1, DUFFEL_ROUTES_PER_RUN)
-    COMMODITY_CAP = _env_int("COMMODITY_CAP", max(1, DUFFEL_ROUTES_PER_RUN // 3))
-    MIN_EXOTIC = _env_int("MIN_EXOTIC", 1)
+    theme_rows = theme_rows_all[:DUFFEL_ROUTES_PER_RUN]
 
-    def gw_type(r: Dict[str, Any]) -> str:
-        return str(r.get("gateway_type") or "").strip().lower()
-
-    # Start selection with mandatory AM/PM representatives (if available)
-    selected: List[Dict[str, Any]] = []
-
-    if am_rows and len(selected) < DUFFEL_ROUTES_PER_RUN:
-        selected.append(am_rows[0])
-    if pm_rows and len(selected) < DUFFEL_ROUTES_PER_RUN:
-        if pm_rows[0] not in selected:
-            selected.append(pm_rows[0])
-
-    # Now fill remaining with existing commodity logic over the whole theme pool
-    pool = [r for r in theme_rows_all if r not in selected]
-
-    non_comm = [r for r in pool if gw_type(r) not in ("commodity", "")]
-    comm = [r for r in pool if gw_type(r) in ("commodity", "")]
-
-    # Ensure some "exotic" presence if possible (existing behaviour)
-    exotic_used = 0
-    for r in non_comm:
-        if len(selected) >= DUFFEL_ROUTES_PER_RUN:
-            break
-        if exotic_used < MIN_EXOTIC:
-            selected.append(r)
-            exotic_used += 1
-
-    comm_used = 0
-    for r in (non_comm + comm):
-        if len(selected) >= DUFFEL_ROUTES_PER_RUN:
-            break
-        if r in selected:
-            continue
-        if gw_type(r) in ("commodity", ""):
-            if comm_used >= COMMODITY_CAP:
-                continue
-            comm_used += 1
-        selected.append(r)
-
-    theme_rows = selected
-
-    # Log final chosen destination_iata + slot_hint so you can verify it "looked beyond"
     chosen_debug = []
     for r in theme_rows:
         chosen_debug.append(f"{str(r.get('destination_iata') or '').strip().upper()}[{cfg_slot(r) or '—'}]")
-    log(
-        f"🧭 Selected destinations to attempt: {len(theme_rows)} (cap DESTS_PER_RUN={DUFFEL_ROUTES_PER_RUN}) "
-        f"| commodity_cap={COMMODITY_CAP} commodity_used={comm_used} min_exotic={MIN_EXOTIC} "
-        f"| chosen={chosen_debug}"
-    )
+    log(f"🧭 Selected destinations to attempt: {len(theme_rows)} (cap DESTS_PER_RUN={DUFFEL_ROUTES_PER_RUN}) | chosen={chosen_debug}")
 
     # Geo dictionary from RCM + IATA_MASTER
     rcm_all = ws_rcm.get_all_records()
@@ -538,10 +518,10 @@ def main() -> int:
         return _csv_list(raw)
 
     def choose_origins_for_dest(cfg_row: Dict[str, Any], dest: str, cap: int) -> List[str]:
-        is_long = str(cfg_row.get("is_long_haul") or "").strip().upper() == "TRUE"
+        is_long_local = str(cfg_row.get("is_long_haul") or "").strip().upper() == "TRUE"
         gw = str(cfg_row.get("gateway_type") or "").strip().lower()
 
-        if is_long:
+        if is_long_local:
             candidate_pool = [o for o in hub_origins if o in origins_default] or origins_default[:]
         else:
             if gw in ("commodity", "value"):
@@ -579,11 +559,18 @@ def main() -> int:
             log(f"⚠️ No in-season outbound dates available for dest={dest}. Skipping.")
             continue
 
+        is_long = str(cfg.get("is_long_haul") or "").strip().upper() == "TRUE"
+
         cfg_max_conn = _safe_int(cfg.get("max_connections"), 2)
         max_conn = min(cfg_max_conn, ztb_max_conn)
 
+        # Product rule: ALL shorthaul must be direct (0 connections).
+        if not is_long:
+            max_conn = 0
+
         cabin = str(cfg.get("cabin_class") or "economy").strip().lower() or "economy"
         included_airlines = carriers_from_cfg(cfg)
+
         origins = choose_origins_for_dest(cfg, dest, ORIGINS_PER_DEST)
 
         for origin in origins:
@@ -605,8 +592,13 @@ def main() -> int:
                 if not resp:
                     continue
 
-                price = _min_price_gbp(resp)
-                if price is None:
+                best = _best_offer_gbp(resp)
+                if best is None:
+                    continue
+                price, offer_stops = best
+
+                # Enforce product rule: ALL shorthaul must be direct.
+                if not is_long and int(offer_stops) != 0:
                     continue
 
                 row = [""] * len(headers)
@@ -619,7 +611,7 @@ def main() -> int:
                 oc, ok = geo_for(origin) or ("", "")
                 dc, dk = geo_for(dest) or ("", "")
 
-                did = _deal_id(origin, dest, od, rd, float(price), cabin, max_conn)
+                did = _deal_id(origin, dest, od, rd, float(price), cabin, int(offer_stops))
 
                 set_if("status", "NEW")
                 set_if("deal_id", did)
@@ -635,17 +627,17 @@ def main() -> int:
                 set_if("return_date", rd.isoformat())
                 set_if("price_gbp", float(price))
 
-                set_if("stops", int(max_conn))
+                # Stops derived from the chosen offer (truth)
+                set_if("stops", int(offer_stops))
 
                 set_if("theme", theme_today)
                 set_if("primary_theme", cfg_theme(cfg))
                 set_if("ingested_at", dt.datetime.utcnow().isoformat() + "Z")
                 set_if("source", "duffel")
-                set_if("max_connections", max_conn)
+                set_if("max_connections", int(max_conn))
                 set_if("cabin_class", cabin)
                 set_if("included_airlines", ",".join(included_airlines) if included_airlines else "")
 
-                # If RAW_DEALS has slot_hint column, preserve CONFIG hint for downstream scorer/publisher
                 set_if("slot_hint", cfg_slot(cfg))
 
                 deals_out.append(row)

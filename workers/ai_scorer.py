@@ -1,34 +1,36 @@
 # workers/ai_scorer.py
-# FULL FILE REPLACEMENT — AI SCORER v4.8i (RDV DUPLICATE-HEADER SAFE)
+# FULL FILE REPLACEMENT — AI SCORER v4.8j (PHRASE_BANK RESTORED + RDV DUPLICATE-SAFE)
 #
-# Fixes the crash:
-#   gspread.exceptions.GSpreadException: the header row in the worksheet is not unique
+# Fixes restored behavior:
+# - When a row is promoted NEW -> READY_TO_POST, populate:
+#     * RAW_DEALS.phrase_bank (required)
+#     * RAW_DEALS.phrase_used (if column exists)
 #
-# Root cause:
-# - RAW_DEALS_VIEW (RDV) header row contains duplicate column names.
-# - gspread.get_all_records() refuses to parse non-unique headers.
-#
-# This replacement avoids get_all_records() for RDV entirely.
-# It reads RDV via get_all_values(), builds a tolerant row-mapper, and only
-# extracts the few fields the scorer needs (deal_id, worthiness_verdict, hard_reject, priority_score, etc.).
+# Maintains fixes:
+# - Uses ingested_at_utc (canonical) for ingest timestamp
+# - Reads RAW_DEALS_VIEW (RDV) via get_all_values() to avoid duplicate header crash
 #
 # Governance:
-# - Writes ONLY to RAW_DEALS (status transitions)
-# - Reads RDV (RAW_DEALS_VIEW) as read-only intelligence
+# - Writes ONLY to RAW_DEALS
+# - Reads RDV and PHRASE_BANK (read-only)
 # - Does not write to RDV
-# - No schema changes required
 
 from __future__ import annotations
 
 import os
 import json
 import re
+import hashlib
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
 
+
+# -----------------------------
+# Logging / env helpers
+# -----------------------------
 
 def log(msg: str) -> None:
     ts = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -56,8 +58,8 @@ def _norm_header(h: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_")
 
 
-def _build_header_index(headers: List[str]) -> Dict[str, int]:
-    """Exact header -> index (0-based). Keeps first occurrence if duplicates exist."""
+def _build_first_index(headers: List[str]) -> Dict[str, int]:
+    """Exact header -> first index (0-based). Duplicate-safe."""
     idx: Dict[str, int] = {}
     for i, h in enumerate(headers):
         hh = str(h or "").strip()
@@ -66,7 +68,7 @@ def _build_header_index(headers: List[str]) -> Dict[str, int]:
     return idx
 
 
-def _build_norm_index(headers: List[str]) -> Dict[str, int]:
+def _build_norm_first_index(headers: List[str]) -> Dict[str, int]:
     """Normalized header -> first index (0-based). Duplicate-safe."""
     idx: Dict[str, int] = {}
     for i, h in enumerate(headers):
@@ -92,6 +94,10 @@ def _get_gspread_client() -> gspread.Client:
     creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
     return gspread.authorize(creds)
 
+
+# -----------------------------
+# Date parsing / theme-of-day
+# -----------------------------
 
 def _parse_dt(val: Any) -> Optional[dt.datetime]:
     if val is None:
@@ -122,30 +128,29 @@ def _parse_dt(val: Any) -> Optional[dt.datetime]:
     return None
 
 
-def _find_ingest_header(headers: List[str]) -> Optional[str]:
+def _find_ingest_header(raw_headers: List[str]) -> Optional[str]:
+    # Canonical first
     candidates = [
-        "ingested_at_utc",  # canonical in your RAW_DEALS header row
+        "ingested_at_utc",
         "ingested_at",
         "ingest_ts",
         "ingest_timestamp",
-        "ingestedat",
-        "ingested",
         "created_utc",
         "created_at",
         "timestamp",
     ]
-    header_set = set(headers)
+    header_set = set(raw_headers)
     for c in candidates:
         if c in header_set:
             return c
 
-    norm_map = {_norm_header(h): h for h in headers}
+    norm_map = {_norm_header(h): h for h in raw_headers}
     for c in candidates:
         nc = _norm_header(c)
         if nc in norm_map:
             return norm_map[nc]
 
-    for h in headers:
+    for h in raw_headers:
         nh = _norm_header(h)
         if "ingest" in nh and ("utc" in nh or "at" in nh or "ts" in nh or "time" in nh):
             return h
@@ -187,6 +192,81 @@ def _theme_of_day(eligible: List[str]) -> str:
     return sorted(eligible)[idx]
 
 
+# -----------------------------
+# Phrase selection
+# -----------------------------
+
+def _sha_int(s: str) -> int:
+    return int(hashlib.sha1(s.encode("utf-8")).hexdigest(), 16)
+
+
+def _pick_phrase(
+    deal_id: str,
+    theme: str,
+    channel: str,
+    phrases: List[Dict[str, Any]],
+) -> str:
+    """
+    Deterministic selection.
+    PHRASE_BANK expected headers:
+      theme, category, phrase, approved, channel_hint, max_per_month, notes
+    """
+    th = (theme or "").strip().lower()
+    ch = (channel or "").strip().upper()
+
+    # 1) strict match: theme + channel_hint
+    strict: List[str] = []
+    for r in phrases:
+        if not _is_true(r.get("approved")):
+            continue
+        p = str(r.get("phrase") or "").strip()
+        if not p:
+            continue
+        rt = str(r.get("theme") or "").strip().lower()
+        rh = str(r.get("channel_hint") or "").strip().upper()
+        if rt == th and rh == ch:
+            strict.append(p)
+
+    if strict:
+        idx = _sha_int(f"{deal_id}|{th}|{ch}|strict") % len(strict)
+        return strict[idx]
+
+    # 2) theme-only approved
+    theme_only: List[str] = []
+    for r in phrases:
+        if not _is_true(r.get("approved")):
+            continue
+        p = str(r.get("phrase") or "").strip()
+        if not p:
+            continue
+        rt = str(r.get("theme") or "").strip().lower()
+        if rt == th:
+            theme_only.append(p)
+
+    if theme_only:
+        idx = _sha_int(f"{deal_id}|{th}|theme") % len(theme_only)
+        return theme_only[idx]
+
+    # 3) any approved fallback
+    any_ok: List[str] = []
+    for r in phrases:
+        if not _is_true(r.get("approved")):
+            continue
+        p = str(r.get("phrase") or "").strip()
+        if p:
+            any_ok.append(p)
+
+    if any_ok:
+        idx = _sha_int(f"{deal_id}|any") % len(any_ok)
+        return any_ok[idx]
+
+    return ""
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
 def main() -> int:
     SPREADSHEET_ID = (_env("SPREADSHEET_ID") or _env("SHEET_ID")).strip()
     if not SPREADSHEET_ID:
@@ -196,6 +276,7 @@ def main() -> int:
     RAW_DEALS_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
     RDV_TAB = _env("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
     ZTB_TAB = _env("ZTB_TAB", "ZTB")
+    PHRASE_BANK_TAB = _env("PHRASE_BANK_TAB", "PHRASE_BANK")
 
     MIN_INGEST_AGE_SECONDS = _env_int("MIN_INGEST_AGE_SECONDS", 30)
     MAX_AGE_HOURS = _env_int("SCORER_MAX_AGE_HOURS", 72)
@@ -215,25 +296,42 @@ def main() -> int:
     except Exception:
         ws_ztb = sh.worksheet("ZONE_THEME_BENCHMARKS")
 
-    # Theme-of-day (lightweight, same idea as feeder)
+    ws_phr = sh.worksheet(PHRASE_BANK_TAB)
+
+    # Theme-of-day
     ztb_rows = ws_ztb.get_all_records()
     eligible = _eligible_themes_from_ztb(ztb_rows)
     theme_today = _theme_of_day(eligible)
     log(f"✅ ZTB: eligible_today={len(eligible)} | theme_today={theme_today} | pool={sorted(eligible)}")
 
+    # Load phrase bank (this sheet should have unique headers; if it doesn't, we can harden it too)
+    phrase_rows = ws_phr.get_all_records()
+    approved_count = sum(1 for r in phrase_rows if _is_true(r.get("approved")) and str(r.get("phrase") or "").strip())
+    log(f"✅ PHRASE_BANK loaded: {len(phrase_rows)} rows | approved_with_phrase={approved_count}")
+
     # RAW headers
     raw_headers = ws_raw.row_values(1)
-    raw_idx = _build_header_index(raw_headers)
+    raw_idx = _build_first_index(raw_headers)
 
-    if "status" not in raw_idx or "deal_id" not in raw_idx:
-        log("❌ RAW_DEALS missing required headers: status and/or deal_id")
-        return 1
+    required_raw = ["status", "deal_id", "ingested_at_utc"]
+    for col in ("status", "deal_id"):
+        if col not in raw_idx:
+            log(f"❌ RAW_DEALS missing required header: {col}")
+            return 1
 
     ingest_header = _find_ingest_header(raw_headers)
     if not ingest_header:
         log("❌ Could not find an ingest timestamp header in RAW_DEALS.")
         return 1
     log(f"🕒 Using ingest timestamp header: {ingest_header}")
+
+    # Optional write columns
+    phrase_bank_col = "phrase_bank" if "phrase_bank" in raw_idx else None
+    phrase_used_col = "phrase_used" if "phrase_used" in raw_idx else None
+
+    if not phrase_bank_col:
+        log("❌ RAW_DEALS missing required header: phrase_bank (needed to lock phrase).")
+        return 1
 
     # RDV duplicate-safe load
     rdv_values = ws_rdv.get_all_values()
@@ -242,27 +340,25 @@ def main() -> int:
         return 1
 
     rdv_headers = rdv_values[0]
-    rdv_norm_idx = _build_norm_index(rdv_headers)
+    rdv_norm_idx = _build_norm_first_index(rdv_headers)
 
     def rdv_cell(row: List[str], *candidate_headers: str) -> str:
-        """Fetch by normalized header candidates; returns first match."""
         for h in candidate_headers:
             j = rdv_norm_idx.get(_norm_header(h))
             if j is not None and j < len(row):
                 return str(row[j] or "").strip()
         return ""
 
-    # Build RDV lookup by deal_id (only the few fields we need)
+    # Build RDV lookup by deal_id
     rdv_by_id: Dict[str, Dict[str, str]] = {}
-    missing_did = 0
-
+    rdv_missing_did = 0
     for r in rdv_values[1:]:
         did = rdv_cell(r, "deal_id")
         if not did:
-            missing_did += 1
+            rdv_missing_did += 1
             continue
         if did in rdv_by_id:
-            continue  # keep first
+            continue
         rdv_by_id[did] = {
             "deal_id": did,
             "worthiness_verdict": rdv_cell(r, "worthiness_verdict"),
@@ -272,23 +368,20 @@ def main() -> int:
             "dynamic_theme": rdv_cell(r, "dynamic_theme"),
         }
 
-    if not rdv_by_id:
-        log("❌ RDV lookup is empty after parsing. Check RDV has a deal_id column.")
-        return 1
+    if rdv_missing_did:
+        log(f"⚠️ RDV rows missing deal_id: {rdv_missing_did}")
 
-    if missing_did > 0:
-        log(f"⚠️ RDV rows missing deal_id: {missing_did}")
-
-    # RAW rows with row numbers
+    # Load RAW values (with row numbers)
     raw_values = ws_raw.get_all_values()
     now = dt.datetime.now(dt.timezone.utc)
 
+    # Candidate selection
     eligible_rows: List[Tuple[int, str, Dict[str, str]]] = []
     skipped_no_ingest_ts = 0
     skipped_too_fresh = 0
     skipped_too_old = 0
     skipped_missing_rdv = 0
-    skipped_no_ingest_ids: List[str] = []
+    missing_ingest_ids: List[str] = []
 
     def raw_cell(row: List[str], col: str) -> str:
         j = raw_idx.get(col)
@@ -313,8 +406,8 @@ def main() -> int:
         ts = _parse_dt(ingest_val)
         if not ts:
             skipped_no_ingest_ts += 1
-            if len(skipped_no_ingest_ids) < 10:
-                skipped_no_ingest_ids.append(did)
+            if len(missing_ingest_ids) < 10:
+                missing_ingest_ids.append(did)
             continue
 
         age_s = (now - ts).total_seconds()
@@ -338,7 +431,7 @@ def main() -> int:
         f"skipped_too_old={skipped_too_old} skipped_missing_raw_row={skipped_missing_rdv}"
     )
     if skipped_no_ingest_ts:
-        log(f"⚠️ Missing ingest ts for first {len(skipped_no_ingest_ids)} NEW rows: {skipped_no_ingest_ids}")
+        log(f"⚠️ Missing ingest ts for first {len(missing_ingest_ids)} NEW rows: {missing_ingest_ids}")
 
     if not eligible_rows:
         log("No eligible NEW rows")
@@ -353,12 +446,12 @@ def main() -> int:
                 continue
         return 0.0
 
-    # Sort by RDV priority_score desc
     eligible_rows.sort(key=lambda t: score_of(t[2]), reverse=True)
 
-    winners_pro: List[int] = []
-    winners_vip: List[int] = []
-    winners_free: List[int] = []
+    # Allocate winners
+    winners_pro: List[Tuple[int, str]] = []
+    winners_vip: List[Tuple[int, str]] = []
+    winners_free: List[Tuple[int, str]] = []
     to_scored: List[int] = []
 
     for rownum, did, rdv in eligible_rows:
@@ -370,27 +463,51 @@ def main() -> int:
             continue
 
         if verdict.startswith("PRO_") and len(winners_pro) < QUOTA_PRO:
-            winners_pro.append(rownum)
+            winners_pro.append((rownum, did))
             continue
 
         if ("VIP" in verdict or verdict.startswith("POSTABLE")) and len(winners_vip) < QUOTA_VIP:
-            winners_vip.append(rownum)
+            winners_vip.append((rownum, did))
             continue
 
         if len(winners_free) < QUOTA_FREE:
-            winners_free.append(rownum)
+            winners_free.append((rownum, did))
             continue
 
         to_scored.append(rownum)
 
-    # Batch update statuses in RAW_DEALS
-    status_col = raw_idx["status"] + 1  # 1-based for gspread
+    # Prepare batch updates
     updates: List[gspread.Cell] = []
+    status_col = raw_idx["status"] + 1
+    phrase_bank_col_idx = raw_idx[phrase_bank_col] + 1
+    phrase_used_col_idx = (raw_idx[phrase_used_col] + 1) if phrase_used_col else None
 
+    def set_status(rownum: int, v: str) -> None:
+        updates.append(gspread.Cell(rownum, status_col, v))
+
+    def set_phrase(rownum: int, deal_id: str, theme: str, channel: str) -> None:
+        phrase = _pick_phrase(deal_id=deal_id, theme=theme, channel=channel, phrases=phrase_rows)
+        if phrase:
+            updates.append(gspread.Cell(rownum, phrase_bank_col_idx, phrase))
+            if phrase_used_col_idx is not None:
+                updates.append(gspread.Cell(rownum, phrase_used_col_idx, phrase))
+
+    # SCORED
     for r in to_scored:
-        updates.append(gspread.Cell(r, status_col, "SCORED"))
-    for r in winners_pro + winners_vip + winners_free:
-        updates.append(gspread.Cell(r, status_col, "READY_TO_POST"))
+        set_status(r, "SCORED")
+
+    # READY_TO_POST + phrase lock
+    for rownum, did in winners_pro:
+        set_status(rownum, "READY_TO_POST")
+        set_phrase(rownum, did, theme_today, "PRO")
+
+    for rownum, did in winners_vip:
+        set_status(rownum, "READY_TO_POST")
+        set_phrase(rownum, did, theme_today, "VIP")
+
+    for rownum, did in winners_free:
+        set_status(rownum, "READY_TO_POST")
+        set_phrase(rownum, did, theme_today, "FREE")
 
     if updates:
         ws_raw.update_cells(updates, value_input_option="USER_ENTERED")
@@ -399,6 +516,11 @@ def main() -> int:
         f"✅ Promoted: PRO={len(winners_pro)} VIP={len(winners_vip)} FREE={len(winners_free)} "
         f"| Marked SCORED={len(to_scored)}"
     )
+
+    # Extra visibility
+    phrase_written = sum(1 for c in updates if c.col == phrase_bank_col_idx)
+    log(f"📝 phrase_bank written: {phrase_written}")
+
     return 0
 
 

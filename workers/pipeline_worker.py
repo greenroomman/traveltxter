@@ -1,22 +1,22 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8d (HOTFIX)
+# FULL FILE REPLACEMENT — FEEDER v4.8e (VARIETY GUARANTEE)
 #
-# What this fixes (root cause of your 0-winner run):
-# - The prior worker started using CONFIG_CARRIER_BIAS as an *airline filter* (allowed_carrier_*) when CONFIG.included_airlines was blank.
-#   That is NOT a “hint” in Duffel — it is a hard restriction, which frequently yields 0 offers.
-#   Result: Duffel calls succeed, but offers list is empty / GBP prices missing → 0 deals.
+# Purpose:
+# - Ensure feeder "looks beyond" top-ranked CONFIG rows by guaranteeing within-theme spread:
+#   * At least 1 AM slot_hint row (if available)
+#   * At least 1 PM slot_hint row (if available)
+# - Feeder still does NOT decide what is "good". Scorer remains the judge.
 #
-# This file:
-# - Loads CONFIG_CARRIER_BIAS (your schema) for visibility only (no filtering unless CONFIG explicitly sets included_airlines).
-# - Restores the known-good Duffel request shape (per-slice max_connections + allowed_carrier_iatas).
-# - Ensures RAW_DEALS.deal_id is ALWAYS populated (deterministic) + fills stops.
-# - Improves IATA_MASTER parsing (supports iata_code / iata / IATA).
-# - Keeps ZTB fallback: ZTB -> ZONE_THEME_BENCHMARKS.
-# - PRICE PSYCHOLOGY is NOT used as feeder gating.
+# What stays the same:
+# - Spreadsheet drives theme + allowable destinations (ZTB + CONFIG)
+# - Same caps: MAX_SEARCHES, DESTS_PER_RUN, ORIGINS_PER_DEST, etc.
+# - Same Duffel request shape; no carrier bias hard-filter unless CONFIG sets included_airlines.
+# - Writes ONLY to RAW_DEALS.
 #
 # Governance:
-# - Writes ONLY to RAW_DEALS.
-# - No schema changes, no tab renames, no RDV writes.
+# - No schema changes
+# - No tab renames
+# - No RDV writes
 
 from __future__ import annotations
 
@@ -194,11 +194,10 @@ def _duffel_search(
         }
     }
 
-    # ✅ Known-good behaviour: set max_connections on each slice (Duffel accepts it)
     for sl in payload["data"]["slices"]:
         sl["max_connections"] = int(max_connections)
 
-    # ✅ IMPORTANT: this is a hard filter. Only apply when CONFIG explicitly sets included_airlines.
+    # Hard filter only when explicitly set in CONFIG
     if included_airlines:
         payload["data"]["allowed_carrier_iatas"] = included_airlines
 
@@ -247,7 +246,6 @@ def _candidate_outbounds_seasonal(
     if max_start < min_d:
         max_start = min_d
 
-    # Year-round => normal
     if start_mmdd <= 101 and end_mmdd >= 1231:
         pts = [min_d]
         if n > 1 and max_start != min_d:
@@ -344,7 +342,6 @@ def main() -> int:
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
     ws_cfg = sh.worksheet(CONFIG_TAB)
 
-    # ✅ ZTB fallback to legacy name
     try:
         ws_ztb = sh.worksheet(ZTB_TAB)
     except Exception:
@@ -353,7 +350,7 @@ def main() -> int:
     ws_rcm = sh.worksheet(RCM_TAB)
     ws_iata = sh.worksheet(IATA_TAB)
 
-    # --- CONFIG_CARRIER_BIAS (your schema) — load + log only (NO Duffel filtering unless CONFIG sets included_airlines) ---
+    # Carrier bias: load+log only
     bias_rows: List[Dict[str, Any]] = []
     try:
         ws_bias = sh.worksheet(CONFIG_CARRIER_BIAS_TAB)
@@ -361,7 +358,6 @@ def main() -> int:
     except Exception:
         bias_rows = []
 
-    # Validate your schema presence (for operator confidence)
     usable_bias = 0
     if bias_rows:
         for r in bias_rows:
@@ -371,7 +367,6 @@ def main() -> int:
             bw = r.get("bias_weight")
             if cc and th and di and _safe_float(bw, 0.0) > 0:
                 usable_bias += 1
-
     if usable_bias > 0:
         log(f"✅ CONFIG_CARRIER_BIAS loaded: {usable_bias} usable rows")
     else:
@@ -396,8 +391,11 @@ def main() -> int:
     def cfg_theme(r: Dict[str, Any]) -> str:
         return (str(r.get("primary_theme") or "").strip() or str(r.get("audience_type") or "").strip())
 
-    theme_rows = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
-    if not theme_rows:
+    def cfg_slot(r: Dict[str, Any]) -> str:
+        return str(r.get("slot_hint") or "").strip().upper()
+
+    theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
+    if not theme_rows_all:
         fallback = "unexpected_value"
         log(f"⚠️ No CONFIG rows for theme={theme_today}. Falling back to {fallback}")
         theme_today = fallback
@@ -405,10 +403,10 @@ def main() -> int:
         ztb_start = _safe_int(ztb_today.get("start_mmdd"), 101)
         ztb_end = _safe_int(ztb_today.get("end_mmdd"), 1231)
         ztb_max_conn = _connections_from_tolerance(str(ztb_today.get("connection_tolerance") or "any"))
-        theme_rows = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
+        theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
 
-    # simple sort (priority, search_weight, content_priority)
-    theme_rows.sort(
+    # Sort remains: (priority, search_weight, content_priority)
+    theme_rows_all.sort(
         key=lambda r: (
             _safe_float(r.get("priority"), 0),
             _safe_float(r.get("search_weight"), 0),
@@ -417,7 +415,13 @@ def main() -> int:
         reverse=True,
     )
 
-    # Quotas
+    # Diversity guarantees by slot_hint (AM/PM) — feeder is not deciding publish slot, only ensuring pool coverage.
+    am_rows = [r for r in theme_rows_all if cfg_slot(r) == "AM"]
+    pm_rows = [r for r in theme_rows_all if cfg_slot(r) == "PM"]
+    other_rows = [r for r in theme_rows_all if cfg_slot(r) not in ("AM", "PM")]
+
+    log(f"🧩 Slot split within theme={theme_today}: AM={len(am_rows)} | PM={len(pm_rows)} | other/blank={len(other_rows)}")
+
     DUFFEL_ROUTES_PER_RUN = max(1, DUFFEL_ROUTES_PER_RUN)
     COMMODITY_CAP = _env_int("COMMODITY_CAP", max(1, DUFFEL_ROUTES_PER_RUN // 3))
     MIN_EXOTIC = _env_int("MIN_EXOTIC", 1)
@@ -425,15 +429,29 @@ def main() -> int:
     def gw_type(r: Dict[str, Any]) -> str:
         return str(r.get("gateway_type") or "").strip().lower()
 
-    non_comm = [r for r in theme_rows if gw_type(r) not in ("commodity", "")]
-    comm = [r for r in theme_rows if gw_type(r) in ("commodity", "")]
-
+    # Start selection with mandatory AM/PM representatives (if available)
     selected: List[Dict[str, Any]] = []
+
+    if am_rows and len(selected) < DUFFEL_ROUTES_PER_RUN:
+        selected.append(am_rows[0])
+    if pm_rows and len(selected) < DUFFEL_ROUTES_PER_RUN:
+        if pm_rows[0] not in selected:
+            selected.append(pm_rows[0])
+
+    # Now fill remaining with existing commodity logic over the whole theme pool
+    pool = [r for r in theme_rows_all if r not in selected]
+
+    non_comm = [r for r in pool if gw_type(r) not in ("commodity", "")]
+    comm = [r for r in pool if gw_type(r) in ("commodity", "")]
+
+    # Ensure some "exotic" presence if possible (existing behaviour)
+    exotic_used = 0
     for r in non_comm:
         if len(selected) >= DUFFEL_ROUTES_PER_RUN:
             break
-        if len(selected) < MIN_EXOTIC:
+        if exotic_used < MIN_EXOTIC:
             selected.append(r)
+            exotic_used += 1
 
     comm_used = 0
     for r in (non_comm + comm):
@@ -448,12 +466,18 @@ def main() -> int:
         selected.append(r)
 
     theme_rows = selected
+
+    # Log final chosen destination_iata + slot_hint so you can verify it "looked beyond"
+    chosen_debug = []
+    for r in theme_rows:
+        chosen_debug.append(f"{str(r.get('destination_iata') or '').strip().upper()}[{cfg_slot(r) or '—'}]")
     log(
         f"🧭 Selected destinations to attempt: {len(theme_rows)} (cap DESTS_PER_RUN={DUFFEL_ROUTES_PER_RUN}) "
-        f"| commodity_cap={COMMODITY_CAP} commodity_used={comm_used} min_exotic={MIN_EXOTIC}"
+        f"| commodity_cap={COMMODITY_CAP} commodity_used={comm_used} min_exotic={MIN_EXOTIC} "
+        f"| chosen={chosen_debug}"
     )
 
-    # Geo dictionary from RCM + IATA_MASTER (support multiple header names)
+    # Geo dictionary from RCM + IATA_MASTER
     rcm_all = ws_rcm.get_all_records()
     iata_geo: Dict[str, Tuple[str, str]] = {}
 
@@ -508,7 +532,6 @@ def main() -> int:
         return True
 
     def carriers_from_cfg(cfg_row: Dict[str, Any]) -> List[str]:
-        # IMPORTANT: only use filters when explicitly specified in CONFIG
         raw = str(cfg_row.get("included_airlines") or "").strip()
         if not raw:
             return []
@@ -526,7 +549,6 @@ def main() -> int:
             else:
                 candidate_pool = origins_default[:]
 
-        # Deterministic daily rotation
         seed = f"{_today_utc().isoformat()}|{theme_today}|{dest}|{_env('RUN_SLOT','')}"
         h = int(hashlib.md5(seed.encode("utf-8")).hexdigest(), 16)
         ranked = sorted(candidate_pool, reverse=True)
@@ -561,7 +583,7 @@ def main() -> int:
         max_conn = min(cfg_max_conn, ztb_max_conn)
 
         cabin = str(cfg.get("cabin_class") or "economy").strip().lower() or "economy"
-        included_airlines = carriers_from_cfg(cfg)  # ONLY from CONFIG
+        included_airlines = carriers_from_cfg(cfg)
         origins = choose_origins_for_dest(cfg, dest, ORIGINS_PER_DEST)
 
         for origin in origins:
@@ -613,7 +635,6 @@ def main() -> int:
                 set_if("return_date", rd.isoformat())
                 set_if("price_gbp", float(price))
 
-                # Stops proxy
                 set_if("stops", int(max_conn))
 
                 set_if("theme", theme_today)
@@ -623,6 +644,9 @@ def main() -> int:
                 set_if("max_connections", max_conn)
                 set_if("cabin_class", cabin)
                 set_if("included_airlines", ",".join(included_airlines) if included_airlines else "")
+
+                # If RAW_DEALS has slot_hint column, preserve CONFIG hint for downstream scorer/publisher
+                set_if("slot_hint", cfg_slot(cfg))
 
                 deals_out.append(row)
                 inserted_by_origin[origin] = inserted_by_origin.get(origin, 0) + 1

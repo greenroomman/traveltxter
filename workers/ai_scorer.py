@@ -1,13 +1,22 @@
 # workers/ai_scorer.py
-# FULL FILE REPLACEMENT — AI SCORER v4.8h (INGESTED_AT_UTC CANONICAL)
+# FULL FILE REPLACEMENT — AI SCORER v4.8i (RDV DUPLICATE-HEADER SAFE)
 #
-# Fixes: Eligible NEW candidates: 0 + skipped_no_ingest_ts=65
-# Root cause: RAW_DEALS uses ingested_at_utc but scorer was not resolving it.
+# Fixes the crash:
+#   gspread.exceptions.GSpreadException: the header row in the worksheet is not unique
+#
+# Root cause:
+# - RAW_DEALS_VIEW (RDV) header row contains duplicate column names.
+# - gspread.get_all_records() refuses to parse non-unique headers.
+#
+# This replacement avoids get_all_records() for RDV entirely.
+# It reads RDV via get_all_values(), builds a tolerant row-mapper, and only
+# extracts the few fields the scorer needs (deal_id, worthiness_verdict, hard_reject, priority_score, etc.).
 #
 # Governance:
-# - RAW_DEALS is the only writable state
-# - RAW_DEALS_VIEW is read-only intelligence (RDV)
-# - Scorer reads RDV for worthiness, writes status updates to RAW_DEALS only
+# - Writes ONLY to RAW_DEALS (status transitions)
+# - Reads RDV (RAW_DEALS_VIEW) as read-only intelligence
+# - Does not write to RDV
+# - No schema changes required
 
 from __future__ import annotations
 
@@ -48,11 +57,22 @@ def _norm_header(h: str) -> str:
 
 
 def _build_header_index(headers: List[str]) -> Dict[str, int]:
+    """Exact header -> index (0-based). Keeps first occurrence if duplicates exist."""
     idx: Dict[str, int] = {}
     for i, h in enumerate(headers):
         hh = str(h or "").strip()
-        if hh:
+        if hh and hh not in idx:
             idx[hh] = i
+    return idx
+
+
+def _build_norm_index(headers: List[str]) -> Dict[str, int]:
+    """Normalized header -> first index (0-based). Duplicate-safe."""
+    idx: Dict[str, int] = {}
+    for i, h in enumerate(headers):
+        nh = _norm_header(h)
+        if nh and nh not in idx:
+            idx[nh] = i
     return idx
 
 
@@ -83,7 +103,6 @@ def _parse_dt(val: Any) -> Optional[dt.datetime]:
     if not s:
         return None
 
-    # ISO 8601, with optional Z
     try:
         if s.endswith("Z"):
             return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -92,7 +111,6 @@ def _parse_dt(val: Any) -> Optional[dt.datetime]:
     except Exception:
         pass
 
-    # Date-only: YYYY-MM-DD
     m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
     if m:
         try:
@@ -105,35 +123,28 @@ def _parse_dt(val: Any) -> Optional[dt.datetime]:
 
 
 def _find_ingest_header(headers: List[str]) -> Optional[str]:
-    """
-    Canonical for your sheet: ingested_at_utc
-    Fallbacks kept for backward compatibility.
-    """
     candidates = [
-        "ingested_at_utc",  # CANONICAL (your header row)
+        "ingested_at_utc",  # canonical in your RAW_DEALS header row
         "ingested_at",
         "ingest_ts",
         "ingest_timestamp",
-        "ingestedAt",
+        "ingestedat",
         "ingested",
         "created_utc",
         "created_at",
         "timestamp",
     ]
-
     header_set = set(headers)
     for c in candidates:
         if c in header_set:
             return c
 
-    # normalized matching
     norm_map = {_norm_header(h): h for h in headers}
     for c in candidates:
         nc = _norm_header(c)
         if nc in norm_map:
             return norm_map[nc]
 
-    # heuristic: any header containing ingest + (utc/at/ts/time)
     for h in headers:
         nh = _norm_header(h)
         if "ingest" in nh and ("utc" in nh or "at" in nh or "ts" in nh or "time" in nh):
@@ -204,15 +215,19 @@ def main() -> int:
     except Exception:
         ws_ztb = sh.worksheet("ZONE_THEME_BENCHMARKS")
 
+    # Theme-of-day (lightweight, same idea as feeder)
     ztb_rows = ws_ztb.get_all_records()
     eligible = _eligible_themes_from_ztb(ztb_rows)
     theme_today = _theme_of_day(eligible)
     log(f"✅ ZTB: eligible_today={len(eligible)} | theme_today={theme_today} | pool={sorted(eligible)}")
 
+    # RAW headers
     raw_headers = ws_raw.row_values(1)
-    rdv_headers = ws_rdv.row_values(1)
-
     raw_idx = _build_header_index(raw_headers)
+
+    if "status" not in raw_idx or "deal_id" not in raw_idx:
+        log("❌ RAW_DEALS missing required headers: status and/or deal_id")
+        return 1
 
     ingest_header = _find_ingest_header(raw_headers)
     if not ingest_header:
@@ -220,31 +235,63 @@ def main() -> int:
         return 1
     log(f"🕒 Using ingest timestamp header: {ingest_header}")
 
-    # Required headers (exact names exist in your sheet)
-    if "status" not in raw_idx or "deal_id" not in raw_idx:
-        log("❌ RAW_DEALS missing required headers: status and/or deal_id")
+    # RDV duplicate-safe load
+    rdv_values = ws_rdv.get_all_values()
+    if not rdv_values or len(rdv_values) < 2:
+        log("❌ RDV appears empty (no rows).")
         return 1
 
-    # RDV lookup by deal_id (read-only)
-    rdv_rows = ws_rdv.get_all_records()
-    rdv_by_id: Dict[str, Dict[str, Any]] = {}
-    for r in rdv_rows:
-        did = str(r.get("deal_id") or "").strip()
-        if did:
-            rdv_by_id[did] = r
+    rdv_headers = rdv_values[0]
+    rdv_norm_idx = _build_norm_index(rdv_headers)
 
+    def rdv_cell(row: List[str], *candidate_headers: str) -> str:
+        """Fetch by normalized header candidates; returns first match."""
+        for h in candidate_headers:
+            j = rdv_norm_idx.get(_norm_header(h))
+            if j is not None and j < len(row):
+                return str(row[j] or "").strip()
+        return ""
+
+    # Build RDV lookup by deal_id (only the few fields we need)
+    rdv_by_id: Dict[str, Dict[str, str]] = {}
+    missing_did = 0
+
+    for r in rdv_values[1:]:
+        did = rdv_cell(r, "deal_id")
+        if not did:
+            missing_did += 1
+            continue
+        if did in rdv_by_id:
+            continue  # keep first
+        rdv_by_id[did] = {
+            "deal_id": did,
+            "worthiness_verdict": rdv_cell(r, "worthiness_verdict"),
+            "hard_reject": rdv_cell(r, "hard_reject"),
+            "priority_score": rdv_cell(r, "priority_score"),
+            "worthiness_score": rdv_cell(r, "worthiness_score"),
+            "dynamic_theme": rdv_cell(r, "dynamic_theme"),
+        }
+
+    if not rdv_by_id:
+        log("❌ RDV lookup is empty after parsing. Check RDV has a deal_id column.")
+        return 1
+
+    if missing_did > 0:
+        log(f"⚠️ RDV rows missing deal_id: {missing_did}")
+
+    # RAW rows with row numbers
     raw_values = ws_raw.get_all_values()
     now = dt.datetime.now(dt.timezone.utc)
 
-    eligible_rows: List[Tuple[int, str, Dict[str, Any]]] = []
+    eligible_rows: List[Tuple[int, str, Dict[str, str]]] = []
     skipped_no_ingest_ts = 0
     skipped_too_fresh = 0
     skipped_too_old = 0
     skipped_missing_rdv = 0
-    missing_ingest_ids: List[str] = []
+    skipped_no_ingest_ids: List[str] = []
 
-    def get_cell(row: List[str], col_name: str) -> str:
-        j = raw_idx.get(col_name)
+    def raw_cell(row: List[str], col: str) -> str:
+        j = raw_idx.get(col)
         if j is None:
             return ""
         return row[j] if j < len(row) else ""
@@ -254,27 +301,26 @@ def main() -> int:
         if not row:
             continue
 
-        status = get_cell(row, "status").strip()
+        status = raw_cell(row, "status").strip()
         if status != "NEW":
             continue
 
-        did = get_cell(row, "deal_id").strip()
+        did = raw_cell(row, "deal_id").strip()
         if not did:
             continue
 
-        ingest_val = get_cell(row, ingest_header).strip()
+        ingest_val = raw_cell(row, ingest_header).strip()
         ts = _parse_dt(ingest_val)
         if not ts:
             skipped_no_ingest_ts += 1
-            if len(missing_ingest_ids) < 10:
-                missing_ingest_ids.append(did)
+            if len(skipped_no_ingest_ids) < 10:
+                skipped_no_ingest_ids.append(did)
             continue
 
         age_s = (now - ts).total_seconds()
         if age_s < MIN_INGEST_AGE_SECONDS:
             skipped_too_fresh += 1
             continue
-
         if age_s > MAX_AGE_HOURS * 3600:
             skipped_too_old += 1
             continue
@@ -292,31 +338,22 @@ def main() -> int:
         f"skipped_too_old={skipped_too_old} skipped_missing_raw_row={skipped_missing_rdv}"
     )
     if skipped_no_ingest_ts:
-        log(f"⚠️ Missing ingest ts for first {len(missing_ingest_ids)} NEW rows: {missing_ingest_ids}")
+        log(f"⚠️ Missing ingest ts for first {len(skipped_no_ingest_ids)} NEW rows: {skipped_no_ingest_ids}")
 
     if not eligible_rows:
         log("No eligible NEW rows")
         return 0
 
-    def rdv_get(r: Dict[str, Any], key: str) -> str:
-        if key in r:
-            return str(r.get(key) or "").strip()
-        nk = _norm_header(key)
-        for kk in r.keys():
-            if _norm_header(kk) == nk:
-                return str(r.get(kk) or "").strip()
-        return ""
-
-    def score_of(rdv: Dict[str, Any]) -> float:
+    def score_of(rdv: Dict[str, str]) -> float:
         for k in ("priority_score", "worthiness_score"):
-            v = rdv_get(rdv, k)
+            v = (rdv.get(k) or "").strip()
             try:
                 return float(v)
             except Exception:
                 continue
         return 0.0
 
-    # Sort candidates by RDV priority_score (desc)
+    # Sort by RDV priority_score desc
     eligible_rows.sort(key=lambda t: score_of(t[2]), reverse=True)
 
     winners_pro: List[int] = []
@@ -325,8 +362,8 @@ def main() -> int:
     to_scored: List[int] = []
 
     for rownum, did, rdv in eligible_rows:
-        verdict = rdv_get(rdv, "worthiness_verdict").upper()
-        hard_reject = rdv_get(rdv, "hard_reject").upper() == "TRUE"
+        verdict = (rdv.get("worthiness_verdict") or "").upper().strip()
+        hard_reject = (rdv.get("hard_reject") or "").upper().strip() == "TRUE"
 
         if hard_reject:
             to_scored.append(rownum)

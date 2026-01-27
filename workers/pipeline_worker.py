@@ -413,9 +413,9 @@ def main() -> int:
 
     carrier_origin_weight: Dict[str, Dict[str, float]] = {}
     for r in bias_rows:
-        c = str(r.get("carrier_iata") or "").strip().upper()
-        o = str(r.get("origin_iata") or "").strip().upper()
-        w = _safe_float(r.get("weight"), 0.0)
+        c = str(r.get("carrier_code") or "").strip().upper()
+        o = str(r.get("destination_iata") or "").strip().upper()
+        w = _safe_float(r.get("bias_weight"), 0.0)
         if c and o and w > 0:
             carrier_origin_weight.setdefault(c, {})[o] = w
 

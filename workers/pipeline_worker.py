@@ -1,7 +1,8 @@
 # workers/pipeline_worker.py
 # FULL FILE REPLACEMENT — FEEDER vNext (CONFIG + ZTB + carrier-biased origin pools + seasonal clamp)
 # Patch: if ZTB tab isn't literally named "ZTB", fallback to "ZONE_THEME_BENCHMARKS"
-# Patch: CONFIG_CARRIER_BIAS tab name is env-configurable (CONFIG_CARRIER_BIAS_TAB)
+# Patch: CONFIG_CARRIER_BIAS load is now DIAGNOSTIC + ROBUST (no silent failures)
+# Patch: CONFIG_CARRIER_BIAS header normalization (handles odd casing/spacing)
 # Patch: PRICE PSYCHOLOGY REMOVED from feeder (no hard-gating on price_psychology_*)
 
 from __future__ import annotations
@@ -275,6 +276,63 @@ def _append_rows(ws: gspread.Worksheet, rows: List[List[Any]]) -> None:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
+def _norm_header(h: str) -> str:
+    return "".join(ch for ch in (h or "").strip().lower() if ch.isalnum() or ch == "_")
+
+
+def _load_carrier_bias_rows(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
+    """
+    Robust loader that does not silently return empty when:
+    - there are blank top rows
+    - headers have odd spacing/case
+    - the sheet has extra columns
+    """
+    values = ws.get_all_values()
+    # find first non-empty row as header
+    header_row_idx = -1
+    for i, row in enumerate(values[:20]):  # look at first 20 rows only
+        if any(str(c).strip() for c in row):
+            header_row_idx = i
+            break
+    if header_row_idx < 0:
+        return []
+
+    raw_headers = values[header_row_idx]
+    headers_norm = [_norm_header(h) for h in raw_headers]
+
+    # expected keys (normalized)
+    # allow variants: carrier_iata / carrier / airline_iata ; origin_iata / origin ; weight / w
+    def find_col(*cands: str) -> Optional[int]:
+        cand_set = set(cands)
+        for j, hn in enumerate(headers_norm):
+            if hn in cand_set:
+                return j
+        return None
+
+    j_carrier = find_col("carrier_iata", "carrier", "airline_iata", "airline", "carrieriata")
+    j_origin = find_col("origin_iata", "origin", "originiata", "originairport")
+    j_weight = find_col("weight", "w", "bias_weight", "score", "wt")
+
+    if j_carrier is None or j_origin is None or j_weight is None:
+        log(
+            "⚠️ CONFIG_CARRIER_BIAS headers not recognized. "
+            f"Found(normalized)={headers_norm[:10]}..."
+        )
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for row in values[header_row_idx + 1 :]:
+        if not any(str(c).strip() for c in row):
+            continue
+        c = (row[j_carrier] if j_carrier < len(row) else "").strip()
+        o = (row[j_origin] if j_origin < len(row) else "").strip()
+        w = (row[j_weight] if j_weight < len(row) else "").strip()
+        if not c or not o or not w:
+            continue
+        out.append({"carrier_iata": c, "origin_iata": o, "weight": w})
+    return out
+
+
 def main() -> int:
     log("================================================================================")
     log("TRAVELTXTTER PIPELINE WORKER (FEEDER) START")
@@ -324,11 +382,33 @@ def main() -> int:
     ws_rcm = sh.worksheet(RCM_TAB)
     ws_iata = sh.worksheet(IATA_TAB)
 
-    # Carrier bias tab optional + env-configurable
+    # Carrier bias tab optional + env-configurable + diagnostic
+    bias_rows: List[Dict[str, Any]] = []
     try:
         ws_bias = sh.worksheet(CONFIG_CARRIER_BIAS_TAB)
-        bias_rows = ws_bias.get_all_records()
-    except Exception:
+        bias_rows = _load_carrier_bias_rows(ws_bias)
+        if not bias_rows:
+            # fallback to get_all_records() just in case, but log it
+            try:
+                recs = ws_bias.get_all_records()
+                if recs:
+                    bias_rows = recs
+                    log(
+                        f"⚠️ CONFIG_CARRIER_BIAS robust loader returned 0 rows, "
+                        f"but get_all_records() returned {len(recs)}. Using get_all_records()."
+                    )
+            except Exception as e2:
+                log(f"⚠️ CONFIG_CARRIER_BIAS get_all_records() also failed: {e2}")
+    except Exception as e:
+        # include sheet tab list for hard proof
+        try:
+            tabs = [w.title for w in sh.worksheets()]
+            log(
+                f"⚠️ CONFIG_CARRIER_BIAS load failed for tab={CONFIG_CARRIER_BIAS_TAB}: {e}. "
+                f"Available tabs={tabs}"
+            )
+        except Exception:
+            log(f"⚠️ CONFIG_CARRIER_BIAS load failed for tab={CONFIG_CARRIER_BIAS_TAB}: {e}. (Could not list tabs)")
         bias_rows = []
 
     carrier_origin_weight: Dict[str, Dict[str, float]] = {}
@@ -340,7 +420,10 @@ def main() -> int:
             carrier_origin_weight.setdefault(c, {})[o] = w
 
     if carrier_origin_weight:
-        log(f"✅ CONFIG_CARRIER_BIAS loaded: tab={CONFIG_CARRIER_BIAS_TAB} | carriers={len(carrier_origin_weight)}")
+        log(
+            f"✅ CONFIG_CARRIER_BIAS loaded: tab={CONFIG_CARRIER_BIAS_TAB} | "
+            f"rows={len(bias_rows)} | carriers={len(carrier_origin_weight)}"
+        )
     else:
         log("⚠️ CONFIG_CARRIER_BIAS not loaded or empty. Origin selection will use fallback pools.")
 
@@ -374,7 +457,6 @@ def main() -> int:
         ztb_max_conn = _connections_from_tolerance(str(ztb_today.get("connection_tolerance") or "any"))
         theme_rows = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
 
-    # simple sort (priority, search_weight, content_priority)
     theme_rows.sort(
         key=lambda r: (
             _safe_float(r.get("priority"), 0),
@@ -384,7 +466,6 @@ def main() -> int:
         reverse=True,
     )
 
-    # Quotas
     DUFFEL_ROUTES_PER_RUN = max(1, DUFFEL_ROUTES_PER_RUN)
     COMMODITY_CAP = _env_int("COMMODITY_CAP", max(1, DUFFEL_ROUTES_PER_RUN // 3))
     MIN_EXOTIC = _env_int("MIN_EXOTIC", 1)
@@ -420,7 +501,6 @@ def main() -> int:
         f"| commodity_cap={COMMODITY_CAP} commodity_used={comm_used} min_exotic={MIN_EXOTIC}"
     )
 
-    # Geo dictionary from RCM + IATA_MASTER
     rcm_all = ws_rcm.get_all_records()
     iata_geo: Dict[str, Tuple[str, str]] = {}
     for r in rcm_all:

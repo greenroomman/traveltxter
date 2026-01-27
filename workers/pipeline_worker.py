@@ -1,8 +1,9 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER vNext (CONFIG + ZTB + carrier-biased origin pools + seasonal clamp)
+# FULL FILE REPLACEMENT — FEEDER vNext (CONFIG + ZTB + carrier-bias + seasonal clamp)
 # Patch: if ZTB tab isn't literally named "ZTB", fallback to "ZONE_THEME_BENCHMARKS"
-# Patch: CONFIG_CARRIER_BIAS load is now DIAGNOSTIC + ROBUST (no silent failures)
-# Patch: CONFIG_CARRIER_BIAS header normalization (handles odd casing/spacing)
+# Patch: CONFIG_CARRIER_BIAS load supports BOTH schemas:
+#   A) carrier_iata, origin_iata, weight   (origin weighting)
+#   B) carrier_code, carrier_name, theme, destination_iata, bias_weight, notes  (destination carrier bias)
 # Patch: PRICE PSYCHOLOGY REMOVED from feeder (no hard-gating on price_psychology_*)
 
 from __future__ import annotations
@@ -280,48 +281,38 @@ def _norm_header(h: str) -> str:
     return "".join(ch for ch in (h or "").strip().lower() if ch.isalnum() or ch == "_")
 
 
-def _load_carrier_bias_rows(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
-    """
-    Robust loader that does not silently return empty when:
-    - there are blank top rows
-    - headers have odd spacing/case
-    - the sheet has extra columns
-    """
-    values = ws.get_all_values()
-    # find first non-empty row as header
-    header_row_idx = -1
-    for i, row in enumerate(values[:20]):  # look at first 20 rows only
+def _find_first_nonempty_row(values: List[List[str]], max_scan: int = 30) -> int:
+    for i, row in enumerate(values[:max_scan]):
         if any(str(c).strip() for c in row):
-            header_row_idx = i
-            break
-    if header_row_idx < 0:
-        return []
+            return i
+    return -1
 
-    raw_headers = values[header_row_idx]
+
+def _col_index(headers_norm: List[str], candidates: List[str]) -> Optional[int]:
+    cand = set(candidates)
+    for j, hn in enumerate(headers_norm):
+        if hn in cand:
+            return j
+    return None
+
+
+def _load_bias_schema_A(values: List[List[str]]) -> List[Dict[str, Any]]:
+    # Schema A: carrier_iata, origin_iata, weight
+    hdr_i = _find_first_nonempty_row(values)
+    if hdr_i < 0:
+        return []
+    raw_headers = values[hdr_i]
     headers_norm = [_norm_header(h) for h in raw_headers]
 
-    # expected keys (normalized)
-    # allow variants: carrier_code / carrier / airline_code ; origin_iata / origin ; weight / weight_bias / bias_weight
-    def find_col(*cands: str) -> Optional[int]:
-        cand_set = set(cands)
-        for j, hn in enumerate(headers_norm):
-            if hn in cand_set:
-                return j
-        return None
-
-    j_carrier = find_col("carrier_iata", "carrier", "airline_iata", "airline", "carrieriata")
-    j_origin = find_col("origin_iata", "origin", "originiata", "originairport")
-    j_weight = find_col("weight", "w", "bias_weight", "score", "wt")
+    j_carrier = _col_index(headers_norm, ["carrier_iata", "carrier", "airline_iata", "airline", "carrieriata"])
+    j_origin = _col_index(headers_norm, ["origin_iata", "origin", "originiata"])
+    j_weight = _col_index(headers_norm, ["weight", "w", "bias_weight", "wt", "score"])
 
     if j_carrier is None or j_origin is None or j_weight is None:
-        log(
-            "⚠️ CONFIG_CARRIER_BIAS headers not recognized. "
-            f"Found(normalized)={headers_norm[:10]}..."
-        )
         return []
 
     out: List[Dict[str, Any]] = []
-    for row in values[header_row_idx + 1 :]:
+    for row in values[hdr_i + 1 :]:
         if not any(str(c).strip() for c in row):
             continue
         c = (row[j_carrier] if j_carrier < len(row) else "").strip()
@@ -330,6 +321,36 @@ def _load_carrier_bias_rows(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
         if not c or not o or not w:
             continue
         out.append({"carrier_iata": c, "origin_iata": o, "weight": w})
+    return out
+
+
+def _load_bias_schema_B(values: List[List[str]]) -> List[Dict[str, Any]]:
+    # Schema B (your current): carrier_code, carrier_name, theme, destination_iata, bias_weight, notes
+    hdr_i = _find_first_nonempty_row(values)
+    if hdr_i < 0:
+        return []
+    raw_headers = values[hdr_i]
+    headers_norm = [_norm_header(h) for h in raw_headers]
+
+    j_carrier = _col_index(headers_norm, ["carrier_code", "carrier_iata", "carrier", "airline_iata", "airline"])
+    j_theme = _col_index(headers_norm, ["theme", "primary_theme"])
+    j_dest = _col_index(headers_norm, ["destination_iata", "dest_iata", "destination", "to_iata"])
+    j_weight = _col_index(headers_norm, ["bias_weight", "weight", "w", "score", "wt"])
+
+    if j_carrier is None or j_theme is None or j_dest is None or j_weight is None:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for row in values[hdr_i + 1 :]:
+        if not any(str(c).strip() for c in row):
+            continue
+        c = (row[j_carrier] if j_carrier < len(row) else "").strip()
+        t = (row[j_theme] if j_theme < len(row) else "").strip()
+        d = (row[j_dest] if j_dest < len(row) else "").strip()
+        w = (row[j_weight] if j_weight < len(row) else "").strip()
+        if not c or not t or not d or not w:
+            continue
+        out.append({"carrier_code": c, "theme": t, "destination_iata": d, "bias_weight": w})
     return out
 
 
@@ -361,6 +382,9 @@ def main() -> int:
     DUFFEL_ROUTES_PER_RUN = _env_int("DUFFEL_ROUTES_PER_RUN", 4)
     ORIGINS_PER_DEST = _env_int("ORIGINS_PER_DEST", 3)
 
+    # How many carriers to apply (Schema B) when CONFIG.included_airlines is empty
+    BIAS_CARRIERS_PER_ROUTE = max(0, _env_int("BIAS_CARRIERS_PER_ROUTE", 2))
+
     log(
         f"CAPS: MAX_INSERTS={DUFFEL_MAX_INSERTS} | PER_ORIGIN={DUFFEL_MAX_INSERTS_PER_ORIGIN} | "
         f"PER_ROUTE={DUFFEL_MAX_INSERTS_PER_ROUTE} | MAX_SEARCHES={DUFFEL_MAX_SEARCHES_PER_RUN} | "
@@ -382,51 +406,64 @@ def main() -> int:
     ws_rcm = sh.worksheet(RCM_TAB)
     ws_iata = sh.worksheet(IATA_TAB)
 
-    # Carrier bias tab optional + env-configurable + diagnostic
-    bias_rows: List[Dict[str, Any]] = []
+    # -------------------------
+    # CONFIG_CARRIER_BIAS (two schemas)
+    # -------------------------
+    carrier_origin_weight: Dict[str, Dict[str, float]] = {}  # Schema A
+    dest_carrier_bias: Dict[Tuple[str, str], Dict[str, float]] = {}  # Schema B: (theme, dest)-> carrier->weight
+
     try:
         ws_bias = sh.worksheet(CONFIG_CARRIER_BIAS_TAB)
-        bias_rows = _load_carrier_bias_rows(ws_bias)
-        if not bias_rows:
-            # fallback to get_all_records() just in case, but log it
-            try:
-                recs = ws_bias.get_all_records()
-                if recs:
-                    bias_rows = recs
-                    log(
-                        f"⚠️ CONFIG_CARRIER_BIAS robust loader returned 0 rows, "
-                        f"but get_all_records() returned {len(recs)}. Using get_all_records()."
-                    )
-            except Exception as e2:
-                log(f"⚠️ CONFIG_CARRIER_BIAS get_all_records() also failed: {e2}")
+        values = ws_bias.get_all_values()
+
+        rows_A = _load_bias_schema_A(values)
+        rows_B = _load_bias_schema_B(values)
+
+        # Build Schema A mapping
+        for r in rows_A:
+            c = str(r.get("carrier_iata") or "").strip().upper()
+            o = str(r.get("origin_iata") or "").strip().upper()
+            w = _safe_float(r.get("weight"), 0.0)
+            if c and o and w > 0:
+                carrier_origin_weight.setdefault(c, {})[o] = w
+
+        # Build Schema B mapping
+        for r in rows_B:
+            c = str(r.get("carrier_code") or "").strip().upper()
+            t = str(r.get("theme") or "").strip().lower()
+            d = str(r.get("destination_iata") or "").strip().upper()
+            w = _safe_float(r.get("bias_weight"), 0.0)
+            if c and t and d and w > 0:
+                dest_carrier_bias.setdefault((t, d), {})[c] = w
+
+        if carrier_origin_weight or dest_carrier_bias:
+            log(
+                "✅ CONFIG_CARRIER_BIAS loaded: "
+                f"tab={CONFIG_CARRIER_BIAS_TAB} | "
+                f"schemaA_carriers={len(carrier_origin_weight)} | "
+                f"schemaB_theme_dest_pairs={len(dest_carrier_bias)}"
+            )
+        else:
+            # fall back to get_all_records just for diagnostics (but don't depend on its header assumptions)
+            recs = ws_bias.get_all_records()
+            hdrs = ws_bias.row_values(1)
+            log(
+                "⚠️ CONFIG_CARRIER_BIAS not usable (no recognized schema rows). "
+                f"tab={CONFIG_CARRIER_BIAS_TAB} | row1_headers={hdrs} | get_all_records_rows={len(recs)}"
+            )
     except Exception as e:
-        # include sheet tab list for hard proof
         try:
             tabs = [w.title for w in sh.worksheets()]
-            log(
-                f"⚠️ CONFIG_CARRIER_BIAS load failed for tab={CONFIG_CARRIER_BIAS_TAB}: {e}. "
-                f"Available tabs={tabs}"
-            )
+            log(f"⚠️ CONFIG_CARRIER_BIAS load failed for tab={CONFIG_CARRIER_BIAS_TAB}: {e}. Available tabs={tabs}")
         except Exception:
             log(f"⚠️ CONFIG_CARRIER_BIAS load failed for tab={CONFIG_CARRIER_BIAS_TAB}: {e}. (Could not list tabs)")
-        bias_rows = []
 
-    carrier_origin_weight: Dict[str, Dict[str, float]] = {}
-    for r in bias_rows:
-        c = str(r.get("carrier_code") or "").strip().upper()
-        o = str(r.get("destination_iata") or "").strip().upper()
-        w = _safe_float(r.get("bias_weight"), 0.0)
-        if c and o and w > 0:
-            carrier_origin_weight.setdefault(c, {})[o] = w
-
-    if carrier_origin_weight:
-        log(
-            f"✅ CONFIG_CARRIER_BIAS loaded: tab={CONFIG_CARRIER_BIAS_TAB} | "
-            f"rows={len(bias_rows)} | carriers={len(carrier_origin_weight)}"
-        )
-    else:
+    if not (carrier_origin_weight or dest_carrier_bias):
         log("⚠️ CONFIG_CARRIER_BIAS not loaded or empty. Origin selection will use fallback pools.")
 
+    # -------------------------
+    # ZTB + theme of day
+    # -------------------------
     ztb_rows_all = ws_ztb.get_all_records()
     eligible_themes = _eligible_themes_from_ztb(ztb_rows_all)
     theme_today = _theme_of_day(eligible_themes)
@@ -439,6 +476,9 @@ def main() -> int:
     ztb_end = _safe_int(ztb_today.get("end_mmdd"), 1231)
     ztb_max_conn = _connections_from_tolerance(str(ztb_today.get("connection_tolerance") or "any"))
 
+    # -------------------------
+    # CONFIG attempts
+    # -------------------------
     cfg_all = ws_cfg.get_all_records()
     cfg_active = [r for r in cfg_all if _is_true(r.get("active_in_feeder")) and _is_true(r.get("enabled"))]
     log(f"✅ CONFIG loaded: {len(cfg_active)} active rows (of {len(cfg_all)} total)")
@@ -466,6 +506,7 @@ def main() -> int:
         reverse=True,
     )
 
+    # Quotas
     DUFFEL_ROUTES_PER_RUN = max(1, DUFFEL_ROUTES_PER_RUN)
     COMMODITY_CAP = _env_int("COMMODITY_CAP", max(1, DUFFEL_ROUTES_PER_RUN // 3))
     MIN_EXOTIC = _env_int("MIN_EXOTIC", 1)
@@ -501,6 +542,9 @@ def main() -> int:
         f"| commodity_cap={COMMODITY_CAP} commodity_used={comm_used} min_exotic={MIN_EXOTIC}"
     )
 
+    # -------------------------
+    # Geo dictionary from RCM + IATA_MASTER
+    # -------------------------
     rcm_all = ws_rcm.get_all_records()
     iata_geo: Dict[str, Tuple[str, str]] = {}
     for r in rcm_all:
@@ -547,16 +591,26 @@ def main() -> int:
             return False
         return True
 
-    def carriers_from_cfg(cfg_row: Dict[str, Any]) -> List[str]:
+    def carriers_from_cfg(cfg_row: Dict[str, Any], theme: str, dest: str) -> List[str]:
         raw = str(cfg_row.get("included_airlines") or "").strip()
-        if not raw:
-            return []
-        return _csv_list(raw)
+        if raw:
+            return _csv_list(raw)
 
-    def choose_origins_for_dest(cfg_row: Dict[str, Any], dest: str, cap: int) -> List[str]:
+        # If CONFIG doesn't specify, Schema B can supply "allowed carriers" per theme+dest.
+        if BIAS_CARRIERS_PER_ROUTE > 0 and dest_carrier_bias:
+            key = (str(theme or "").strip().lower(), str(dest or "").strip().upper())
+            cmap = dest_carrier_bias.get(key) or {}
+            if cmap:
+                ranked = sorted(cmap.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+                return [c for c, _w in ranked[:BIAS_CARRIERS_PER_ROUTE]]
+
+        return []
+
+    def choose_origins_for_dest(cfg_row: Dict[str, Any], dest: str, cap: int, theme: str) -> List[str]:
         is_long = str(cfg_row.get("is_long_haul") or "").strip().upper() == "TRUE"
         gw = str(cfg_row.get("gateway_type") or "").strip().lower()
-        carriers = carriers_from_cfg(cfg_row)
+
+        carriers = carriers_from_cfg(cfg_row, theme, dest)
 
         if is_long:
             candidate_pool = [o for o in hub_origins if o in origins_default] or origins_default[:]
@@ -567,6 +621,8 @@ def main() -> int:
                 candidate_pool = origins_default[:]
 
         scores: Dict[str, float] = {o: 0.0 for o in candidate_pool}
+
+        # Schema A: carriers -> origin weighting
         if carriers and carrier_origin_weight:
             for c in carriers:
                 cmap = carrier_origin_weight.get(c)
@@ -576,6 +632,7 @@ def main() -> int:
                     if o in scores:
                         scores[o] += float(w)
 
+        # Fallback base reality (unchanged)
         if all(v == 0.0 for v in scores.values()):
             if is_long:
                 for o in hub_origins:
@@ -586,7 +643,7 @@ def main() -> int:
                     if o in scores:
                         scores[o] += 0.5
 
-        seed = f"{_today_utc().isoformat()}|{theme_today}|{dest}|{_env('RUN_SLOT','')}"
+        seed = f"{_today_utc().isoformat()}|{theme}|{dest}|{_env('RUN_SLOT','')}"
         h = int(hashlib.md5(seed.encode("utf-8")).hexdigest(), 16)
         ranked = sorted(candidate_pool, key=lambda o: (scores.get(o, 0.0), o), reverse=True)
         if ranked:
@@ -620,8 +677,9 @@ def main() -> int:
         max_conn = min(cfg_max_conn, ztb_max_conn)
 
         cabin = str(cfg.get("cabin_class") or "economy").strip().lower() or "economy"
-        included_airlines = carriers_from_cfg(cfg)
-        origins = choose_origins_for_dest(cfg, dest, ORIGINS_PER_DEST)
+        included_airlines = carriers_from_cfg(cfg, theme_today, dest)
+
+        origins = choose_origins_for_dest(cfg, dest, ORIGINS_PER_DEST, theme_today)
 
         for origin in origins:
             if searches >= DUFFEL_MAX_SEARCHES_PER_RUN:

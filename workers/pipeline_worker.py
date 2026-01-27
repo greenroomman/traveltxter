@@ -301,7 +301,7 @@ def _load_carrier_bias_rows(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
     headers_norm = [_norm_header(h) for h in raw_headers]
 
     # expected keys (normalized)
-    # allow variants: carrier_iata / carrier / airline_iata ; origin_iata / origin ; weight / w
+    # allow variants: carrier_code / carrier / airline_code ; origin_iata / origin ; weight / weight_bias / bias_weight
     def find_col(*cands: str) -> Optional[int]:
         cand_set = set(cands)
         for j, hn in enumerate(headers_norm):

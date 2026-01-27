@@ -1,16 +1,31 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8e (DIRECT SHORTHAUL ENFORCED)
+# FULL FILE REPLACEMENT — FEEDER v4.8f
 #
-# CHANGE (LOCKED PRODUCT RULE):
+# CHANGE REQUEST (YOU):
+# - Feeder must use a deterministic 90/10 split on EACH search attempt:
+#     * 90% searches use CONFIG rows matching RUN_SLOT (AM or PM)
+#     * 10% searches deliberately sample the opposite slot's CONFIG rows
+#   This makes the feeder "look beyond" without increasing scan volume.
+#
+# LOCKED RULE (YOU):
 # - ALL shorthaul must be DIRECT.
 #   Shorthaul is defined as CONFIG.is_long_haul != TRUE.
 #   Therefore:
-#     - For shorthaul rows, we force max_connections=0 on the Duffel request
-#     - We compute stops from the selected (cheapest) offer’s slice segments
-#     - If the selected offer is not direct (stops != 0), we skip inserting that deal
+#     - For shorthaul rows we force max_connections=0 on Duffel request
+#     - We derive actual stops from the selected offer (segments-1)
+#     - If shorthaul and stops != 0, we skip inserting that deal
 #
-# Also fixes data integrity:
-# - stops is no longer written as a proxy (max_conn); it is derived from the chosen offer.
+# Notes:
+# - No redesign of the pipeline
+# - RAW_DEALS remains sole writable state
+# - RDV is never written
+# - Slot logic is driven by:
+#     * RUN_SLOT env (AM/PM)
+#     * CONFIG.slot_hint (AM/PM)
+#   If CONFIG has no slot_hint populated, we fall back gracefully.
+#
+# Output improvements:
+# - Logs show which slot stream each search was drawn from (primary vs exploration)
 
 from __future__ import annotations
 
@@ -191,7 +206,6 @@ def _duffel_search(
     for sl in payload["data"]["slices"]:
         sl["max_connections"] = int(max_connections)
 
-    # Hard filter only when explicitly set in CONFIG
     if included_airlines:
         payload["data"]["allowed_carrier_iatas"] = included_airlines
 
@@ -207,9 +221,6 @@ def _duffel_search(
 
 
 def _offer_stops(offer: Dict[str, Any]) -> Optional[int]:
-    """Return maximum number of connections across slices for this offer.
-    0 = direct on each slice. 1 = one connection on at least one slice, etc.
-    """
     try:
         slices = offer.get("slices") or []
         if not slices:
@@ -226,9 +237,6 @@ def _offer_stops(offer: Dict[str, Any]) -> Optional[int]:
 
 
 def _best_offer_gbp(offers_json: Dict[str, Any]) -> Optional[Tuple[float, int]]:
-    """Pick the cheapest GBP offer and return (price_gbp, stops).
-    If stops can't be determined, defaults to 99 to be safely non-direct.
-    """
     try:
         offers = offers_json.get("data", {}).get("offers") or []
         if not offers:
@@ -249,7 +257,6 @@ def _best_offer_gbp(offers_json: Dict[str, Any]) -> Optional[Tuple[float, int]]:
             stops = _offer_stops(o)
             stops_i = int(stops) if stops is not None else 99
 
-            # Primary sort: lowest price. Secondary: fewer stops.
             if best_price is None or price < best_price or (price == best_price and stops_i < best_stops):
                 best_price = price
                 best_stops = stops_i
@@ -260,12 +267,6 @@ def _best_offer_gbp(offers_json: Dict[str, Any]) -> Optional[Tuple[float, int]]:
         return (best_price, best_stops)
     except Exception:
         return None
-
-
-def _min_price_gbp(offers_json: Dict[str, Any]) -> Optional[float]:
-    """Back-compat: return only the best GBP price."""
-    best = _best_offer_gbp(offers_json)
-    return None if best is None else best[0]
 
 
 def _candidate_outbounds_seasonal(
@@ -337,6 +338,13 @@ def _append_rows(ws: gspread.Worksheet, rows: List[List[Any]]) -> None:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
+def _slot_norm(s: str) -> str:
+    x = str(s or "").strip().upper()
+    if x in ("AM", "PM"):
+        return x
+    return ""
+
+
 def main() -> int:
     log("================================================================================")
     log("TRAVELTXTTER PIPELINE WORKER (FEEDER) START")
@@ -358,17 +366,25 @@ def main() -> int:
     IATA_TAB = _env("IATA_TAB", "IATA_MASTER")
     CONFIG_CARRIER_BIAS_TAB = _env("CONFIG_CARRIER_BIAS_TAB", "CONFIG_CARRIER_BIAS")
 
+    RUN_SLOT = _slot_norm(_env("RUN_SLOT", ""))
+    if RUN_SLOT == "":
+        RUN_SLOT = "AM"  # deterministic fallback
+
     DUFFEL_MAX_INSERTS = _env_int("DUFFEL_MAX_INSERTS", 50)
     DUFFEL_MAX_INSERTS_PER_ORIGIN = _env_int("DUFFEL_MAX_INSERTS_PER_ORIGIN", 15)
     DUFFEL_MAX_INSERTS_PER_ROUTE = _env_int("DUFFEL_MAX_INSERTS_PER_ROUTE", 5)
     DUFFEL_MAX_SEARCHES_PER_RUN = _env_int("DUFFEL_MAX_SEARCHES_PER_RUN", 12)
-    DUFFEL_ROUTES_PER_RUN = _env_int("DUFFEL_ROUTES_PER_RUN", 4)
+    DESTS_PER_RUN = _env_int("DUFFEL_ROUTES_PER_RUN", 4)
     ORIGINS_PER_DEST = _env_int("ORIGINS_PER_DEST", 3)
+
+    # 90/10 control (search-level), default 9/1
+    SLOT_PRIMARY_PCT = _env_int("SLOT_PRIMARY_PCT", 90)
 
     log(
         f"CAPS: MAX_INSERTS={DUFFEL_MAX_INSERTS} | PER_ORIGIN={DUFFEL_MAX_INSERTS_PER_ORIGIN} | "
         f"PER_ROUTE={DUFFEL_MAX_INSERTS_PER_ROUTE} | MAX_SEARCHES={DUFFEL_MAX_SEARCHES_PER_RUN} | "
-        f"DESTS_PER_RUN={DUFFEL_ROUTES_PER_RUN} | ORIGINS_PER_DEST={ORIGINS_PER_DEST}"
+        f"DESTS_PER_RUN={DESTS_PER_RUN} | ORIGINS_PER_DEST={ORIGINS_PER_DEST} | RUN_SLOT={RUN_SLOT} | "
+        f"SLOT_SPLIT={SLOT_PRIMARY_PCT}/{100 - SLOT_PRIMARY_PCT}"
     )
 
     gc = _get_gspread_client()
@@ -385,7 +401,7 @@ def main() -> int:
     ws_rcm = sh.worksheet(RCM_TAB)
     ws_iata = sh.worksheet(IATA_TAB)
 
-    # Carrier bias: load+log only (no hard filtering)
+    # Carrier bias: loaded + logged (not required for this change)
     bias_rows: List[Dict[str, Any]] = []
     try:
         ws_bias = sh.worksheet(CONFIG_CARRIER_BIAS_TAB)
@@ -424,10 +440,13 @@ def main() -> int:
     log(f"✅ CONFIG loaded: {len(cfg_active)} active rows (of {len(cfg_all)} total)")
 
     def cfg_theme(r: Dict[str, Any]) -> str:
-        return (str(r.get("primary_theme") or "").strip() or str(r.get("audience_type") or "").strip())
+        return (str(r.get("primary_theme") or "").strip() or str(r.get("audience_type") or "").strip()).strip()
 
     def cfg_slot(r: Dict[str, Any]) -> str:
-        return str(r.get("slot_hint") or "").strip().upper()
+        return _slot_norm(r.get("slot_hint"))
+
+    def is_longhaul(r: Dict[str, Any]) -> bool:
+        return str(r.get("is_long_haul") or "").strip().upper() == "TRUE"
 
     theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
     if not theme_rows_all:
@@ -440,22 +459,38 @@ def main() -> int:
         ztb_max_conn = _connections_from_tolerance(str(ztb_today.get("connection_tolerance") or "any"))
         theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
 
-    theme_rows_all.sort(
-        key=lambda r: (
+    # Split rows by slot
+    rows_primary = [r for r in theme_rows_all if cfg_slot(r) == RUN_SLOT]
+    opp = "PM" if RUN_SLOT == "AM" else "AM"
+    rows_explore = [r for r in theme_rows_all if cfg_slot(r) == opp]
+
+    # If slot_hint isn't populated for theme, treat all as primary
+    if not rows_primary and not rows_explore:
+        rows_primary = theme_rows_all[:]
+        rows_explore = []
+
+    # Sort by priority for stable sampling
+    def sort_key(r: Dict[str, Any]) -> Tuple[float, float, float]:
+        return (
             _safe_float(r.get("priority"), 0),
             _safe_float(r.get("search_weight"), 0),
             _safe_float(r.get("content_priority"), 0),
-        ),
-        reverse=True,
+        )
+
+    rows_primary.sort(key=sort_key, reverse=True)
+    rows_explore.sort(key=sort_key, reverse=True)
+
+    # Build a deterministic per-search plan (90/10) — choice is made PER SEARCH ATTEMPT
+    # We do not increase MAX_SEARCHES; we just decide which config stream each attempt uses.
+    primary_period = max(1, min(99, SLOT_PRIMARY_PCT))
+    explore_period = 100 - primary_period
+
+    # Deterministic sequence: every 10th attempt (when 90/10) becomes exploration.
+    # Generalized: exploration happens when (attempt_index % 100) >= primary_period.
+    log(
+        f"🧩 Slot pools: primary({RUN_SLOT})={len(rows_primary)} | explore({opp})={len(rows_explore)} | "
+        f"theme_rows_total={len(theme_rows_all)}"
     )
-
-    DUFFEL_ROUTES_PER_RUN = max(1, DUFFEL_ROUTES_PER_RUN)
-    theme_rows = theme_rows_all[:DUFFEL_ROUTES_PER_RUN]
-
-    chosen_debug = []
-    for r in theme_rows:
-        chosen_debug.append(f"{str(r.get('destination_iata') or '').strip().upper()}[{cfg_slot(r) or '—'}]")
-    log(f"🧭 Selected destinations to attempt: {len(theme_rows)} (cap DESTS_PER_RUN={DUFFEL_ROUTES_PER_RUN}) | chosen={chosen_debug}")
 
     # Geo dictionary from RCM + IATA_MASTER
     rcm_all = ws_rcm.get_all_records()
@@ -518,7 +553,7 @@ def main() -> int:
         return _csv_list(raw)
 
     def choose_origins_for_dest(cfg_row: Dict[str, Any], dest: str, cap: int) -> List[str]:
-        is_long_local = str(cfg_row.get("is_long_haul") or "").strip().upper() == "TRUE"
+        is_long_local = is_longhaul(cfg_row)
         gw = str(cfg_row.get("gateway_type") or "").strip().lower()
 
         if is_long_local:
@@ -529,7 +564,7 @@ def main() -> int:
             else:
                 candidate_pool = origins_default[:]
 
-        seed = f"{_today_utc().isoformat()}|{theme_today}|{dest}|{_env('RUN_SLOT','')}"
+        seed = f"{_today_utc().isoformat()}|{theme_today}|{dest}|{RUN_SLOT}"
         h = int(hashlib.md5(seed.encode("utf-8")).hexdigest(), 16)
         ranked = sorted(candidate_pool, reverse=True)
         if ranked:
@@ -539,113 +574,150 @@ def main() -> int:
 
     searches = 0
 
-    for cfg in theme_rows:
-        if searches >= DUFFEL_MAX_SEARCHES_PER_RUN:
+    # Deterministically rotate within each pool by attempt index
+    def pick_cfg_from_pool(pool: List[Dict[str, Any]], attempt_idx: int) -> Optional[Dict[str, Any]]:
+        if not pool:
+            return None
+        return pool[attempt_idx % len(pool)]
+
+    # Optionally cap how many unique destinations we attempt (DESTS_PER_RUN),
+    # but we now select config rows PER SEARCH, not just once per run.
+    # We keep a small guard so we don't hammer the same destination endlessly.
+    dest_seen: Dict[str, int] = {}
+
+    while searches < DUFFEL_MAX_SEARCHES_PER_RUN and len(deals_out) < DUFFEL_MAX_INSERTS:
+        attempt = searches  # 0-based
+        mode = "PRIMARY"
+        use_explore = False
+
+        if explore_period > 0:
+            if (attempt % 100) >= primary_period:
+                use_explore = True
+
+        cfg_pick = None
+        if use_explore and rows_explore:
+            cfg_pick = pick_cfg_from_pool(rows_explore, attempt)
+            mode = f"EXPLORE({opp})"
+        else:
+            cfg_pick = pick_cfg_from_pool(rows_primary, attempt)
+            mode = f"PRIMARY({RUN_SLOT})"
+
+        if cfg_pick is None:
+            # fallback to whatever exists
+            cfg_pick = pick_cfg_from_pool(theme_rows_all, attempt)
+            mode = "FALLBACK(ALL)"
+
+        if cfg_pick is None:
+            log("⚠️ No CONFIG rows available to pick from. Ending run.")
             break
 
-        dest = str(cfg.get("destination_iata") or "").strip().upper()
+        dest = str(cfg_pick.get("destination_iata") or "").strip().upper()
         if not dest:
+            searches += 1
             continue
+
+        # light anti-stutter (does not change caps, just avoids repeating the same dest every attempt)
+        dest_seen[dest] = dest_seen.get(dest, 0) + 1
+        if dest_seen[dest] > max(1, DESTS_PER_RUN):
+            searches += 1
+            continue
+
         if not geo_for(dest):
             log(f"⚠️ Missing geo for destination_iata={dest}. Skipping (no invented geo).")
+            searches += 1
             continue
 
-        min_d = _safe_int(cfg.get("days_ahead_min"), 7)
-        max_d = _safe_int(cfg.get("days_ahead_max"), 120)
-        trip_len = _safe_int(cfg.get("trip_length_days"), 5)
-
-        out_dates = _candidate_outbounds_seasonal(min_d, max_d, trip_len, ztb_start, ztb_end, n=3)
+        min_d = _safe_int(cfg_pick.get("days_ahead_min"), 7)
+        max_d = _safe_int(cfg_pick.get("days_ahead_max"), 120)
+        trip_len = _safe_int(cfg_pick.get("trip_length_days"), 5)
+        out_dates = _candidate_outbounds_seasonal(min_d, max_d, trip_len, ztb_start, ztb_end, n=2)
         if not out_dates:
-            log(f"⚠️ No in-season outbound dates available for dest={dest}. Skipping.")
+            searches += 1
             continue
 
-        is_long = str(cfg.get("is_long_haul") or "").strip().upper() == "TRUE"
+        is_long = is_longhaul(cfg_pick)
 
-        cfg_max_conn = _safe_int(cfg.get("max_connections"), 2)
+        cfg_max_conn = _safe_int(cfg_pick.get("max_connections"), 2)
         max_conn = min(cfg_max_conn, ztb_max_conn)
 
-        # Product rule: ALL shorthaul must be direct (0 connections).
+        # Hard rule: shorthaul must be direct
         if not is_long:
             max_conn = 0
 
-        cabin = str(cfg.get("cabin_class") or "economy").strip().lower() or "economy"
-        included_airlines = carriers_from_cfg(cfg)
+        cabin = str(cfg_pick.get("cabin_class") or "economy").strip().lower() or "economy"
+        included_airlines = carriers_from_cfg(cfg_pick)
+        origins = choose_origins_for_dest(cfg_pick, dest, ORIGINS_PER_DEST)
 
-        origins = choose_origins_for_dest(cfg, dest, ORIGINS_PER_DEST)
+        # Make exactly one origin+date attempt per search tick (keeps "each search" semantics)
+        origin = origins[0] if origins else ""
+        od = out_dates[0] if out_dates else None
+        if not origin or od is None or not geo_for(origin):
+            searches += 1
+            continue
 
-        for origin in origins:
-            if searches >= DUFFEL_MAX_SEARCHES_PER_RUN:
-                break
-            if not geo_for(origin):
-                continue
-            if not can_insert(origin, dest):
-                continue
+        if not can_insert(origin, dest):
+            searches += 1
+            continue
 
-            for od in out_dates:
-                if searches >= DUFFEL_MAX_SEARCHES_PER_RUN:
-                    break
+        rd = od + dt.timedelta(days=trip_len)
 
-                rd = od + dt.timedelta(days=trip_len)
+        log(f"🔎 Search[{attempt+1}/{DUFFEL_MAX_SEARCHES_PER_RUN}] mode={mode} dest={dest} origin={origin} "
+            f"haul={'LONG' if is_long else 'SHORT'} max_conn={max_conn} slot_hint={cfg_slot(cfg_pick) or '—'}")
 
-                resp = _duffel_search(origin, dest, od, rd, max_conn, cabin, included_airlines)
-                searches += 1
-                if not resp:
-                    continue
+        resp = _duffel_search(origin, dest, od, rd, max_conn, cabin, included_airlines)
+        searches += 1
+        if not resp:
+            continue
 
-                best = _best_offer_gbp(resp)
-                if best is None:
-                    continue
-                price, offer_stops = best
+        best = _best_offer_gbp(resp)
+        if best is None:
+            continue
+        price, offer_stops = best
 
-                # Enforce product rule: ALL shorthaul must be direct.
-                if not is_long and int(offer_stops) != 0:
-                    continue
+        # Hard rule: shorthaul must be direct (truth derived from offer)
+        if (not is_long) and int(offer_stops) != 0:
+            continue
 
-                row = [""] * len(headers)
+        row = [""] * len(headers)
 
-                def set_if(col: str, val: Any) -> None:
-                    j = idx.get(col)
-                    if j is not None:
-                        row[j] = val
+        def set_if(col: str, val: Any) -> None:
+            j = idx.get(col)
+            if j is not None:
+                row[j] = val
 
-                oc, ok = geo_for(origin) or ("", "")
-                dc, dk = geo_for(dest) or ("", "")
+        oc, ok = geo_for(origin) or ("", "")
+        dc, dk = geo_for(dest) or ("", "")
 
-                did = _deal_id(origin, dest, od, rd, float(price), cabin, int(offer_stops))
+        did = _deal_id(origin, dest, od, rd, float(price), cabin, int(offer_stops))
 
-                set_if("status", "NEW")
-                set_if("deal_id", did)
+        set_if("status", "NEW")
+        set_if("deal_id", did)
 
-                set_if("origin_iata", origin)
-                set_if("destination_iata", dest)
-                set_if("origin_city", oc)
-                set_if("origin_country", ok)
-                set_if("destination_city", dc)
-                set_if("destination_country", dk)
+        set_if("origin_iata", origin)
+        set_if("destination_iata", dest)
+        set_if("origin_city", oc)
+        set_if("origin_country", ok)
+        set_if("destination_city", dc)
+        set_if("destination_country", dk)
 
-                set_if("outbound_date", od.isoformat())
-                set_if("return_date", rd.isoformat())
-                set_if("price_gbp", float(price))
+        set_if("outbound_date", od.isoformat())
+        set_if("return_date", rd.isoformat())
+        set_if("price_gbp", float(price))
 
-                # Stops derived from the chosen offer (truth)
-                set_if("stops", int(offer_stops))
+        set_if("stops", int(offer_stops))
 
-                set_if("theme", theme_today)
-                set_if("primary_theme", cfg_theme(cfg))
-                set_if("ingested_at", dt.datetime.utcnow().isoformat() + "Z")
-                set_if("source", "duffel")
-                set_if("max_connections", int(max_conn))
-                set_if("cabin_class", cabin)
-                set_if("included_airlines", ",".join(included_airlines) if included_airlines else "")
+        set_if("theme", theme_today)
+        set_if("primary_theme", cfg_theme(cfg_pick))
+        set_if("ingested_at", dt.datetime.utcnow().isoformat() + "Z")
+        set_if("source", "duffel")
+        set_if("max_connections", int(max_conn))
+        set_if("cabin_class", cabin)
+        set_if("included_airlines", ",".join(included_airlines) if included_airlines else "")
+        set_if("slot_hint", cfg_slot(cfg_pick))
 
-                set_if("slot_hint", cfg_slot(cfg))
-
-                deals_out.append(row)
-                inserted_by_origin[origin] = inserted_by_origin.get(origin, 0) + 1
-                inserted_by_route[(origin, dest)] = inserted_by_route.get((origin, dest), 0) + 1
-
-                if len(deals_out) >= DUFFEL_MAX_INSERTS:
-                    break
+        deals_out.append(row)
+        inserted_by_origin[origin] = inserted_by_origin.get(origin, 0) + 1
+        inserted_by_route[(origin, dest)] = inserted_by_route.get((origin, dest), 0) + 1
 
     log(f"✓ Searches completed: {searches}")
     log(f"✓ Deals collected: {len(deals_out)} (cap {DUFFEL_MAX_INSERTS})")

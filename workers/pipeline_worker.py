@@ -1,14 +1,14 @@
 # workers/pipeline_worker.py
 # FULL FILE REPLACEMENT — FEEDER vNext (CONFIG + ZTB + carrier-biased origin pools + seasonal clamp)
 # Patch: if ZTB tab isn't literally named "ZTB", fallback to "ZONE_THEME_BENCHMARKS"
+# Patch: CONFIG_CARRIER_BIAS tab name is env-configurable (CONFIG_CARRIER_BIAS_TAB)
+# Patch: PRICE PSYCHOLOGY REMOVED from feeder (no hard-gating on price_psychology_*)
 
 from __future__ import annotations
 
 import os
 import sys
-import time
 import json
-import math
 import hashlib
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
@@ -294,6 +294,7 @@ def main() -> int:
     ZTB_TAB = _env("ZTB_TAB", "ZTB")
     RCM_TAB = _env("RCM_TAB", "ROUTE_CAPABILITY_MAP")
     IATA_TAB = _env("IATA_TAB", "IATA_MASTER")
+    CONFIG_CARRIER_BIAS_TAB = _env("CONFIG_CARRIER_BIAS_TAB", "CONFIG_CARRIER_BIAS")
 
     DUFFEL_MAX_INSERTS = _env_int("DUFFEL_MAX_INSERTS", 50)
     DUFFEL_MAX_INSERTS_PER_ORIGIN = _env_int("DUFFEL_MAX_INSERTS_PER_ORIGIN", 15)
@@ -323,9 +324,9 @@ def main() -> int:
     ws_rcm = sh.worksheet(RCM_TAB)
     ws_iata = sh.worksheet(IATA_TAB)
 
-    # Carrier bias tab optional
+    # Carrier bias tab optional + env-configurable
     try:
-        ws_bias = sh.worksheet("CONFIG_CARRIER_BIAS")
+        ws_bias = sh.worksheet(CONFIG_CARRIER_BIAS_TAB)
         bias_rows = ws_bias.get_all_records()
     except Exception:
         bias_rows = []
@@ -339,7 +340,7 @@ def main() -> int:
             carrier_origin_weight.setdefault(c, {})[o] = w
 
     if carrier_origin_weight:
-        log(f"✅ CONFIG_CARRIER_BIAS loaded: carriers={len(carrier_origin_weight)}")
+        log(f"✅ CONFIG_CARRIER_BIAS loaded: tab={CONFIG_CARRIER_BIAS_TAB} | carriers={len(carrier_origin_weight)}")
     else:
         log("⚠️ CONFIG_CARRIER_BIAS not loaded or empty. Origin selection will use fallback pools.")
 
@@ -375,7 +376,11 @@ def main() -> int:
 
     # simple sort (priority, search_weight, content_priority)
     theme_rows.sort(
-        key=lambda r: (_safe_float(r.get("priority"), 0), _safe_float(r.get("search_weight"), 0), _safe_float(r.get("content_priority"), 0)),
+        key=lambda r: (
+            _safe_float(r.get("priority"), 0),
+            _safe_float(r.get("search_weight"), 0),
+            _safe_float(r.get("content_priority"), 0),
+        ),
         reverse=True,
     )
 
@@ -559,11 +564,6 @@ def main() -> int:
 
                 price = _min_price_gbp(resp)
                 if price is None:
-                    continue
-
-                psy_min = _safe_float(ztb_today.get("price_psychology_min"), 0.0)
-                psy_max = _safe_float(ztb_today.get("price_psychology_max"), 1e9)
-                if price > psy_max:
                     continue
 
                 row = [""] * len(headers)

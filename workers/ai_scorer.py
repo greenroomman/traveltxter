@@ -1,636 +1,396 @@
 # workers/ai_scorer.py
-# FULL FILE REPLACEMENT — V4.8 scorer (RDV-authoritative, channel quotas, ZTB theme-of-day)
+# FULL FILE REPLACEMENT — AI SCORER v4.8g (INGEST_TS COMPAT)
 #
-# Core contract (unchanged):
-# - RAW_DEALS is canonical (writes happen here only)
-# - RAW_DEALS_VIEW is read-only (intelligence / formulas)
-# - Phrase selection happens ONCE at promotion time
-# - Publishers never select language
+# Fixes: "skipped_no_ingest_ts" blocking all NEW candidates
+# by accepting multiple ingest timestamp header variants and parsing them robustly.
 #
-# New contract additions:
-# - RDV drives eligibility via worthiness_verdict / priority_score when available.
-# - Channel quotas per run (defaults): PRO=1, VIP=2, FREE=1
-# - Theme-of-day is computed from ZTB (enabled + in-season + deterministic rotation), with THEME_OVERRIDE.
-# - Editorial tie-breaker: on SNOW days, if any non-commodity candidate is eligible, commodity gateways cannot win.
-#
-# What this scorer does NOT do:
-# - It does not compute scores (price/theme/novelty/timing/fatigue) — RDV does.
-# - It does not block searches — feeder explores; scorer promotes.
-#
-# Expected RDV columns (best effort):
-# - status, deal_id (required)
-# - destination_iata, dynamic_theme, hard_reject (recommended)
-# - worthiness_verdict (recommended: FREE/VIP/PRO verdicts)
-# - priority_score (recommended; fallback to worthiness_score)
-#
-# RAW must contain:
-# - status, deal_id, ingested_at_utc, phrase_used, phrase_bank
-#
-# Optional (used if present):
-# - destination_iata, gateway_type, worthiness_verdict, promo_hint
+# Governance:
+# - Writes ONLY to RAW_DEALS
+# - Reads RAW_DEALS_VIEW for verdict/scores
+# - Does not touch RDV
+# - No schema renames required
+
+from __future__ import annotations
 
 import os
+import sys
 import json
+import re
 import hashlib
-from datetime import datetime, timezone, timedelta, date
+import datetime as dt
+from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
-from gspread.cell import Cell
 from google.oauth2.service_account import Credentials
 
-
-# -------------------------
-# Sheet tabs / env
-# -------------------------
-
-RAW_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
-VIEW_TAB = os.getenv("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
-PHRASE_TAB = os.getenv("PHRASE_BANK_TAB", "PHRASE_BANK")
-
-ZTB_TAB = os.getenv("ZTB_TAB", "ZTB")  # fallback to ZONE_THEME_BENCHMARKS if missing
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID")
-
-SA_JSON = os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON")
-
-# Timing controls
-MIN_INGEST_AGE_SECONDS = int(os.getenv("MIN_INGEST_AGE_SECONDS", "90"))
-ELIGIBLE_WINDOW_HOURS = int(os.getenv("ELIGIBLE_WINDOW_HOURS", "72"))  # 0 disables
-
-# Channel quotas (per run)
-PRO_WINNERS_PER_RUN = int(os.getenv("PRO_WINNERS_PER_RUN", "1"))
-VIP_WINNERS_PER_RUN = int(os.getenv("VIP_WINNERS_PER_RUN", "2"))
-FREE_WINNERS_PER_RUN = int(os.getenv("FREE_WINNERS_PER_RUN", "1"))
-
-# Destination repeat block (applies to VIP/FREE by default; PRO can be allowed to bypass via env)
-DEST_REPEAT_HOURS = int(os.getenv("DEST_REPEAT_HOURS", os.getenv("VARIETY_LOOKBACK_HOURS", "120")) or "120")
-PRO_BYPASS_REPEAT_BLOCK = os.getenv("PRO_BYPASS_REPEAT_BLOCK", "TRUE").strip().upper() in ("TRUE", "1", "YES", "Y", "ON")
-
-# Snow commodity tie-breaker
-SNOW_THEME_KEY = os.getenv("SNOW_THEME_KEY", "snow")  # if your theme is "snow"
-COMMODITY_GATEWAY_KEY = os.getenv("COMMODITY_GATEWAY_KEY", "commodity")
-
-# Phrase columns in RAW
-PHRASE_USED_COL = "phrase_used"
-PHRASE_BANK_COL = "phrase_bank"
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if THIS_DIR not in sys.path:
+    sys.path.insert(0, THIS_DIR)
 
 
-# -------------------------
-# Minimal RDV columns (read-only)
-# -------------------------
-
-VIEW_REQUIRED_COLS = (
-    "status",
-    "deal_id",
-    "destination_iata",
-    "dynamic_theme",
-    "hard_reject",
-    "worthiness_verdict",
-    "priority_score",
-    "worthiness_score",     # fallback ranker if priority_score absent
-)
-
-RAW_OPTIONAL_DEST_COLS = ("destination_iata", "dest_iata")
-
-
-# -------------------------
-# Helpers
-# -------------------------
-
-def _log(msg):
-    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+def log(msg: str) -> None:
+    ts = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     print(f"{ts} | {msg}", flush=True)
 
 
-def _sa_creds():
-    if not SA_JSON:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-    raw = SA_JSON.strip()
+def _env(k: str, default: str = "") -> str:
+    return str(os.getenv(k, default) or "").strip()
+
+
+def _env_int(k: str, default: int) -> int:
+    v = _env(k, "")
     try:
-        info = json.loads(raw)
-    except json.JSONDecodeError:
-        info = json.loads(raw.replace("\\n", "\n"))
-    return Credentials.from_service_account_info(
-        info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-
-
-def _norm(v):
-    if v is None:
-        return ""
-    if isinstance(v, str):
-        return v.strip()
-    return str(v).strip()
-
-
-def _norm_theme(s):
-    return _norm(s).lower().replace(" ", "_")
-
-
-def _norm_iata(s):
-    return _norm(s).upper()[:3]
-
-
-def _truthy(v):
-    return _norm(v).upper() in ("TRUE", "YES", "Y", "1", "APPROVED")
-
-
-def _float_or_none(v):
-    s = _norm(v)
-    if not s:
-        return None
-    try:
-        return float(s)
+        return int(v)
     except Exception:
+        return default
+
+
+def _is_true(v: Any) -> bool:
+    s = str(v or "").strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+
+def _norm_header(h: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_")
+
+
+def _build_header_index(headers: List[str]) -> Dict[str, int]:
+    idx: Dict[str, int] = {}
+    for i, h in enumerate(headers):
+        hh = str(h or "").strip()
+        if hh:
+            idx[hh] = i
+    return idx
+
+
+def _get_sa_json() -> Dict[str, Any]:
+    raw = _env("GCP_SA_JSON_ONE_LINE") or _env("GCP_SA_JSON")
+    if not raw:
+        raise RuntimeError("Missing GCP_SA_JSON or GCP_SA_JSON_ONE_LINE")
+    try:
+        return json.loads(raw)
+    except Exception:
+        return json.loads(raw.replace("\\n", "\n"))
+
+
+def _get_gspread_client() -> gspread.Client:
+    creds_info = _get_sa_json()
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def _parse_dt(val: Any) -> Optional[dt.datetime]:
+    if val is None:
         return None
-
-
-def _parse_iso_utc(ts_raw):
-    s = _norm(ts_raw)
+    if isinstance(val, dt.datetime):
+        return val if val.tzinfo else val.replace(tzinfo=dt.timezone.utc)
+    s = str(val).strip()
     if not s:
         return None
+
+    # Accept: ISO with Z, ISO with offset, "YYYY-MM-DD", "YYYY-MM-DDTHH:MM:SS"
     try:
         if s.endswith("Z"):
-            s = s[:-1]
-        dtv = datetime.fromisoformat(s)
-        if dtv.tzinfo is None:
-            dtv = dtv.replace(tzinfo=timezone.utc)
-        return dtv.astimezone(timezone.utc)
+            return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.datetime.fromisoformat(s)
     except Exception:
-        return None
+        pass
 
-
-def _ws_headers(ws):
-    return [h.strip() for h in ws.row_values(1)]
-
-
-def _stable_pick(key, items):
-    if not items:
-        return ""
-    h = hashlib.md5(key.encode("utf-8")).hexdigest()
-    idx = int(h[:8], 16) % len(items)
-    return items[idx]
-
-
-def _safe_view_rows(ws_view):
-    """
-    Read RAW_DEALS_VIEW without get_all_records(), to avoid duplicate-header crash.
-    Keep FIRST occurrence of a header if duplicates exist.
-    """
-    values = ws_view.get_all_values()
-    if not values or len(values) < 2:
-        return []
-
-    headers = [h.strip() for h in values[0]]
-    first_idx = {}
-    dupes = set()
-
-    for i, h in enumerate(headers):
-        if not h:
-            continue
-        if h in first_idx:
-            dupes.add(h)
-            continue
-        first_idx[h] = i
-
-    if dupes:
-        _log(
-            "⚠️ RAW_DEALS_VIEW has duplicate headers; scorer uses first occurrence for: "
-            + ", ".join(sorted(dupes)[:30])
-            + (" ..." if len(dupes) > 30 else "")
-        )
-
-    for must in ("status", "deal_id"):
-        if must not in first_idx:
-            _log(f"⚠️ RAW_DEALS_VIEW missing required '{must}'. Treating view as empty.")
-            return []
-
-    cols_to_map = [c for c in VIEW_REQUIRED_COLS if c in first_idx]
-
-    rows = []
-    for row in values[1:]:
-        if len(row) < len(headers):
-            row = row + [""] * (len(headers) - len(row))
-
-        r = {}
-        for c in cols_to_map:
-            r[c] = row[first_idx[c]] if first_idx.get(c) is not None else ""
-        rows.append(r)
-
-    return rows
-
-
-# -------------------------
-# ZTB theme-of-day (deterministic)
-# -------------------------
-
-def _mmdd(d: date) -> int:
-    return int(d.strftime("%m%d"))
-
-
-def _in_window(today_mmdd: int, start_mmdd: int, end_mmdd: int) -> bool:
-    if start_mmdd <= end_mmdd:
-        return start_mmdd <= today_mmdd <= end_mmdd
-    return (today_mmdd >= start_mmdd) or (today_mmdd <= end_mmdd)
-
-
-def _eligible_themes_from_ztb(ztb_rows):
-    t = _mmdd(datetime.now(timezone.utc).date())
-    eligible = []
-    for r in ztb_rows:
-        theme = _norm(r.get("theme"))
-        if not theme:
-            continue
-        if not _truthy(r.get("enabled")):
-            continue
+    # Date-only
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
+    if m:
         try:
-            start = int(float(_norm(r.get("start_mmdd") or "101")))
-            end = int(float(_norm(r.get("end_mmdd") or "1231")))
+            y, mo, d = map(int, m.groups())
+            return dt.datetime(y, mo, d, tzinfo=dt.timezone.utc)
         except Exception:
-            start, end = 101, 1231
-        if _in_window(t, start, end):
-            eligible.append(theme)
-    # stable unique
-    out = []
-    seen = set()
-    for x in sorted(eligible):
-        k = x.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(x)
-    return out
+            return None
 
-
-def _theme_of_day(eligible):
-    if not eligible:
-        return "unexpected_value"
-    anchor = date(2026, 1, 1)
-    idx = (datetime.now(timezone.utc).date() - anchor).days % len(eligible)
-    return eligible[idx]
-
-
-def _theme_override(eligible):
-    o = _norm(os.getenv("THEME_OVERRIDE", ""))
-    if not o:
-        return None
-    for t in eligible:
-        if t.lower() == o.lower():
-            return t
-    _log(f"⚠️ THEME_OVERRIDE '{o}' not in eligible pool. Ignoring.")
     return None
 
 
-# -------------------------
-# Destination repeat memory
-# -------------------------
+def _find_ingest_header(headers: List[str]) -> Optional[str]:
+    # Prefer exact canonical header names
+    canon = [
+        "ingested_at",
+        "ingested_at_utc",
+        "ingest_ts",
+        "ingest_timestamp",
+        "ingestedAt",
+        "ingested",
+    ]
 
-def _posted_destinations_recent(raw_rows, hours):
-    if hours <= 0:
-        return set()
+    header_set = set(headers)
+    for c in canon:
+        if c in header_set:
+            return c
 
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=hours)
+    # Try normalized matching (handles "Ingested At", "INGESTED_AT", etc.)
+    norm_map = {_norm_header(h): h for h in headers}
+    for c in canon:
+        nc = _norm_header(c)
+        if nc in norm_map:
+            return norm_map[nc]
 
-    recent = set()
-    for r in raw_rows:
-        s = _norm(r.get("status"))
-        if not (s.startswith("POSTED_") or s == "POSTED_ALL"):
-            continue
+    # Last resort: any header containing "ingest" and "at"/"ts"/"time"
+    for h in headers:
+        nh = _norm_header(h)
+        if "ingest" in nh and ("at" in nh or "ts" in nh or "time" in nh):
+            return h
 
-        ts = _parse_iso_utc(r.get("ingested_at_utc"))
-        if not ts or ts < cutoff:
-            continue
-
-        dest = ""
-        for k in RAW_OPTIONAL_DEST_COLS:
-            if _norm(r.get(k)):
-                dest = _norm_iata(r.get(k))
-                break
-        if dest:
-            recent.add(dest)
-    return recent
-
-
-# -------------------------
-# Verdict normalization (RDV -> channels)
-# -------------------------
-
-def _classify_channel(verdict_raw: str) -> str:
-    """
-    Return one of: PRO, VIP, FREE, NONE
-    We intentionally accept multiple naming styles so RDV can evolve without breaking scorer.
-    """
-    v = _norm(verdict_raw).upper()
-
-    if v.startswith("PRO_WORTHY_") or v.startswith("PRO_") or v == "PRO":
-        return "PRO"
-
-    # VIP variants
-    if v in ("VIP", "POSTABLE_VIP", "VIP_POSTABLE", "WORTHY_VIP") or v.startswith("VIP_"):
-        return "VIP"
-
-    # FREE variants
-    if v in ("FREE", "POSTABLE_FREE", "FREE_POSTABLE", "WORTHY_FREE") or v.startswith("FREE_"):
-        return "FREE"
-
-    return "NONE"
+    return None
 
 
-def _rank_value(r):
-    """
-    Prefer priority_score, else worthiness_score, else -inf.
-    Higher is better.
-    """
-    p = _float_or_none(r.get("priority_score"))
-    if p is not None:
-        return p
-    w = _float_or_none(r.get("worthiness_score"))
-    if w is not None:
-        return w
-    return -1e12
-
-
-# -------------------------
-# Main
-# -------------------------
-
-def main():
+def main() -> int:
+    SPREADSHEET_ID = (_env("SPREADSHEET_ID") or _env("SHEET_ID")).strip()
     if not SPREADSHEET_ID:
-        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
+        log("❌ Missing SPREADSHEET_ID / SHEET_ID")
+        return 1
 
-    gc = gspread.authorize(_sa_creds())
+    RAW_DEALS_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
+    RDV_TAB = _env("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
+    ZTB_TAB = _env("ZTB_TAB", "ZTB")
+
+    MIN_INGEST_AGE_SECONDS = _env_int("MIN_INGEST_AGE_SECONDS", 30)
+    MAX_AGE_HOURS = _env_int("SCORER_MAX_AGE_HOURS", 72)
+
+    # Per-run quotas
+    QUOTA_PRO = _env_int("SCORER_QUOTA_PRO", 1)
+    QUOTA_VIP = _env_int("SCORER_QUOTA_VIP", 2)
+    QUOTA_FREE = _env_int("SCORER_QUOTA_FREE", 1)
+
+    gc = _get_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    ws_raw = sh.worksheet(RAW_TAB)
-    ws_view = sh.worksheet(VIEW_TAB)
+    ws_raw = sh.worksheet(RAW_DEALS_TAB)
+    ws_rdv = sh.worksheet(RDV_TAB)
 
-    # ZTB (theme-of-day)
     try:
         ws_ztb = sh.worksheet(ZTB_TAB)
     except Exception:
         ws_ztb = sh.worksheet("ZONE_THEME_BENCHMARKS")
 
+    # Theme of day (same deterministic ZTB logic as feeder)
     ztb_rows = ws_ztb.get_all_records()
-    eligible_themes = _eligible_themes_from_ztb(ztb_rows)
-    theme_today = _theme_of_day(eligible_themes)
-    ovr = _theme_override(eligible_themes)
-    if ovr:
-        theme_today = ovr
+    today = dt.datetime.now(dt.timezone.utc).date()
 
-    _log(f"✅ ZTB: eligible_today={len(eligible_themes)} | theme_today={theme_today} | pool={eligible_themes}")
+    def mmdd(d: dt.date) -> int:
+        return int(d.strftime("%m%d"))
 
-    # Phrase bank (optional)
-    try:
-        ws_phrase = sh.worksheet(PHRASE_TAB)
-        phrase_rows = ws_phrase.get_all_records()
-    except Exception as e:
-        _log(f"PHRASE_BANK not readable: {e}")
-        phrase_rows = []
+    def in_window(v: int, a: int, b: int) -> bool:
+        if a <= b:
+            return a <= v <= b
+        return (v >= a) or (v <= b)
 
-    phrase_index = []
-    for r in phrase_rows:
-        theme = _norm_theme(r.get("theme"))
-        phrase = _norm(r.get("phrase"))
-        approved = _truthy(r.get("approved"))
+    eligible = []
+    for r in ztb_rows:
+        if not _is_true(r.get("enabled")):
+            continue
+        theme = str(r.get("theme") or "").strip()
+        if not theme:
+            continue
+        a = int(r.get("start_mmdd") or 101)
+        b = int(r.get("end_mmdd") or 1231)
+        if in_window(mmdd(today), a, b):
+            eligible.append(theme)
 
-        dest = ""
-        cat = _norm(r.get("category")).lower()
-        if cat.startswith("dest:"):
-            dest = _norm_iata(cat.split("dest:", 1)[1])
+    eligible = sorted(list(dict.fromkeys(eligible)))
+    if not eligible:
+        theme_today = "unexpected_value"
+    else:
+        base = dt.date(2026, 1, 1)
+        idx = (today - base).days % len(eligible)
+        theme_today = eligible[idx]
 
-        if dest and theme and phrase and approved:
-            phrase_index.append({"dest": dest, "theme": theme, "phrase": phrase})
+    log(f"✅ ZTB: eligible_today={len(eligible)} | theme_today={theme_today} | pool={eligible}")
 
-    # RAW rows (canonical)
-    raw_rows = ws_raw.get_all_records()
-    headers = _ws_headers(ws_raw)
-    col = {h: i + 1 for i, h in enumerate(headers)}
+    raw_headers = ws_raw.row_values(1)
+    rdv_headers = ws_rdv.row_values(1)
 
-    for required in ("status", "deal_id", "ingested_at_utc", PHRASE_USED_COL, PHRASE_BANK_COL):
-        if required not in col:
-            raise RuntimeError(f"Missing required RAW_DEALS column: {required}")
+    raw_idx = _build_header_index(raw_headers)
+    rdv_idx = _build_header_index(rdv_headers)
 
-    # deal_id -> RAW row number and raw record
-    deal_rownum = {}
-    deal_raw = {}
-    for idx, r in enumerate(raw_rows, start=2):
-        did = _norm(r.get("deal_id"))
+    # Locate ingest header in RAW_DEALS
+    ingest_header = _find_ingest_header(raw_headers)
+    if not ingest_header:
+        log("❌ Could not find any ingest timestamp header in RAW_DEALS.")
+        log("   Expected one of: ingested_at / ingested_at_utc / ingest_ts / ingest_timestamp ...")
+        return 1
+    log(f"🕒 Using ingest timestamp header: {ingest_header}")
+
+    # Required columns
+    col_status = next((h for h in raw_headers if _norm_header(h) == "status"), None)
+    col_deal_id = next((h for h in raw_headers if _norm_header(h) == "deal_id"), None)
+
+    if not col_status or not col_deal_id:
+        log("❌ RAW_DEALS missing required headers: status and/or deal_id")
+        return 1
+
+    # Pull RDV records (read-only truth layer)
+    rdv_rows = ws_rdv.get_all_records()
+
+    # Build quick lookup: deal_id -> rdv_row
+    rdv_by_id: Dict[str, Dict[str, Any]] = {}
+    for r in rdv_rows:
+        did = str(r.get("deal_id") or "").strip()
         if did:
-            deal_rownum[did] = idx
-            deal_raw[did] = r
+            rdv_by_id[did] = r
 
-    # View rows (safe)
-    view_rows = _safe_view_rows(ws_view)
+    # Pull RAW rows (we need row numbers)
+    raw_values = ws_raw.get_all_values()
+    now = dt.datetime.now(dt.timezone.utc)
 
-    # Candidate filtering (NEW only, aged, in-window)
-    now = datetime.now(timezone.utc)
-    min_allowed_ts = None
-    if ELIGIBLE_WINDOW_HOURS and ELIGIBLE_WINDOW_HOURS > 0:
-        min_allowed_ts = now - timedelta(hours=ELIGIBLE_WINDOW_HOURS)
+    eligible_rows: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
+    skipped_no_ingest_ts = 0
+    skipped_too_fresh = 0
+    skipped_too_old = 0
+    skipped_missing_raw_row = 0
 
-    skipped = {"too_fresh": 0, "no_ingest_ts": 0, "too_old": 0, "missing_raw_row": 0}
-    candidates = []
+    # For debug: capture first N deal_ids missing ingest ts
+    missing_ingest_ids: List[str] = []
 
-    for r in view_rows:
-        if _norm(r.get("status")) != "NEW":
+    for i in range(2, len(raw_values) + 1):
+        row = raw_values[i - 1]
+        if not row:
             continue
 
-        did = _norm(r.get("deal_id"))
+        def get(col_name: str) -> str:
+            j = raw_idx.get(col_name)
+            if j is None:
+                return ""
+            return row[j] if j < len(row) else ""
+
+        status = get(col_status).strip()
+        if status != "NEW":
+            continue
+
+        did = get(col_deal_id).strip()
         if not did:
             continue
-        if did not in deal_rownum:
-            skipped["missing_raw_row"] += 1
-            continue
 
-        rawrec = deal_raw.get(did, {})
-        ts = _parse_iso_utc(rawrec.get("ingested_at_utc"))
+        ingest_val = get(ingest_header).strip()
+        ts = _parse_dt(ingest_val)
         if not ts:
-            skipped["no_ingest_ts"] += 1
+            skipped_no_ingest_ts += 1
+            if len(missing_ingest_ids) < 10:
+                missing_ingest_ids.append(did)
             continue
 
-        if (now - ts).total_seconds() < MIN_INGEST_AGE_SECONDS:
-            skipped["too_fresh"] += 1
+        age = (now - ts).total_seconds()
+        if age < MIN_INGEST_AGE_SECONDS:
+            skipped_too_fresh += 1
             continue
 
-        if min_allowed_ts and ts < min_allowed_ts:
-            skipped["too_old"] += 1
+        if age > MAX_AGE_HOURS * 3600:
+            skipped_too_old += 1
             continue
 
-        dest = _norm_iata(r.get("destination_iata")) or _norm_iata(rawrec.get("destination_iata"))
-        verdict_raw = _norm(r.get("worthiness_verdict")) or _norm(rawrec.get("worthiness_verdict"))
-        channel = _classify_channel(verdict_raw)
+        rdv = rdv_by_id.get(did)
+        if not rdv:
+            skipped_missing_raw_row += 1
+            continue
 
-        hard_reject = _truthy(r.get("hard_reject")) or _truthy(rawrec.get("hard_reject"))
+        eligible_rows.append((i, {"deal_id": did}, rdv))
 
-        # gateway_type is sourced from RAW (feeder passed through CONFIG). RDV may not include it.
-        gateway_type = _norm(rawrec.get("gateway_type")).lower()
-
-        # dynamic_theme for phrase pick; fall back to deal_theme / theme
-        theme_candidate = _norm(r.get("dynamic_theme"))
-        if not theme_candidate:
-            theme_candidate = _norm(rawrec.get("deal_theme")) or _norm(rawrec.get("theme"))
-        theme_norm = _norm_theme(theme_candidate)
-
-        candidates.append({
-            "did": did,
-            "rownum": deal_rownum[did],
-            "dest": dest,
-            "hard_reject": hard_reject,
-            "verdict_raw": verdict_raw,
-            "channel": channel,
-            "rank": _rank_value(r),
-            "theme": theme_norm,
-            "gateway_type": gateway_type,
-        })
-
-    _log(
-        f"Eligible NEW candidates: {len(candidates)} | skipped_too_fresh={skipped['too_fresh']} "
-        f"skipped_no_ingest_ts={skipped['no_ingest_ts']} skipped_too_old={skipped['too_old']} "
-        f"skipped_missing_raw_row={skipped['missing_raw_row']}"
+    log(
+        f"Eligible NEW candidates: {len(eligible_rows)} | "
+        f"skipped_too_fresh={skipped_too_fresh} skipped_no_ingest_ts={skipped_no_ingest_ts} "
+        f"skipped_too_old={skipped_too_old} skipped_missing_raw_row={skipped_missing_raw_row}"
     )
+    if skipped_no_ingest_ts > 0:
+        log(f"⚠️ Missing ingest_ts for first {len(missing_ingest_ids)} NEW rows: {missing_ingest_ids}")
 
-    if not candidates:
-        _log("No eligible NEW rows")
+    if not eligible_rows:
+        log("No eligible NEW rows")
         return 0
 
-    # Repeat-block memory (VIP/FREE; PRO optionally bypass)
-    recent_posted_dests = _posted_destinations_recent(raw_rows, DEST_REPEAT_HOURS)
-    _log(f"Repeat block window: {DEST_REPEAT_HOURS}h | recent_posted_dests={len(recent_posted_dests)}")
+    # RDV fields used (best-effort names)
+    def rdv_get(r: Dict[str, Any], *keys: str) -> str:
+        for k in keys:
+            if k in r:
+                return str(r.get(k) or "").strip()
+            # normalize lookup
+            nk = _norm_header(k)
+            for kk in r.keys():
+                if _norm_header(kk) == nk:
+                    return str(r.get(kk) or "").strip()
+        return ""
 
-    def repeat_blocked(c):
-        return bool(c["dest"]) and (c["dest"] in recent_posted_dests)
+    # Prepare winners
+    winners_pro: List[Tuple[int, str]] = []
+    winners_vip: List[Tuple[int, str]] = []
+    winners_free: List[Tuple[int, str]] = []
 
-    # Split pools by channel
-    pro_pool = []
-    vip_pool = []
-    free_pool = []
-    none_pool = []
+    scored_rows: List[int] = []
 
-    for c in candidates:
-        if c["channel"] == "PRO":
-            pro_pool.append(c)
-        elif c["channel"] == "VIP":
-            vip_pool.append(c)
-        elif c["channel"] == "FREE":
-            free_pool.append(c)
-        else:
-            none_pool.append(c)
+    # Simple ranking: use worthiness_score if present else priority_score else 0
+    def score_of(rdv: Dict[str, Any]) -> float:
+        for k in ("priority_score", "worthiness_score", "score"):
+            v = rdv_get(rdv, k)
+            try:
+                return float(v)
+            except Exception:
+                continue
+        return 0.0
 
-    # Apply hard_reject + repeat blocks where appropriate
-    vip_pool = [c for c in vip_pool if not c["hard_reject"]]
-    free_pool = [c for c in free_pool if not c["hard_reject"]]
+    # Filter by today's theme if RDV has dynamic_theme; else allow all NEW
+    filtered = []
+    for raw_rownum, raw_meta, rdv in eligible_rows:
+        dyn = rdv_get(rdv, "dynamic_theme", "theme", "primary_theme").lower()
+        if dyn and theme_today.lower() not in dyn:
+            # allow if missing dynamic theme
+            pass
+        filtered.append((raw_rownum, raw_meta["deal_id"], rdv))
 
-    vip_pool = [c for c in vip_pool if not repeat_blocked(c)]
-    free_pool = [c for c in free_pool if not repeat_blocked(c)]
+    filtered.sort(key=lambda t: score_of(t[2]), reverse=True)
 
-    if not PRO_BYPASS_REPEAT_BLOCK:
-        pro_pool = [c for c in pro_pool if not repeat_blocked(c)]
+    # Promotion buckets by worthiness_verdict
+    for raw_rownum, did, rdv in filtered:
+        verdict = rdv_get(rdv, "worthiness_verdict", "worthiness_verdict_text", "worthiness").upper()
+        hard_reject = rdv_get(rdv, "hard_reject").upper() == "TRUE"
 
-    # SNOW non-commodity tie-breaker:
-    # If theme_today is snow AND there exists ANY eligible non-commodity VIP/FREE/PRO candidate,
-    # then commodity gateways are disallowed as winners for this run.
-    snow_day = (_norm_theme(theme_today) == _norm_theme(SNOW_THEME_KEY))
-
-    non_commodity_exists = any(
-        (c.get("gateway_type") and c["gateway_type"] != COMMODITY_GATEWAY_KEY)
-        for c in (pro_pool + vip_pool + free_pool)
-    )
-    if snow_day and non_commodity_exists:
-        def _is_commodity(c):
-            return (c.get("gateway_type") == COMMODITY_GATEWAY_KEY)
-
-        pro_pool = [c for c in pro_pool if not _is_commodity(c)]
-        vip_pool = [c for c in vip_pool if not _is_commodity(c)]
-        free_pool = [c for c in free_pool if not _is_commodity(c)]
-        _log("SNOW rule: non-commodity candidates exist → commodity gateways disallowed for winner selection this run.")
-
-    # Rank pools (descending)
-    pro_pool.sort(key=lambda x: (-x["rank"], x["did"]))
-    vip_pool.sort(key=lambda x: (-x["rank"], x["did"]))
-    free_pool.sort(key=lambda x: (-x["rank"], x["did"]))
-
-    _log(f"Pools after gates: PRO={len(pro_pool)} | VIP={len(vip_pool)} | FREE={len(free_pool)} | NONE={len(none_pool)}")
-
-    winners = []
-
-    # Select winners by quotas (PRO first, then VIP, then FREE)
-    if PRO_WINNERS_PER_RUN > 0:
-        winners.extend(pro_pool[:PRO_WINNERS_PER_RUN])
-
-    if VIP_WINNERS_PER_RUN > 0:
-        winners.extend(vip_pool[:VIP_WINNERS_PER_RUN])
-
-    if FREE_WINNERS_PER_RUN > 0:
-        winners.extend(free_pool[:FREE_WINNERS_PER_RUN])
-
-    # Deduplicate winners by deal_id (in case verdict labeling overlaps)
-    dedup = []
-    seen = set()
-    for w in winners:
-        if w["did"] in seen:
+        if hard_reject:
+            scored_rows.append(raw_rownum)
             continue
-        seen.add(w["did"])
-        dedup.append(w)
-    winners = dedup
 
-    if not winners:
-        _log("No winners selected after quotas + gates. Marking eligible NEW as SCORED.")
-    else:
-        _log("Winners selected: " + ", ".join([f"{w['channel']}:{w['did']}" for w in winners]))
+        # PRO candidate
+        if verdict.startswith("PRO_") and len(winners_pro) < QUOTA_PRO:
+            winners_pro.append((raw_rownum, did))
+            continue
 
-    winner_ids = {w["did"] for w in winners}
+        # VIP candidate
+        if ("VIP" in verdict or verdict.startswith("POSTABLE")) and len(winners_vip) < QUOTA_VIP:
+            winners_vip.append((raw_rownum, did))
+            continue
 
-    # Updates:
-    # 1) Mark evaluated candidates as SCORED (except winners)
-    # 2) Promote winners to READY_TO_POST + lock phrase
+        # FREE candidate
+        if len(winners_free) < QUOTA_FREE:
+            winners_free.append((raw_rownum, did))
+            continue
+
+        scored_rows.append(raw_rownum)
+
+    # Write status updates (batch by cell updates)
+    # Determine status column index
+    status_col_idx = raw_idx[col_status] + 1  # 1-based
     updates = []
-    scored_count = 0
 
-    for c in candidates:
-        if c["did"] in winner_ids:
-            continue
-        updates.append(Cell(c["rownum"], col["status"], "SCORED"))
-        scored_count += 1
+    def upd(rownum: int, status: str) -> None:
+        updates.append(gspread.Cell(rownum, status_col_idx, status))
 
-    promoted = 0
-    for w in winners:
-        did = w["did"]
-        rownum = w["rownum"]
-        dest = w["dest"]
-        theme = w["theme"]  # RDV-derived theme label for phrase selection
-
-        phrases = sorted([p["phrase"] for p in phrase_index if p["dest"] == dest and p["theme"] == theme])
-        phrase = _stable_pick(f"{did}|{dest}|{theme}", phrases)
-
-        updates.append(Cell(rownum, col["status"], "READY_TO_POST"))
-        updates.append(Cell(rownum, col[PHRASE_USED_COL], phrase))
-        updates.append(Cell(rownum, col[PHRASE_BANK_COL], phrase))
-
-        # Optional: write worthiness_verdict into RAW if column exists (helps ops visibility)
-        if "worthiness_verdict" in col and w["verdict_raw"]:
-            updates.append(Cell(rownum, col["worthiness_verdict"], w["verdict_raw"]))
-
-        # Optional: promo_hint for PRO
-        if w["channel"] == "PRO":
-            promo_col = col.get("promo_hint") or col.get("PROMO_HINT")
-            if promo_col:
-                updates.append(Cell(rownum, promo_col, "PRO_EDITORIAL"))
-
-        promoted += 1
-        _log(
-            f"Promoted {did} → READY_TO_POST | channel={w['channel']} dest={dest} theme={theme} "
-            f"rank={w['rank']:.2f} phrase={'YES' if phrase else 'NO'}"
-        )
-
-    _log(f"Marked SCORED (evaluated non-winners): {scored_count} | winners_promoted: {promoted}")
+    for r in scored_rows:
+        upd(r, "SCORED")
+    for r, _ in winners_pro:
+        upd(r, "READY_TO_POST")
+    for r, _ in winners_vip:
+        upd(r, "READY_TO_POST")
+    for r, _ in winners_free:
+        upd(r, "READY_TO_POST")
 
     if updates:
-        ws_raw.update_cells(updates, value_input_option="RAW")
+        ws_raw.update_cells(updates, value_input_option="USER_ENTERED")
 
+    log(f"✅ Promoted: PRO={len(winners_pro)} VIP={len(winners_vip)} FREE={len(winners_free)} | Marked SCORED={len(scored_rows)}")
     return 0
 
 

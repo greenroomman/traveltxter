@@ -708,7 +708,7 @@ def main() -> int:
 
         set_if("theme", theme_today)
         set_if("primary_theme", cfg_theme(cfg_pick))
-        set_if("ingested_at", dt.datetime.utcnow().isoformat() + "Z")
+        set_if("ingested_at_utc", dt.datetime.utcnow().isoformat() + "Z")
         set_if("source", "duffel")
         set_if("max_connections", int(max_conn))
         set_if("cabin_class", cabin)

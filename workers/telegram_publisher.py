@@ -1,7 +1,9 @@
 # workers/telegram_publisher.py
-# V4.10 - RUN_SLOT driven publishing (manual-safe) + optional FREE -1 run lag + Instagram proof link
-# VIP: AM + PM. FREE: optional AM + PM with lag gate (default 10h), otherwise PM-only with 24h lag (legacy).
-# Full-file replacement only. No schema renames.
+# V4.11 - RUN_SLOT driven publishing + TRUE FREE "-1 RUN" lag + ALWAYS include Instagram @handle in FREE template
+#
+# VIP: AM + PM
+# FREE: publishes ONLY deals posted to VIP in the *previous run window* (true -1 run lag)
+# Legacy fallback (no RUN_SLOT): windowed time checks + FREE_LAG_HOURS (default 24h unless overridden)
 
 import os
 import json
@@ -43,7 +45,6 @@ def _sa_creds():
     try:
         info = json.loads(raw)
     except json.JSONDecodeError:
-        # support one-line secret where newlines were escaped
         info = json.loads(raw.replace("\\n", "\n"))
     return Credentials.from_service_account_info(
         info,
@@ -61,7 +62,6 @@ def parse_iso_utc(s):
     if not s:
         return None
     try:
-        # supports "2026-01-19T13:15:54Z" and "+00:00"
         if s.endswith("Z"):
             s = s.replace("Z", "+00:00")
         return dt.datetime.fromisoformat(s).astimezone(dt.timezone.utc)
@@ -85,95 +85,36 @@ def normalize_price_gbp(x):
     s = s.replace("£", "").replace(",", "").strip()
     try:
         v = float(s)
-        # keep 2dp for consistency
         return f"{v:.2f}"
     except Exception:
-        # fallback: return original (without leading £)
         return s
 
 def phrase_from_row(row):
-    # locked behaviour: phrase_used first, fallback to phrase_bank
     return (row.get("phrase_used") or row.get("phrase_bank") or "").strip()
 
 def get_country_flag(country_name):
-    # keep your existing mapping (extend anytime)
     flag_map = {
-        "Iceland": "🇮🇸",
-        "Spain": "🇪🇸",
-        "Portugal": "🇵🇹",
-        "Greece": "🇬🇷",
-        "Turkey": "🇹🇷",
-        "Morocco": "🇲🇦",
-        "Egypt": "🇪🇬",
-        "UAE": "🇦🇪",
-        "United Arab Emirates": "🇦🇪",
-        "Tunisia": "🇹🇳",
-        "Cape Verde": "🇨🇻",
-        "Gambia": "🇬🇲",
-        "Jordan": "🇯🇴",
-        "Madeira": "🇵🇹",
-        "Canary Islands": "🇪🇸",
-        "Tenerife": "🇪🇸",
-        "Lanzarote": "🇪🇸",
-        "Fuerteventura": "🇪🇸",
-        "Gran Canaria": "🇪🇸",
-        "Croatia": "🇭🇷",
-        "Italy": "🇮🇹",
-        "Cyprus": "🇨🇾",
-        "Malta": "🇲🇹",
-        "Bulgaria": "🇧🇬",
-        "Barbados": "🇧🇧",
-        "Jamaica": "🇯🇲",
-        "Antigua": "🇦🇬",
-        "St Lucia": "🇱🇨",
-        "Mexico": "🇲🇽",
-        "Thailand": "🇹🇭",
-        "Indonesia": "🇮🇩",
-        "Bali": "🇮🇩",
-        "Malaysia": "🇲🇾",
-        "Maldives": "🇲🇻",
-        "Mauritius": "🇲🇺",
-        "Seychelles": "🇸🇨",
-        "Azores": "🇵🇹",
-        "Switzerland": "🇨🇭",
-        "Austria": "🇦🇹",
-        "France": "🇫🇷",
-        "Norway": "🇳🇴",
-        "Sweden": "🇸🇪",
-        "Finland": "🇫🇮",
-        "Czech Republic": "🇨🇿",
-        "Hungary": "🇭🇺",
-        "Poland": "🇵🇱",
-        "Germany": "🇩🇪",
-        "Belgium": "🇧🇪",
-        "Netherlands": "🇳🇱",
-        "Denmark": "🇩🇰",
-        "Estonia": "🇪🇪",
-        "Latvia": "🇱🇻",
-        "Lithuania": "🇱🇹",
-        "Romania": "🇷🇴",
-        "Israel": "🇮🇱",
-        "USA": "🇺🇸",
-        "United States": "🇺🇸",
-        "Canada": "🇨🇦",
-        "Qatar": "🇶🇦",
-        "South Africa": "🇿🇦",
-        "Singapore": "🇸🇬",
-        "Hong Kong": "🇭🇰",
-        "India": "🇮🇳",
-        "Japan": "🇯🇵",
-        "South Korea": "🇰🇷",
-        "China": "🇨🇳",
-        "Australia": "🇦🇺",
-        "New Zealand": "🇦🇺",
-        "Brazil": "🇧🇷",
-        "Argentina": "🇦🇷",
-        "Colombia": "🇨🇴",
-        "Slovakia": "🇸🇰",
-        "Bosnia": "🇧🇦",
-        "North Macedonia": "🇲🇰",
-        "Armenia": "🇦🇲",
-        "Georgia": "🇬🇪",
+        "Iceland": "🇮🇸", "Spain": "🇪🇸", "Portugal": "🇵🇹", "Greece": "🇬🇷", "Turkey": "🇹🇷",
+        "Morocco": "🇲🇦", "Egypt": "🇪🇬", "UAE": "🇦🇪", "United Arab Emirates": "🇦🇪",
+        "Tunisia": "🇹🇳", "Cape Verde": "🇨🇻", "Gambia": "🇬🇲", "Jordan": "🇯🇴",
+        "Madeira": "🇵🇹", "Canary Islands": "🇪🇸", "Tenerife": "🇪🇸", "Lanzarote": "🇪🇸",
+        "Fuerteventura": "🇪🇸", "Gran Canaria": "🇪🇸",
+        "Croatia": "🇭🇷", "Italy": "🇮🇹", "Cyprus": "🇨🇾", "Malta": "🇲🇹", "Bulgaria": "🇧🇬",
+        "Barbados": "🇧🇧", "Jamaica": "🇯🇲", "Antigua": "🇦🇬", "St Lucia": "🇱🇨",
+        "Mexico": "🇲🇽", "Thailand": "🇹🇭", "Indonesia": "🇮🇩", "Bali": "🇮🇩", "Malaysia": "🇲🇾",
+        "Maldives": "🇲🇻", "Mauritius": "🇲🇺", "Seychelles": "🇸🇨",
+        "Azores": "🇵🇹", "Switzerland": "🇨🇭", "Austria": "🇦🇹", "France": "🇫🇷",
+        "Norway": "🇳🇴", "Sweden": "🇸🇪", "Finland": "🇫🇮",
+        "Czech Republic": "🇨🇿", "Hungary": "🇭🇺", "Poland": "🇵🇱", "Germany": "🇩🇪",
+        "Belgium": "🇧🇪", "Netherlands": "🇳🇱", "Denmark": "🇩🇰",
+        "Estonia": "🇪🇪", "Latvia": "🇱🇻", "Lithuania": "🇱🇹", "Romania": "🇷🇴",
+        "Israel": "🇮🇱", "USA": "🇺🇸", "United States": "🇺🇸", "Canada": "🇨🇦",
+        "Qatar": "🇶🇦", "South Africa": "🇿🇦", "Singapore": "🇸🇬", "Hong Kong": "🇭🇰",
+        "India": "🇮🇳", "Japan": "🇯🇵", "South Korea": "🇰🇷", "China": "🇨🇳",
+        "Australia": "🇦🇺", "New Zealand": "🇦🇺",
+        "Brazil": "🇧🇷", "Argentina": "🇦🇷", "Colombia": "🇨🇴",
+        "Slovakia": "🇸🇰", "Bosnia": "🇧🇦", "North Macedonia": "🇲🇰",
+        "Armenia": "🇦🇲", "Georgia": "🇬🇪",
     }
     return flag_map.get(country_name, "🌍")
 
@@ -193,16 +134,9 @@ def tg_send(token, chat_id, text, disable_preview=True):
         raise RuntimeError(f"Telegram send failed: {r.text}")
 
 
-# ------------------ publish windows (legacy fallback) ------------------
+# ------------------ legacy publish windows ------------------
 
 def in_vip_window(now):
-    """
-    VIP twice daily.
-    Defaults (UTC): AM 06:00–11:59, PM 15:00–20:59
-    Override with:
-      VIP_WINDOW_AM_START, VIP_WINDOW_AM_END (hours 0-23)
-      VIP_WINDOW_PM_START, VIP_WINDOW_PM_END
-    """
     am_start = env_int("VIP_WINDOW_AM_START", 6)
     am_end = env_int("VIP_WINDOW_AM_END", 11)
     pm_start = env_int("VIP_WINDOW_PM_START", 15)
@@ -211,20 +145,59 @@ def in_vip_window(now):
     return (am_start <= h <= am_end) or (pm_start <= h <= pm_end)
 
 def in_free_window(now):
-    """
-    FREE once daily (PM only).
-    Defaults (UTC): 15:00–20:59
-    Override with:
-      FREE_WINDOW_PM_START, FREE_WINDOW_PM_END
-    """
     pm_start = env_int("FREE_WINDOW_PM_START", 15)
     pm_end = env_int("FREE_WINDOW_PM_END", 20)
     h = now.hour
     return (pm_start <= h <= pm_end)
 
 
+# ------------------ run schedule windows (true -1 run lag) ------------------
+
+def parse_hhmm(s, default_hhmm):
+    s = (s or "").strip()
+    if not s:
+        s = default_hhmm
+    if ":" not in s:
+        raise ValueError(f"Bad HH:MM value: {s}")
+    hh, mm = s.split(":", 1)
+    return int(hh), int(mm)
+
+def slot_windows(now):
+    """
+    Returns (am_run_dt, pm_run_dt) for today in UTC.
+    Defaults to your canonical schedule: 07:30 and 16:30 UTC.
+    Override with AM_RUN_TIME_UTC, PM_RUN_TIME_UTC (HH:MM).
+    """
+    am_h, am_m = parse_hhmm(env("AM_RUN_TIME_UTC", "07:30"), "07:30")
+    pm_h, pm_m = parse_hhmm(env("PM_RUN_TIME_UTC", "16:30"), "16:30")
+    d = now.date()
+    am_dt = dt.datetime(d.year, d.month, d.day, am_h, am_m, tzinfo=dt.timezone.utc)
+    pm_dt = dt.datetime(d.year, d.month, d.day, pm_h, pm_m, tzinfo=dt.timezone.utc)
+    return am_dt, pm_dt
+
+def previous_vip_window(now, run_slot):
+    """
+    True -1 run lag:
+      - If current run_slot=PM: publish FREE for deals VIP-posted in [today AM run, today PM run)
+      - If current run_slot=AM: publish FREE for deals VIP-posted in [yesterday PM run, today AM run)
+    """
+    am_dt, pm_dt = slot_windows(now)
+    if run_slot == "PM":
+        start = am_dt
+        end = pm_dt
+        return start, end
+    if run_slot == "AM":
+        # yesterday PM -> today AM
+        y = now.date() - dt.timedelta(days=1)
+        pm_h, pm_m = parse_hhmm(env("PM_RUN_TIME_UTC", "16:30"), "16:30")
+        y_pm = dt.datetime(y.year, y.month, y.day, pm_h, pm_m, tzinfo=dt.timezone.utc)
+        start = y_pm
+        end = am_dt
+        return start, end
+    return None, None
+
+
 # ------------------ message builders ------------------
-# DO NOT MODIFY CORE SCHEMATIC (fields/order). Copy tweaks are allowed.
 
 def build_vip_message(row):
     country = get_first(row, ["destination_country"])
@@ -269,13 +242,14 @@ def build_free_message(row):
     if not monthly or not yearly:
         raise RuntimeError("Missing STRIPE_LINK_MONTHLY / STRIPE_LINK_YEARLY (or legacy SUBSCRIPTION_LINK_*)")
 
-    # Optional Instagram proof link for external distribution (Reddit etc.)
-    ig_url = env("INSTAGRAM_PROFILE_URL") or env("IG_PROFILE_URL") or env("INSTAGRAM_URL")
+    # Always include Instagram handle in FREE messages
     ig_handle = env("INSTAGRAM_HANDLE", "Traveltxter").lstrip("@").strip()
+    ig_url = env("INSTAGRAM_PROFILE_URL") or env("IG_PROFILE_URL") or env("INSTAGRAM_URL")
 
-    footer = ""
     if ig_url:
-        footer = f'Want to sanity-check us first? We post the same finds on Instagram: <a href="{ig_url}">@{ig_handle}</a>'
+        ig_line = f'Instagram: <a href="{ig_url}">@{ig_handle}</a>'
+    else:
+        ig_line = f"Instagram: @{ig_handle}"
 
     lines = [
         f"£{price} to {country} {flag}",
@@ -287,9 +261,8 @@ def build_free_message(row):
         "VIP members saw this first. We share deals with them early so they get a bit of breathing room to decide, rather than rushing it.",
         "If you’d like that early access, VIP is £3 per month or £30 per year.",
         f'<a href="{monthly}">Monthly</a> | <a href="{yearly}">Yearly</a>',
+        ig_line,
     ]
-    if footer:
-        lines.append(footer)
 
     return "\n".join(lines).strip()
 
@@ -329,22 +302,15 @@ def main():
     h = idx_map(headers)
 
     must_have(h, "status")
-    # optional fields handled best-effort:
-    # posted_telegram_vip_at, posted_telegram_free_at
 
     now = now_utc()
 
-    # FREE options:
-    # - FREE_BOTH_SLOTS=true enables FREE eligibility on AM and PM runs (manual mode).
-    # - FREE_LAG_HOURS is the minimum hours after VIP before FREE can publish (default 10h for "-1 run" feel).
-    # If RUN_SLOT is missing, we fall back to legacy windows and 24h lag unless overridden.
-    free_both_slots = env_bool("FREE_BOTH_SLOTS", True)
+    # Legacy FREE lag fallback (only used if RUN_SLOT is missing)
     free_lag_hours = env_float("FREE_LAG_HOURS", 10.0)
 
     # ---------------- STAGE 1: VIP ----------------
     vip_allowed = True
     if not run_slot:
-        # legacy fallback when running on schedules without RUN_SLOT
         vip_allowed = in_vip_window(now)
 
     if vip_allowed:
@@ -367,21 +333,20 @@ def main():
     print("No VIP deals ready (status=READY_TO_POST)")
 
     # ---------------- STAGE 2: FREE ----------------
-    # If RUN_SLOT is present (manual mode), FREE can run AM+PM when FREE_BOTH_SLOTS=true.
-    # If FREE_BOTH_SLOTS=false, FREE runs only on PM slot.
-    # If RUN_SLOT is missing, fall back to legacy window and 24h lag (unless overridden).
     free_allowed = True
-
-    if run_slot:
-        if (not free_both_slots) and (run_slot != "PM"):
-            free_allowed = False
-    else:
+    if not run_slot:
         free_allowed = in_free_window(now)
-        # legacy default was 24h; respect that unless user explicitly sets FREE_LAG_HOURS
+        # legacy default was 24h unless overridden
         if env("FREE_LAG_HOURS", "").strip() == "":
             free_lag_hours = 24.0
 
     if free_allowed:
+        # True -1 run window if RUN_SLOT exists; else legacy lag gate
+        win_start, win_end = (None, None)
+        if run_slot:
+            win_start, win_end = previous_vip_window(now, run_slot)
+            print(f"🧭 FREE window (-1 run): {win_start.isoformat()} → {win_end.isoformat()}")
+
         for i, r in enumerate(values[1:], start=2):
             if r[h["status"]] != "POSTED_TELEGRAM_VIP":
                 continue
@@ -391,14 +356,19 @@ def main():
             vip_ts = row.get("posted_telegram_vip_at", "")
             vip_time = parse_iso_utc(vip_ts)
             if not vip_time:
-                # Do NOT violate lag logic; hold until fixed.
                 print("⏳ FREE blocked: missing/invalid posted_telegram_vip_at timestamp")
                 continue
 
-            hours = (now - vip_time).total_seconds() / 3600.0
-            if hours < free_lag_hours:
-                print(f"⏳ FREE not ready: {hours:.1f}h elapsed (need {free_lag_hours:.1f}h)")
-                continue
+            if run_slot:
+                # TRUE -1 run lag: only VIP posts from the previous run window
+                if not (win_start <= vip_time < win_end):
+                    continue
+            else:
+                # Legacy lag: time since VIP posting
+                hours = (now - vip_time).total_seconds() / 3600.0
+                if hours < free_lag_hours:
+                    print(f"⏳ FREE not ready: {hours:.1f}h elapsed (need {free_lag_hours:.1f}h)")
+                    continue
 
             msg = build_free_message(row)
             tg_send(env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHANNEL"), msg, disable_preview=True)
@@ -410,7 +380,7 @@ def main():
             print("✅ Published to Telegram FREE")
             return 0
     else:
-        print("⏱️ FREE not enabled for this slot — skipping FREE stage for this run")
+        print("⏱️ FREE window closed — skipping FREE stage for this run")
 
     print("No deals ready to publish")
     return 0

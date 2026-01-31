@@ -1,4 +1,4 @@
-# workers/telegram_publisher.py
+#redy_to workers/telegram_publisher.py
 # V4.11 - RUN_SLOT driven publishing + TRUE FREE "-1 RUN" lag + ALWAYS include Instagram @handle in FREE template
 #
 # VIP: AM + PM
@@ -315,7 +315,7 @@ def main():
 
     if vip_allowed:
         for i, r in enumerate(values[1:], start=2):
-            if r[h["status"]] == "READY_TO_POST":
+            if r[h["status"]] == "READY_TO_PUBLISH":
                 row = {headers[j]: r[j] for j in range(len(headers))}
                 msg = build_vip_message(row)
 

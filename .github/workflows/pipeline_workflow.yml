@@ -7,6 +7,10 @@ on:
         description: "Run slot (AM or PM)"
         required: true
         default: "AM"
+        type: choice
+        options:
+          - AM
+          - PM
 
   schedule:
     # AM run (07:30 UTC)
@@ -14,18 +18,72 @@ on:
     # PM run (16:30 UTC)
     - cron: "30 16 * * *"
 
-env:
-  # For scheduled runs, infer slot from the cron that fired.
-  # For manual runs, use workflow_dispatch input.
-  RUN_SLOT: >-
-    ${{ github.event_name == 'schedule' && github.event.schedule == '30 7 * * *' && 'AM'
-        || github.event_name == 'schedule' && github.event.schedule == '30 16 * * *' && 'PM'
-        || github.event.inputs.run_slot
-        || 'AM' }}
+concurrency:
+  group: traveltxter-pipeline
+  cancel-in-progress: false
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
+
+    env:
+      # ---------------- Run slot (deterministic) ----------------
+      RUN_SLOT: >-
+        ${{ github.event_name == 'schedule' && github.event.schedule == '30 7 * * *' && 'AM'
+            || github.event_name == 'schedule' && github.event.schedule == '30 16 * * *' && 'PM'
+            || github.event.inputs.run_slot
+            || 'AM' }}
+
+      # ---------------- Spreadsheet identity (legacy compatible) ----------------
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+
+      # ---------------- Service account JSON (legacy compatible) ----------------
+      GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+      GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+
+      # ---------------- Tabs (Secrets + Vars compatibility) ----------------
+      RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+      FEEDER_LOG_TAB: ${{ secrets.FEEDER_LOG_TAB }}
+      INSTA_FEED_TAB: ${{ secrets.INSTA_FEED_TAB }}
+      SUBSCRIBERS_TAB: ${{ secrets.SUBSCRIBERS_TAB }}
+
+      FEEDER_CONFIG_TAB: ${{ vars.FEEDER_CONFIG_TAB }}
+      THEMES_TAB: ${{ vars.THEMES_TAB }}
+      PHRASES_TAB: ${{ vars.PHRASES_TAB }}
+
+      # ---------------- API keys / tokens (Secrets) ----------------
+      DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+      RENDER_URL: ${{ secrets.RENDER_URL }}
+      REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
+
+      IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+      TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+      TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
+      STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
+
+      # ---------------- Vars (budget / knobs) ----------------
+      DUFFEL_BUDGET_GBP: ${{ vars.DUFFEL_BUDGET_GBP }}
+      DUFFEL_EXCESS_SEARCH_USD: ${{ vars.DUFFEL_EXCESS_SEARCH_USD }}
+
+      DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
+      DUFFEL_MAX_INSERTS_PER_ORIGIN: ${{ vars.DUFFEL_MAX_INSERTS_PER_ORIGIN }}
+      DUFFEL_MAX_INSERTS_PER_ROUTE: ${{ vars.DUFFEL_MAX_INSERTS_PER_ROUTE }}
+      DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
+      DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+
+      MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS }}
+      VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
+
+      GRAPH_API_VERSION: ${{ vars.GRAPH_API_VERSION }}
 
     steps:
       - name: Checkout repo
@@ -41,48 +99,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Echo RUN_SLOT
+      - name: Debug env presence (safe)
         run: |
-          echo "RUN_SLOT=${RUN_SLOT}"
-          echo "EVENT=${{ github.event_name }}"
-          echo "SCHEDULE=${{ github.event.schedule }}"
+          python -c "import os; print('RUN_SLOT:', os.getenv('RUN_SLOT'))"
+          python -c "import os; print('DUFFEL_API_KEY present:', bool(os.getenv('DUFFEL_API_KEY')))"
+          python -c "import os; print('SPREADSHEET_ID present:', bool(os.getenv('SPREADSHEET_ID') or os.getenv('SHEET_ID')))"
+          python -c "import os; print('GCP_SA_JSON present:', bool(os.getenv('GCP_SA_JSON_ONE_LINE') or os.getenv('GCP_SA_JSON')))"
 
-      # ============================================================
-      # FEEDER
-      # ============================================================
+      # ---------------- FEEDER ----------------
       - name: Run Feeder
         run: python workers/pipeline_worker.py
-        env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}
 
-      # ============================================================
-      # SCORER
-      # ============================================================
+      - name: Wait for ingest age gate
+        run: |
+          echo "Sleeping for ${MIN_INGEST_AGE_SECONDS:-30}s to satisfy MIN_INGEST_AGE_SECONDS"
+          sleep ${MIN_INGEST_AGE_SECONDS:-30}
+
+      # ---------------- SCORER ----------------
       - name: Run Scorer
         run: python workers/ai_scorer.py
-        env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}
 
-      # ============================================================
-      # RENDER (PA ASSET CREATION)
-      # ============================================================
-      - name: Run Render Client
+      # ---------------- RENDER ----------------
+      - name: Run Renderer
         run: python workers/render_client.py
-        env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}
 
-      # ============================================================
-      # INSTAGRAM (MARKETING ONLY) — AM + PM
-      # ============================================================
+      # ---------------- LINK ROUTER ----------------
+      - name: Run Link Router
+        run: python workers/link_router.py
+
+      # ---------------- INSTAGRAM (AM + PM) ----------------
       - name: Run Instagram Publisher
         run: python workers/instagram_publisher.py
-        env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}
 
-      # ============================================================
-      # TELEGRAM (VIP then FREE inside file / or separate)
-      # ============================================================
-      - name: Run Telegram Publisher
+      # ---------------- TELEGRAM ----------------
+      - name: Run Telegram Publisher (AM=VIPam, PM=VIPpm+FREE)
         run: python workers/telegram_publisher.py
-        env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}

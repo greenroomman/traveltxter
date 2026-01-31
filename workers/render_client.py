@@ -47,10 +47,6 @@ GOOGLE_SCOPE = [
 
 # ============================================================
 # THEME GOVERNANCE (LOCKED)
-# - OPS_MASTER!B5 is authoritative theme of the day.
-# - RDV AT may contain multiple themes (e.g. "snow, long_haul").
-# - Render payload must carry ONE theme for palette selection.
-# - Rule: use OPS_MASTER theme if present; else fallback to RDV AT (collapsed deterministically).
 # ============================================================
 
 AUTHORITATIVE_THEMES = {
@@ -83,7 +79,6 @@ THEME_ALIASES = {
     "unexpected": "unexpected_value",
 }
 
-# Deterministic collapse if RDV AT contains multiple themes
 THEME_PRIORITY = [
     "luxury_value",
     "unexpected_value",
@@ -101,13 +96,6 @@ THEME_PRIORITY = [
 
 
 def normalize_theme(raw_theme: str | None) -> str:
-    """
-    Accepts:
-      - single theme tokens
-      - multi-theme strings (comma/pipe/semicolon separated)
-    Returns:
-      - one authoritative theme token
-    """
     if not raw_theme:
         return "adventure"
 
@@ -249,10 +237,6 @@ def normalize_date_ddmmyy(raw_date: str | None) -> str:
 # ============================================================
 
 def read_ops_theme(sh: gspread.Spreadsheet) -> str:
-    """
-    OPS_MASTER!B5 is the authoritative theme of the day.
-    Returns a normalized single theme token, or "" if blank.
-    """
     ws_ops = sh.worksheet(OPS_MASTER_TAB)
     raw = (ws_ops.acell(OPS_THEME_CELL).value or "").strip()
     if not raw:
@@ -280,8 +264,10 @@ def build_payload(row: Dict[str, str], theme_for_palette: str) -> Dict[str, str]
         "theme": normalize_theme(theme_for_palette),
     }
 
-    # Slot hint only (does not change visuals unless PA uses it)
+    # ✅ CRITICAL: renderer API uses "layout" (defaults to PM if missing)
     if RUN_SLOT in ("AM", "PM"):
+        payload["layout"] = RUN_SLOT
+        # keep for logging/future-proofing
         payload["run_slot"] = RUN_SLOT
 
     return payload
@@ -307,10 +293,6 @@ def find_candidates_from_sheet_values(
     graphic_i: int,
     max_n: int,
 ) -> List[int]:
-    """
-    sheet_values includes header row at index 0.
-    Returns list of 1-based sheet row numbers (>=2).
-    """
     candidates: List[int] = []
     for idx0 in range(1, len(sheet_values)):
         row = sheet_values[idx0]
@@ -343,16 +325,14 @@ def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int, ops_theme: str) ->
         print(f"⚠️ Skip row {sheet_row}: status={status!r}")
         return False
 
-    # RDV dynamic_theme may be multi-theme. Used ONLY as fallback if OPS_THEME is blank.
     rdv_dynamic_theme_raw = ws_rdv.cell(sheet_row, RDV_DYNAMIC_THEME_COL).value
-
     theme_for_palette = ops_theme.strip() if ops_theme.strip() else normalize_theme(rdv_dynamic_theme_raw)
     payload = build_payload(row, theme_for_palette)
 
     print(
         f"Target row {sheet_row} | RUN_SLOT={RUN_SLOT!r} | "
-        f"OPS_THEME={ops_theme!r} | RDV_AT={rdv_dynamic_theme_raw!r} | "
-        f"theme_used={payload.get('theme')!r} | payload={payload}"
+        f"layout={payload.get('layout')!r} | OPS_THEME={ops_theme!r} | "
+        f"RDV_AT={rdv_dynamic_theme_raw!r} | theme_used={payload.get('theme')!r} | payload={payload}"
     )
 
     if not payload["FROM"] or not payload["TO"]:
@@ -423,7 +403,6 @@ def main() -> int:
     gc = gspread.authorize(_sa_creds())
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    # Authoritative theme of the day
     ops_theme = read_ops_theme(sh)
     if ops_theme:
         print(f"🎯 OPS_MASTER theme of the day ({OPS_THEME_CELL}): {ops_theme}")

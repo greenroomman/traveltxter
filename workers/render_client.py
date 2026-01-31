@@ -16,26 +16,25 @@ from google.oauth2.service_account import Credentials
 # CONFIG
 # ============================================================
 
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or "").strip()
 RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
 RAW_DEALS_VIEW_TAB = os.getenv("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
-RENDER_URL = os.environ["RENDER_URL"]
+RENDER_URL = (os.getenv("RENDER_URL") or "").strip()
+
+SERVICE_ACCOUNT_JSON = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
+
+STATUS_READY_TO_POST = os.getenv("STATUS_READY_TO_POST", "READY_TO_POST")
+STATUS_READY_TO_PUBLISH = os.getenv("STATUS_READY_TO_PUBLISH", "READY_TO_PUBLISH")
+
+RENDER_MAX_PER_RUN = int(float(os.getenv("RENDER_MAX_PER_RUN", "1") or "1"))
+
+# RDV dynamic_theme locked column AT = 46 (1-based)
+RDV_DYNAMIC_THEME_COL = int(float(os.getenv("RDV_DYNAMIC_THEME_COL", "46") or "46"))
 
 GOOGLE_SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-
-SERVICE_ACCOUNT_JSON = os.environ["GCP_SA_JSON_ONE_LINE"]
-
-STATUS_READY_TO_POST = os.getenv("STATUS_READY_TO_POST", "READY_TO_POST")
-STATUS_READY_TO_PUBLISH = os.getenv("STATUS_READY_TO_PUBLISH", "READY_TO_PUBLISH")
-
-# How many rows to render per run (default 1 to keep it safe)
-RENDER_MAX_PER_RUN = int(os.getenv("RENDER_MAX_PER_RUN", "1"))
-
-# RDV locked column index for dynamic_theme (AT = 46)
-RDV_DYNAMIC_THEME_COL = int(os.getenv("RDV_DYNAMIC_THEME_COL", "46"))
 
 
 # ============================================================
@@ -57,21 +56,6 @@ AUTHORITATIVE_THEMES = {
     "unexpected_value",
 }
 
-THEME_PRIORITY = [
-    "luxury_value",
-    "unexpected_value",
-    "long_haul",
-    "snow",
-    "northern_lights",
-    "winter_sun",
-    "summer_sun",
-    "beach_break",
-    "surf",
-    "culture_history",
-    "city_breaks",
-    "adventure",
-]
-
 THEME_ALIASES = {
     "winter sun": "winter_sun",
     "summer sun": "summer_sun",
@@ -87,12 +71,27 @@ THEME_ALIASES = {
     "unexpected": "unexpected_value",
 }
 
+THEME_PRIORITY = [
+    "luxury_value",
+    "unexpected_value",
+    "long_haul",
+    "snow",
+    "northern_lights",
+    "winter_sun",
+    "summer_sun",
+    "beach_break",
+    "surf",
+    "culture_history",
+    "city_breaks",
+    "adventure",
+]
+
 
 def normalize_theme(raw_theme: str | None) -> str:
     if not raw_theme:
         return "adventure"
 
-    parts = re.split(r"[,\|;]+", raw_theme.lower())
+    parts = re.split(r"[,\|;]+", str(raw_theme).lower())
     tokens: list[str] = []
 
     for p in parts:
@@ -110,91 +109,64 @@ def normalize_theme(raw_theme: str | None) -> str:
     if not tokens:
         return "adventure"
 
-    for priority in THEME_PRIORITY:
-        if priority in tokens:
-            return priority
+    for pr in THEME_PRIORITY:
+        if pr in tokens:
+            return pr
 
     return tokens[0]
 
 
 # ============================================================
-# GOOGLE SHEETS
+# GOOGLE SHEETS HELPERS
 # ============================================================
 
-def get_gspread_client():
-    creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
-    creds = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=GOOGLE_SCOPE,
-    )
-    return gspread.authorize(creds)
-
-
-def utc_now_iso() -> str:
+def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat() + "Z"
 
 
-def find_col_index(headers: list[str], col_name: str) -> Optional[int]:
-    target = col_name.strip().lower()
-    for i, h in enumerate(headers, start=1):
-        if str(h).strip().lower() == target:
+def _sa_creds() -> Credentials:
+    if not SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+    try:
+        info = json.loads(SERVICE_ACCOUNT_JSON)
+    except json.JSONDecodeError:
+        info = json.loads(SERVICE_ACCOUNT_JSON.replace("\\n", "\n"))
+    return Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPE)
+
+
+def _col_index(headers: list[str], name: str) -> Optional[int]:
+    target = name.strip().lower()
+    for i, h in enumerate(headers):
+        if (h or "").strip().lower() == target:
             return i
     return None
 
 
-def a1(col_index: int, row_index_1_based: int) -> str:
-    n = col_index
+def _a1(col_1_based: int, row_1_based: int) -> str:
+    n = col_1_based
     letters = ""
     while n > 0:
         n, r = divmod(n - 1, 26)
         letters = chr(65 + r) + letters
-    return f"{letters}{row_index_1_based}"
+    return f"{letters}{row_1_based}"
 
 
-def update_cells_by_header(
-    ws: gspread.Worksheet,
-    headers: list[str],
-    sheet_row_1_based: int,
-    updates: Dict[str, str],
-) -> None:
+def _batch_update(ws: gspread.Worksheet, headers: list[str], row_1_based: int, updates: Dict[str, str]) -> None:
+    idx = {h: i for i, h in enumerate(headers)}
     data = []
-    for col_name, value in updates.items():
-        idx = find_col_index(headers, col_name)
-        if not idx:
+    for k, v in updates.items():
+        if k not in idx:
             continue
-        data.append(
-            {
-                "range": a1(idx, sheet_row_1_based),
-                "values": [[value]],
-            }
-        )
+        data.append({"range": _a1(idx[k] + 1, row_1_based), "values": [[v]]})
     if data:
         ws.batch_update(data)
 
 
 # ============================================================
-# NORMALISERS (LOCKED RENDER CONTRACT)
+# NORMALISERS (LOCKED PA PAYLOAD CONTRACT)
+# OUT/IN: ddmmyy
+# PRICE: £ integer (rounded up)
 # ============================================================
-
-_MONTHS = {
-    "jan": 1, "january": 1,
-    "feb": 2, "february": 2,
-    "mar": 3, "march": 3,
-    "apr": 4, "april": 4,
-    "may": 5,
-    "jun": 6, "june": 6,
-    "jul": 7, "july": 7,
-    "aug": 8, "august": 8,
-    "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10,
-    "nov": 11, "november": 11,
-    "dec": 12, "december": 12,
-}
-
-
-def _two_digit_year(year: int) -> int:
-    return year % 100
-
 
 def normalize_price_gbp(raw_price: str | None) -> str:
     if not raw_price:
@@ -206,8 +178,7 @@ def normalize_price_gbp(raw_price: str | None) -> str:
     if not m:
         return ""
     val = float(m.group(1))
-    val_int = int(math.ceil(val))
-    return f"£{val_int}"
+    return f"£{int(math.ceil(val))}"
 
 
 def normalize_date_ddmmyy(raw_date: str | None) -> str:
@@ -219,39 +190,36 @@ def normalize_date_ddmmyy(raw_date: str | None) -> str:
 
     if re.fullmatch(r"\d{6}", s):
         return s
+
     if re.fullmatch(r"\d{8}", s):
+        # ddmmyyyy or yyyymmdd ambiguity exists; we only handle ddmmyyyy by picking yy from end
         dd = s[0:2]
         mm = s[2:4]
         yy = s[6:8]
         return f"{dd}{mm}{yy}"
 
-    m = re.fullmatch(r"(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})", s)
-    if m:
-        y = int(m.group(1))
-        mo = int(m.group(2))
-        d = int(m.group(3))
-        return f"{d:02d}{mo:02d}{_two_digit_year(y):02d}"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        y, mo, d = s.split("-")
+        return f"{int(d):02d}{int(mo):02d}{int(y) % 100:02d}"
 
     m = re.fullmatch(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})", s)
     if m:
         d = int(m.group(1))
         mo = int(m.group(2))
         y = int(m.group(3))
-        return f"{d:02d}{mo:02d}{_two_digit_year(y):02d}"
+        return f"{d:02d}{mo:02d}{y % 100:02d}"
 
-    # If it's already ISO YYYY-MM-DD but failed above, try split
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        y, mo, d = s.split("-")
-        return f"{int(d):02d}{int(mo):02d}{_two_digit_year(int(y)):02d}"
+    m = re.fullmatch(r"(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})", s)
+    if m:
+        y = int(m.group(1))
+        mo = int(m.group(2))
+        d = int(m.group(3))
+        return f"{d:02d}{mo:02d}{y % 100:02d}"
 
     raise ValueError(f"Cannot normalize date to ddmmyy: {raw_date!r}")
 
 
-# ============================================================
-# RENDER PAYLOAD
-# ============================================================
-
-def build_render_payload(row: Dict[str, Any], dynamic_theme: str | None) -> Dict[str, Any]:
+def build_payload(row: Dict[str, str], dynamic_theme: str | None) -> Dict[str, str]:
     out_raw = row.get("outbound_date", "") or row.get("out_date", "")
     in_raw = row.get("return_date", "") or row.get("in_date", "")
     price_raw = row.get("price_gbp", "") or row.get("price", "")
@@ -283,153 +251,134 @@ def extract_graphic_url(resp_json: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# CORE: RENDER A SPECIFIC SHEET ROW
+# CORE: FIND CANDIDATES AND RENDER
 # ============================================================
 
-def render_sheet_row(sheet_row_1_based: int) -> bool:
-    gc = get_gspread_client()
-    sheet = gc.open_by_key(SPREADSHEET_ID)
-    raw_ws = sheet.worksheet(RAW_DEALS_TAB)
-    rdv_ws = sheet.worksheet(RAW_DEALS_VIEW_TAB)
+def find_candidates(ws_raw: gspread.Worksheet, headers: list[str], max_n: int) -> List[int]:
+    status_i = _col_index(headers, "status")
+    graphic_i = _col_index(headers, "graphic_url")
 
-    raw_headers = raw_ws.row_values(1)
-    raw_row = raw_ws.row_values(sheet_row_1_based)
-
-    print(f"Target sheet row: {sheet_row_1_based}")
-    print(f"Row has {len(raw_row)} values | Headers: {len(raw_headers)} columns")
-
-    if not raw_row or all(not str(v).strip() for v in raw_row):
-        print("⚠️ Row is empty - skipping")
-        return False
-
-    row_data = dict(zip(raw_headers, raw_row))
-
-    status = str(row_data.get("status") or "").strip()
-    if status != STATUS_READY_TO_POST:
-        print(f"⚠️ Skip row {sheet_row_1_based}: status={status!r} (needs {STATUS_READY_TO_POST!r})")
-        return False
-
-    # RDV dynamic_theme (AT=46) aligned by row number
-    dynamic_theme = rdv_ws.cell(sheet_row_1_based, RDV_DYNAMIC_THEME_COL).value
-    print(f"Dynamic theme from RDV col {RDV_DYNAMIC_THEME_COL}: {dynamic_theme}")
-
-    payload = build_render_payload(row_data, dynamic_theme)
-    print(f"Built payload: {payload}")
-
-    if not payload["TO"] or not payload["FROM"] or not payload["OUT"] or not payload["IN"]:
-        raise ValueError("Payload missing required fields (FROM/TO/OUT/IN)")
-
-    if not re.fullmatch(r"\d{6}", payload["OUT"]):
-        raise ValueError(f"OUT must be ddmmyy (6 digits). Got: {payload['OUT']!r}")
-    if not re.fullmatch(r"\d{6}", payload["IN"]):
-        raise ValueError(f"IN must be ddmmyy (6 digits). Got: {payload['IN']!r}")
-
-    # Call renderer
-    response = requests.post(RENDER_URL, json=payload, timeout=60)
-    if not response.ok:
-        raise RuntimeError(f"Render failed ({response.status_code}): {response.text}")
-
-    try:
-        resp_json = response.json()
-    except Exception:
-        raise RuntimeError(f"Render returned non-JSON: {response.text[:200]}")
-
-    graphic_url = extract_graphic_url(resp_json)
-    if not graphic_url:
-        raise RuntimeError("Render JSON missing graphic_url")
-
-    ts = utc_now_iso()
-
-    updates: Dict[str, str] = {
-        "graphic_url": graphic_url,
-        "rendered_timestamp": ts,
-        "rendered_at": ts,
-        "render_error": "",
-        "status": STATUS_READY_TO_PUBLISH,  # promote after successful asset creation
-    }
-
-    update_cells_by_header(raw_ws, raw_headers, sheet_row_1_based, updates)
-
-    print(f"✅ Render OK row {sheet_row_1_based} | status {STATUS_READY_TO_POST}→{STATUS_READY_TO_PUBLISH}")
-    return True
-
-
-# ============================================================
-# SELECT: FIND ELIGIBLE ROWS (READY_TO_POST, no graphic_url)
-# ============================================================
-
-def find_render_candidates(
-    raw_ws: gspread.Worksheet,
-    raw_headers: List[str],
-    max_n: int,
-) -> List[int]:
-    status_col = find_col_index(raw_headers, "status")
-    graphic_col = find_col_index(raw_headers, "graphic_url")
-
-    if not status_col:
+    if status_i is None:
         raise RuntimeError("RAW_DEALS missing required header: status")
+    if graphic_i is None:
+        raise RuntimeError("RAW_DEALS missing required header: graphic_url")
 
-    # Pull only needed columns (cheaper than full sheet)
-    status_vals = raw_ws.col_values(status_col)  # includes header
-    graphic_vals = raw_ws.col_values(graphic_col) if graphic_col else []
+    status_vals = ws_raw.col_values(status_i + 1)  # includes header
+    graphic_vals = ws_raw.col_values(graphic_i + 1)  # includes header
 
     candidates: List[int] = []
-    for r in range(2, len(status_vals) + 1):  # sheet rows start at 2 for data
-        st = str(status_vals[r - 1] or "").strip()
+    for sheet_row in range(2, len(status_vals) + 1):
+        st = (status_vals[sheet_row - 1] or "").strip()
         if st != STATUS_READY_TO_POST:
             continue
-
-        if graphic_col and r - 1 < len(graphic_vals):
-            gu = str(graphic_vals[r - 1] or "").strip()
-            if gu:
-                continue
-
-        candidates.append(r)
+        gu = (graphic_vals[sheet_row - 1] or "").strip()
+        if gu:
+            continue
+        candidates.append(sheet_row)
         if len(candidates) >= max_n:
             break
 
     return candidates
 
 
+def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int) -> bool:
+    ws_raw = sh.worksheet(RAW_DEALS_TAB)
+    ws_rdv = sh.worksheet(RAW_DEALS_VIEW_TAB)
+
+    headers = ws_raw.row_values(1)
+    values = ws_raw.row_values(sheet_row)
+    row = dict(zip(headers, values))
+
+    status = (row.get("status") or "").strip()
+    if status != STATUS_READY_TO_POST:
+        print(f"⚠️ Skip row {sheet_row}: status={status!r}")
+        return False
+
+    dynamic_theme = ws_rdv.cell(sheet_row, RDV_DYNAMIC_THEME_COL).value
+    payload = build_payload(row, dynamic_theme)
+
+    print(f"Target row {sheet_row} | dynamic_theme={dynamic_theme!r} | payload={payload}")
+
+    if not payload["FROM"] or not payload["TO"]:
+        raise ValueError("FROM/TO missing (origin_city/destination_city)")
+    if not re.fullmatch(r"\d{6}", payload["OUT"]):
+        raise ValueError(f"OUT must be ddmmyy (6 digits). Got {payload['OUT']!r}")
+    if not re.fullmatch(r"\d{6}", payload["IN"]):
+        raise ValueError(f"IN must be ddmmyy (6 digits). Got {payload['IN']!r}")
+    if not payload["PRICE"].startswith("£"):
+        raise ValueError(f"PRICE must be £<int>. Got {payload['PRICE']!r}")
+
+    try:
+        resp = requests.post(RENDER_URL, json=payload, timeout=60)
+        if not resp.ok:
+            raise RuntimeError(f"Render failed ({resp.status_code}): {resp.text}")
+
+        try:
+            resp_json = resp.json()
+        except Exception:
+            raise RuntimeError(f"Render returned non-JSON: {resp.text[:200]}")
+
+        graphic_url = extract_graphic_url(resp_json)
+        if not graphic_url:
+            raise RuntimeError("Render response missing graphic_url")
+
+        ts = _utc_now_iso()
+        _batch_update(
+            ws_raw,
+            headers,
+            sheet_row,
+            {
+                "graphic_url": graphic_url,
+                "rendered_timestamp": ts,
+                "rendered_at": ts,
+                "render_error": "",
+                "status": STATUS_READY_TO_PUBLISH,
+            },
+        )
+
+        print(f"✅ Render OK row {sheet_row}: status {STATUS_READY_TO_POST}→{STATUS_READY_TO_PUBLISH}")
+        return True
+
+    except Exception as e:
+        ts = _utc_now_iso()
+        _batch_update(
+            ws_raw,
+            headers,
+            sheet_row,
+            {
+                "render_error": f"{type(e).__name__}: {e}",
+                "rendered_timestamp": ts,
+                "rendered_at": ts,
+            },
+        )
+        raise
+
+
 def main() -> int:
-    gc = get_gspread_client()
-    sheet = gc.open_by_key(SPREADSHEET_ID)
-    raw_ws = sheet.worksheet(RAW_DEALS_TAB)
+    if not SPREADSHEET_ID:
+        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
+    if not RENDER_URL:
+        raise RuntimeError("Missing RENDER_URL")
 
-    raw_headers = raw_ws.row_values(1)
+    gc = gspread.authorize(_sa_creds())
+    sh = gc.open_by_key(SPREADSHEET_ID)
 
-    candidates = find_render_candidates(raw_ws, raw_headers, max_n=RENDER_MAX_PER_RUN)
+    ws_raw = sh.worksheet(RAW_DEALS_TAB)
+    headers = ws_raw.row_values(1)
 
+    candidates = find_candidates(ws_raw, headers, max_n=RENDER_MAX_PER_RUN)
     if not candidates:
-        print(f"ℹ️ No candidates found with status={STATUS_READY_TO_POST} and blank graphic_url")
+        print(f"ℹ️ No render candidates (status={STATUS_READY_TO_POST}, graphic_url blank)")
         return 0
 
     print(f"🎯 Render candidates (sheet rows): {candidates}")
 
-    ok_count = 0
+    ok = 0
     for sheet_row in candidates:
-        try:
-            if render_sheet_row(sheet_row):
-                ok_count += 1
-        except Exception as e:
-            # Write render_error on the row (best effort) and continue
-            try:
-                ts = utc_now_iso()
-                update_cells_by_header(
-                    raw_ws,
-                    raw_headers,
-                    sheet_row,
-                    {
-                        "render_error": f"{type(e).__name__}: {e}",
-                        "rendered_timestamp": ts,
-                        "rendered_at": ts,
-                    },
-                )
-            except Exception:
-                pass
-            raise
+        if render_sheet_row(sh, sheet_row):
+            ok += 1
 
-    print(f"✅ Render complete. Success count: {ok_count}/{len(candidates)}")
+    print(f"✅ Render complete: {ok}/{len(candidates)}")
     return 0
 
 

@@ -365,6 +365,7 @@ def main() -> int:
     RCM_TAB = _env("RCM_TAB", "ROUTE_CAPABILITY_MAP")
     IATA_TAB = _env("IATA_TAB", "IATA_MASTER")
     CONFIG_CARRIER_BIAS_TAB = _env("CONFIG_CARRIER_BIAS_TAB", "CONFIG_CARRIER_BIAS")
+    OPS_MASTER_TAB = _env("OPS_MASTER_TAB", "OPS_MASTER")
 
     RUN_SLOT = _slot_norm(_env("RUN_SLOT", ""))
     if RUN_SLOT == "":
@@ -401,6 +402,13 @@ def main() -> int:
     ws_rcm = sh.worksheet(RCM_TAB)
     ws_iata = sh.worksheet(IATA_TAB)
 
+    # Load OPS_MASTER to get theme of the day
+    try:
+        ws_ops = sh.worksheet(OPS_MASTER_TAB)
+    except Exception:
+        ws_ops = None
+        log("⚠️ OPS_MASTER worksheet not found - will use calculated theme")
+
     # Carrier bias: loaded + logged (not required for this change)
     bias_rows: List[Dict[str, Any]] = []
     try:
@@ -425,7 +433,22 @@ def main() -> int:
 
     ztb_rows_all = ws_ztb.get_all_records()
     eligible_themes = _eligible_themes_from_ztb(ztb_rows_all)
-    theme_today = _theme_of_day(eligible_themes)
+
+    # Read theme from OPS_MASTER cell B5
+    theme_today = None
+    if ws_ops:
+        try:
+            theme_from_sheet = ws_ops.acell('B5').value
+            if theme_from_sheet and str(theme_from_sheet).strip():
+                theme_today = str(theme_from_sheet).strip()
+                log(f"✅ Theme read from OPS_MASTER!B5: {theme_today}")
+        except Exception as e:
+            log(f"⚠️ Could not read OPS_MASTER!B5: {e}")
+
+    # Fallback to calculated theme if B5 is empty or error
+    if not theme_today:
+        theme_today = _theme_of_day(eligible_themes)
+        log(f"ℹ️ Using calculated theme (B5 was empty or errored): {theme_today}")
 
     log(f"✅ ZTB loaded: {len(ztb_rows_all)} rows | eligible_today={len(eligible_themes)} | pool={eligible_themes}")
     log(f"🎯 Theme of the day (UTC): {theme_today}")

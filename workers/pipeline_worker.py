@@ -1,31 +1,19 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8f
+# FULL FILE REPLACEMENT — FEEDER v4.8f+enrich
 #
-# CHANGE REQUEST (YOU):
-# - Feeder must use a deterministic 90/10 split on EACH search attempt:
-#     * 90% searches use CONFIG rows matching RUN_SLOT (AM or PM)
-#     * 10% searches deliberately sample the opposite slot's CONFIG rows
-#   This makes the feeder "look beyond" without increasing scan volume.
+# Adds: feeder-side enrichment from selected Duffel offer:
+#   - connection_type, via_hub, carriers, currency
+#   - outbound/inbound durations, total_duration_hours
+#   - bags_incl (best-effort)
+#   - trip_length_days
+#   - created_utc/timestamp mirrors (if columns exist)
 #
-# LOCKED RULE (YOU):
-# - ALL shorthaul must be DIRECT.
-#   Shorthaul is defined as CONFIG.is_long_haul != TRUE.
-#   Therefore:
-#     - For shorthaul rows we force max_connections=0 on Duffel request
-#     - We derive actual stops from the selected offer (segments-1)
-#     - If shorthaul and stops != 0, we skip inserting that deal
-#
-# Notes:
-# - No redesign of the pipeline
-# - RAW_DEALS remains sole writable state
+# Preserves LOCKED rules:
+# - No redesign of pipeline
+# - RAW_DEALS is sole writable state
 # - RDV is never written
-# - Slot logic is driven by:
-#     * RUN_SLOT env (AM/PM)
-#     * CONFIG.slot_hint (AM/PM)
-#   If CONFIG has no slot_hint populated, we fall back gracefully.
-#
-# Output improvements:
-# - Logs show which slot stream each search was drawn from (primary vs exploration)
+# - 90/10 slot split per search attempt
+# - Shorthaul must be direct (max_conn forced 0 + offer stops check)
 
 from __future__ import annotations
 
@@ -35,7 +23,8 @@ import json
 import hashlib
 import datetime as dt
 import math
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
 import gspread
@@ -182,6 +171,40 @@ HEADERS = {
 }
 
 
+def _get_gspread_client() -> gspread.Client:
+    sa_json = _env("GCP_SA_JSON_ONE_LINE") or _env("GCP_SA_JSON")
+    if not sa_json:
+        raise RuntimeError("Missing GCP_SA_JSON or GCP_SA_JSON_ONE_LINE")
+    try:
+        creds_info = json.loads(sa_json)
+    except Exception:
+        creds_info = json.loads(sa_json.replace("\\n", "\n"))
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def _build_header_index(headers: List[str]) -> Dict[str, int]:
+    idx: Dict[str, int] = {}
+    for i, h in enumerate(headers):
+        hh = str(h or "").strip()
+        if hh:
+            idx[hh] = i
+    return idx
+
+
+def _append_rows(ws: gspread.Worksheet, rows: List[List[Any]]) -> None:
+    if rows:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+
+def _slot_norm(s: str) -> str:
+    x = str(s or "").strip().upper()
+    if x in ("AM", "PM"):
+        return x
+    return ""
+
+
 def _duffel_search(
     origin: str,
     destination: str,
@@ -236,12 +259,142 @@ def _offer_stops(offer: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-def _best_offer_gbp(offers_json: Dict[str, Any]) -> Optional[Tuple[float, int]]:
+def _iata_from_location(loc: Any) -> str:
+    if isinstance(loc, dict):
+        for k in ("iata_code", "iata", "code"):
+            v = loc.get(k)
+            if v:
+                return str(v).strip().upper()
+    if isinstance(loc, str):
+        return loc.strip().upper()
+    return ""
+
+
+def _parse_iso_dt(s: str) -> Optional[dt.datetime]:
+    try:
+        if not s:
+            return None
+        ss = str(s).strip()
+        if ss.endswith("Z"):
+            ss = ss.replace("Z", "+00:00")
+        x = dt.datetime.fromisoformat(ss)
+        if x.tzinfo is None:
+            # Duffel usually has timezone offsets; fallback to UTC if missing
+            x = x.replace(tzinfo=dt.timezone.utc)
+        return x
+    except Exception:
+        return None
+
+
+def _duration_minutes_from_segments(segs: List[Dict[str, Any]]) -> Optional[int]:
+    # Prefer timestamps if present
+    if not segs:
+        return None
+    dep = _parse_iso_dt(str(segs[0].get("departing_at") or ""))
+    arr = _parse_iso_dt(str(segs[-1].get("arriving_at") or ""))
+    if dep and arr:
+        mins = int(round((arr - dep).total_seconds() / 60.0))
+        if mins > 0:
+            return mins
+    return None
+
+
+def _duration_minutes_from_iso8601(dur: Any) -> Optional[int]:
+    # Handles strings like "PT2H35M" (common)
+    if not dur:
+        return None
+    s = str(dur).strip().upper()
+    if not s.startswith("PT"):
+        return None
+    h = 0
+    m = 0
+    mh = re.search(r"(\d+)H", s)
+    mm = re.search(r"(\d+)M", s)
+    if mh:
+        h = int(mh.group(1))
+    if mm:
+        m = int(mm.group(1))
+    total = h * 60 + m
+    return total if total > 0 else None
+
+
+def _slice_enrichment(slice_obj: Dict[str, Any]) -> Tuple[int, str, Set[str]]:
+    """
+    Returns:
+      stops (int),
+      via_hub (str - first hub iata if any),
+      carriers (set of carrier iata codes across segments)
+    """
+    segs = slice_obj.get("segments") or []
+    stops = max(0, len(segs) - 1)
+
+    via = ""
+    if stops >= 1 and len(segs) >= 2:
+        # Hub = destination of first segment (where you connect)
+        first_dest = segs[0].get("destination") or {}
+        via = _iata_from_location(first_dest)
+
+    carriers: Set[str] = set()
+    for seg in segs:
+        op = seg.get("operating_carrier") or seg.get("marketing_carrier") or seg.get("carrier") or {}
+        code = ""
+        if isinstance(op, dict):
+            code = str(op.get("iata_code") or op.get("iata") or op.get("code") or "").strip().upper()
+        elif isinstance(op, str):
+            code = op.strip().upper()
+        if code:
+            carriers.add(code)
+
+    return stops, via, carriers
+
+
+def _bags_incl_best_effort(offer: Dict[str, Any]) -> str:
+    """
+    Duffel's baggage structure can vary by offer version.
+    We do best-effort extraction and otherwise return "".
+    """
+    try:
+        # Common: offer["passengers"][0]["baggages"] list
+        pax = offer.get("passengers") or []
+        if pax and isinstance(pax[0], dict):
+            bags = pax[0].get("baggages")
+            if isinstance(bags, list) and bags:
+                # Try to summarize: count checked/cabin if possible
+                types = []
+                for b in bags:
+                    if isinstance(b, dict):
+                        bt = str(b.get("type") or b.get("category") or "").strip().lower()
+                        if bt:
+                            types.append(bt)
+                if types:
+                    # e.g. "cabin,checked"
+                    return ",".join(sorted(set(types)))
+                return "included"
+        # Some offers include services in "available_services"
+        av = offer.get("available_services")
+        if isinstance(av, list) and av:
+            # If any looks like baggage, mark "maybe"
+            for s in av:
+                if isinstance(s, dict):
+                    name = str(s.get("type") or s.get("name") or "").lower()
+                    if "bag" in name or "baggage" in name:
+                        return "available"
+    except Exception:
+        pass
+    return ""
+
+
+def _best_offer_gbp_with_meta(offers_json: Dict[str, Any]) -> Optional[Tuple[float, int, Dict[str, Any]]]:
+    """
+    Returns: (best_price_gbp, stops, offer_object)
+    Best = lowest price; tie-break = fewer stops.
+    """
     try:
         offers = offers_json.get("data", {}).get("offers") or []
         if not offers:
             return None
 
+        best_offer: Optional[Dict[str, Any]] = None
         best_price: Optional[float] = None
         best_stops: int = 99
 
@@ -260,11 +413,12 @@ def _best_offer_gbp(offers_json: Dict[str, Any]) -> Optional[Tuple[float, int]]:
             if best_price is None or price < best_price or (price == best_price and stops_i < best_stops):
                 best_price = price
                 best_stops = stops_i
+                best_offer = o
 
-        if best_price is None:
+        if best_price is None or best_offer is None:
             return None
 
-        return (best_price, best_stops)
+        return (best_price, best_stops, best_offer)
     except Exception:
         return None
 
@@ -311,40 +465,6 @@ def _candidate_outbounds_seasonal(
     return out[:n]
 
 
-def _get_gspread_client() -> gspread.Client:
-    sa_json = _env("GCP_SA_JSON_ONE_LINE") or _env("GCP_SA_JSON")
-    if not sa_json:
-        raise RuntimeError("Missing GCP_SA_JSON or GCP_SA_JSON_ONE_LINE")
-    try:
-        creds_info = json.loads(sa_json)
-    except Exception:
-        creds_info = json.loads(sa_json.replace("\\n", "\n"))
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    return gspread.authorize(creds)
-
-
-def _build_header_index(headers: List[str]) -> Dict[str, int]:
-    idx: Dict[str, int] = {}
-    for i, h in enumerate(headers):
-        hh = str(h or "").strip()
-        if hh:
-            idx[hh] = i
-    return idx
-
-
-def _append_rows(ws: gspread.Worksheet, rows: List[List[Any]]) -> None:
-    if rows:
-        ws.append_rows(rows, value_input_option="USER_ENTERED")
-
-
-def _slot_norm(s: str) -> str:
-    x = str(s or "").strip().upper()
-    if x in ("AM", "PM"):
-        return x
-    return ""
-
-
 def main() -> int:
     log("================================================================================")
     log("TRAVELTXTTER PIPELINE WORKER (FEEDER) START")
@@ -378,7 +498,6 @@ def main() -> int:
     DESTS_PER_RUN = _env_int("DUFFEL_ROUTES_PER_RUN", 4)
     ORIGINS_PER_DEST = _env_int("ORIGINS_PER_DEST", 3)
 
-    # 90/10 control (search-level), default 9/1
     SLOT_PRIMARY_PCT = _env_int("SLOT_PRIMARY_PCT", 90)
 
     log(
@@ -438,14 +557,13 @@ def main() -> int:
     theme_today = None
     if ws_ops:
         try:
-            theme_from_sheet = ws_ops.acell('B5').value
+            theme_from_sheet = ws_ops.acell("B5").value
             if theme_from_sheet and str(theme_from_sheet).strip():
                 theme_today = str(theme_from_sheet).strip()
                 log(f"✅ Theme read from OPS_MASTER!B5: {theme_today}")
         except Exception as e:
             log(f"⚠️ Could not read OPS_MASTER!B5: {e}")
 
-    # Fallback to calculated theme if B5 is empty or error
     if not theme_today:
         theme_today = _theme_of_day(eligible_themes)
         log(f"ℹ️ Using calculated theme (B5 was empty or errored): {theme_today}")
@@ -462,75 +580,18 @@ def main() -> int:
     cfg_active = [r for r in cfg_all if _is_true(r.get("active_in_feeder")) and _is_true(r.get("enabled"))]
     log(f"✅ CONFIG loaded: {len(cfg_active)} active rows (of {len(cfg_all)} total)")
 
-    def cfg_theme(r: Dict[str, Any]) -> str:
-        return (str(r.get("primary_theme") or "").strip() or str(r.get("audience_type") or "").strip()).strip()
+    # Capability map + IATA geo
+    rcm_rows = ws_rcm.get_all_records()
+    enabled_routes: Set[Tuple[str, str]] = set()
+    for r in rcm_rows:
+        o = str(r.get("origin_iata") or r.get("origin") or "").strip().upper()
+        d = str(r.get("destination_iata") or r.get("destination") or "").strip().upper()
+        enabled = _is_true(r.get("enabled"))
+        if o and d and enabled:
+            enabled_routes.add((o, d))
+    log(f"✅ ROUTE_CAPABILITY_MAP loaded: {len(enabled_routes)} enabled routes")
 
-    def cfg_slot(r: Dict[str, Any]) -> str:
-        return _slot_norm(r.get("slot_hint"))
-
-    def is_longhaul(r: Dict[str, Any]) -> bool:
-        return str(r.get("is_long_haul") or "").strip().upper() == "TRUE"
-
-    theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
-    if not theme_rows_all:
-        fallback = "unexpected_value"
-        log(f"⚠️ No CONFIG rows for theme={theme_today}. Falling back to {fallback}")
-        theme_today = fallback
-        ztb_today = _ztb_row_for_theme(ztb_rows_all, theme_today) or {"connection_tolerance": "any"}
-        ztb_start = _safe_int(ztb_today.get("start_mmdd"), 101)
-        ztb_end = _safe_int(ztb_today.get("end_mmdd"), 1231)
-        ztb_max_conn = _connections_from_tolerance(str(ztb_today.get("connection_tolerance") or "any"))
-        theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
-
-    # Split rows by slot
-    rows_primary = [r for r in theme_rows_all if cfg_slot(r) == RUN_SLOT]
-    opp = "PM" if RUN_SLOT == "AM" else "AM"
-    rows_explore = [r for r in theme_rows_all if cfg_slot(r) == opp]
-
-    # If slot_hint isn't populated for theme, treat all as primary
-    if not rows_primary and not rows_explore:
-        rows_primary = theme_rows_all[:]
-        rows_explore = []
-
-    # Sort by priority for stable sampling
-    def sort_key(r: Dict[str, Any]) -> Tuple[float, float, float]:
-        return (
-            _safe_float(r.get("priority"), 0),
-            _safe_float(r.get("search_weight"), 0),
-            _safe_float(r.get("content_priority"), 0),
-        )
-
-    rows_primary.sort(key=sort_key, reverse=True)
-    rows_explore.sort(key=sort_key, reverse=True)
-
-    # Build a deterministic per-search plan (90/10) — choice is made PER SEARCH ATTEMPT
-    # We do not increase MAX_SEARCHES; we just decide which config stream each attempt uses.
-    primary_period = max(1, min(99, SLOT_PRIMARY_PCT))
-    explore_period = 100 - primary_period
-
-    # Deterministic sequence: every 10th attempt (when 90/10) becomes exploration.
-    # Generalized: exploration happens when (attempt_index % 100) >= primary_period.
-    log(
-        f"🧩 Slot pools: primary({RUN_SLOT})={len(rows_primary)} | explore({opp})={len(rows_explore)} | "
-        f"theme_rows_total={len(theme_rows_all)}"
-    )
-
-    # Geo dictionary from RCM + IATA_MASTER
-    rcm_all = ws_rcm.get_all_records()
     iata_geo: Dict[str, Tuple[str, str]] = {}
-
-    for r in rcm_all:
-        o = str(r.get("origin_iata") or "").strip().upper()
-        oc = str(r.get("origin_city") or "").strip()
-        ok = str(r.get("origin_country") or "").strip()
-        d = str(r.get("destination_iata") or "").strip().upper()
-        dc = str(r.get("destination_city") or "").strip()
-        dk = str(r.get("destination_country") or "").strip()
-        if o and oc and ok and o not in iata_geo:
-            iata_geo[o] = (oc, ok)
-        if d and dc and dk and d not in iata_geo:
-            iata_geo[d] = (dc, dk)
-
     for r in ws_iata.get_all_records():
         code = str(
             r.get("iata_code")
@@ -543,7 +604,6 @@ def main() -> int:
         country = str(r.get("country") or r.get("Country") or "").strip()
         if code and city and country and code not in iata_geo:
             iata_geo[code] = (city, country)
-
     log(f"✅ Geo dictionary loaded: {len(iata_geo)} IATA entries (RCM + {IATA_TAB})")
 
     origins_default = _csv_list(_env("ORIGINS_DEFAULT", "LHR,LGW,MAN,BRS,STN,LTN,BHX,EDI,GLA"))
@@ -575,6 +635,15 @@ def main() -> int:
             return []
         return _csv_list(raw)
 
+    def cfg_theme(r: Dict[str, Any]) -> str:
+        return (str(r.get("primary_theme") or "").strip() or str(r.get("audience_type") or "").strip()).strip()
+
+    def cfg_slot(r: Dict[str, Any]) -> str:
+        return _slot_norm(r.get("slot_hint"))
+
+    def is_longhaul(r: Dict[str, Any]) -> bool:
+        return str(r.get("is_long_haul") or "").strip().upper() == "TRUE"
+
     def choose_origins_for_dest(cfg_row: Dict[str, Any], dest: str, cap: int) -> List[str]:
         is_long_local = is_longhaul(cfg_row)
         gw = str(cfg_row.get("gateway_type") or "").strip().lower()
@@ -595,22 +664,50 @@ def main() -> int:
             ranked = ranked[rot:] + ranked[:rot]
         return ranked[:cap]
 
+    theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
+    if not theme_rows_all:
+        fallback = "unexpected_value"
+        log(f"⚠️ No CONFIG rows for theme={theme_today}. Falling back to {fallback}")
+        theme_today = fallback
+        ztb_today = _ztb_row_for_theme(ztb_rows_all, theme_today) or {"connection_tolerance": "any"}
+        ztb_start = _safe_int(ztb_today.get("start_mmdd"), 101)
+        ztb_end = _safe_int(ztb_today.get("end_mmdd"), 1231)
+        ztb_max_conn = _connections_from_tolerance(str(ztb_today.get("connection_tolerance") or "any"))
+        theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
+
+    rows_primary = [r for r in theme_rows_all if cfg_slot(r) == RUN_SLOT]
+    opp = "PM" if RUN_SLOT == "AM" else "AM"
+    rows_explore = [r for r in theme_rows_all if cfg_slot(r) == opp]
+
+    if not rows_primary and not rows_explore:
+        rows_primary = theme_rows_all[:]
+        rows_explore = []
+
+    def sort_key(r: Dict[str, Any]) -> Tuple[float, float, float]:
+        return (
+            _safe_float(r.get("priority"), 0),
+            _safe_float(r.get("search_weight"), 0),
+            _safe_float(r.get("content_priority"), 0),
+        )
+
+    rows_primary.sort(key=sort_key, reverse=True)
+    rows_explore.sort(key=sort_key, reverse=True)
+
+    # 90/10 per attempt (primary vs explore)
+    primary_period = max(1, min(100, SLOT_PRIMARY_PCT))
+    explore_period = 100 - primary_period
+
     searches = 0
 
-    # Deterministically rotate within each pool by attempt index
     def pick_cfg_from_pool(pool: List[Dict[str, Any]], attempt_idx: int) -> Optional[Dict[str, Any]]:
         if not pool:
             return None
         return pool[attempt_idx % len(pool)]
 
-    # Optionally cap how many unique destinations we attempt (DESTS_PER_RUN),
-    # but we now select config rows PER SEARCH, not just once per run.
-    # We keep a small guard so we don't hammer the same destination endlessly.
     dest_seen: Dict[str, int] = {}
 
     while searches < DUFFEL_MAX_SEARCHES_PER_RUN and len(deals_out) < DUFFEL_MAX_INSERTS:
-        attempt = searches  # 0-based
-        mode = "PRIMARY"
+        attempt = searches
         use_explore = False
 
         if explore_period > 0:
@@ -626,7 +723,6 @@ def main() -> int:
             mode = f"PRIMARY({RUN_SLOT})"
 
         if cfg_pick is None:
-            # fallback to whatever exists
             cfg_pick = pick_cfg_from_pool(theme_rows_all, attempt)
             mode = "FALLBACK(ALL)"
 
@@ -639,7 +735,6 @@ def main() -> int:
             searches += 1
             continue
 
-        # light anti-stutter (does not change caps, just avoids repeating the same dest every attempt)
         dest_seen[dest] = dest_seen.get(dest, 0) + 1
         if dest_seen[dest] > max(1, DESTS_PER_RUN):
             searches += 1
@@ -671,7 +766,6 @@ def main() -> int:
         included_airlines = carriers_from_cfg(cfg_pick)
         origins = choose_origins_for_dest(cfg_pick, dest, ORIGINS_PER_DEST)
 
-        # Make exactly one origin+date attempt per search tick (keeps "each search" semantics)
         origin = origins[0] if origins else ""
         od = out_dates[0] if out_dates else None
         if not origin or od is None or not geo_for(origin):
@@ -682,24 +776,64 @@ def main() -> int:
             searches += 1
             continue
 
+        # Capability gate
+        if enabled_routes and (origin, dest) not in enabled_routes:
+            searches += 1
+            continue
+
         rd = od + dt.timedelta(days=trip_len)
 
-        log(f"🔎 Search[{attempt+1}/{DUFFEL_MAX_SEARCHES_PER_RUN}] mode={mode} dest={dest} origin={origin} "
-            f"haul={'LONG' if is_long else 'SHORT'} max_conn={max_conn} slot_hint={cfg_slot(cfg_pick) or '—'}")
+        log(
+            f"🔎 Search[{attempt+1}/{DUFFEL_MAX_SEARCHES_PER_RUN}] mode={mode} dest={dest} origin={origin} "
+            f"haul={'LONG' if is_long else 'SHORT'} max_conn={max_conn} slot_hint={cfg_slot(cfg_pick) or '—'}"
+        )
 
         resp = _duffel_search(origin, dest, od, rd, max_conn, cabin, included_airlines)
         searches += 1
         if not resp:
             continue
 
-        best = _best_offer_gbp(resp)
+        best = _best_offer_gbp_with_meta(resp)
         if best is None:
             continue
-        price, offer_stops = best
+
+        price, offer_stops, offer_obj = best
 
         # Hard rule: shorthaul must be direct (truth derived from offer)
         if (not is_long) and int(offer_stops) != 0:
             continue
+
+        # Enrichment from offer object
+        slices = offer_obj.get("slices") or []
+        out_slice = slices[0] if len(slices) >= 1 else {}
+        in_slice = slices[1] if len(slices) >= 2 else {}
+
+        out_stops, out_via, out_carriers = _slice_enrichment(out_slice) if isinstance(out_slice, dict) else (int(offer_stops), "", set())
+        in_stops, in_via, in_carriers = _slice_enrichment(in_slice) if isinstance(in_slice, dict) else (int(offer_stops), "", set())
+
+        # Use overall stops as max across slices (matches previous logic)
+        stops_final = int(max(int(out_stops), int(in_stops), int(offer_stops)))
+
+        carriers_all = sorted(set(out_carriers) | set(in_carriers))
+        carriers_str = ",".join(carriers_all)
+
+        connection_type = "direct" if stops_final == 0 else f"{stops_final}_stop" if stops_final == 1 else f"{stops_final}_stops"
+        via_hub = out_via or ""  # outbound hub only (primary for messaging)
+
+        out_mins = None
+        in_mins = None
+
+        # Prefer slice "duration" (often ISO8601). Fallback to segment timestamps.
+        if isinstance(out_slice, dict):
+            out_mins = _duration_minutes_from_iso8601(out_slice.get("duration")) or _duration_minutes_from_segments(out_slice.get("segments") or [])
+        if isinstance(in_slice, dict):
+            in_mins = _duration_minutes_from_iso8601(in_slice.get("duration")) or _duration_minutes_from_segments(in_slice.get("segments") or [])
+
+        total_hours = ""
+        if out_mins is not None and in_mins is not None:
+            total_hours = str(round((out_mins + in_mins) / 60.0, 1))
+
+        bags_incl = _bags_incl_best_effort(offer_obj)
 
         row = [""] * len(headers)
 
@@ -711,7 +845,9 @@ def main() -> int:
         oc, ok = geo_for(origin) or ("", "")
         dc, dk = geo_for(dest) or ("", "")
 
-        did = _deal_id(origin, dest, od, rd, float(price), cabin, int(offer_stops))
+        did = _deal_id(origin, dest, od, rd, float(price), cabin, int(stops_final))
+
+        ingest_iso = dt.datetime.utcnow().isoformat() + "Z"
 
         set_if("status", "NEW")
         set_if("deal_id", did)
@@ -727,16 +863,35 @@ def main() -> int:
         set_if("return_date", rd.isoformat())
         set_if("price_gbp", float(price))
 
-        set_if("stops", int(offer_stops))
+        # Core enrichment
+        set_if("stops", int(stops_final))
+        set_if("connection_type", connection_type)
+        set_if("via_hub", via_hub)
+        set_if("carriers", carriers_str)
+        set_if("currency", "GBP")
+        set_if("bags_incl", bags_incl)
+        set_if("trip_length_days", int(trip_len))
+        if out_mins is not None:
+            set_if("outbound_duration_minutes", int(out_mins))
+        if in_mins is not None:
+            set_if("inbound_duration_minutes", int(in_mins))
+        if total_hours != "":
+            set_if("total_duration_hours", total_hours)
 
+        # Existing fields preserved
         set_if("theme", theme_today)
         set_if("primary_theme", cfg_theme(cfg_pick))
-        set_if("ingested_at_utc", dt.datetime.utcnow().isoformat() + "Z")
+        set_if("ingested_at_utc", ingest_iso)
         set_if("source", "duffel")
         set_if("max_connections", int(max_conn))
         set_if("cabin_class", cabin)
         set_if("included_airlines", ",".join(included_airlines) if included_airlines else "")
         set_if("slot_hint", cfg_slot(cfg_pick))
+
+        # Compatibility mirrors (only if columns exist)
+        set_if("created_utc", ingest_iso)
+        set_if("created_at", ingest_iso)
+        set_if("timestamp", ingest_iso)
 
         deals_out.append(row)
         inserted_by_origin[origin] = inserted_by_origin.get(origin, 0) + 1

@@ -5,7 +5,7 @@ import re
 import json
 import math
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 import requests
 import gspread
@@ -28,9 +28,14 @@ GOOGLE_SCOPE = [
 
 SERVICE_ACCOUNT_JSON = os.environ["GCP_SA_JSON_ONE_LINE"]
 
-# Status transition (strict)
 STATUS_READY_TO_POST = os.getenv("STATUS_READY_TO_POST", "READY_TO_POST")
 STATUS_READY_TO_PUBLISH = os.getenv("STATUS_READY_TO_PUBLISH", "READY_TO_PUBLISH")
+
+# How many rows to render per run (default 1 to keep it safe)
+RENDER_MAX_PER_RUN = int(os.getenv("RENDER_MAX_PER_RUN", "1"))
+
+# RDV locked column index for dynamic_theme (AT = 46)
+RDV_DYNAMIC_THEME_COL = int(os.getenv("RDV_DYNAMIC_THEME_COL", "46"))
 
 
 # ============================================================
@@ -126,7 +131,7 @@ def get_gspread_client():
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat() + "Z"
 
 
 def find_col_index(headers: list[str], col_name: str) -> Optional[int]:
@@ -163,17 +168,12 @@ def update_cells_by_header(
                 "values": [[value]],
             }
         )
-
-    if not data:
-        return
-
-    ws.batch_update(data)
+    if data:
+        ws.batch_update(data)
 
 
 # ============================================================
 # NORMALISERS (LOCKED RENDER CONTRACT)
-#   OUT/IN: ddmmyy (6 digits)
-#   PRICE: £<integer> (rounded up)
 # ============================================================
 
 _MONTHS = {
@@ -196,24 +196,15 @@ def _two_digit_year(year: int) -> int:
     return year % 100
 
 
-def _safe_int(s: str) -> Optional[int]:
-    try:
-        return int(s)
-    except Exception:
-        return None
-
-
 def normalize_price_gbp(raw_price: str | None) -> str:
     if not raw_price:
         return ""
     s = str(raw_price).strip()
     if not s:
         return ""
-
     m = re.search(r"(\d+(?:\.\d+)?)", s.replace(",", ""))
     if not m:
         return ""
-
     val = float(m.group(1))
     val_int = int(math.ceil(val))
     return f"£{val_int}"
@@ -228,26 +219,11 @@ def normalize_date_ddmmyy(raw_date: str | None) -> str:
 
     if re.fullmatch(r"\d{6}", s):
         return s
-
     if re.fullmatch(r"\d{8}", s):
         dd = s[0:2]
         mm = s[2:4]
         yy = s[6:8]
         return f"{dd}{mm}{yy}"
-
-    m = re.fullmatch(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})", s)
-    if m:
-        d = int(m.group(1))
-        mo = int(m.group(2))
-        y = int(m.group(3))
-        return f"{d:02d}{mo:02d}{y:02d}"
-
-    m = re.fullmatch(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})", s)
-    if m:
-        d = int(m.group(1))
-        mo = int(m.group(2))
-        y = int(m.group(3))
-        return f"{d:02d}{mo:02d}{_two_digit_year(y):02d}"
 
     m = re.fullmatch(r"(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})", s)
     if m:
@@ -256,49 +232,17 @@ def normalize_date_ddmmyy(raw_date: str | None) -> str:
         d = int(m.group(3))
         return f"{d:02d}{mo:02d}{_two_digit_year(y):02d}"
 
-    tokens = re.split(r"\s+", re.sub(r"[,\.\-]+", " ", s).strip())
-    tokens_l = [t.lower() for t in tokens if t.strip()]
+    m = re.fullmatch(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})", s)
+    if m:
+        d = int(m.group(1))
+        mo = int(m.group(2))
+        y = int(m.group(3))
+        return f"{d:02d}{mo:02d}{_two_digit_year(y):02d}"
 
-    now = datetime.now(timezone.utc)
-    current_year = now.year
-
-    def infer_year(d: int, mo: int) -> int:
-        try:
-            candidate = datetime(current_year, mo, d, tzinfo=timezone.utc)
-        except Exception:
-            return current_year
-        delta_days = (candidate - now).days
-        if delta_days < -180:
-            return current_year + 1
-        return current_year
-
-    if len(tokens_l) in (2, 3) and tokens_l[0] in _MONTHS:
-        mo = _MONTHS[tokens_l[0]]
-        d = _safe_int(tokens_l[1])
-        if d is None:
-            raise ValueError(f"Cannot parse date (day): {raw_date}")
-        if len(tokens_l) == 3:
-            y = _safe_int(tokens_l[2])
-            if y is None:
-                raise ValueError(f"Cannot parse date (year): {raw_date}")
-            yy = y if y < 100 else _two_digit_year(y)
-            return f"{d:02d}{mo:02d}{yy:02d}"
-        y_full = infer_year(d, mo)
-        return f"{d:02d}{mo:02d}{_two_digit_year(y_full):02d}"
-
-    if len(tokens_l) in (2, 3) and tokens_l[1] in _MONTHS:
-        d = _safe_int(tokens_l[0])
-        if d is None:
-            raise ValueError(f"Cannot parse date (day): {raw_date}")
-        mo = _MONTHS[tokens_l[1]]
-        if len(tokens_l) == 3:
-            y = _safe_int(tokens_l[2])
-            if y is None:
-                raise ValueError(f"Cannot parse date (year): {raw_date}")
-            yy = y if y < 100 else _two_digit_year(y)
-            return f"{d:02d}{mo:02d}{yy:02d}"
-        y_full = infer_year(d, mo)
-        return f"{d:02d}{mo:02d}{_two_digit_year(y_full):02d}"
+    # If it's already ISO YYYY-MM-DD but failed above, try split
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        y, mo, d = s.split("-")
+        return f"{int(d):02d}{int(mo):02d}{_two_digit_year(int(y)):02d}"
 
     raise ValueError(f"Cannot normalize date to ddmmyy: {raw_date!r}")
 
@@ -307,10 +251,7 @@ def normalize_date_ddmmyy(raw_date: str | None) -> str:
 # RENDER PAYLOAD
 # ============================================================
 
-def build_render_payload(
-    row: Dict[str, Any],
-    dynamic_theme: str | None,
-) -> Dict[str, Any]:
+def build_render_payload(row: Dict[str, Any], dynamic_theme: str | None) -> Dict[str, Any]:
     out_raw = row.get("outbound_date", "") or row.get("out_date", "")
     in_raw = row.get("return_date", "") or row.get("in_date", "")
     price_raw = row.get("price_gbp", "") or row.get("price", "")
@@ -342,107 +283,155 @@ def extract_graphic_url(resp_json: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# MAIN RENDER FUNCTION
+# CORE: RENDER A SPECIFIC SHEET ROW
 # ============================================================
 
-def render_row(row_index: int) -> bool:
+def render_sheet_row(sheet_row_1_based: int) -> bool:
     gc = get_gspread_client()
     sheet = gc.open_by_key(SPREADSHEET_ID)
     raw_ws = sheet.worksheet(RAW_DEALS_TAB)
     rdv_ws = sheet.worksheet(RAW_DEALS_VIEW_TAB)
 
     raw_headers = raw_ws.row_values(1)
-    raw_row = raw_ws.row_values(row_index + 1)
+    raw_row = raw_ws.row_values(sheet_row_1_based)
 
-    print(f"Row {row_index + 1} has {len(raw_row)} values")
-    print(f"Headers: {len(raw_headers)} columns")
+    print(f"Target sheet row: {sheet_row_1_based}")
+    print(f"Row has {len(raw_row)} values | Headers: {len(raw_headers)} columns")
 
     if not raw_row or all(not str(v).strip() for v in raw_row):
-        print(f"⚠️ Row {row_index + 1} is empty or all blank - skipping")
+        print("⚠️ Row is empty - skipping")
         return False
 
     row_data = dict(zip(raw_headers, raw_row))
 
-    # Column AT = dynamic_theme (1-based index 46)
-    dynamic_theme = rdv_ws.cell(row_index + 1, 46).value
-    print(f"Dynamic theme from RDV col 46: {dynamic_theme}")
+    status = str(row_data.get("status") or "").strip()
+    if status != STATUS_READY_TO_POST:
+        print(f"⚠️ Skip row {sheet_row_1_based}: status={status!r} (needs {STATUS_READY_TO_POST!r})")
+        return False
+
+    # RDV dynamic_theme (AT=46) aligned by row number
+    dynamic_theme = rdv_ws.cell(sheet_row_1_based, RDV_DYNAMIC_THEME_COL).value
+    print(f"Dynamic theme from RDV col {RDV_DYNAMIC_THEME_COL}: {dynamic_theme}")
 
     payload = build_render_payload(row_data, dynamic_theme)
     print(f"Built payload: {payload}")
 
-    if payload["OUT"] and not re.fullmatch(r"\d{6}", payload["OUT"]):
-        raise ValueError(f"OUT not ddmmyy after normalization: {payload['OUT']!r}")
-    if payload["IN"] and not re.fullmatch(r"\d{6}", payload["IN"]):
-        raise ValueError(f"IN not ddmmyy after normalization: {payload['IN']!r}")
-
     if not payload["TO"] or not payload["FROM"] or not payload["OUT"] or not payload["IN"]:
-        raise ValueError(
-            f"Payload has empty required fields! "
-            f"TO={payload['TO']!r} FROM={payload['FROM']!r} "
-            f"OUT={payload['OUT']!r} IN={payload['IN']!r}"
-        )
+        raise ValueError("Payload missing required fields (FROM/TO/OUT/IN)")
 
-    sheet_row_1_based = row_index + 1  # includes header row
+    if not re.fullmatch(r"\d{6}", payload["OUT"]):
+        raise ValueError(f"OUT must be ddmmyy (6 digits). Got: {payload['OUT']!r}")
+    if not re.fullmatch(r"\d{6}", payload["IN"]):
+        raise ValueError(f"IN must be ddmmyy (6 digits). Got: {payload['IN']!r}")
+
+    # Call renderer
+    response = requests.post(RENDER_URL, json=payload, timeout=60)
+    if not response.ok:
+        raise RuntimeError(f"Render failed ({response.status_code}): {response.text}")
 
     try:
-        response = requests.post(RENDER_URL, json=payload, timeout=60)
-        if not response.ok:
-            raise RuntimeError(f"{response.status_code}: {response.text}")
+        resp_json = response.json()
+    except Exception:
+        raise RuntimeError(f"Render returned non-JSON: {response.text[:200]}")
 
+    graphic_url = extract_graphic_url(resp_json)
+    if not graphic_url:
+        raise RuntimeError("Render JSON missing graphic_url")
+
+    ts = utc_now_iso()
+
+    updates: Dict[str, str] = {
+        "graphic_url": graphic_url,
+        "rendered_timestamp": ts,
+        "rendered_at": ts,
+        "render_error": "",
+        "status": STATUS_READY_TO_PUBLISH,  # promote after successful asset creation
+    }
+
+    update_cells_by_header(raw_ws, raw_headers, sheet_row_1_based, updates)
+
+    print(f"✅ Render OK row {sheet_row_1_based} | status {STATUS_READY_TO_POST}→{STATUS_READY_TO_PUBLISH}")
+    return True
+
+
+# ============================================================
+# SELECT: FIND ELIGIBLE ROWS (READY_TO_POST, no graphic_url)
+# ============================================================
+
+def find_render_candidates(
+    raw_ws: gspread.Worksheet,
+    raw_headers: List[str],
+    max_n: int,
+) -> List[int]:
+    status_col = find_col_index(raw_headers, "status")
+    graphic_col = find_col_index(raw_headers, "graphic_url")
+
+    if not status_col:
+        raise RuntimeError("RAW_DEALS missing required header: status")
+
+    # Pull only needed columns (cheaper than full sheet)
+    status_vals = raw_ws.col_values(status_col)  # includes header
+    graphic_vals = raw_ws.col_values(graphic_col) if graphic_col else []
+
+    candidates: List[int] = []
+    for r in range(2, len(status_vals) + 1):  # sheet rows start at 2 for data
+        st = str(status_vals[r - 1] or "").strip()
+        if st != STATUS_READY_TO_POST:
+            continue
+
+        if graphic_col and r - 1 < len(graphic_vals):
+            gu = str(graphic_vals[r - 1] or "").strip()
+            if gu:
+                continue
+
+        candidates.append(r)
+        if len(candidates) >= max_n:
+            break
+
+    return candidates
+
+
+def main() -> int:
+    gc = get_gspread_client()
+    sheet = gc.open_by_key(SPREADSHEET_ID)
+    raw_ws = sheet.worksheet(RAW_DEALS_TAB)
+
+    raw_headers = raw_ws.row_values(1)
+
+    candidates = find_render_candidates(raw_ws, raw_headers, max_n=RENDER_MAX_PER_RUN)
+
+    if not candidates:
+        print(f"ℹ️ No candidates found with status={STATUS_READY_TO_POST} and blank graphic_url")
+        return 0
+
+    print(f"🎯 Render candidates (sheet rows): {candidates}")
+
+    ok_count = 0
+    for sheet_row in candidates:
         try:
-            resp_json = response.json()
-        except Exception:
-            raise RuntimeError(f"Render returned non-JSON: {response.text[:200]}")
+            if render_sheet_row(sheet_row):
+                ok_count += 1
+        except Exception as e:
+            # Write render_error on the row (best effort) and continue
+            try:
+                ts = utc_now_iso()
+                update_cells_by_header(
+                    raw_ws,
+                    raw_headers,
+                    sheet_row,
+                    {
+                        "render_error": f"{type(e).__name__}: {e}",
+                        "rendered_timestamp": ts,
+                        "rendered_at": ts,
+                    },
+                )
+            except Exception:
+                pass
+            raise
 
-        graphic_url = extract_graphic_url(resp_json)
-        if not graphic_url:
-            raise RuntimeError(f"Render JSON missing graphic_url (keys={list(resp_json.keys())})")
-
-        ts = utc_now_iso()
-
-        updates: Dict[str, str] = {
-            "graphic_url": graphic_url,
-            "rendered_timestamp": ts,
-            "rendered_at": ts,
-            "render_error": "",
-        }
-
-        # Strict status promotion: READY_TO_POST -> READY_TO_PUBLISH only
-        status_idx = find_col_index(raw_headers, "status")
-        if status_idx:
-            current_status = str(row_data.get("status") or "").strip()
-            if current_status == STATUS_READY_TO_POST:
-                updates["status"] = STATUS_READY_TO_PUBLISH
-
-        update_cells_by_header(raw_ws, raw_headers, sheet_row_1_based, updates)
-
-        print(
-            f"✅ Render successful for row {sheet_row_1_based} -> graphic_url set"
-            f"{' + status promoted' if updates.get('status') else ''}"
-        )
-        return True
-
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        print(f"❌ Render failed for row {sheet_row_1_based}: {err}")
-
-        try:
-            update_cells_by_header(
-                raw_ws,
-                raw_headers,
-                sheet_row_1_based,
-                {
-                    "render_error": err,
-                    "rendered_timestamp": utc_now_iso(),
-                    "rendered_at": utc_now_iso(),
-                },
-            )
-        except Exception as e2:
-            print(f"⚠️ Could not write render_error back to sheet: {type(e2).__name__}: {e2}")
-
-        raise
+    print(f"✅ Render complete. Success count: {ok_count}/{len(candidates)}")
+    return 0
 
 
 if __name__ == "__main__":
-    ok = render_row(1)
-    print("Render OK:", ok)
+    raise SystemExit(main())

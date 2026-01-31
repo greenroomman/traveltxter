@@ -8,12 +8,18 @@ import sys
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
+import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Import local render engine
-sys.path.insert(0, '/home/Greenroomman/mysite')
-from render_engine import generate_deal_image
+# Try to import local render engine (works on PythonAnywhere)
+# Falls back to remote API if not available (GitHub Actions)
+try:
+    sys.path.insert(0, '/home/Greenroomman/mysite')
+    from render_engine import generate_deal_image
+    LOCAL_RENDER_AVAILABLE = True
+except ImportError:
+    LOCAL_RENDER_AVAILABLE = False
 
 
 # ============================================================
@@ -24,9 +30,11 @@ SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or "").st
 RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
 RAW_DEALS_VIEW_TAB = os.getenv("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
 
-# Local output directory for rendered images
+# Remote rendering (fallback for GitHub Actions)
+RENDER_URL = (os.getenv("RENDER_URL") or "").strip()
+
+# Local rendering (PythonAnywhere only)
 OUTPUT_DIR = os.getenv("RENDER_OUTPUT_DIR", "/home/Greenroomman/mysite/static/renders")
-# Base URL for accessing rendered images
 BASE_URL = os.getenv("RENDER_BASE_URL", "https://greenroomman.pythonanywhere.com/static/renders")
 
 SERVICE_ACCOUNT_JSON = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
@@ -41,8 +49,12 @@ RDV_DYNAMIC_THEME_COL = int(float(os.getenv("RDV_DYNAMIC_THEME_COL", "46") or "4
 
 GOOGLE_SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/drive",
+    "https://www.googleapis.com/auth/drive",
 ]
+
+# Determine render mode
+USE_LOCAL_RENDER = LOCAL_RENDER_AVAILABLE and os.path.exists(OUTPUT_DIR)
+print(f"🎨 Render mode: {'LOCAL' if USE_LOCAL_RENDER else 'REMOTE'}")
 
 
 # ============================================================
@@ -258,7 +270,7 @@ def build_payload(row: Dict[str, str], dynamic_theme: str | None) -> Dict[str, s
 
 
 def extract_graphic_url(resp_json: Dict[str, Any]) -> str:
-    """Not needed for local rendering, kept for compatibility"""
+    """Extract graphic URL from remote API response"""
     for k in ("graphic_url", "png_url", "image_url", "url"):
         v = resp_json.get(k)
         if isinstance(v, str) and v.strip():
@@ -274,7 +286,7 @@ def generate_filename(row_data: Dict[str, str]) -> str:
     if deal_id:
         return f"deal_{deal_id}.png"
     
-    # Fallback: use timestamp + destination
+    # Fallback: timestamp + destination
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     dest = row_data.get("destination_iata", "UNK")
     return f"deal_{dest}_{ts}.png"
@@ -283,10 +295,6 @@ def generate_filename(row_data: Dict[str, str]) -> str:
 def render_local(payload: Dict[str, str], output_path: str) -> bool:
     """Call local render_engine.py to generate image"""
     try:
-        # render_engine expects these parameters:
-        # out_path, to_city, from_city, out_date, in_date, price, layout="PM", theme=None
-        
-        # Determine layout from payload or default to PM
         layout = payload.get("layout", "PM")
         
         success = generate_deal_image(
@@ -305,6 +313,29 @@ def render_local(payload: Dict[str, str], output_path: str) -> bool:
     except Exception as e:
         print(f"❌ Local render failed: {e}")
         raise RuntimeError(f"Local render failed: {e}")
+
+
+def render_remote(payload: Dict[str, str]) -> str:
+    """Call remote render API and return graphic URL"""
+    try:
+        resp = requests.post(RENDER_URL, json=payload, timeout=60)
+        if not resp.ok:
+            raise RuntimeError(f"Render failed ({resp.status_code}): {resp.text}")
+
+        try:
+            resp_json = resp.json()
+        except Exception:
+            raise RuntimeError(f"Render returned non-JSON: {resp.text[:200]}")
+
+        graphic_url = extract_graphic_url(resp_json)
+        if not graphic_url:
+            raise RuntimeError("Render response missing graphic_url")
+        
+        return graphic_url
+        
+    except Exception as e:
+        print(f"❌ Remote render failed: {e}")
+        raise
 
 
 # ============================================================
@@ -369,27 +400,33 @@ def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int) -> bool:
         raise ValueError(f"PRICE must be £<int>. Got {payload['PRICE']!r}")
 
     try:
-        # Ensure output directory exists
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        if USE_LOCAL_RENDER:
+            # LOCAL RENDERING (PythonAnywhere)
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            filename = generate_filename(row)
+            output_path = os.path.join(OUTPUT_DIR, filename)
+            graphic_url = f"{BASE_URL}/{filename}"
+            
+            print(f"🎨 Rendering locally to: {output_path}")
+            success = render_local(payload, output_path)
+            
+            if not success:
+                raise RuntimeError("Local render_engine returned False")
+            
+            if not os.path.exists(output_path):
+                raise RuntimeError(f"Render completed but file not found: {output_path}")
+            
+            file_size = os.path.getsize(output_path)
+            print(f"✅ Rendered successfully: {filename} ({file_size} bytes)")
         
-        # Generate filename and full path
-        filename = generate_filename(row)
-        output_path = os.path.join(OUTPUT_DIR, filename)
-        graphic_url = f"{BASE_URL}/{filename}"
-        
-        # Call local render engine
-        print(f"🎨 Rendering locally to: {output_path}")
-        success = render_local(payload, output_path)
-        
-        if not success:
-            raise RuntimeError("Local render_engine returned False")
-        
-        # Verify file was created
-        if not os.path.exists(output_path):
-            raise RuntimeError(f"Render completed but file not found: {output_path}")
-        
-        file_size = os.path.getsize(output_path)
-        print(f"✅ Rendered successfully: {filename} ({file_size} bytes)")
+        else:
+            # REMOTE RENDERING (GitHub Actions)
+            if not RENDER_URL:
+                raise RuntimeError("RENDER_URL not set and local rendering unavailable")
+            
+            print(f"🌐 Rendering remotely via: {RENDER_URL}")
+            graphic_url = render_remote(payload)
+            print(f"✅ Rendered successfully: {graphic_url}")
 
         ts = _utc_now_iso()
         _batch_update(
@@ -431,18 +468,22 @@ def main() -> int:
     if not SPREADSHEET_ID:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
     
-    # Verify output directory is writable
-    try:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        test_file = os.path.join(OUTPUT_DIR, ".test_write")
-        with open(test_file, 'w') as f:
-            f.write("test")
-        os.remove(test_file)
-    except Exception as e:
-        raise RuntimeError(f"OUTPUT_DIR not writable: {OUTPUT_DIR} - {e}")
-    
-    print(f"📁 Output directory: {OUTPUT_DIR}")
-    print(f"🌐 Base URL: {BASE_URL}")
+    if USE_LOCAL_RENDER:
+        # Verify output directory is writable
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            test_file = os.path.join(OUTPUT_DIR, ".test_write")
+            with open(test_file, 'w') as f:
+                f.write("test")
+            os.remove(test_file)
+            print(f"📁 Output directory: {OUTPUT_DIR}")
+            print(f"🌐 Base URL: {BASE_URL}")
+        except Exception as e:
+            raise RuntimeError(f"OUTPUT_DIR not writable: {OUTPUT_DIR} - {e}")
+    else:
+        if not RENDER_URL:
+            raise RuntimeError("Neither local render nor RENDER_URL available")
+        print(f"🌐 Remote render URL: {RENDER_URL}")
 
     gc = gspread.authorize(_sa_creds())
     sh = gc.open_by_key(SPREADSHEET_ID)

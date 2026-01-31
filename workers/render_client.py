@@ -5,7 +5,7 @@ import re
 import json
 import math
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 
 import requests
 import gspread
@@ -162,6 +162,16 @@ def _batch_update(ws: gspread.Worksheet, headers: list[str], row_1_based: int, u
         ws.batch_update(data)
 
 
+def _row_get(row: List[str], i: Optional[int]) -> str:
+    if i is None:
+        return ""
+    if i < 0:
+        return ""
+    if i >= len(row):
+        return ""
+    return (row[i] or "").strip()
+
+
 # ============================================================
 # NORMALISERS (LOCKED PA PAYLOAD CONTRACT)
 # OUT/IN: ddmmyy
@@ -192,7 +202,6 @@ def normalize_date_ddmmyy(raw_date: str | None) -> str:
         return s
 
     if re.fullmatch(r"\d{8}", s):
-        # ddmmyyyy or yyyymmdd ambiguity exists; we only handle ddmmyyyy by picking yy from end
         dd = s[0:2]
         mm = s[2:4]
         yy = s[6:8]
@@ -251,35 +260,38 @@ def extract_graphic_url(resp_json: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# CORE: FIND CANDIDATES AND RENDER
+# CANDIDATE SELECTION (ROBUST)
 # ============================================================
 
-def find_candidates(ws_raw: gspread.Worksheet, headers: list[str], max_n: int) -> List[int]:
-    status_i = _col_index(headers, "status")
-    graphic_i = _col_index(headers, "graphic_url")
-
-    if status_i is None:
-        raise RuntimeError("RAW_DEALS missing required header: status")
-    if graphic_i is None:
-        raise RuntimeError("RAW_DEALS missing required header: graphic_url")
-
-    status_vals = ws_raw.col_values(status_i + 1)  # includes header
-    graphic_vals = ws_raw.col_values(graphic_i + 1)  # includes header
-
+def find_candidates_from_sheet_values(
+    sheet_values: List[List[str]],
+    status_i: int,
+    graphic_i: int,
+    max_n: int,
+) -> List[int]:
+    """
+    sheet_values: includes header row at index 0.
+    Returns list of 1-based sheet row numbers (>=2).
+    """
     candidates: List[int] = []
-    for sheet_row in range(2, len(status_vals) + 1):
-        st = (status_vals[sheet_row - 1] or "").strip()
+    for idx0 in range(1, len(sheet_values)):
+        row = sheet_values[idx0]
+        st = _row_get(row, status_i)
         if st != STATUS_READY_TO_POST:
             continue
-        gu = (graphic_vals[sheet_row - 1] or "").strip()
+        gu = _row_get(row, graphic_i)
         if gu:
             continue
-        candidates.append(sheet_row)
+        sheet_row_1_based = idx0 + 1
+        candidates.append(sheet_row_1_based)
         if len(candidates) >= max_n:
             break
-
     return candidates
 
+
+# ============================================================
+# RENDER ONE SHEET ROW
+# ============================================================
 
 def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int) -> bool:
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
@@ -354,6 +366,10 @@ def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int) -> bool:
         raise
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main() -> int:
     if not SPREADSHEET_ID:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
@@ -364,9 +380,29 @@ def main() -> int:
     sh = gc.open_by_key(SPREADSHEET_ID)
 
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
-    headers = ws_raw.row_values(1)
 
-    candidates = find_candidates(ws_raw, headers, max_n=RENDER_MAX_PER_RUN)
+    # Pull whole sheet once to avoid col_values length mismatch
+    sheet_values = ws_raw.get_all_values()
+    if len(sheet_values) < 2:
+        print("ℹ️ RAW_DEALS has no data rows")
+        return 0
+
+    headers = sheet_values[0]
+    status_i = _col_index(headers, "status")
+    graphic_i = _col_index(headers, "graphic_url")
+
+    if status_i is None:
+        raise RuntimeError("RAW_DEALS missing required header: status")
+    if graphic_i is None:
+        raise RuntimeError("RAW_DEALS missing required header: graphic_url")
+
+    candidates = find_candidates_from_sheet_values(
+        sheet_values=sheet_values,
+        status_i=status_i,
+        graphic_i=graphic_i,
+        max_n=RENDER_MAX_PER_RUN,
+    )
+
     if not candidates:
         print(f"ℹ️ No render candidates (status={STATUS_READY_TO_POST}, graphic_url blank)")
         return 0

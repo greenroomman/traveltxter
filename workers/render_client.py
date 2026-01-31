@@ -5,7 +5,7 @@ import re
 import json
 import math
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 
 import requests
 import gspread
@@ -27,6 +27,9 @@ GOOGLE_SCOPE = [
 ]
 
 SERVICE_ACCOUNT_JSON = os.environ["GCP_SA_JSON_ONE_LINE"]
+
+# Status transition (safe, header-gated)
+STATUS_READY_TO_PUBLISH = os.getenv("STATUS_READY_TO_PUBLISH", "READY_TO_PUBLISH")
 
 
 # ============================================================
@@ -126,9 +129,6 @@ def utc_now_iso() -> str:
 
 
 def find_col_index(headers: list[str], col_name: str) -> Optional[int]:
-    """
-    Return 1-based column index for a header name (case-insensitive exact match).
-    """
     target = col_name.strip().lower()
     for i, h in enumerate(headers, start=1):
         if str(h).strip().lower() == target:
@@ -137,9 +137,6 @@ def find_col_index(headers: list[str], col_name: str) -> Optional[int]:
 
 
 def a1(col_index: int, row_index_1_based: int) -> str:
-    """
-    Convert column index + row to A1 notation, e.g. (1,2)->A2
-    """
     n = col_index
     letters = ""
     while n > 0:
@@ -154,10 +151,6 @@ def update_cells_by_header(
     sheet_row_1_based: int,
     updates: Dict[str, str],
 ) -> None:
-    """
-    Batch update named columns on a single row using A1 ranges.
-    Ignores any column names not found in headers.
-    """
     data = []
     for col_name, value in updates.items():
         idx = find_col_index(headers, col_name)
@@ -317,7 +310,6 @@ def build_render_payload(
     row: Dict[str, Any],
     dynamic_theme: str | None,
 ) -> Dict[str, Any]:
-    # RAW_DEALS uses: origin_city, destination_city, outbound_date, return_date, price_gbp
     out_raw = row.get("outbound_date", "") or row.get("out_date", "")
     in_raw = row.get("return_date", "") or row.get("in_date", "")
     price_raw = row.get("price_gbp", "") or row.get("price", "")
@@ -339,14 +331,10 @@ def build_render_payload(
 
 
 def extract_graphic_url(resp_json: Dict[str, Any]) -> str:
-    """
-    Accept common response shapes without guessing too much.
-    """
     for k in ("graphic_url", "png_url", "image_url", "url"):
         v = resp_json.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-    # Some renderers wrap payloads
     if isinstance(resp_json.get("data"), dict):
         return extract_graphic_url(resp_json["data"])
     return ""
@@ -357,10 +345,6 @@ def extract_graphic_url(resp_json: Dict[str, Any]) -> str:
 # ============================================================
 
 def render_row(row_index: int) -> bool:
-    """
-    row_index is 1-based Google Sheets row index (excluding header).
-    RAW_DEALS_VIEW is assumed to be 1:1 aligned with RAW_DEALS.
-    """
     gc = get_gspread_client()
     sheet = gc.open_by_key(SPREADSHEET_ID)
     raw_ws = sheet.worksheet(RAW_DEALS_TAB)
@@ -404,7 +388,6 @@ def render_row(row_index: int) -> bool:
         if not response.ok:
             raise RuntimeError(f"{response.status_code}: {response.text}")
 
-        # Expect JSON
         try:
             resp_json = response.json()
         except Exception:
@@ -416,23 +399,27 @@ def render_row(row_index: int) -> bool:
 
         ts = utc_now_iso()
 
-        update_cells_by_header(
-            raw_ws,
-            raw_headers,
-            sheet_row_1_based,
-            {
-                "graphic_url": graphic_url,
-                "rendered_timestamp": ts,
-                "rendered_at": ts,
-                "render_error": "",
-            },
-        )
+        updates: Dict[str, str] = {
+            "graphic_url": graphic_url,
+            "rendered_timestamp": ts,
+            "rendered_at": ts,
+            "render_error": "",
+        }
 
-        print(f"✅ Render successful for row {sheet_row_1_based} -> graphic_url set")
+        # Trigger publisher stage by status if column exists
+        status_idx = find_col_index(raw_headers, "status")
+        if status_idx:
+            current_status = str(row_data.get("status") or "").strip()
+            # Only promote if not already posted
+            if not current_status.startswith("POSTED_"):
+                updates["status"] = STATUS_READY_TO_PUBLISH
+
+        update_cells_by_header(raw_ws, raw_headers, sheet_row_1_based, updates)
+
+        print(f"✅ Render successful for row {sheet_row_1_based} -> graphic_url set (+status if present)")
         return True
 
     except Exception as e:
-        # Write render_error (best-effort)
         err = f"{type(e).__name__}: {e}"
         print(f"❌ Render failed for row {sheet_row_1_based}: {err}")
 
@@ -452,10 +439,6 @@ def render_row(row_index: int) -> bool:
 
         raise
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     ok = render_row(1)

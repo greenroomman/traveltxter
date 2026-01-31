@@ -28,7 +28,8 @@ GOOGLE_SCOPE = [
 
 SERVICE_ACCOUNT_JSON = os.environ["GCP_SA_JSON_ONE_LINE"]
 
-# Status transition (safe, header-gated)
+# Status transition (strict)
+STATUS_READY_TO_POST = os.getenv("STATUS_READY_TO_POST", "READY_TO_POST")
 STATUS_READY_TO_PUBLISH = os.getenv("STATUS_READY_TO_PUBLISH", "READY_TO_PUBLISH")
 
 
@@ -406,17 +407,19 @@ def render_row(row_index: int) -> bool:
             "render_error": "",
         }
 
-        # Trigger publisher stage by status if column exists
+        # Strict status promotion: READY_TO_POST -> READY_TO_PUBLISH only
         status_idx = find_col_index(raw_headers, "status")
         if status_idx:
             current_status = str(row_data.get("status") or "").strip()
-            # Only promote if not already posted
-            if not current_status.startswith("POSTED_"):
+            if current_status == STATUS_READY_TO_POST:
                 updates["status"] = STATUS_READY_TO_PUBLISH
 
         update_cells_by_header(raw_ws, raw_headers, sheet_row_1_based, updates)
 
-        print(f"✅ Render successful for row {sheet_row_1_based} -> graphic_url set (+status if present)")
+        print(
+            f"✅ Render successful for row {sheet_row_1_based} -> graphic_url set"
+            f"{' + status promoted' if updates.get('status') else ''}"
+        )
         return True
 
     except Exception as e:

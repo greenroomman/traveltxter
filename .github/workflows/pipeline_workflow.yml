@@ -2,51 +2,162 @@ name: TravelTxter Pipeline
 
 on:
   schedule:
-    - cron: "30 6 * * *"    # 06:30 GMT (AM)
-    - cron: "30 16 * * *"   # 16:30 GMT (PM)
+    # 06:30 and 16:30 UTC (GMT)
+    - cron: "30 6 * * *"
+    - cron: "30 16 * * *"
   workflow_dispatch:
     inputs:
-      run_mode:
-        description: "Run mode (TEST does not publish)"
-        required: true
-        default: "TEST"
-        type: choice
-        options:
-          - TEST
-          - AM
-          - PM
+      run_slot:
+        description: "Force RUN_SLOT (AM or PM). Leave blank for auto."
+        required: false
+        default: ""
+      feeder_only:
+        description: "If true, run ONLY the feeder (smoke test)."
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: traveltxter-pipeline
+  cancel-in-progress: false
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
 
+    env:
+      # ---------------- Core Sheet Access (Secrets) ----------------
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+      GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+
+      # ---------------- Tabs (Secrets + Vars compatibility) ----------------
+      RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+      FEEDER_LOG_TAB: ${{ secrets.FEEDER_LOG_TAB }}
+      INSTA_FEED_TAB: ${{ secrets.INSTA_FEED_TAB }}
+      SUBSCRIBERS_TAB: ${{ secrets.SUBSCRIBERS_TAB }}
+
+      FEEDER_CONFIG_TAB: ${{ vars.FEEDER_CONFIG_TAB }}
+      THEMES_TAB: ${{ vars.THEMES_TAB }}
+      PHRASES_TAB: ${{ vars.PHRASES_TAB }}
+
+      # ---------------- API keys / tokens (Secrets) ----------------
+      # Robust: allows DUFFEL_KEY fallback if that is what exists in repo settings
+      DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY || secrets.DUFFEL_KEY }}
+
+      RENDER_URL: ${{ secrets.RENDER_URL }}
+      REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
+
+      IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+      TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
+      TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
+
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
+      STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
+
+      # ---------------- Vars (budget / knobs) ----------------
+      DUFFEL_BUDGET_GBP: ${{ vars.DUFFEL_BUDGET_GBP }}
+      DUFFEL_EXCESS_SEARCH_USD: ${{ vars.DUFFEL_EXCESS_SEARCH_USD }}
+
+      DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
+      DUFFEL_MAX_INSERTS_PER_ORIGIN: ${{ vars.DUFFEL_MAX_INSERTS_PER_ORIGIN }}
+      DUFFEL_MAX_INSERTS_PER_ROUTE: ${{ vars.DUFFEL_MAX_INSERTS_PER_ROUTE }}
+      DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
+      DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+
+      MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS }}
+      VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
+
+      GRAPH_API_VERSION: ${{ vars.GRAPH_API_VERSION }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set RUN_SLOT
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "RUN_SLOT=${{ inputs.run_mode }}" >> $GITHUB_ENV
-          else
-            HOUR=$(date -u +"%H")
-            if [ "$HOUR" -lt 12 ]; then
-              echo "RUN_SLOT=AM" >> $GITHUB_ENV
-            else
-              echo "RUN_SLOT=PM" >> $GITHUB_ENV
-            fi
-          fi
-
-      - name: Echo run context
-        run: |
-          echo "RUN_SLOT=$RUN_SLOT"
-          echo "Event: ${{ github.event_name }}"
-          date -u
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run pipeline
+      - name: Determine RUN_SLOT (AM/PM)
+        shell: bash
+        run: |
+          # Manual override first
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RS="${{ inputs.run_slot }}"
+            RS="$(echo "$RS" | tr '[:lower:]' '[:upper:]' | xargs)"
+            if [ "$RS" = "AM" ] || [ "$RS" = "PM" ]; then
+              echo "RUN_SLOT=$RS" >> $GITHUB_ENV
+              echo "Resolved RUN_SLOT (manual): $RS"
+              exit 0
+            fi
+          fi
+
+          # Scheduled mapping by cron string
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            CRON="${{ github.event.schedule }}"
+            if [ "$CRON" = "30 6 * * *" ]; then
+              echo "RUN_SLOT=AM" >> $GITHUB_ENV
+              echo "Resolved RUN_SLOT (schedule): AM"
+              exit 0
+            fi
+            if [ "$CRON" = "30 16 * * *" ]; then
+              echo "RUN_SLOT=PM" >> $GITHUB_ENV
+              echo "Resolved RUN_SLOT (schedule): PM"
+              exit 0
+            fi
+          fi
+
+          # Fallback: derive from current UTC hour
+          HOUR="$(date -u +%H)"
+          if [ "$HOUR" -lt 12 ]; then
+            echo "RUN_SLOT=AM" >> $GITHUB_ENV
+            echo "Resolved RUN_SLOT (fallback hour): AM"
+          else
+            echo "RUN_SLOT=PM" >> $GITHUB_ENV
+            echo "Resolved RUN_SLOT (fallback hour): PM"
+          fi
+
+      - name: Debug env presence (safe)
+        run: |
+          python -c "import os; print('RUN_SLOT:', os.getenv('RUN_SLOT'))"
+          python -c "import os; print('DUFFEL_API_KEY present:', bool(os.getenv('DUFFEL_API_KEY')))"
+          python -c "import os; print('SPREADSHEET_ID present:', bool(os.getenv('SPREADSHEET_ID') or os.getenv('SHEET_ID')))"
+          python -c "import os; print('GCP_SA_JSON present:', bool(os.getenv('GCP_SA_JSON_ONE_LINE') or os.getenv('GCP_SA_JSON')))"
+
+      # ---------------- FEEDER ----------------
+      - name: Run Feeder
         run: python workers/pipeline_worker.py
+
+      - name: Stop after feeder (manual smoke test)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.feeder_only }}
+        run: |
+          echo "feeder_only=true -> stopping after feeder"
+          exit 0
+
+      # ---------------- SCORER ----------------
+      - name: Run Scorer
+        run: python workers/ai_scorer.py
+
+      # ---------------- RENDER ----------------
+      - name: Run Render Client
+        run: python workers/render_client.py
+
+      # ---------------- PUBLISHERS ----------------
+      - name: Run Instagram Publisher
+        run: python workers/instagram_publisher.py
+
+      - name: Run Telegram Publisher
+        run: python workers/telegram_publisher.py

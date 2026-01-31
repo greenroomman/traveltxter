@@ -301,17 +301,21 @@ def build_render_payload(
     row: Dict[str, Any],
     dynamic_theme: str | None,
 ) -> Dict[str, Any]:
-    out_raw = row.get("out_date", "")
-    in_raw = row.get("in_date", "")
-    price_raw = row.get("price", "")
+    # Map actual sheet column names to expected names
+    # RAW_DEALS uses: origin_city, destination_city, outbound_date, return_date, price_gbp
+    out_raw = row.get("outbound_date", "") or row.get("out_date", "")
+    in_raw = row.get("return_date", "") or row.get("in_date", "")
+    price_raw = row.get("price_gbp", "") or row.get("price", "")
+    from_city = row.get("origin_city", "") or row.get("from_city", "")
+    to_city = row.get("destination_city", "") or row.get("to_city", "")
 
     out_ddmmyy = normalize_date_ddmmyy(out_raw) if out_raw else ""
     in_ddmmyy = normalize_date_ddmmyy(in_raw) if in_raw else ""
     price_gbp = normalize_price_gbp(price_raw) if price_raw else ""
 
     payload = {
-        "FROM": row.get("from_city", ""),
-        "TO": row.get("to_city", ""),
+        "FROM": from_city,
+        "TO": to_city,
         "OUT": out_ddmmyy,
         "IN": in_ddmmyy,
         "PRICE": price_gbp,
@@ -338,19 +342,44 @@ def render_row(row_index: int) -> bool:
     raw_headers = raw_ws.row_values(1)
     raw_row = raw_ws.row_values(row_index + 1)
 
+    # Debug: show what we got
+    print(f"Row {row_index + 1} has {len(raw_row)} values")
+    print(f"Headers: {len(raw_headers)} columns")
+    
+    # Check for empty row
+    if not raw_row or all(not str(v).strip() for v in raw_row):
+        print(f"⚠️ Row {row_index + 1} is empty or all blank - skipping")
+        return False
+
     row_data = dict(zip(raw_headers, raw_row))
+    
+    # Debug: show what columns we're looking for
+    print(f"Looking for: origin_city={row_data.get('origin_city', 'MISSING')}")
+    print(f"Looking for: destination_city={row_data.get('destination_city', 'MISSING')}")
+    print(f"Looking for: outbound_date={row_data.get('outbound_date', 'MISSING')}")
 
     # Column AT = dynamic_theme (1-based index 46)
     dynamic_theme = rdv_ws.cell(row_index + 1, 46).value
+    print(f"Dynamic theme from RDV col 46: {dynamic_theme}")
 
     # Build payload (enforces locked ddmmyy contract)
     payload = build_render_payload(row_data, dynamic_theme)
+    
+    print(f"Built payload: {payload}")
 
     # Hard guard: renderer will 500 if OUT/IN are not ddmmyy
     if payload["OUT"] and not re.fullmatch(r"\d{6}", payload["OUT"]):
         raise ValueError(f"OUT not ddmmyy after normalization: {payload['OUT']!r}")
     if payload["IN"] and not re.fullmatch(r"\d{6}", payload["IN"]):
         raise ValueError(f"IN not ddmmyy after normalization: {payload['IN']!r}")
+    
+    # Check for empty payload before sending
+    if not payload["TO"] or not payload["FROM"] or not payload["OUT"] or not payload["IN"]:
+        raise ValueError(
+            f"Payload has empty required fields! "
+            f"TO={payload['TO']!r} FROM={payload['FROM']!r} "
+            f"OUT={payload['OUT']!r} IN={payload['IN']!r}"
+        )
 
     response = requests.post(RENDER_URL, json=payload, timeout=30)
 
@@ -359,6 +388,7 @@ def render_row(row_index: int) -> bool:
             f"Render failed ({response.status_code}): {response.text} | payload={payload}"
         )
 
+    print(f"✅ Render successful for row {row_index + 1}")
     return True
 
 

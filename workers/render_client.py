@@ -2,22 +2,31 @@
 """
 workers/render_client.py
 
-Render Client — V4.6.3 STATUS PROMOTION HOTFIX
+Render Client — V4.6.3 THEME PASS-THROUGH (OPTION B) + STATUS PROMOTION
 FULL REPLACEMENT (per protocol)
 
-What this fixes:
-- Keeps the renderer payload contract EXACTLY the same (FROM/TO/OUT/IN/PRICE)
-- Keeps PythonAnywhere renderer untouched
+LOCKED BEHAVIOUR:
+- Google Sheets is the single source of truth
+- RAW_DEALS_VIEW is NEVER written to (read-only)
+- Renderer is stateless
+- ALWAYS prioritise newest eligible deals (fresh-first)
+- No schema changes, no workflow changes
+- Keeps renderer payload contract EXACTLY the same (FROM/TO/OUT/IN/PRICE)
+- Adds ONE optional field to payload: theme (for palette selection in PA)
 - After successful render + graphic_url write:
   - Promote status READY_TO_POST -> READY_TO_PUBLISH
   - (If already READY_TO_PUBLISH, leave as-is)
 
-LOCKED BEHAVIOUR:
-- Google Sheets is the single source of truth
-- RAW_DEALS_VIEW is never written to
-- Renderer is stateless
-- ALWAYS prioritise newest eligible deals (fresh-first)
-- No schema changes, no workflow changes
+THEME SOURCE (OPTION B):
+- Read theme from RAW_DEALS_VIEW column header: dynamic_theme
+- Row alignment assumed: RAW_DEALS row N == RAW_DEALS_VIEW row N (both start from row 2)
+
+MULTI-THEME SUPPORT:
+- dynamic_theme may include multiple themes (e.g. "long_haul, snow" or "long_haul|snow")
+- We deterministically choose ONE theme via priority to ensure a single palette per render.
+- Authoritative theme set (ONLY these should be sent):
+  winter_sun, summer_sun, beach_break, snow, northern_lights, surf, adventure,
+  city_breaks, culture_history, long_haul, luxury_value, unexpected_value
 """
 
 import os
@@ -39,9 +48,12 @@ except Exception:
 # ==================== ENV ====================
 
 SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or "").strip()
+
 RAW_DEALS_TAB = (os.getenv("RAW_DEALS_TAB", "RAW_DEALS") or "RAW_DEALS").strip()
+RAW_DEALS_VIEW_TAB = (os.getenv("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW") or "RAW_DEALS_VIEW").strip()
 
 RENDER_URL = (os.getenv("RENDER_URL") or "").strip()
+
 
 def _get_int_env(name: str, default: int) -> int:
     v = (os.getenv(name) or "").strip()
@@ -52,10 +64,11 @@ def _get_int_env(name: str, default: int) -> int:
     except Exception:
         return int(default)
 
+
 RENDER_MAX_ROWS = _get_int_env("RENDER_MAX_ROWS", 1)
 RUN_SLOT = (os.getenv("RUN_SLOT", "UNKNOWN") or "UNKNOWN").strip()
 
-# Rows eligible for rendering (we keep READY_TO_POST included for compatibility)
+# Rows eligible for rendering (kept READY_TO_POST for compatibility)
 ELIGIBLE_STATUSES = {
     "READY_TO_PUBLISH",
     "READY_TO_POST",
@@ -179,6 +192,102 @@ def normalise_price_to_pounds_rounded(raw: str) -> str:
         return ""
 
 
+# ==================== THEME NORMALISATION (LOCKED) ====================
+
+AUTHORITATIVE_THEMES = {
+    "winter_sun",
+    "summer_sun",
+    "beach_break",
+    "snow",
+    "northern_lights",
+    "surf",
+    "adventure",
+    "city_breaks",
+    "culture_history",
+    "long_haul",
+    "luxury_value",
+    "unexpected_value",
+}
+
+THEME_ALIASES = {
+    "winter sun": "winter_sun",
+    "summer sun": "summer_sun",
+    "beach break": "beach_break",
+    "northern lights": "northern_lights",
+    "city breaks": "city_breaks",
+    "culture / history": "culture_history",
+    "culture & history": "culture_history",
+    "culture": "culture_history",
+    "history": "culture_history",
+    "long haul": "long_haul",
+    "luxury": "luxury_value",
+    "unexpected": "unexpected_value",
+    # If RDV leaks pro-like outputs, map deterministically
+    "pro": "luxury_value",
+    "pro+": "luxury_value",
+    "vip pro": "luxury_value",
+}
+
+# Deterministic single-theme selection if multiple are present
+THEME_PRIORITY = [
+    "luxury_value",
+    "unexpected_value",
+    "long_haul",
+    "snow",
+    "northern_lights",
+    "winter_sun",
+    "summer_sun",
+    "beach_break",
+    "surf",
+    "culture_history",
+    "city_breaks",
+    "adventure",
+]
+
+
+def normalize_theme(theme: str) -> str:
+    raw = (theme or "").strip()
+    if not raw:
+        return "adventure"
+
+    # Split multi-theme strings: "long_haul, snow" or "long_haul|snow"
+    parts = re.split(r"[,\|;]+", raw)
+    tokens: list[str] = []
+
+    for p in parts:
+        t_raw = p.strip().lower()
+        if not t_raw:
+            continue
+
+        # alias pre-normalisation (handles "winter sun")
+        if t_raw in THEME_ALIASES:
+            t_raw = THEME_ALIASES[t_raw]
+
+        # normalise separators
+        t = re.sub(r"[^a-z0-9_]+", "_", t_raw).strip("_")
+
+        # alias post-normalisation
+        if t in THEME_ALIASES:
+            t = THEME_ALIASES[t]
+
+        if t:
+            tokens.append(t)
+
+    # Keep only authoritative
+    tokens = [t for t in tokens if t in AUTHORITATIVE_THEMES]
+    if not tokens:
+        return "adventure"
+
+    # Choose by priority
+    for p in THEME_PRIORITY:
+        if p in tokens:
+            return p
+
+    return tokens[0]
+
+
+# ==================== PAYLOAD BUILD ====================
+
 def build_render_payload(row: list, idx_norm: dict) -> dict:
     from_city = get_first_value(
         row, idx_norm,
@@ -232,21 +341,44 @@ def main():
 
     gc = gs_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
-    ws = sh.worksheet(RAW_DEALS_TAB)
 
+    ws = sh.worksheet(RAW_DEALS_TAB)
+    ws_view = sh.worksheet(RAW_DEALS_VIEW_TAB)
+
+    # RAW_DEALS
     headers = ws.row_values(1)
     rows = ws.get_all_values()[1:]
-
     idx_norm = {norm_header(h): i for i, h in enumerate(headers)}
 
-    # Required baseline columns
+    # Required baseline columns in RAW_DEALS
     for col in ("status", "ingested_at_utc", "graphic_url"):
         if norm_header(col) not in idx_norm:
-            raise RuntimeError(f"Missing required column: {col}")
+            raise RuntimeError(f"Missing required column in RAW_DEALS: {col}")
 
     status_col = idx_norm[norm_header("status")] + 1
     ingested_col = idx_norm[norm_header("ingested_at_utc")] + 1
     graphic_col = idx_norm[norm_header("graphic_url")] + 1
+
+    # RAW_DEALS_VIEW (READ-ONLY)
+    view_headers = ws_view.row_values(1)
+    view_rows = ws_view.get_all_values()[1:]
+    view_idx = {norm_header(h): i for i, h in enumerate(view_headers)}
+
+    dyn_key = norm_header("dynamic_theme")
+    if dyn_key not in view_idx:
+        raise RuntimeError("Missing required column in RAW_DEALS_VIEW: dynamic_theme")
+    dyn_idx = view_idx[dyn_key]
+
+    def theme_for_row(row_num: int) -> str:
+        # row_num is 1-indexed sheet row number (2..)
+        i = row_num - 2
+        if i < 0 or i >= len(view_rows):
+            return "adventure"
+        try:
+            raw_theme = (view_rows[i][dyn_idx] or "").strip()
+        except Exception:
+            raw_theme = ""
+        return normalize_theme(raw_theme)
 
     eligible = []
     for i, row in enumerate(rows, start=2):
@@ -281,13 +413,17 @@ def main():
         row = rows[row_num - 2]
         payload = build_render_payload(row, idx_norm)
 
+        # Add optional theme (for palette selection in PA)
+        payload["theme"] = theme_for_row(row_num)
+
         log(
             "Render payload: "
             f"FROM='{payload.get('FROM')}' "
             f"TO='{payload.get('TO')}' "
             f"OUT='{payload.get('OUT')}' "
             f"IN='{payload.get('IN')}' "
-            f"PRICE='{payload.get('PRICE')}'"
+            f"PRICE='{payload.get('PRICE')}' "
+            f"theme='{payload.get('theme')}'"
         )
 
         if not payload_is_complete(payload):

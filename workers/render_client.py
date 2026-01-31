@@ -7,7 +7,7 @@ import requests
 from typing import Dict, Any
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 
 # ============================================================
@@ -21,7 +21,7 @@ RAW_DEALS_VIEW_TAB = os.getenv("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
 RENDER_URL = os.environ["RENDER_URL"]
 
 GOOGLE_SCOPE = [
-    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
@@ -79,15 +79,11 @@ THEME_ALIASES = {
 
 
 def normalize_theme(raw_theme: str | None) -> str:
-    """
-    Accepts single or multi-theme strings (comma, pipe, semicolon separated).
-    Returns ONE authoritative theme using deterministic priority.
-    """
     if not raw_theme:
         return "adventure"
 
     parts = re.split(r"[,\|;]+", raw_theme.lower())
-    tokens = []
+    tokens: list[str] = []
 
     for p in parts:
         t = p.strip()
@@ -117,8 +113,9 @@ def normalize_theme(raw_theme: str | None) -> str:
 
 def get_gspread_client():
     creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(
-        creds_dict, GOOGLE_SCOPE
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=GOOGLE_SCOPE,
     )
     return gspread.authorize(creds)
 
@@ -131,7 +128,7 @@ def build_render_payload(
     row: Dict[str, Any],
     dynamic_theme: str | None,
 ) -> Dict[str, Any]:
-    payload = {
+    return {
         "FROM": row.get("from_city", ""),
         "TO": row.get("to_city", ""),
         "OUT": row.get("out_date", ""),
@@ -139,7 +136,6 @@ def build_render_payload(
         "PRICE": row.get("price", ""),
         "theme": normalize_theme(dynamic_theme),
     }
-    return payload
 
 
 # ============================================================
@@ -153,15 +149,16 @@ def render_row(row_index: int) -> bool:
     """
     gc = get_gspread_client()
 
-    raw_ws = gc.open_by_key(SPREADSHEET_ID).worksheet(RAW_DEALS_TAB)
-    rdv_ws = gc.open_by_key(SPREADSHEET_ID).worksheet(RAW_DEALS_VIEW_TAB)
+    sheet = gc.open_by_key(SPREADSHEET_ID)
+    raw_ws = sheet.worksheet(RAW_DEALS_TAB)
+    rdv_ws = sheet.worksheet(RAW_DEALS_VIEW_TAB)
 
     raw_headers = raw_ws.row_values(1)
     raw_row = raw_ws.row_values(row_index + 1)
 
     row_data = dict(zip(raw_headers, raw_row))
 
-    # Column AT = dynamic_theme (index 46, 1-based)
+    # Column AT = dynamic_theme (1-based index 46)
     dynamic_theme = rdv_ws.cell(row_index + 1, 46).value
 
     payload = build_render_payload(row_data, dynamic_theme)
@@ -181,6 +178,5 @@ def render_row(row_index: int) -> bool:
 # ============================================================
 
 if __name__ == "__main__":
-    # Example manual test (row 2)
     ok = render_row(1)
     print("Render OK:", ok)

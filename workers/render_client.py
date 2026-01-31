@@ -4,7 +4,6 @@ import os
 import re
 import json
 import math
-import sys
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
@@ -12,32 +11,22 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Try to import local render engine (works on PythonAnywhere)
-# Falls back to remote API if not available (GitHub Actions)
-try:
-    sys.path.insert(0, '/home/Greenroomman/mysite')
-    from render_engine import generate_deal_image
-    LOCAL_RENDER_AVAILABLE = True
-except ImportError:
-    LOCAL_RENDER_AVAILABLE = False
-
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or "").strip()
+
 RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB", "RAW_DEALS")
 RAW_DEALS_VIEW_TAB = os.getenv("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
+OPS_MASTER_TAB = os.getenv("OPS_MASTER_TAB", "OPS_MASTER")
 
-# Remote rendering (fallback for GitHub Actions)
 RENDER_URL = (os.getenv("RENDER_URL") or "").strip()
 
-# Local rendering (PythonAnywhere only)
-OUTPUT_DIR = os.getenv("RENDER_OUTPUT_DIR", "/home/Greenroomman/mysite/static/renders")
-BASE_URL = os.getenv("RENDER_BASE_URL", "https://greenroomman.pythonanywhere.com/static/renders")
-
 SERVICE_ACCOUNT_JSON = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
+
+RUN_SLOT = (os.getenv("RUN_SLOT") or "").strip().upper()  # "AM" or "PM"
 
 STATUS_READY_TO_POST = os.getenv("STATUS_READY_TO_POST", "READY_TO_POST")
 STATUS_READY_TO_PUBLISH = os.getenv("STATUS_READY_TO_PUBLISH", "READY_TO_PUBLISH")
@@ -47,18 +36,21 @@ RENDER_MAX_PER_RUN = int(float(os.getenv("RENDER_MAX_PER_RUN", "1") or "1"))
 # RDV dynamic_theme locked column AT = 46 (1-based)
 RDV_DYNAMIC_THEME_COL = int(float(os.getenv("RDV_DYNAMIC_THEME_COL", "46") or "46"))
 
+# OPS_MASTER theme-of-day locked cell
+OPS_THEME_CELL = os.getenv("OPS_THEME_CELL", "B5")
+
 GOOGLE_SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Determine render mode
-USE_LOCAL_RENDER = LOCAL_RENDER_AVAILABLE and os.path.exists(OUTPUT_DIR)
-print(f"🎨 Render mode: {'LOCAL' if USE_LOCAL_RENDER else 'REMOTE'}")
-
 
 # ============================================================
 # THEME GOVERNANCE (LOCKED)
+# - OPS_MASTER!B5 is authoritative theme of the day.
+# - RDV AT may contain multiple themes (e.g. "snow, long_haul").
+# - Render payload must carry ONE theme for palette selection.
+# - Rule: use OPS_MASTER theme if present; else fallback to RDV AT (collapsed deterministically).
 # ============================================================
 
 AUTHORITATIVE_THEMES = {
@@ -91,6 +83,7 @@ THEME_ALIASES = {
     "unexpected": "unexpected_value",
 }
 
+# Deterministic collapse if RDV AT contains multiple themes
 THEME_PRIORITY = [
     "luxury_value",
     "unexpected_value",
@@ -108,6 +101,13 @@ THEME_PRIORITY = [
 
 
 def normalize_theme(raw_theme: str | None) -> str:
+    """
+    Accepts:
+      - single theme tokens
+      - multi-theme strings (comma/pipe/semicolon separated)
+    Returns:
+      - one authoritative theme token
+    """
     if not raw_theme:
         return "adventure"
 
@@ -183,11 +183,7 @@ def _batch_update(ws: gspread.Worksheet, headers: list[str], row_1_based: int, u
 
 
 def _row_get(row: List[str], i: Optional[int]) -> str:
-    if i is None:
-        return ""
-    if i < 0:
-        return ""
-    if i >= len(row):
+    if i is None or i < 0 or i >= len(row):
         return ""
     return (row[i] or "").strip()
 
@@ -248,29 +244,50 @@ def normalize_date_ddmmyy(raw_date: str | None) -> str:
     raise ValueError(f"Cannot normalize date to ddmmyy: {raw_date!r}")
 
 
-def build_payload(row: Dict[str, str], dynamic_theme: str | None) -> Dict[str, str]:
+# ============================================================
+# THEME SOURCE OF TRUTH
+# ============================================================
+
+def read_ops_theme(sh: gspread.Spreadsheet) -> str:
+    """
+    OPS_MASTER!B5 is the authoritative theme of the day.
+    Returns a normalized single theme token, or "" if blank.
+    """
+    ws_ops = sh.worksheet(OPS_MASTER_TAB)
+    raw = (ws_ops.acell(OPS_THEME_CELL).value or "").strip()
+    if not raw:
+        return ""
+    return normalize_theme(raw)
+
+
+# ============================================================
+# PAYLOAD BUILDING
+# ============================================================
+
+def build_payload(row: Dict[str, str], theme_for_palette: str) -> Dict[str, str]:
     out_raw = row.get("outbound_date", "") or row.get("out_date", "")
     in_raw = row.get("return_date", "") or row.get("in_date", "")
     price_raw = row.get("price_gbp", "") or row.get("price", "")
     from_city = row.get("origin_city", "") or row.get("from_city", "")
     to_city = row.get("destination_city", "") or row.get("to_city", "")
 
-    out_ddmmyy = normalize_date_ddmmyy(out_raw) if out_raw else ""
-    in_ddmmyy = normalize_date_ddmmyy(in_raw) if in_raw else ""
-    price_gbp = normalize_price_gbp(price_raw) if price_raw else ""
-
-    return {
+    payload: Dict[str, str] = {
         "FROM": from_city,
         "TO": to_city,
-        "OUT": out_ddmmyy,
-        "IN": in_ddmmyy,
-        "PRICE": price_gbp,
-        "theme": normalize_theme(dynamic_theme),
+        "OUT": normalize_date_ddmmyy(out_raw) if out_raw else "",
+        "IN": normalize_date_ddmmyy(in_raw) if in_raw else "",
+        "PRICE": normalize_price_gbp(price_raw) if price_raw else "",
+        "theme": normalize_theme(theme_for_palette),
     }
+
+    # Slot hint only (does not change visuals unless PA uses it)
+    if RUN_SLOT in ("AM", "PM"):
+        payload["run_slot"] = RUN_SLOT
+
+    return payload
 
 
 def extract_graphic_url(resp_json: Dict[str, Any]) -> str:
-    """Extract graphic URL from remote API response"""
     for k in ("graphic_url", "png_url", "image_url", "url"):
         v = resp_json.get(k)
         if isinstance(v, str) and v.strip():
@@ -278,64 +295,6 @@ def extract_graphic_url(resp_json: Dict[str, Any]) -> str:
     if isinstance(resp_json.get("data"), dict):
         return extract_graphic_url(resp_json["data"])
     return ""
-
-
-def generate_filename(row_data: Dict[str, str]) -> str:
-    """Generate unique filename for rendered image"""
-    deal_id = row_data.get("deal_id", "")
-    if deal_id:
-        return f"deal_{deal_id}.png"
-    
-    # Fallback: timestamp + destination
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    dest = row_data.get("destination_iata", "UNK")
-    return f"deal_{dest}_{ts}.png"
-
-
-def render_local(payload: Dict[str, str], output_path: str) -> bool:
-    """Call local render_engine.py to generate image"""
-    try:
-        layout = payload.get("layout", "PM")
-        
-        success = generate_deal_image(
-            out_path=output_path,
-            to_city=payload["TO"],
-            from_city=payload["FROM"],
-            out_date=payload["OUT"],
-            in_date=payload["IN"],
-            price=payload["PRICE"],
-            layout=layout,
-            theme=payload.get("theme"),
-        )
-        
-        return success
-        
-    except Exception as e:
-        print(f"❌ Local render failed: {e}")
-        raise RuntimeError(f"Local render failed: {e}")
-
-
-def render_remote(payload: Dict[str, str]) -> str:
-    """Call remote render API and return graphic URL"""
-    try:
-        resp = requests.post(RENDER_URL, json=payload, timeout=60)
-        if not resp.ok:
-            raise RuntimeError(f"Render failed ({resp.status_code}): {resp.text}")
-
-        try:
-            resp_json = resp.json()
-        except Exception:
-            raise RuntimeError(f"Render returned non-JSON: {resp.text[:200]}")
-
-        graphic_url = extract_graphic_url(resp_json)
-        if not graphic_url:
-            raise RuntimeError("Render response missing graphic_url")
-        
-        return graphic_url
-        
-    except Exception as e:
-        print(f"❌ Remote render failed: {e}")
-        raise
 
 
 # ============================================================
@@ -349,7 +308,7 @@ def find_candidates_from_sheet_values(
     max_n: int,
 ) -> List[int]:
     """
-    sheet_values: includes header row at index 0.
+    sheet_values includes header row at index 0.
     Returns list of 1-based sheet row numbers (>=2).
     """
     candidates: List[int] = []
@@ -361,8 +320,7 @@ def find_candidates_from_sheet_values(
         gu = _row_get(row, graphic_i)
         if gu:
             continue
-        sheet_row_1_based = idx0 + 1
-        candidates.append(sheet_row_1_based)
+        candidates.append(idx0 + 1)  # sheet row number
         if len(candidates) >= max_n:
             break
     return candidates
@@ -372,7 +330,7 @@ def find_candidates_from_sheet_values(
 # RENDER ONE SHEET ROW
 # ============================================================
 
-def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int) -> bool:
+def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int, ops_theme: str) -> bool:
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
     ws_rdv = sh.worksheet(RAW_DEALS_VIEW_TAB)
 
@@ -385,10 +343,17 @@ def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int) -> bool:
         print(f"⚠️ Skip row {sheet_row}: status={status!r}")
         return False
 
-    dynamic_theme = ws_rdv.cell(sheet_row, RDV_DYNAMIC_THEME_COL).value
-    payload = build_payload(row, dynamic_theme)
+    # RDV dynamic_theme may be multi-theme. Used ONLY as fallback if OPS_THEME is blank.
+    rdv_dynamic_theme_raw = ws_rdv.cell(sheet_row, RDV_DYNAMIC_THEME_COL).value
 
-    print(f"Target row {sheet_row} | dynamic_theme={dynamic_theme!r} | payload={payload}")
+    theme_for_palette = ops_theme.strip() if ops_theme.strip() else normalize_theme(rdv_dynamic_theme_raw)
+    payload = build_payload(row, theme_for_palette)
+
+    print(
+        f"Target row {sheet_row} | RUN_SLOT={RUN_SLOT!r} | "
+        f"OPS_THEME={ops_theme!r} | RDV_AT={rdv_dynamic_theme_raw!r} | "
+        f"theme_used={payload.get('theme')!r} | payload={payload}"
+    )
 
     if not payload["FROM"] or not payload["TO"]:
         raise ValueError("FROM/TO missing (origin_city/destination_city)")
@@ -400,33 +365,18 @@ def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int) -> bool:
         raise ValueError(f"PRICE must be £<int>. Got {payload['PRICE']!r}")
 
     try:
-        if USE_LOCAL_RENDER:
-            # LOCAL RENDERING (PythonAnywhere)
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            filename = generate_filename(row)
-            output_path = os.path.join(OUTPUT_DIR, filename)
-            graphic_url = f"{BASE_URL}/{filename}"
-            
-            print(f"🎨 Rendering locally to: {output_path}")
-            success = render_local(payload, output_path)
-            
-            if not success:
-                raise RuntimeError("Local render_engine returned False")
-            
-            if not os.path.exists(output_path):
-                raise RuntimeError(f"Render completed but file not found: {output_path}")
-            
-            file_size = os.path.getsize(output_path)
-            print(f"✅ Rendered successfully: {filename} ({file_size} bytes)")
-        
-        else:
-            # REMOTE RENDERING (GitHub Actions)
-            if not RENDER_URL:
-                raise RuntimeError("RENDER_URL not set and local rendering unavailable")
-            
-            print(f"🌐 Rendering remotely via: {RENDER_URL}")
-            graphic_url = render_remote(payload)
-            print(f"✅ Rendered successfully: {graphic_url}")
+        resp = requests.post(RENDER_URL, json=payload, timeout=60)
+        if not resp.ok:
+            raise RuntimeError(f"Render failed ({resp.status_code}): {resp.text}")
+
+        try:
+            resp_json = resp.json()
+        except Exception:
+            raise RuntimeError(f"Render returned non-JSON: {resp.text[:200]}")
+
+        graphic_url = extract_graphic_url(resp_json)
+        if not graphic_url:
+            raise RuntimeError("Render response missing graphic_url")
 
         ts = _utc_now_iso()
         _batch_update(
@@ -467,30 +417,20 @@ def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int) -> bool:
 def main() -> int:
     if not SPREADSHEET_ID:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
-    
-    if USE_LOCAL_RENDER:
-        # Verify output directory is writable
-        try:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            test_file = os.path.join(OUTPUT_DIR, ".test_write")
-            with open(test_file, 'w') as f:
-                f.write("test")
-            os.remove(test_file)
-            print(f"📁 Output directory: {OUTPUT_DIR}")
-            print(f"🌐 Base URL: {BASE_URL}")
-        except Exception as e:
-            raise RuntimeError(f"OUTPUT_DIR not writable: {OUTPUT_DIR} - {e}")
-    else:
-        if not RENDER_URL:
-            raise RuntimeError("Neither local render nor RENDER_URL available")
-        print(f"🌐 Remote render URL: {RENDER_URL}")
+    if not RENDER_URL:
+        raise RuntimeError("Missing RENDER_URL")
 
     gc = gspread.authorize(_sa_creds())
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    ws_raw = sh.worksheet(RAW_DEALS_TAB)
+    # Authoritative theme of the day
+    ops_theme = read_ops_theme(sh)
+    if ops_theme:
+        print(f"🎯 OPS_MASTER theme of the day ({OPS_THEME_CELL}): {ops_theme}")
+    else:
+        print(f"⚠️ OPS_MASTER theme of the day ({OPS_THEME_CELL}) is blank -> will fallback to RDV AT per row")
 
-    # Pull whole sheet once to avoid col_values length mismatch
+    ws_raw = sh.worksheet(RAW_DEALS_TAB)
     sheet_values = ws_raw.get_all_values()
     if len(sheet_values) < 2:
         print("ℹ️ RAW_DEALS has no data rows")
@@ -505,22 +445,16 @@ def main() -> int:
     if graphic_i is None:
         raise RuntimeError("RAW_DEALS missing required header: graphic_url")
 
-    candidates = find_candidates_from_sheet_values(
-        sheet_values=sheet_values,
-        status_i=status_i,
-        graphic_i=graphic_i,
-        max_n=RENDER_MAX_PER_RUN,
-    )
-
+    candidates = find_candidates_from_sheet_values(sheet_values, status_i, graphic_i, RENDER_MAX_PER_RUN)
     if not candidates:
         print(f"ℹ️ No render candidates (status={STATUS_READY_TO_POST}, graphic_url blank)")
         return 0
 
-    print(f"🎯 Render candidates (sheet rows): {candidates}")
+    print(f"🎯 Render candidates (sheet rows): {candidates} | RUN_SLOT={RUN_SLOT!r}")
 
     ok = 0
     for sheet_row in candidates:
-        if render_sheet_row(sh, sheet_row):
+        if render_sheet_row(sh, sheet_row, ops_theme):
             ok += 1
 
     print(f"✅ Render complete: {ok}/{len(candidates)}")

@@ -1,5 +1,5 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — TravelTxter V5 Feeder (hotfix: import random)
+# FULL FILE REPLACEMENT — TravelTxter V5 Feeder (hotfix: bad log placeholder)
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import hashlib
 import datetime as dt
 import math
 import re
-import random  # ✅ HOTFIX: required for random.Random(...)
+import random
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
@@ -150,24 +150,6 @@ def _theme_of_day(eligible: List[str]) -> str:
     base = dt.date(2026, 1, 1)
     idx = (_today_utc() - base).days % len(eligible)
     return sorted(eligible)[idx]
-
-
-def _ztb_row_for_theme(ztb_rows: List[Dict[str, Any]], theme: str) -> Optional[Dict[str, Any]]:
-    for r in ztb_rows:
-        if str(r.get("theme") or "").strip().lower() == theme.lower():
-            return r
-    return None
-
-
-def _connections_from_tolerance(tol: str) -> int:
-    t = (tol or "").strip().lower()
-    if t in ("direct", "0", "zero"):
-        return 0
-    if t in ("1", "one_stop", "one-stop", "onestop"):
-        return 1
-    if t in ("2", "two_stop", "two-stop", "twostop"):
-        return 2
-    return 2
 
 
 def _sha12(s: str) -> str:
@@ -354,6 +336,8 @@ def main() -> int:
     log("TRAVELTXTTER PIPELINE WORKER (FEEDER) START")
     log("==============================================================================")
 
+    RAW_DEALS_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
+
     run_slot = _env("RUN_SLOT", "").upper()
     if run_slot not in ("AM", "PM"):
         run_slot = "AM" if dt.datetime.utcnow().hour < 12 else "PM"
@@ -377,7 +361,7 @@ def main() -> int:
     gc = _gs_client()
     sh = _open_sheet(gc)
 
-    ws_raw = _ws(sh, _env("RAW_DEALS_TAB", "RAW_DEALS"))
+    ws_raw = _ws(sh, RAW_DEALS_TAB)
     ws_cfg = _ws(sh, _env("CONFIG_TAB", "CONFIG"))
     ws_rcm = _ws(sh, _env("ROUTE_CAPABILITY_MAP_TAB", "ROUTE_CAPABILITY_MAP"))
     ws_iata = _ws(sh, _env("IATA_MASTER_TAB", "IATA_MASTER"))
@@ -468,7 +452,6 @@ def main() -> int:
         log("⚠️ No eligible destinations from CONFIG (Gate 1 fail)")
         return 0
 
-    # ✅ This was crashing before because random wasn't imported
     rnd = random.Random(f"{theme}:{run_slot}:{_today_utc().isoformat()}")
 
     # choose destinations (weighted)
@@ -635,7 +618,10 @@ def main() -> int:
         return 0
 
     _append_rows(ws_raw, out_rows)
+
+    # ✅ HOTFIX: correct log line (no placeholders)
     log(f"✅ Inserted {len(out_rows)} rows into {RAW_DEALS_TAB}")
+
     return 0
 
 

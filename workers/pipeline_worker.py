@@ -1,5 +1,5 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8j
+# FULL FILE REPLACEMENT — FEEDER v4.8k
 #
 # Locked constraints respected:
 # - No redesign / no schema changes
@@ -7,7 +7,12 @@
 # - RDV never written
 # - OPS_MASTER!B5 governs theme (fallback deterministic)
 #
-# Fixes in this version:
+# Fix in v4.8k:
+# - Treat CONFIG.origin_iata="ANY" as sentinel value (not literal IATA code)
+# - "ANY" now correctly triggers RCM-derived origin selection
+# - Resolves skipped_no_viable_origins=240 issue
+#
+# Previous fixes (v4.8j):
 # 1) Prevent "0 Duffel calls" by making origin selection capability-driven:
 #    - If CONFIG.origin_iata exists, use it (only if enabled in ROUTE_CAPABILITY_MAP).
 #    - Else derive viable origins from ROUTE_CAPABILITY_MAP for the destination (RCM used ONLY as a gate/route list).
@@ -567,11 +572,13 @@ def main() -> int:
         """
         Capability-driven origins:
         - If CONFIG.origin_iata exists -> use it, only if (origin,dest) is enabled in RCM.
+        - "ANY" is treated as sentinel for "derive from RCM".
         - Else derive viable origins from RCM origins_by_dest[dest].
         - Apply pool preference ordering (but never invent routes).
         """
         cfg_origin = _norm_iata(cfg_row.get("origin_iata"))
-        if cfg_origin:
+        # Treat "ANY" as "no specific origin" - derive from RCM
+        if cfg_origin and cfg_origin != "ANY":
             return [cfg_origin] if (cfg_origin, dest) in enabled_routes else []
 
         viable = origins_by_dest.get(dest, [])

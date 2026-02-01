@@ -1,19 +1,20 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8f+enrich
+# FULL FILE REPLACEMENT — FEEDER v4.8g+date_fanout
 #
-# Adds: feeder-side enrichment from selected Duffel offer:
-#   - connection_type, via_hub, carriers, currency
-#   - outbound/inbound durations, total_duration_hours
-#   - bags_incl (best-effort)
-#   - trip_length_days
-#   - created_utc/timestamp mirrors (if columns exist)
+# Change (targeted, no redesign):
+# - Stop wasting searches on a single outbound date per route.
+# - Deterministic K-date fanout per destination (route), while preserving variety:
+#     * We cap attempts per destination to K (computed from MAX_SEARCHES / ROUTES_PER_RUN),
+#       and rotate outbound dates and origins deterministically across those attempts.
+# - No schema changes. RAW_DEALS only writable. RDV never written.
+# - Preserves existing locked rules:
+#   - OPS_MASTER!B5 governs theme (with deterministic fallback)
+#   - 90/10 slot split per attempt
+#   - Shorthaul must be direct (max_conn forced 0 + offer stops check)
 #
-# Preserves LOCKED rules:
-# - No redesign of pipeline
-# - RAW_DEALS is sole writable state
-# - RDV is never written
-# - 90/10 slot split per search attempt
-# - Shorthaul must be direct (max_conn forced 0 + offer stops check)
+# Notes:
+# - Uses existing out-date generator, but now actually uses multiple out_dates.
+# - K is derived (or can be overridden via env DATES_PER_DEST / DATES_PER_ROUTE).
 
 from __future__ import annotations
 
@@ -279,7 +280,6 @@ def _parse_iso_dt(s: str) -> Optional[dt.datetime]:
             ss = ss.replace("Z", "+00:00")
         x = dt.datetime.fromisoformat(ss)
         if x.tzinfo is None:
-            # Duffel usually has timezone offsets; fallback to UTC if missing
             x = x.replace(tzinfo=dt.timezone.utc)
         return x
     except Exception:
@@ -287,7 +287,6 @@ def _parse_iso_dt(s: str) -> Optional[dt.datetime]:
 
 
 def _duration_minutes_from_segments(segs: List[Dict[str, Any]]) -> Optional[int]:
-    # Prefer timestamps if present
     if not segs:
         return None
     dep = _parse_iso_dt(str(segs[0].get("departing_at") or ""))
@@ -300,7 +299,6 @@ def _duration_minutes_from_segments(segs: List[Dict[str, Any]]) -> Optional[int]
 
 
 def _duration_minutes_from_iso8601(dur: Any) -> Optional[int]:
-    # Handles strings like "PT2H35M" (common)
     if not dur:
         return None
     s = str(dur).strip().upper()
@@ -319,18 +317,11 @@ def _duration_minutes_from_iso8601(dur: Any) -> Optional[int]:
 
 
 def _slice_enrichment(slice_obj: Dict[str, Any]) -> Tuple[int, str, Set[str]]:
-    """
-    Returns:
-      stops (int),
-      via_hub (str - first hub iata if any),
-      carriers (set of carrier iata codes across segments)
-    """
     segs = slice_obj.get("segments") or []
     stops = max(0, len(segs) - 1)
 
     via = ""
     if stops >= 1 and len(segs) >= 2:
-        # Hub = destination of first segment (where you connect)
         first_dest = segs[0].get("destination") or {}
         via = _iata_from_location(first_dest)
 
@@ -349,17 +340,11 @@ def _slice_enrichment(slice_obj: Dict[str, Any]) -> Tuple[int, str, Set[str]]:
 
 
 def _bags_incl_best_effort(offer: Dict[str, Any]) -> str:
-    """
-    Duffel's baggage structure can vary by offer version.
-    We do best-effort extraction and otherwise return "".
-    """
     try:
-        # Common: offer["passengers"][0]["baggages"] list
         pax = offer.get("passengers") or []
         if pax and isinstance(pax[0], dict):
             bags = pax[0].get("baggages")
             if isinstance(bags, list) and bags:
-                # Try to summarize: count checked/cabin if possible
                 types = []
                 for b in bags:
                     if isinstance(b, dict):
@@ -367,13 +352,10 @@ def _bags_incl_best_effort(offer: Dict[str, Any]) -> str:
                         if bt:
                             types.append(bt)
                 if types:
-                    # e.g. "cabin,checked"
                     return ",".join(sorted(set(types)))
                 return "included"
-        # Some offers include services in "available_services"
         av = offer.get("available_services")
         if isinstance(av, list) and av:
-            # If any looks like baggage, mark "maybe"
             for s in av:
                 if isinstance(s, dict):
                     name = str(s.get("type") or s.get("name") or "").lower()
@@ -385,10 +367,6 @@ def _bags_incl_best_effort(offer: Dict[str, Any]) -> str:
 
 
 def _best_offer_gbp_with_meta(offers_json: Dict[str, Any]) -> Optional[Tuple[float, int, Dict[str, Any]]]:
-    """
-    Returns: (best_price_gbp, stops, offer_object)
-    Best = lowest price; tie-break = fewer stops.
-    """
     try:
         offers = offers_json.get("data", {}).get("offers") or []
         if not offers:
@@ -465,6 +443,14 @@ def _candidate_outbounds_seasonal(
     return out[:n]
 
 
+def _compute_k_dates(max_searches: int, routes_per_run: int, override: int) -> int:
+    if override > 0:
+        return max(1, override)
+    r = max(1, routes_per_run)
+    m = max(1, max_searches)
+    return max(1, m // r)
+
+
 def main() -> int:
     log("================================================================================")
     log("TRAVELTXTTER PIPELINE WORKER (FEEDER) START")
@@ -500,11 +486,17 @@ def main() -> int:
 
     SLOT_PRIMARY_PCT = _env_int("SLOT_PRIMARY_PCT", 90)
 
+    # Date fanout per destination (K)
+    # Override env name options kept flexible but non-breaking:
+    # - DATES_PER_DEST or DATES_PER_ROUTE (if set)
+    K_OVERRIDE = _env_int("DATES_PER_DEST", _env_int("DATES_PER_ROUTE", 0))
+    K_DATES_PER_DEST = _compute_k_dates(DUFFEL_MAX_SEARCHES_PER_RUN, DESTS_PER_RUN, K_OVERRIDE)
+
     log(
         f"CAPS: MAX_INSERTS={DUFFEL_MAX_INSERTS} | PER_ORIGIN={DUFFEL_MAX_INSERTS_PER_ORIGIN} | "
         f"PER_ROUTE={DUFFEL_MAX_INSERTS_PER_ROUTE} | MAX_SEARCHES={DUFFEL_MAX_SEARCHES_PER_RUN} | "
         f"DESTS_PER_RUN={DESTS_PER_RUN} | ORIGINS_PER_DEST={ORIGINS_PER_DEST} | RUN_SLOT={RUN_SLOT} | "
-        f"SLOT_SPLIT={SLOT_PRIMARY_PCT}/{100 - SLOT_PRIMARY_PCT}"
+        f"SLOT_SPLIT={SLOT_PRIMARY_PCT}/{100 - SLOT_PRIMARY_PCT} | K_DATES_PER_DEST={K_DATES_PER_DEST}"
     )
 
     gc = _get_gspread_client()
@@ -693,7 +685,6 @@ def main() -> int:
     rows_primary.sort(key=sort_key, reverse=True)
     rows_explore.sort(key=sort_key, reverse=True)
 
-    # 90/10 per attempt (primary vs explore)
     primary_period = max(1, min(100, SLOT_PRIMARY_PCT))
     explore_period = 100 - primary_period
 
@@ -704,7 +695,13 @@ def main() -> int:
             return None
         return pool[attempt_idx % len(pool)]
 
-    dest_seen: Dict[str, int] = {}
+    # Count attempts per destination (date fanout cap)
+    dest_attempts: Dict[str, int] = {}
+
+    # For observability only (won't change behavior): show intended budget shape
+    intended_routes = max(1, DESTS_PER_RUN)
+    intended_k = max(1, K_DATES_PER_DEST)
+    log(f"PLAN: intended_routes={intended_routes} | dates_per_dest(K)={intended_k} | max_searches={DUFFEL_MAX_SEARCHES_PER_RUN}")
 
     while searches < DUFFEL_MAX_SEARCHES_PER_RUN and len(deals_out) < DUFFEL_MAX_INSERTS:
         attempt = searches
@@ -735,23 +732,24 @@ def main() -> int:
             searches += 1
             continue
 
-        dest_seen[dest] = dest_seen.get(dest, 0) + 1
-        if dest_seen[dest] > max(1, DESTS_PER_RUN):
-            searches += 1
-            continue
-
         if not geo_for(dest):
             log(f"⚠️ Missing geo for destination_iata={dest}. Skipping (no invented geo).")
             searches += 1
             continue
 
+        # Date candidates (generate more than we need, then cap to K deterministically)
         min_d = _safe_int(cfg_pick.get("days_ahead_min"), 7)
         max_d = _safe_int(cfg_pick.get("days_ahead_max"), 120)
         trip_len = _safe_int(cfg_pick.get("trip_length_days"), 5)
-        out_dates = _candidate_outbounds_seasonal(min_d, max_d, trip_len, ztb_start, ztb_end, n=2)
-        if not out_dates:
+
+        # Generate up to max(3, K) dates so we have enough to cap
+        gen_n = max(3, K_DATES_PER_DEST)
+        out_dates_all = _candidate_outbounds_seasonal(min_d, max_d, trip_len, ztb_start, ztb_end, n=gen_n)
+        if not out_dates_all:
             searches += 1
             continue
+
+        out_dates = out_dates_all[: max(1, min(K_DATES_PER_DEST, len(out_dates_all)))]
 
         is_long = is_longhaul(cfg_pick)
 
@@ -765,10 +763,30 @@ def main() -> int:
         cabin = str(cfg_pick.get("cabin_class") or "economy").strip().lower() or "economy"
         included_airlines = carriers_from_cfg(cfg_pick)
         origins = choose_origins_for_dest(cfg_pick, dest, ORIGINS_PER_DEST)
+        if not origins:
+            searches += 1
+            continue
 
-        origin = origins[0] if origins else ""
-        od = out_dates[0] if out_dates else None
-        if not origin or od is None or not geo_for(origin):
+        # Apply deterministic K-date fanout cap per destination:
+        da = dest_attempts.get(dest, 0)
+        if da >= len(out_dates):
+            # We've already tried K dates for this destination this run; move on.
+            searches += 1
+            continue
+
+        # Pick which date + origin for this destination attempt deterministically.
+        # - date cycles per-destination attempt index (0..K-1)
+        # - origin rotates with the same index to avoid single-origin clog
+        date_idx = da % len(out_dates)
+        origin_idx = da % len(origins)
+
+        od = out_dates[date_idx]
+        origin = origins[origin_idx]
+
+        # Track that we have consumed one "date attempt" for this destination
+        dest_attempts[dest] = da + 1
+
+        if not origin or not geo_for(origin):
             searches += 1
             continue
 
@@ -785,7 +803,9 @@ def main() -> int:
 
         log(
             f"🔎 Search[{attempt+1}/{DUFFEL_MAX_SEARCHES_PER_RUN}] mode={mode} dest={dest} origin={origin} "
-            f"haul={'LONG' if is_long else 'SHORT'} max_conn={max_conn} slot_hint={cfg_slot(cfg_pick) or '—'}"
+            f"haul={'LONG' if is_long else 'SHORT'} max_conn={max_conn} "
+            f"date_try={date_idx+1}/{len(out_dates)} out={od.isoformat()} in={rd.isoformat()} "
+            f"slot_hint={cfg_slot(cfg_pick) or '—'}"
         )
 
         resp = _duffel_search(origin, dest, od, rd, max_conn, cabin, included_airlines)
@@ -808,26 +828,32 @@ def main() -> int:
         out_slice = slices[0] if len(slices) >= 1 else {}
         in_slice = slices[1] if len(slices) >= 2 else {}
 
-        out_stops, out_via, out_carriers = _slice_enrichment(out_slice) if isinstance(out_slice, dict) else (int(offer_stops), "", set())
-        in_stops, in_via, in_carriers = _slice_enrichment(in_slice) if isinstance(in_slice, dict) else (int(offer_stops), "", set())
+        out_stops, out_via, out_carriers = (
+            _slice_enrichment(out_slice) if isinstance(out_slice, dict) else (int(offer_stops), "", set())
+        )
+        in_stops, in_via, in_carriers = (
+            _slice_enrichment(in_slice) if isinstance(in_slice, dict) else (int(offer_stops), "", set())
+        )
 
-        # Use overall stops as max across slices (matches previous logic)
         stops_final = int(max(int(out_stops), int(in_stops), int(offer_stops)))
 
         carriers_all = sorted(set(out_carriers) | set(in_carriers))
         carriers_str = ",".join(carriers_all)
 
         connection_type = "direct" if stops_final == 0 else f"{stops_final}_stop" if stops_final == 1 else f"{stops_final}_stops"
-        via_hub = out_via or ""  # outbound hub only (primary for messaging)
+        via_hub = out_via or ""
 
         out_mins = None
         in_mins = None
 
-        # Prefer slice "duration" (often ISO8601). Fallback to segment timestamps.
         if isinstance(out_slice, dict):
-            out_mins = _duration_minutes_from_iso8601(out_slice.get("duration")) or _duration_minutes_from_segments(out_slice.get("segments") or [])
+            out_mins = _duration_minutes_from_iso8601(out_slice.get("duration")) or _duration_minutes_from_segments(
+                out_slice.get("segments") or []
+            )
         if isinstance(in_slice, dict):
-            in_mins = _duration_minutes_from_iso8601(in_slice.get("duration")) or _duration_minutes_from_segments(in_slice.get("segments") or [])
+            in_mins = _duration_minutes_from_iso8601(in_slice.get("duration")) or _duration_minutes_from_segments(
+                in_slice.get("segments") or []
+            )
 
         total_hours = ""
         if out_mins is not None and in_mins is not None:
@@ -863,7 +889,6 @@ def main() -> int:
         set_if("return_date", rd.isoformat())
         set_if("price_gbp", float(price))
 
-        # Core enrichment
         set_if("stops", int(stops_final))
         set_if("connection_type", connection_type)
         set_if("via_hub", via_hub)
@@ -878,7 +903,6 @@ def main() -> int:
         if total_hours != "":
             set_if("total_duration_hours", total_hours)
 
-        # Existing fields preserved
         set_if("theme", theme_today)
         set_if("primary_theme", cfg_theme(cfg_pick))
         set_if("ingested_at_utc", ingest_iso)
@@ -888,7 +912,6 @@ def main() -> int:
         set_if("included_airlines", ",".join(included_airlines) if included_airlines else "")
         set_if("slot_hint", cfg_slot(cfg_pick))
 
-        # Compatibility mirrors (only if columns exist)
         set_if("created_utc", ingest_iso)
         set_if("created_at", ingest_iso)
         set_if("timestamp", ingest_iso)

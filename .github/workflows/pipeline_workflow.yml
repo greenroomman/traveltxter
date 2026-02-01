@@ -38,9 +38,14 @@ jobs:
       INSTA_FEED_TAB: ${{ secrets.INSTA_FEED_TAB }}
       SUBSCRIBERS_TAB: ${{ secrets.SUBSCRIBERS_TAB }}
 
+      # Legacy/compat vars (left intact)
       FEEDER_CONFIG_TAB: ${{ vars.FEEDER_CONFIG_TAB }}
       THEMES_TAB: ${{ vars.THEMES_TAB }}
       PHRASES_TAB: ${{ vars.PHRASES_TAB }}
+
+      # New/explicit tabs for V5 enrichment (safe defaults exist in worker)
+      PHRASE_BANK_TAB: ${{ secrets.PHRASE_BANK_TAB || vars.PHRASE_BANK_TAB }}
+      IATA_MASTER_TAB: ${{ secrets.IATA_MASTER_TAB || vars.IATA_MASTER_TAB }}
 
       # ---------------- API keys / tokens (Secrets) ----------------
       # Robust: allows DUFFEL_KEY fallback if that is what exists in repo settings
@@ -76,6 +81,13 @@ jobs:
       VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
 
       GRAPH_API_VERSION: ${{ vars.GRAPH_API_VERSION }}
+
+      # ---------------- Enrichment Router knobs (optional) ----------------
+      # Which channel to select phrases for (vip/ig/free/pro)
+      PHRASE_CHANNEL: ${{ vars.PHRASE_CHANNEL || 'vip' }}
+      ENRICH_MAX_ROWS_PER_RUN: ${{ vars.ENRICH_MAX_ROWS_PER_RUN || '60' }}
+      ENFORCE_MAX_PER_MONTH: ${{ vars.ENFORCE_MAX_PER_MONTH || 'true' }}
+      REQUIRE_PHRASE: ${{ vars.REQUIRE_PHRASE || 'false' }}
 
     steps:
       - name: Checkout repo
@@ -136,6 +148,9 @@ jobs:
           python -c "import os; print('DUFFEL_API_KEY present:', bool(os.getenv('DUFFEL_API_KEY')))"
           python -c "import os; print('SPREADSHEET_ID present:', bool(os.getenv('SPREADSHEET_ID') or os.getenv('SHEET_ID')))"
           python -c "import os; print('GCP_SA_JSON present:', bool(os.getenv('GCP_SA_JSON_ONE_LINE') or os.getenv('GCP_SA_JSON')))"
+          python -c "import os; print('PHRASE_BANK_TAB:', os.getenv('PHRASE_BANK_TAB'))"
+          python -c "import os; print('IATA_MASTER_TAB:', os.getenv('IATA_MASTER_TAB'))"
+          python -c "import os; print('PHRASE_CHANNEL:', os.getenv('PHRASE_CHANNEL'))"
 
       # ---------------- FEEDER ----------------
       - name: Run Feeder
@@ -151,7 +166,13 @@ jobs:
       - name: Run Scorer
         run: python workers/ai_scorer.py
 
+      # ---------------- ENRICHMENT (fills city/country + phrase_bank) ----------------
+      # Runs on SCORED + READY_* and writes ONLY to enrichment columns if blank.
+      - name: Run Enrichment Router
+        run: python workers/enrich_router.py
+
       # ---------------- LINKS (VIP booking rail) ----------------
+      # Uses destination_city if present; enrichment step ensures it exists.
       - name: Run Link Router
         run: python workers/link_router.py
 

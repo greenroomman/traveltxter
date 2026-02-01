@@ -1,12 +1,22 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8h+date_fanout+nonsilent_skips
+# FULL FILE REPLACEMENT — FEEDER v4.8j
 #
-# Targeted fix:
-# - Ensure CONFIG destination IATA is found even if header isn't exactly "destination_iata"
-# - Add skip counters to diagnose "0 searches / 0 deals" immediately
-# - Preserve date fanout (K) and existing caps / rules
+# Locked constraints respected:
+# - No redesign / no schema changes
+# - RAW_DEALS only writable source of truth
+# - RDV never written
+# - OPS_MASTER!B5 governs theme (fallback deterministic)
 #
-# No schema changes. RAW_DEALS only writable. RDV never written.
+# Fixes in this version:
+# 1) Prevent "0 Duffel calls" by making origin selection capability-driven:
+#    - If CONFIG.origin_iata exists, use it (only if enabled in ROUTE_CAPABILITY_MAP).
+#    - Else derive viable origins from ROUTE_CAPABILITY_MAP for the destination (RCM used ONLY as a gate/route list).
+#    - Origin pools are preference ordering only (never invent routes).
+# 2) MAX_SEARCHES caps real Duffel calls (not capability skips).
+#    - Separate attempt cap prevents infinite loops.
+# 3) K outbound date fanout per destination (K derived from MAX_SEARCHES/ROUTES_PER_RUN or override).
+# 4) IMPORTANT: GEO ENRICHMENT uses IATA_MASTER ONLY.
+#    - RCM is NOT used for geo/IATA enrichment.
 
 from __future__ import annotations
 
@@ -80,8 +90,12 @@ def _csv_list(v: str) -> List[str]:
         x = x.strip().upper()
         if x:
             out.append(x)
-    # stable de-dupe
     return list(dict.fromkeys(out))
+
+
+def _slot_norm(s: Any) -> str:
+    x = str(s or "").strip().upper()
+    return x if x in ("AM", "PM") else ""
 
 
 def _today_utc() -> dt.date:
@@ -148,11 +162,6 @@ def _deal_id(origin: str, dest: str, od: dt.date, rd: dt.date, price_gbp: float,
     price_i = int(math.ceil(float(price_gbp)))
     base = f"{origin}|{dest}|{od.isoformat()}|{rd.isoformat()}|{price_i}|{cabin}|{int(stops)}"
     return f"D{_sha12(base)}"
-
-
-def _slot_norm(s: Any) -> str:
-    x = str(s or "").strip().upper()
-    return x if x in ("AM", "PM") else ""
 
 
 def _get_gspread_client() -> gspread.Client:
@@ -331,24 +340,14 @@ def _best_offer_gbp_with_meta(offers_json: Dict[str, Any]) -> Optional[Tuple[flo
         return None
 
 
-def _cfg_get_iata(cfg: Dict[str, Any], keys: List[str]) -> str:
-    """Try multiple keys for IATA codes to tolerate CONFIG header differences."""
-    for k in keys:
-        v = cfg.get(k)
-        if v is None:
-            continue
-        s = str(v).strip().upper()
-        # tolerate "BRS " etc
-        if s and len(s) in (3, 4) and re.match(r"^[A-Z0-9]{3,4}$", s):
-            return s
-        if s and len(s) == 3:
-            return s
-        if s:
-            # last-resort: split on punctuation/spaces and take first 3 chars if valid
-            m = re.search(r"\b([A-Z]{3})\b", s)
-            if m:
-                return m.group(1)
-    return ""
+def _norm_iata(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if not s:
+        return ""
+    if re.match(r"^[A-Z]{3}$", s):
+        return s
+    m = re.search(r"\b([A-Z]{3})\b", s)
+    return m.group(1) if m else ""
 
 
 def main() -> int:
@@ -378,10 +377,9 @@ def main() -> int:
     DUFFEL_MAX_INSERTS = _env_int("DUFFEL_MAX_INSERTS", 50)
     DUFFEL_MAX_INSERTS_PER_ORIGIN = _env_int("DUFFEL_MAX_INSERTS_PER_ORIGIN", 15)
     DUFFEL_MAX_INSERTS_PER_ROUTE = _env_int("DUFFEL_MAX_INSERTS_PER_ROUTE", 5)
-    DUFFEL_MAX_SEARCHES_PER_RUN = _env_int("DUFFEL_MAX_SEARCHES_PER_RUN", 12)
+    DUFFEL_MAX_SEARCHES_PER_RUN = _env_int("DUFFEL_MAX_SEARCHES_PER_RUN", 12)  # caps Duffel calls
     DESTS_PER_RUN = _env_int("DUFFEL_ROUTES_PER_RUN", 4)
     ORIGINS_PER_DEST = _env_int("ORIGINS_PER_DEST", 3)
-
     SLOT_PRIMARY_PCT = _env_int("SLOT_PRIMARY_PCT", 90)
 
     K_OVERRIDE = _env_int("DATES_PER_DEST", _env_int("DATES_PER_ROUTE", 0))
@@ -408,14 +406,13 @@ def main() -> int:
     ws_rcm = sh.worksheet(RCM_TAB)
     ws_iata = sh.worksheet(IATA_TAB)
 
-    # OPS_MASTER theme
     try:
         ws_ops = sh.worksheet(OPS_MASTER_TAB)
     except Exception:
         ws_ops = None
         log("⚠️ OPS_MASTER worksheet not found - will use calculated theme")
 
-    # Load bias just for continuity
+    # Carrier bias (informational continuity)
     try:
         ws_bias = sh.worksheet(CONFIG_CARRIER_BIAS_TAB)
         bias_rows = ws_bias.get_all_records() or []
@@ -434,6 +431,7 @@ def main() -> int:
     except Exception:
         log("⚠️ CONFIG_CARRIER_BIAS not loaded or empty.")
 
+    # Theme authority
     ztb_rows_all = ws_ztb.get_all_records()
     eligible_themes = _eligible_themes_from_ztb(ztb_rows_all)
 
@@ -463,32 +461,40 @@ def main() -> int:
     cfg_active = [r for r in cfg_all if _is_true(r.get("active_in_feeder")) and _is_true(r.get("enabled"))]
     log(f"✅ CONFIG loaded: {len(cfg_active)} active rows (of {len(cfg_all)} total)")
 
-    # Capability map
+    # ROUTE_CAPABILITY_MAP — route gating ONLY (no geo from here)
     rcm_rows = ws_rcm.get_all_records()
     enabled_routes: Set[Tuple[str, str]] = set()
+    origins_by_dest: Dict[str, List[str]] = {}
     for r in rcm_rows:
-        o = str(r.get("origin_iata") or r.get("origin") or "").strip().upper()
-        d = str(r.get("destination_iata") or r.get("destination") or "").strip().upper()
+        o = _norm_iata(r.get("origin_iata") or r.get("origin"))
+        d = _norm_iata(r.get("destination_iata") or r.get("destination"))
         if o and d and _is_true(r.get("enabled")):
             enabled_routes.add((o, d))
+            origins_by_dest.setdefault(d, []).append(o)
+
+    for d, lst in list(origins_by_dest.items()):
+        origins_by_dest[d] = list(dict.fromkeys([x for x in lst if x]))
+
     log(f"✅ ROUTE_CAPABILITY_MAP loaded: {len(enabled_routes)} enabled routes")
 
-    # Geo
+    # IATA_MASTER — geo enrichment ONLY
     iata_geo: Dict[str, Tuple[str, str]] = {}
     for r in ws_iata.get_all_records():
-        code = str(r.get("iata_code") or r.get("iata") or r.get("IATA") or "").strip().upper()
-        city = str(r.get("city") or r.get("City") or "").strip()
-        country = str(r.get("country") or r.get("Country") or "").strip()
+        code = _norm_iata(r.get("iata_code") or r.get("iata") or r.get("IATA"))
+        city = str(r.get("city") or "").strip()
+        country = str(r.get("country") or "").strip()
         if code and city and country and code not in iata_geo:
             iata_geo[code] = (city, country)
-    log(f"✅ Geo dictionary loaded: {len(iata_geo)} IATA entries (RCM + {IATA_TAB})")
+
+    log(f"✅ Geo dictionary loaded: {len(iata_geo)} IATA entries (IATA_MASTER only)")
 
     def geo_for(iata: str) -> Optional[Tuple[str, str]]:
         return iata_geo.get(str(iata or "").strip().upper())
 
-    origins_default = _csv_list(_env("ORIGINS_DEFAULT", "LHR,MAN,BRS,LGW,STN"))
+    # Pools (preference ordering only)
+    origins_default = _csv_list(_env("ORIGINS_DEFAULT", "LHR,LGW,MAN,BRS,STN,LTN,BHX,EDI,GLA"))
     hub_origins = _csv_list(_env("HUB_ORIGINS", "LHR,LGW,MAN"))
-    lcc_origins = _csv_list(_env("LCC_ORIGINS", "STN,LTN,LGW,MAN,BRS,BHX"))
+    lcc_origins = _csv_list(_env("LCC_ORIGINS", "STN,LTN,LGW,MAN,BRS,BHX,EDI,GLA"))
 
     headers = ws_raw.row_values(1)
     idx = _build_header_index(headers)
@@ -519,26 +525,45 @@ def main() -> int:
         raw = str(cfg_row.get("included_airlines") or "").strip()
         return _csv_list(raw) if raw else []
 
-    def choose_origins_for_dest(cfg_row: Dict[str, Any], dest: str, cap: int) -> List[str]:
-        is_long_local = is_longhaul(cfg_row)
+    def preferred_pool(cfg_row: Dict[str, Any]) -> List[str]:
+        is_long = is_longhaul(cfg_row)
         gw = str(cfg_row.get("gateway_type") or "").strip().lower()
+        if is_long:
+            return [o for o in hub_origins if o in origins_default] or origins_default[:]
+        if gw in ("commodity", "value"):
+            return [o for o in lcc_origins if o in origins_default] or origins_default[:]
+        return origins_default[:]
 
-        if is_long_local:
-            candidate_pool = [o for o in hub_origins if o in origins_default] or origins_default[:]
-        else:
-            if gw in ("commodity", "value"):
-                candidate_pool = [o for o in lcc_origins if o in origins_default] or origins_default[:]
-            else:
-                candidate_pool = origins_default[:]
+    def choose_viable_origins(cfg_row: Dict[str, Any], dest: str, cap: int) -> List[str]:
+        """
+        Capability-driven origins:
+        - If CONFIG.origin_iata exists -> use it, only if (origin,dest) is enabled in RCM.
+        - Else derive viable origins from RCM origins_by_dest[dest].
+        - Apply pool preference ordering (but never invent routes).
+        """
+        cfg_origin = _norm_iata(cfg_row.get("origin_iata"))
+        if cfg_origin:
+            return [cfg_origin] if (cfg_origin, dest) in enabled_routes else []
+
+        viable = origins_by_dest.get(dest, [])
+        if not viable:
+            return []
+
+        pref = preferred_pool(cfg_row)
+        pref_set = set(pref)
+
+        ordered = [o for o in pref if o in viable]
+        ordered += [o for o in viable if o not in pref_set]
 
         seed = f"{_today_utc().isoformat()}|{theme_today}|{dest}|{RUN_SLOT}"
         h = int(hashlib.md5(seed.encode("utf-8")).hexdigest(), 16)
-        ranked = candidate_pool[:]
-        if ranked:
-            rot = h % len(ranked)
-            ranked = ranked[rot:] + ranked[:rot]
-        return ranked[:cap]
+        if ordered:
+            rot = h % len(ordered)
+            ordered = ordered[rot:] + ordered[:rot]
 
+        return ordered[: max(1, cap)]
+
+    # Theme-filter CONFIG
     theme_rows_all = [r for r in cfg_active if cfg_theme(r).lower() == theme_today.lower()]
     if not theme_rows_all:
         fallback = "unexpected_value"
@@ -567,50 +592,53 @@ def main() -> int:
     primary_period = max(1, min(100, SLOT_PRIMARY_PCT))
     explore_period = 100 - primary_period
 
-    # --- skip counters ---
+    # diagnostics counters
     skipped_no_dest = 0
     skipped_missing_geo_dest = 0
-    skipped_no_out_dates = 0
-    skipped_no_origins = 0
     skipped_missing_geo_origin = 0
-    skipped_capability_gate = 0
+    skipped_no_out_dates = 0
+    skipped_no_viable_origins = 0
     skipped_can_insert = 0
-    skipped_dest_attempts_exhausted = 0
-    duffel_calls = 0
+    skipped_offer_not_direct = 0
 
+    # K-date attempts per destination
     dest_attempts: Dict[str, int] = {}
+
+    # MAX_SEARCHES caps Duffel calls
+    duffel_calls = 0
+    attempts = 0
+    max_attempts = max(50, DUFFEL_MAX_SEARCHES_PER_RUN * 20)
 
     log(f"PLAN: intended_routes={max(1, DESTS_PER_RUN)} | dates_per_dest(K)={max(1, K_DATES_PER_DEST)} | max_searches={DUFFEL_MAX_SEARCHES_PER_RUN}")
 
-    searches = 0
-    while searches < DUFFEL_MAX_SEARCHES_PER_RUN and len(deals_out) < DUFFEL_MAX_INSERTS:
-        attempt = searches
+    while duffel_calls < DUFFEL_MAX_SEARCHES_PER_RUN and len(deals_out) < DUFFEL_MAX_INSERTS and attempts < max_attempts:
+        attempt_idx = attempts
+        attempts += 1
 
         use_explore = False
-        if explore_period > 0 and ((attempt % 100) >= primary_period):
+        if explore_period > 0 and ((attempt_idx % 100) >= primary_period):
             use_explore = True
 
         if use_explore and rows_explore:
-            cfg_pick = rows_explore[attempt % len(rows_explore)]
+            cfg_pick = rows_explore[attempt_idx % len(rows_explore)]
             mode = f"EXPLORE({opp})"
         else:
-            cfg_pick = rows_primary[attempt % len(rows_primary)] if rows_primary else (theme_rows_all[attempt % len(theme_rows_all)] if theme_rows_all else None)
+            cfg_pick = rows_primary[attempt_idx % len(rows_primary)] if rows_primary else (
+                theme_rows_all[attempt_idx % len(theme_rows_all)] if theme_rows_all else None
+            )
             mode = f"PRIMARY({RUN_SLOT})"
 
         if cfg_pick is None:
             log("⚠️ No CONFIG rows available to pick from. Ending run.")
             break
 
-        # tolerant destination lookup
-        dest = _cfg_get_iata(cfg_pick, ["destination_iata", "dest_iata", "to_iata", "to", "destination", "dest", "iata"])
+        dest = _norm_iata(cfg_pick.get("destination_iata"))
         if not dest:
             skipped_no_dest += 1
-            searches += 1
             continue
 
         if not geo_for(dest):
             skipped_missing_geo_dest += 1
-            searches += 1
             continue
 
         min_d = _safe_int(cfg_pick.get("days_ahead_min"), 7)
@@ -621,30 +649,26 @@ def main() -> int:
         out_dates_all = _candidate_outbounds_seasonal(min_d, max_d, trip_len, ztb_start, ztb_end, n=gen_n)
         if not out_dates_all:
             skipped_no_out_dates += 1
-            searches += 1
             continue
-
         out_dates = out_dates_all[: max(1, min(K_DATES_PER_DEST, len(out_dates_all)))]
 
         da = dest_attempts.get(dest, 0)
         if da >= len(out_dates):
-            skipped_dest_attempts_exhausted += 1
-            searches += 1
+            # already exhausted K date-tries for this destination this run
             continue
 
         is_long = is_longhaul(cfg_pick)
         cfg_max_conn = _safe_int(cfg_pick.get("max_connections"), 2)
         max_conn = min(cfg_max_conn, ztb_max_conn)
         if not is_long:
-            max_conn = 0  # shorthaul direct only
+            max_conn = 0  # shorthaul direct-only
 
         cabin = str(cfg_pick.get("cabin_class") or "economy").strip().lower() or "economy"
         included_airlines = carriers_from_cfg(cfg_pick)
 
-        origins = choose_origins_for_dest(cfg_pick, dest, _env_int("ORIGINS_PER_DEST", 3))
+        origins = choose_viable_origins(cfg_pick, dest, ORIGINS_PER_DEST)
         if not origins:
-            skipped_no_origins += 1
-            searches += 1
+            skipped_no_viable_origins += 1
             continue
 
         date_idx = da % len(out_dates)
@@ -655,30 +679,22 @@ def main() -> int:
 
         if not geo_for(origin):
             skipped_missing_geo_origin += 1
-            searches += 1
-            continue
-
-        if enabled_routes and (origin, dest) not in enabled_routes:
-            skipped_capability_gate += 1
-            searches += 1
             continue
 
         if not can_insert(origin, dest):
             skipped_can_insert += 1
-            searches += 1
             continue
 
         rd = od + dt.timedelta(days=trip_len)
 
         log(
-            f"🔎 Search[{attempt+1}/{DUFFEL_MAX_SEARCHES_PER_RUN}] mode={mode} dest={dest} origin={origin} "
+            f"🔎 Search[{duffel_calls+1}/{DUFFEL_MAX_SEARCHES_PER_RUN}] mode={mode} dest={dest} origin={origin} "
             f"haul={'LONG' if is_long else 'SHORT'} max_conn={max_conn} "
             f"date_try={date_idx+1}/{len(out_dates)} out={od.isoformat()} in={rd.isoformat()}"
         )
 
         duffel_calls += 1
         resp = _duffel_search(origin, dest, od, rd, max_conn, cabin, included_airlines)
-        searches += 1
         if not resp:
             continue
 
@@ -686,11 +702,11 @@ def main() -> int:
         if best is None:
             continue
 
-        price, offer_stops, offer_obj = best
+        price, offer_stops, _offer_obj = best
         if (not is_long) and int(offer_stops) != 0:
+            skipped_offer_not_direct += 1
             continue
 
-        # --- Build RAW_DEALS row ---
         row = [""] * len(headers)
 
         def set_if(col: str, val: Any) -> None:
@@ -734,17 +750,16 @@ def main() -> int:
         inserted_by_origin[origin] = inserted_by_origin.get(origin, 0) + 1
         inserted_by_route[(origin, dest)] = inserted_by_route.get((origin, dest), 0) + 1
 
-    log(f"✓ Searches completed: {searches}")
-    log(f"✓ Duffel calls made: {duffel_calls}")
+    log(f"✓ Attempts (internal loop): {attempts} (cap {max_attempts})")
+    log(f"✓ Duffel calls made: {duffel_calls} (cap {DUFFEL_MAX_SEARCHES_PER_RUN})")
     log(f"✓ Deals collected: {len(deals_out)} (cap {DUFFEL_MAX_INSERTS})")
 
     if duffel_calls == 0:
         log(
-            "⚠️ Zero Duffel calls. Likely CONFIG destination column mismatch or pre-search gates blocked everything. "
+            "⚠️ Zero Duffel calls. Pre-search gates blocked all candidates. "
             f"skipped_no_dest={skipped_no_dest} skipped_missing_geo_dest={skipped_missing_geo_dest} "
-            f"skipped_no_out_dates={skipped_no_out_dates} skipped_no_origins={skipped_no_origins} "
-            f"skipped_missing_geo_origin={skipped_missing_geo_origin} skipped_capability_gate={skipped_capability_gate} "
-            f"skipped_can_insert={skipped_can_insert} skipped_dest_attempts_exhausted={skipped_dest_attempts_exhausted}"
+            f"skipped_no_out_dates={skipped_no_out_dates} skipped_no_viable_origins={skipped_no_viable_origins} "
+            f"skipped_missing_geo_origin={skipped_missing_geo_origin} skipped_can_insert={skipped_can_insert}"
         )
 
     if not deals_out:

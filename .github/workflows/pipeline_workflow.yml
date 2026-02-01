@@ -151,6 +151,10 @@ jobs:
       - name: Run Scorer
         run: python workers/ai_scorer.py
 
+      # ---------------- LINKS (VIP booking rail) ----------------
+      - name: Run Link Router
+        run: python workers/link_router.py
+
       # ---------------- RENDER ----------------
       - name: Run Render Client
         run: python workers/render_client.py

@@ -1,11 +1,16 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8L
+# FULL FILE REPLACEMENT — FEEDER v4.8M
 #
 # Locked constraints respected:
 # - No redesign / no schema changes
 # - RAW_DEALS only writable source of truth
 # - RDV never written
 # - OPS_MASTER!B5 governs theme (fallback deterministic)
+#
+# Fix in v4.8M:
+# - Replace _get_records() with batch API (get_all_values) to prevent Sheets API hangs
+# - Single API call per sheet instead of row-by-row iteration
+# - Resolves GitHub Actions timeout at CONFIG_CARRIER_BIAS load
 #
 # Fix in v4.8L:
 # - Added diagnostic logging for GitHub Actions stall investigation
@@ -71,13 +76,25 @@ def _unique_headers(headers: list[str]) -> list[str]:
 
 
 def _get_records(ws) -> list[dict]:
-    """Safe replacement for _get_records(ws) that tolerates blank/duplicate headers."""
-    # Read header row (trim only trailing empties to match how row_values behaves)
-    raw_headers = ws.row_values(1)
-    # gspread row_values already trims trailing blanks; still may include blanks inside
-    expected = _unique_headers(raw_headers)
-    # get_all_records will now use expected headers and avoid uniqueness errors
-    return ws.get_all_records(expected_headers=expected)
+    """Fast batch read using get_all_values() - single API call per sheet.
+    Tolerates blank/duplicate headers and large sheets without timeout issues.
+    """
+    all_values = ws.get_all_values()
+    if not all_values:
+        return []
+    
+    # First row is headers
+    raw_headers = all_values[0]
+    headers = _unique_headers(raw_headers)
+    
+    records = []
+    for row in all_values[1:]:
+        # Pad row to match header length (handles short rows)
+        padded = row + [''] * (len(headers) - len(row))
+        record = dict(zip(headers, padded[:len(headers)]))
+        records.append(record)
+    
+    return records
 
 def _env(k: str, default: str = "") -> str:
     return str(os.getenv(k, default) or "").strip()

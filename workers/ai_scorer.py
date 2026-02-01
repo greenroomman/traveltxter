@@ -276,7 +276,7 @@ def main() -> int:
     RAW_DEALS_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
     RDV_TAB = _env("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
     ZTB_TAB = _env("ZTB_TAB", "ZTB")
-    PHRASE_BANK_TAB = _env("PHRASE_BANK_TAB", "PHRASE_BANK")
+    PHRASE_BANK = _env("PHRASE_BANK", "PHRASE_BANK")
 
     MIN_INGEST_AGE_SECONDS = _env_int("MIN_INGEST_AGE_SECONDS", 30)
     MAX_AGE_HOURS = _env_int("SCORER_MAX_AGE_HOURS", 72)
@@ -296,7 +296,7 @@ def main() -> int:
     except Exception:
         ws_ztb = sh.worksheet("ZONE_THEME_BENCHMARKS")
 
-    ws_phr = sh.worksheet(PHRASE_BANK_TAB)
+    ws_phr = sh.worksheet(PHRASE_BANK)
 
     # Theme-of-day
     ztb_rows = ws_ztb.get_all_records()

@@ -1,9 +1,20 @@
-#redy_to workers/telegram_publisher.py
-# V4.11 - RUN_SLOT driven publishing + TRUE FREE "-1 RUN" lag + ALWAYS include Instagram @handle in FREE template
+# workers/telegram_publisher.py
+# V5 — RUN_SLOT driven publishing + TRUE FREE "-1 RUN" lag + AM long-haul / PM short-haul ethos
 #
-# VIP: AM + PM
-# FREE: publishes ONLY deals posted to VIP in the *previous run window* (true -1 run lag)
-# Legacy fallback (no RUN_SLOT): windowed time checks + FREE_LAG_HOURS (default 24h unless overridden)
+# VIP:
+#   - Runs AM + PM (via workflow schedule)
+#   - Posts ONE deal per run (deterministic selection)
+#   - AM prefers long-haul; PM prefers short-haul
+#
+# FREE:
+#   - Dictated by VIP only
+#   - TRUE -1 run lag (previous window)
+#   - Never independent theme-led posting
+#
+# Writes back:
+#   - status
+#   - posted_telegram_vip_at (if column exists)
+#   - posted_telegram_free_at (if column exists)
 
 import os
 import json
@@ -17,14 +28,6 @@ from google.oauth2.service_account import Credentials
 
 def env(k, d=""):
     return (os.getenv(k, d) or "").strip()
-
-def env_bool(k, default=False):
-    v = (os.getenv(k) or "").strip().lower()
-    if v in ("1", "true", "yes", "y", "on"):
-        return True
-    if v in ("0", "false", "no", "n", "off"):
-        return False
-    return default
 
 def env_int(k, d):
     try:
@@ -77,6 +80,24 @@ def get_first(row, keys):
         if v != "":
             return v
     return ""
+
+def safe_float(x, default=None):
+    try:
+        s = str(x or "").strip()
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+def safe_int(x, default=None):
+    try:
+        s = str(x or "").strip()
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
 
 def normalize_price_gbp(x):
     s = str(x or "").strip()
@@ -134,7 +155,7 @@ def tg_send(token, chat_id, text, disable_preview=True):
         raise RuntimeError(f"Telegram send failed: {r.text}")
 
 
-# ------------------ legacy publish windows ------------------
+# ------------------ legacy publish windows (only if RUN_SLOT missing) ------------------
 
 def in_vip_window(now):
     am_start = env_int("VIP_WINDOW_AM_START", 6)
@@ -165,7 +186,7 @@ def parse_hhmm(s, default_hhmm):
 def slot_windows(now):
     """
     Returns (am_run_dt, pm_run_dt) for today in UTC.
-    Defaults to your canonical schedule: 07:30 and 16:30 UTC.
+    Defaults to canonical schedule: 07:30 and 16:30 UTC.
     Override with AM_RUN_TIME_UTC, PM_RUN_TIME_UTC (HH:MM).
     """
     am_h, am_m = parse_hhmm(env("AM_RUN_TIME_UTC", "07:30"), "07:30")
@@ -183,17 +204,12 @@ def previous_vip_window(now, run_slot):
     """
     am_dt, pm_dt = slot_windows(now)
     if run_slot == "PM":
-        start = am_dt
-        end = pm_dt
-        return start, end
+        return am_dt, pm_dt
     if run_slot == "AM":
-        # yesterday PM -> today AM
         y = now.date() - dt.timedelta(days=1)
         pm_h, pm_m = parse_hhmm(env("PM_RUN_TIME_UTC", "16:30"), "16:30")
         y_pm = dt.datetime(y.year, y.month, y.day, pm_h, pm_m, tzinfo=dt.timezone.utc)
-        start = y_pm
-        end = am_dt
-        return start, end
+        return y_pm, am_dt
     return None, None
 
 
@@ -208,7 +224,6 @@ def build_vip_message(row):
     back = get_first(row, ["inbound_date", "return_date", "ret_date", "back_date"])
     phrase = phrase_from_row(row)
     booking_link = get_first(row, ["booking_link_vip"])
-
     flag = get_country_flag(country)
 
     msg = "\n".join([
@@ -233,23 +248,16 @@ def build_free_message(row):
     outbound = get_first(row, ["outbound_date", "dep_date", "out_date"])
     back = get_first(row, ["inbound_date", "return_date", "ret_date", "back_date"])
     phrase = phrase_from_row(row)
-
     flag = get_country_flag(country)
 
     monthly = env("STRIPE_LINK_MONTHLY") or env("SUBSCRIPTION_LINK_MONTHLY")
     yearly = env("STRIPE_LINK_YEARLY") or env("SUBSCRIPTION_LINK_YEARLY")
-
     if not monthly or not yearly:
         raise RuntimeError("Missing STRIPE_LINK_MONTHLY / STRIPE_LINK_YEARLY (or legacy SUBSCRIPTION_LINK_*)")
 
-    # Always include Instagram handle in FREE messages
     ig_handle = env("INSTAGRAM_HANDLE", "Traveltxter").lstrip("@").strip()
     ig_url = env("INSTAGRAM_PROFILE_URL") or env("IG_PROFILE_URL") or env("INSTAGRAM_URL")
-
-    if ig_url:
-        ig_line = f'Instagram: <a href="{ig_url}">@{ig_handle}</a>'
-    else:
-        ig_line = f"Instagram: @{ig_handle}"
+    ig_line = f'Instagram: <a href="{ig_url}">@{ig_handle}</a>' if ig_url else f"Instagram: @{ig_handle}"
 
     lines = [
         f"£{price} to {country} {flag}",
@@ -263,8 +271,90 @@ def build_free_message(row):
         f'<a href="{monthly}">Monthly</a> | <a href="{yearly}">Yearly</a>',
         ig_line,
     ]
-
     return "\n".join(lines).strip()
+
+
+# ------------------ selection (AM long-haul / PM short-haul) ------------------
+
+def _is_longhaul(row: dict) -> bool:
+    """
+    Deterministic heuristic using existing columns:
+      - outbound_duration_minutes >= 360 (6h) OR
+      - total_duration_hours >= 9 OR
+      - via_hub truthy AND outbound_duration_minutes >= 300
+    Soft hints:
+      - deal_theme/theme contains "long_haul"
+    """
+    out_min = safe_int(row.get("outbound_duration_minutes"), None)
+    tot_hr = safe_float(row.get("total_duration_hours"), None)
+    via_hub = str(row.get("via_hub") or "").strip().lower() in ("true", "1", "yes", "y")
+    connection_type = str(row.get("connection_type") or "").strip().lower()
+
+    theme = (row.get("theme") or row.get("deal_theme") or "").strip().lower()
+    if "long_haul" in theme:
+        return True
+
+    if out_min is not None and out_min >= 360:
+        return True
+    if tot_hr is not None and tot_hr >= 9:
+        return True
+    if via_hub and out_min is not None and out_min >= 300:
+        return True
+    if connection_type in ("multi_stop", "connecting", "connection"):
+        # only count as long-haul if also reasonably long
+        if out_min is not None and out_min >= 300:
+            return True
+
+    return False
+
+
+def _pick_vip_candidate(values, headers, h, run_slot: str) -> tuple:
+    """
+    Returns (row_index_1based, row_dict) or (None, None).
+    Strategy:
+      1) Collect all READY_TO_PUBLISH rows.
+      2) Partition into preferred (AM: longhaul, PM: shorthaul) and fallback.
+      3) Deterministic ordering: newest first by ingested_at_utc if present, else sheet order.
+    """
+    candidates = []
+    for i, r in enumerate(values[1:], start=2):
+        if r[h["status"]] != "READY_TO_PUBLISH":
+            continue
+        row = {headers[j]: r[j] for j in range(len(headers))}
+        candidates.append((i, row))
+
+    if not candidates:
+        return None, None
+
+    has_ingested = "ingested_at_utc" in h
+
+    def ingested_key(item):
+        _, row = item
+        if not has_ingested:
+            return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        t = parse_iso_utc(row.get("ingested_at_utc", ""))
+        return t or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+    # newest first if timestamp exists
+    if has_ingested:
+        candidates.sort(key=ingested_key, reverse=True)
+
+    preferred = []
+    fallback = []
+    for item in candidates:
+        _, row = item
+        is_long = _is_longhaul(row)
+        if run_slot == "AM":
+            (preferred if is_long else fallback).append(item)
+        elif run_slot == "PM":
+            (preferred if (not is_long) else fallback).append(item)
+        else:
+            # if RUN_SLOT missing, just prefer whatever comes first (timestamp-sorted)
+            preferred.append(item)
+
+    # If no preferred exists, fall back to any READY_TO_PUBLISH
+    pick = (preferred[0] if preferred else fallback[0])
+    return pick
 
 
 # ------------------ sheet updates ------------------
@@ -314,23 +404,22 @@ def main():
         vip_allowed = in_vip_window(now)
 
     if vip_allowed:
-        for i, r in enumerate(values[1:], start=2):
-            if r[h["status"]] == "READY_TO_PUBLISH":
-                row = {headers[j]: r[j] for j in range(len(headers))}
-                msg = build_vip_message(row)
+        row_i, row = _pick_vip_candidate(values, headers, h, run_slot)
+        if row_i and row:
+            msg = build_vip_message(row)
+            tg_send(env("TELEGRAM_BOT_TOKEN_VIP"), env("TELEGRAM_CHANNEL_VIP"), msg, disable_preview=True)
 
-                tg_send(env("TELEGRAM_BOT_TOKEN_VIP"), env("TELEGRAM_CHANNEL_VIP"), msg, disable_preview=True)
+            set_cell(ws, row_i, h["status"], "POSTED_TELEGRAM_VIP")
+            if "posted_telegram_vip_at" in h:
+                set_cell(ws, row_i, h["posted_telegram_vip_at"], now.isoformat().replace("+00:00", "Z"))
 
-                set_cell(ws, i, h["status"], "POSTED_TELEGRAM_VIP")
-                if "posted_telegram_vip_at" in h:
-                    set_cell(ws, i, h["posted_telegram_vip_at"], now.isoformat().replace("+00:00", "Z"))
+            print(f"✅ Published to Telegram VIP | selected_row={row_i} | ethos={'longhaul' if run_slot=='AM' else 'shorthaul' if run_slot=='PM' else 'auto'}")
+            return 0
 
-                print("✅ Published to Telegram VIP")
-                return 0
     else:
         print("⏱️ VIP window closed — skipping VIP stage for this run")
 
-    print("No VIP deals ready (status=READY_TO_POST)")
+    print("No VIP deals ready (status=READY_TO_PUBLISH)")
 
     # ---------------- STAGE 2: FREE ----------------
     free_allowed = True

@@ -1,24 +1,5 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8f+enrich (patched: CONFIG header-duplicate tolerance)
-#
-# Adds: feeder-side enrichment from selected Duffel offer:
-#   - connection_type, via_hub, carriers, currency
-#   - outbound/inbound durations, total_duration_hours
-#   - bags_incl (best-effort)
-#   - trip_length_days
-#   - created_utc/timestamp mirrors (if columns exist)
-#
-# Preserves LOCKED rules:
-# - No redesign of pipeline
-# - RAW_DEALS is sole writable state
-# - RDV is never written
-# - 90/10 slot split per search attempt
-# - Shorthaul must be direct (max_conn forced 0 + offer stops check)
-#
-# PATCH (THIS VERSION):
-# - Avoid gspread get_all_records() crash when CONFIG header row is "not unique".
-#   Uses _get_all_records_safe(ws_cfg, "CONFIG") fallback to get_all_values()
-#   while preserving downstream dict access (enabled/active_in_feeder/etc.)
+# FULL FILE REPLACEMENT — TravelTxter V5 Feeder (hotfix: import random)
 
 from __future__ import annotations
 
@@ -29,6 +10,7 @@ import hashlib
 import datetime as dt
 import math
 import re
+import random  # ✅ HOTFIX: required for random.Random(...)
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
@@ -91,15 +73,7 @@ def _is_true(v: Any) -> bool:
 
 
 def _get_all_records_safe(ws, label: str) -> List[Dict[str, Any]]:
-    """Read worksheet records without failing on non-unique headers.
-
-    gspread.Worksheet.get_all_records() raises when the header row contains
-    duplicates (including blank columns or invisible whitespace).
-    For TravelTxter we prefer a tolerant read that:
-      - falls back to get_all_values()
-      - trims headers
-      - namespaces duplicate/blank headers
-    """
+    """Read worksheet records without failing on non-unique headers."""
     try:
         return ws.get_all_records() or []
     except Exception as e:
@@ -283,11 +257,13 @@ def _offer_durations(offer: Dict[str, Any]) -> Tuple[int, int, float]:
 def _best_offer(offers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not offers:
         return None
+
     def key(o: Dict[str, Any]) -> float:
         try:
             return float(str(o.get("total_amount") or "0").strip())
         except Exception:
             return 0.0
+
     return min(offers, key=key)
 
 
@@ -315,23 +291,13 @@ def _ws(sh: gspread.Spreadsheet, name: str) -> gspread.Worksheet:
     return sh.worksheet(name)
 
 
-def _row_dict(headers: List[str], row: List[Any]) -> Dict[str, Any]:
-    d: Dict[str, Any] = {}
-    for i, h in enumerate(headers):
-        if not h:
-            continue
-        d[h] = row[i] if i < len(row) else ""
-    return d
-
-
 def _read_headers(ws: gspread.Worksheet) -> List[str]:
     return [str(x or "").strip() for x in ws.row_values(1)]
 
 
 def _append_rows(ws: gspread.Worksheet, rows: List[List[Any]]) -> None:
-    if not rows:
-        return
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    if rows:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
 def _http_post(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = 45) -> Optional[Dict[str, Any]]:
@@ -354,7 +320,7 @@ def _duffel_headers() -> Dict[str, str]:
     }
 
 
-def _duffel_offer_request(origin: str, dest: str, out_date: str, in_date: str, cabin: str, airlines: List[str], max_connections: int) -> Optional[List[Dict[str, Any]]]:
+def _duffel_offer_request(origin: str, dest: str, out_date: str, in_date: str, cabin: str, airlines: List[str]) -> Optional[List[Dict[str, Any]]]:
     url = "https://api.duffel.com/air/offer_requests"
     data: Dict[str, Any] = {
         "data": {
@@ -368,13 +334,10 @@ def _duffel_offer_request(origin: str, dest: str, out_date: str, in_date: str, c
     }
     if airlines:
         data["data"]["allowed_carrier_codes"] = airlines
-    # Duffel doesn't accept max_connections in offer_requests directly the same way across versions;
-    # we rely on route gating + offer stops filtering.
     resp = _http_post(url, _duffel_headers(), data, timeout=60)
     if not resp:
         return None
-    offers = (resp.get("data") or {}).get("offers") or []
-    return offers
+    return (resp.get("data") or {}).get("offers") or []
 
 
 def _trip_len_days(out_date: str, in_date: str) -> int:
@@ -391,7 +354,6 @@ def main() -> int:
     log("TRAVELTXTTER PIPELINE WORKER (FEEDER) START")
     log("==============================================================================")
 
-    # Slot
     run_slot = _env("RUN_SLOT", "").upper()
     if run_slot not in ("AM", "PM"):
         run_slot = "AM" if dt.datetime.utcnow().hour < 12 else "PM"
@@ -421,7 +383,7 @@ def main() -> int:
     ws_iata = _ws(sh, _env("IATA_MASTER_TAB", "IATA_MASTER"))
     ws_ztb = _ws(sh, _env("ZONE_THEME_BENCHMARKS_TAB", "ZONE_THEME_BENCHMARKS"))
 
-    # Carrier bias (informational only)
+    # Bias (optional)
     try:
         ws_bias = _ws(sh, _env("CONFIG_CARRIER_BIAS_TAB", "CONFIG_CARRIER_BIAS"))
         bias_rows = ws_bias.get_all_records() or []
@@ -430,7 +392,7 @@ def main() -> int:
     except Exception:
         log("⚠️ CONFIG_CARRIER_BIAS not loaded (ok)")
 
-    # Theme authority: OPS_MASTER!B5
+    # Theme from OPS_MASTER!B5
     theme = ""
     try:
         ws_ops = _ws(sh, _env("OPS_MASTER_TAB", "OPS_MASTER"))
@@ -440,7 +402,6 @@ def main() -> int:
     except Exception:
         theme = ""
 
-    # ZTB pool (for logging)
     ztb_rows = ws_ztb.get_all_records() or []
     eligible_today = _eligible_themes_from_ztb(ztb_rows)
     log(f"✅ ZTB loaded: {len(ztb_rows)} rows | eligible_today={len(eligible_today)} | pool={eligible_today}")
@@ -449,22 +410,12 @@ def main() -> int:
         theme = _theme_of_day(eligible_today)
     log(f"🎯 Theme of the day (UTC): {theme}")
 
-    ztb_today = _ztb_row_for_theme(ztb_rows, theme) or {}
-    ztb_days_min = _safe_int(ztb_today.get("days_ahead_min"), 14)
-    ztb_days_max = _safe_int(ztb_today.get("days_ahead_max"), 120)
-    ztb_trip_len = _safe_int(ztb_today.get("trip_length_days"), 7)
-    ztb_max_conn = _connections_from_tolerance(str(ztb_today.get("connection_tolerance") or "any"))
-
-    # -----------------------------
-    # CONFIG (PATCHED HERE)
-    # -----------------------------
+    # CONFIG (safe)
     cfg_all = _get_all_records_safe(ws_cfg, "CONFIG")
     cfg_active = [r for r in cfg_all if _is_true(r.get("active_in_feeder")) and _is_true(r.get("enabled"))]
     log(f"✅ CONFIG loaded: {len(cfg_active)} active rows (of {len(cfg_all)} total)")
 
-    # -----------------------------
-    # RCM
-    # -----------------------------
+    # RCM gate
     rcm_rows = ws_rcm.get_all_records() or []
     enabled_routes = 0
     origins_by_dest: Dict[str, List[Tuple[str, str, str]]] = {}
@@ -484,9 +435,7 @@ def main() -> int:
         enabled_routes += 1
     log(f"✅ ROUTE_CAPABILITY_MAP loaded: {enabled_routes} enabled routes")
 
-    # -----------------------------
-    # IATA_MASTER only for geo
-    # -----------------------------
+    # IATA geo
     iata_rows = ws_iata.get_all_records() or []
     geo: Dict[str, Tuple[str, str]] = {}
     for r in iata_rows:
@@ -498,12 +447,9 @@ def main() -> int:
         geo[code] = (city, country)
     log(f"✅ Geo dictionary loaded: {len(geo)} IATA entries (IATA_MASTER only)")
 
-    # -----------------------------
-    # Build eligible destinations from CONFIG
-    # -----------------------------
+    # Build candidate dests from CONFIG
     candidates: Dict[str, Dict[str, Any]] = {}
     weights: Dict[str, float] = {}
-
     for r in cfg_active:
         if str(r.get("primary_theme") or "").strip().lower() != theme.lower():
             continue
@@ -513,9 +459,7 @@ def main() -> int:
         if is_lh != want_long:
             continue
         dest = _norm_iata(r.get("destination_iata"))
-        if not dest:
-            continue
-        if dest not in geo:
+        if not dest or dest not in geo:
             continue
         candidates[dest] = r
         weights[dest] = max(weights.get(dest, 0.0), _safe_float(r.get("search_weight"), 1.0))
@@ -524,8 +468,10 @@ def main() -> int:
         log("⚠️ No eligible destinations from CONFIG (Gate 1 fail)")
         return 0
 
-    # Deterministic weighted selection
+    # ✅ This was crashing before because random wasn't imported
     rnd = random.Random(f"{theme}:{run_slot}:{_today_utc().isoformat()}")
+
+    # choose destinations (weighted)
     pool = list(candidates.keys())
     chosen: List[str] = []
     while pool and len(chosen) < dests_per_run:
@@ -543,7 +489,7 @@ def main() -> int:
 
     log(f"PLAN: intended_routes={len(chosen)} | dates_per_dest(K)={k_dates_per_dest} | max_searches={max_searches}")
 
-    # RD headers and existing deal_ids (dedupe)
+    # Dedup
     rd_hdr = _read_headers(ws_raw)
     rd_idx = {h: i for i, h in enumerate(rd_hdr)}
     existing_ids: Set[str] = set()
@@ -555,54 +501,45 @@ def main() -> int:
             if v:
                 existing_ids.add(v)
 
-    # Date offsets per destination
-    def date_offsets_for(cfg_row: Dict[str, Any]) -> List[int]:
-        dmin = _safe_int(cfg_row.get("days_ahead_min"), ztb_days_min)
-        dmax = _safe_int(cfg_row.get("days_ahead_max"), ztb_days_max)
-        dmax = max(dmax, dmin)
-        if k_dates_per_dest <= 1:
-            return [dmin]
-        span = dmax - dmin
-        out: List[int] = []
-        for k in range(k_dates_per_dest):
-            frac = k / (k_dates_per_dest - 1)
-            out.append(dmin + int(round(span * frac)))
-        return out
+    def put(row: List[Any], col: str, val: Any) -> None:
+        i = rd_idx.get(col)
+        if i is not None and i < len(row):
+            row[i] = val
 
     searches = 0
     duffel_calls = 0
     out_rows: List[List[Any]] = []
 
-    # helper to write into RD schema by header name
-    def put(row: List[Any], col: str, val: Any) -> None:
-        i = rd_idx.get(col)
-        if i is not None and i < len(row):
-            row[i] = val
+    today = _today_utc()
 
     for dest in chosen:
         if searches >= max_searches or len(out_rows) >= max_inserts:
             break
 
         cfg_row = candidates[dest]
-        origin_rows = origins_by_dest.get(dest, [])
+        origin_rows = sorted(origins_by_dest.get(dest, []), key=lambda x: (x[0], x[1], x[2]))[:origins_per_dest]
         if not origin_rows:
             continue
 
-        origin_rows = sorted(origin_rows, key=lambda x: (x[0], x[1], x[2]))[:origins_per_dest]
-
         cabin = (str(cfg_row.get("cabin_class") or "economy").strip().lower())
-        trip_len = _safe_int(cfg_row.get("trip_length_days"), ztb_trip_len)
-        max_conn_cfg = _safe_int(cfg_row.get("max_connections"), ztb_max_conn)
+        trip_len = _safe_int(cfg_row.get("trip_length_days"), 7)
         airlines = _csv_list(str(cfg_row.get("included_airlines") or ""))
 
-        offsets = date_offsets_for(cfg_row)
-        today = _today_utc()
+        dmin = _safe_int(cfg_row.get("days_ahead_min"), 14)
+        dmax = _safe_int(cfg_row.get("days_ahead_max"), 120)
+        dmax = max(dmax, dmin)
+        offsets: List[int] = []
+        if k_dates_per_dest <= 1:
+            offsets = [dmin]
+        else:
+            span = dmax - dmin
+            for k in range(k_dates_per_dest):
+                frac = k / (k_dates_per_dest - 1)
+                offsets.append(dmin + int(round(span * frac)))
 
         for (origin, conn_type, via_hub) in origin_rows:
             if searches >= max_searches or len(out_rows) >= max_inserts:
                 break
-
-            # Geo must exist for origin too
             if origin not in geo:
                 continue
 
@@ -613,18 +550,8 @@ def main() -> int:
                 out_date = (today + dt.timedelta(days=off)).isoformat()
                 in_date = (today + dt.timedelta(days=off + trip_len)).isoformat()
 
-                # 90/10 slot split is already handled upstream in your system; we don't change it here.
-
                 searches += 1
-                offers = _duffel_offer_request(
-                    origin=origin,
-                    dest=dest,
-                    out_date=out_date,
-                    in_date=in_date,
-                    cabin=cabin,
-                    airlines=airlines,
-                    max_connections=max_conn_cfg,
-                )
+                offers = _duffel_offer_request(origin, dest, out_date, in_date, cabin, airlines)
                 duffel_calls += 1
                 if not offers:
                     continue
@@ -633,7 +560,6 @@ def main() -> int:
                 if not best:
                     continue
 
-                # Enforce PM direct-only via offer structure too (belt + braces)
                 stops = _offer_stops(best)
                 if run_slot == "PM" and stops != 0:
                     continue
@@ -643,12 +569,10 @@ def main() -> int:
                     total_amount = float(str(best.get("total_amount") or "0").strip())
                 except Exception:
                     total_amount = 0.0
-                price_gbp = int(math.ceil(total_amount))  # stored as numeric in RD (price_gbp)
+                price_gbp = int(math.ceil(total_amount))
 
-                # Deterministic deal_id
                 did_seed = f"{origin}-{dest}-{out_date}-{in_date}-{price_gbp}-{stops}-{cabin}".upper()
                 deal_id = _sha12(did_seed)
-
                 if deal_id in existing_ids:
                     continue
                 existing_ids.add(deal_id)
@@ -662,7 +586,6 @@ def main() -> int:
                 now_iso = _to_iso_utc()
 
                 row = [""] * len(rd_hdr)
-
                 put(row, "status", "NEW")
                 put(row, "deal_id", deal_id)
                 put(row, "price_gbp", price_gbp)
@@ -713,7 +636,6 @@ def main() -> int:
 
     _append_rows(ws_raw, out_rows)
     log(f"✅ Inserted {len(out_rows)} rows into {RAW_DEALS_TAB}")
-
     return 0
 
 

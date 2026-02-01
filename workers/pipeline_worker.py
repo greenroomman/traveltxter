@@ -1,11 +1,17 @@
 # workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — FEEDER v4.8k
+# FULL FILE REPLACEMENT — FEEDER v4.8L
 #
 # Locked constraints respected:
 # - No redesign / no schema changes
 # - RAW_DEALS only writable source of truth
 # - RDV never written
 # - OPS_MASTER!B5 governs theme (fallback deterministic)
+#
+# Fix in v4.8L:
+# - Added diagnostic logging for GitHub Actions stall investigation
+# - Timing logs for all Google Sheets operations
+# - Progress indicators in main search loop
+# - Early detection of silent loop exhaustion
 #
 # Fix in v4.8k:
 # - Treat CONFIG.origin_iata="ANY" as sentinel value (not literal IATA code)
@@ -448,8 +454,11 @@ def main() -> int:
 
     # Carrier bias (informational continuity)
     try:
+        log("📥 Loading CONFIG_CARRIER_BIAS...")
+        t_start = dt.datetime.utcnow()
         ws_bias = sh.worksheet(CONFIG_CARRIER_BIAS_TAB)
         bias_rows = _get_records(ws_bias) or []
+        elapsed = (dt.datetime.utcnow() - t_start).total_seconds()
         usable_bias = sum(
             1
             for r in bias_rows
@@ -459,14 +468,17 @@ def main() -> int:
             and _safe_float(r.get("bias_weight"), 0.0) > 0
         )
         if usable_bias > 0:
-            log(f"✅ CONFIG_CARRIER_BIAS loaded: {usable_bias} usable rows")
+            log(f"✅ CONFIG_CARRIER_BIAS loaded: {usable_bias} usable rows ({elapsed:.1f}s)")
         else:
-            log("⚠️ CONFIG_CARRIER_BIAS not loaded or empty.")
-    except Exception:
-        log("⚠️ CONFIG_CARRIER_BIAS not loaded or empty.")
+            log(f"⚠️ CONFIG_CARRIER_BIAS not loaded or empty ({elapsed:.1f}s)")
+    except Exception as e:
+        log(f"⚠️ CONFIG_CARRIER_BIAS not loaded: {e}")
 
     # Theme authority
+    log("📥 Loading ZTB...")
+    t_start = dt.datetime.utcnow()
     ztb_rows_all = _get_records(ws_ztb)
+    elapsed = (dt.datetime.utcnow() - t_start).total_seconds()
     eligible_themes = _eligible_themes_from_ztb(ztb_rows_all)
 
     theme_today = None
@@ -483,7 +495,7 @@ def main() -> int:
         theme_today = _theme_of_day(eligible_themes)
         log(f"ℹ️ Using calculated theme (B5 was empty or errored): {theme_today}")
 
-    log(f"✅ ZTB loaded: {len(ztb_rows_all)} rows | eligible_today={len(eligible_themes)} | pool={eligible_themes}")
+    log(f"✅ ZTB loaded: {len(ztb_rows_all)} rows | eligible_today={len(eligible_themes)} | pool={eligible_themes} ({elapsed:.1f}s)")
     log(f"🎯 Theme of the day (UTC): {theme_today}")
 
     ztb_today = _ztb_row_for_theme(ztb_rows_all, theme_today) or {"connection_tolerance": "any"}
@@ -491,11 +503,16 @@ def main() -> int:
     ztb_end = _safe_int(ztb_today.get("end_mmdd"), 1231)
     ztb_max_conn = _connections_from_tolerance(str(ztb_today.get("connection_tolerance") or "any"))
 
+    log("📥 Loading CONFIG...")
+    t_start = dt.datetime.utcnow()
     cfg_all = _get_records(ws_cfg)
     cfg_active = [r for r in cfg_all if _is_true(r.get("active_in_feeder")) and _is_true(r.get("enabled"))]
-    log(f"✅ CONFIG loaded: {len(cfg_active)} active rows (of {len(cfg_all)} total)")
+    elapsed = (dt.datetime.utcnow() - t_start).total_seconds()
+    log(f"✅ CONFIG loaded: {len(cfg_active)} active rows (of {len(cfg_all)} total) ({elapsed:.1f}s)")
 
     # ROUTE_CAPABILITY_MAP — route gating ONLY (no geo from here)
+    log("📥 Loading ROUTE_CAPABILITY_MAP...")
+    t_start = dt.datetime.utcnow()
     rcm_rows = _get_records(ws_rcm)
     enabled_routes: Set[Tuple[str, str]] = set()
     origins_by_dest: Dict[str, List[str]] = {}
@@ -509,9 +526,12 @@ def main() -> int:
     for d, lst in list(origins_by_dest.items()):
         origins_by_dest[d] = list(dict.fromkeys([x for x in lst if x]))
 
-    log(f"✅ ROUTE_CAPABILITY_MAP loaded: {len(enabled_routes)} enabled routes")
+    elapsed = (dt.datetime.utcnow() - t_start).total_seconds()
+    log(f"✅ ROUTE_CAPABILITY_MAP loaded: {len(enabled_routes)} enabled routes ({elapsed:.1f}s)")
 
     # IATA_MASTER — geo enrichment ONLY
+    log("📥 Loading IATA_MASTER (6000+ rows, may take time)...")
+    t_start = dt.datetime.utcnow()
     iata_geo: Dict[str, Tuple[str, str]] = {}
     for r in _get_records(ws_iata):
         code = _norm_iata(r.get("iata_code") or r.get("iata") or r.get("IATA"))
@@ -520,7 +540,8 @@ def main() -> int:
         if code and city and country and code not in iata_geo:
             iata_geo[code] = (city, country)
 
-    log(f"✅ Geo dictionary loaded: {len(iata_geo)} IATA entries (IATA_MASTER only)")
+    elapsed = (dt.datetime.utcnow() - t_start).total_seconds()
+    log(f"✅ Geo dictionary loaded: {len(iata_geo)} IATA entries (IATA_MASTER only) ({elapsed:.1f}s)")
 
     def geo_for(iata: str) -> Optional[Tuple[str, str]]:
         return iata_geo.get(str(iata or "").strip().upper())
@@ -647,9 +668,23 @@ def main() -> int:
 
     log(f"PLAN: intended_routes={max(1, DESTS_PER_RUN)} | dates_per_dest(K)={max(1, K_DATES_PER_DEST)} | max_searches={DUFFEL_MAX_SEARCHES_PER_RUN}")
 
+    loop_start = dt.datetime.utcnow()
+    last_progress_log = 0
+    consecutive_skips = 0
+
     while duffel_calls < DUFFEL_MAX_SEARCHES_PER_RUN and len(deals_out) < DUFFEL_MAX_INSERTS and attempts < max_attempts:
         attempt_idx = attempts
         attempts += 1
+
+        # Progress indicator every 50 attempts
+        if attempts - last_progress_log >= 50:
+            log(f"🔄 Loop progress: attempts={attempts}/{max_attempts} | duffel_calls={duffel_calls}/{DUFFEL_MAX_SEARCHES_PER_RUN} | deals={len(deals_out)}")
+            last_progress_log = attempts
+
+        # Detect silent exhaustion (50+ consecutive skips with no progress)
+        if consecutive_skips >= 50:
+            log(f"⚠️ Loop exhaustion detected: {consecutive_skips} consecutive skips. Ending run early.")
+            break
 
         use_explore = False
         if explore_period > 0 and ((attempt_idx % 100) >= primary_period):
@@ -671,10 +706,12 @@ def main() -> int:
         dest = _norm_iata(cfg_pick.get("destination_iata"))
         if not dest:
             skipped_no_dest += 1
+            consecutive_skips += 1
             continue
 
         if not geo_for(dest):
             skipped_missing_geo_dest += 1
+            consecutive_skips += 1
             continue
 
         min_d = _safe_int(cfg_pick.get("days_ahead_min"), 7)
@@ -685,12 +722,14 @@ def main() -> int:
         out_dates_all = _candidate_outbounds_seasonal(min_d, max_d, trip_len, ztb_start, ztb_end, n=gen_n)
         if not out_dates_all:
             skipped_no_out_dates += 1
+            consecutive_skips += 1
             continue
         out_dates = out_dates_all[: max(1, min(K_DATES_PER_DEST, len(out_dates_all)))]
 
         da = dest_attempts.get(dest, 0)
         if da >= len(out_dates):
             # already exhausted K date-tries for this destination this run
+            consecutive_skips += 1
             continue
 
         is_long = is_longhaul(cfg_pick)
@@ -705,6 +744,7 @@ def main() -> int:
         origins = choose_viable_origins(cfg_pick, dest, ORIGINS_PER_DEST)
         if not origins:
             skipped_no_viable_origins += 1
+            consecutive_skips += 1
             continue
 
         date_idx = da % len(out_dates)
@@ -715,10 +755,12 @@ def main() -> int:
 
         if not geo_for(origin):
             skipped_missing_geo_origin += 1
+            consecutive_skips += 1
             continue
 
         if not can_insert(origin, dest):
             skipped_can_insert += 1
+            consecutive_skips += 1
             continue
 
         rd = od + dt.timedelta(days=trip_len)
@@ -730,6 +772,7 @@ def main() -> int:
         )
 
         duffel_calls += 1
+        consecutive_skips = 0  # Reset on progress
         resp = _duffel_search(origin, dest, od, rd, max_conn, cabin, included_airlines)
         if not resp:
             continue
@@ -741,6 +784,7 @@ def main() -> int:
         price, offer_stops, _offer_obj = best
         if (not is_long) and int(offer_stops) != 0:
             skipped_offer_not_direct += 1
+            consecutive_skips += 1
             continue
 
         row = [""] * len(headers)
@@ -791,9 +835,11 @@ def main() -> int:
         inserted_by_origin[origin] = inserted_by_origin.get(origin, 0) + 1
         inserted_by_route[(origin, dest)] = inserted_by_route.get((origin, dest), 0) + 1
 
+    loop_elapsed = (dt.datetime.utcnow() - loop_start).total_seconds()
     log(f"✓ Attempts (internal loop): {attempts} (cap {max_attempts})")
     log(f"✓ Duffel calls made: {duffel_calls} (cap {DUFFEL_MAX_SEARCHES_PER_RUN})")
     log(f"✓ Deals collected: {len(deals_out)} (cap {DUFFEL_MAX_INSERTS})")
+    log(f"✓ Search loop completed in {loop_elapsed:.1f}s")
 
     if duffel_calls == 0:
         log(

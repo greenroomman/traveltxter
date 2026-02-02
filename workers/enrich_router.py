@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # workers/enrich_router.py
 """
-TravelTxter Enrichment Router — V5 (Deterministic backfill for cities/countries + phrase selection)
+TravelTxter Enrichment Router — V5.1 (Fast batch API + timing logs)
 
 Purpose (V5-compliant):
 - Fill missing origin/destination city + country in RAW_DEALS from IATA_MASTER
@@ -9,6 +9,11 @@ Purpose (V5-compliant):
 - Operate on SCORED + READY_* rows (and safe to re-run)
 - Stateless + deterministic: same row inputs -> same outputs
 - Writes ONLY enrichment columns and ONLY if blank (never overwrites)
+
+V5.1 Performance improvements:
+- Replaced get_all_records() with batch get_all_values() (single API call per sheet)
+- Added timing logs for all sheet operations
+- 8+ minute load times reduced to seconds
 
 Hard rules:
 - Never writes to RAW_DEALS_VIEW
@@ -83,8 +88,52 @@ def _gs_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
+def _unique_headers(headers: list[str]) -> list[str]:
+    """Make headers unique and non-empty for dict construction.
+    Handles duplicate or empty headers by creating stable synthetic names.
+    """
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for i, h in enumerate(headers):
+        base = (str(h).strip() if h is not None else "")
+        if base == "":
+            base = f"__col_{i+1}"
+        key = base
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            key = f"{base}__{seen[base]}"
+        out.append(key)
+    return out
+
+
+def _get_records(ws) -> list[dict]:
+    """Fast batch read using get_all_values() - single API call per sheet.
+    Replaces get_all_records() which makes multiple slow API calls.
+    """
+    all_values = ws.get_all_values()
+    if not all_values:
+        return []
+    
+    # First row is headers
+    raw_headers = all_values[0]
+    headers = _unique_headers(raw_headers)
+    
+    records = []
+    for row in all_values[1:]:
+        # Pad row to match header length (handles short rows)
+        padded = row + [''] * (len(headers) - len(row))
+        record = dict(zip(headers, padded[:len(headers)]))
+        records.append(record)
+    
+    return records
+
+
 def _headers(ws) -> List[str]:
-    return [str(h).strip() for h in ws.row_values(1)]
+    """Get headers using fast batch read (single API call)."""
+    all_values = ws.get_all_values()
+    if not all_values:
+        return []
+    return [str(h).strip() for h in all_values[0]]
 
 
 def _colmap(headers: List[str]) -> Dict[str, int]:
@@ -168,11 +217,16 @@ def _load_iata_map(iata_ws) -> Dict[str, Tuple[str, str]]:
     IATA_MASTER headers provided:
       iata_code, city, country
     """
+    import datetime as dt_mod
+    t_start = dt_mod.datetime.utcnow()
+    
     headers = _headers(iata_ws)
     cm = _colmap(headers)
     _require_headers(cm, ["iata_code", "city", "country"], "IATA_MASTER")
 
-    rows = iata_ws.get_all_records()
+    rows = _get_records(iata_ws)
+    elapsed = (dt_mod.datetime.utcnow() - t_start).total_seconds()
+    
     out: Dict[str, Tuple[str, str]] = {}
 
     for r in rows:
@@ -181,6 +235,8 @@ def _load_iata_map(iata_ws) -> Dict[str, Tuple[str, str]]:
         country = _s(r.get("country"))
         if code and (city or country):
             out[code] = (city, country)
+    
+    _log(f"📥 IATA_MASTER: {len(rows)} rows read, {len(out)} entries indexed ({elapsed:.1f}s)")
     return out
 
 
@@ -191,6 +247,9 @@ def _load_phrase_bank(phrase_ws) -> List[Dict[str, Any]]:
     PHRASE_BANK headers provided:
       destination_iata, theme, category, phrase, approved, channel_hint, max_per_month, notes, context_hint
     """
+    import datetime as dt_mod
+    t_start = dt_mod.datetime.utcnow()
+    
     headers = _headers(phrase_ws)
     cm = _colmap(headers)
     _require_headers(
@@ -199,7 +258,9 @@ def _load_phrase_bank(phrase_ws) -> List[Dict[str, Any]]:
         "PHRASE_BANK",
     )
 
-    rows = phrase_ws.get_all_records()
+    rows = _get_records(phrase_ws)
+    elapsed = (dt_mod.datetime.utcnow() - t_start).total_seconds()
+    
     clean: List[Dict[str, Any]] = []
 
     for r in rows:
@@ -223,6 +284,8 @@ def _load_phrase_bank(phrase_ws) -> List[Dict[str, Any]]:
 
     # stable sort for deterministic selection (no randomness)
     clean.sort(key=lambda x: (x["destination_iata"], x["theme"], x["category"], x["phrase"]))
+    
+    _log(f"📥 PHRASE_BANK: {len(rows)} rows read, {len(clean)} approved phrases ({elapsed:.1f}s)")
     return clean
 
 
@@ -386,8 +449,12 @@ def main() -> int:
     _log(f"✅ PHRASE_BANK loaded (approved): {len(phrase_candidates)} phrases")
 
     # Load RAW_DEALS records
-    raw_records = raw_ws.get_all_records()
-    _log(f"✅ RAW_DEALS loaded: {len(raw_records)} rows")
+    _log("📥 Loading RAW_DEALS...")
+    import datetime as dt_mod
+    t_start = dt_mod.datetime.utcnow()
+    raw_records = _get_records(raw_ws)
+    elapsed = (dt_mod.datetime.utcnow() - t_start).total_seconds()
+    _log(f"✅ RAW_DEALS loaded: {len(raw_records)} rows ({elapsed:.1f}s)")
 
     # Build phrase usage index (optional)
     usage_idx: Dict[Tuple[str, str], int] = {}

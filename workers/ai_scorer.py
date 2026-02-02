@@ -1,26 +1,26 @@
 # workers/ai_scorer.py
-# FULL FILE REPLACEMENT — AI SCORER v4.8j (PHRASE_BANK RESTORED + RDV DUPLICATE-SAFE)
+# FULL FILE REPLACEMENT — AI SCORER v4.9 (PHRASE LOGIC DELEGATED TO ENRICH_ROUTER)
 #
-# Fixes restored behavior:
-# - When a row is promoted NEW -> READY_TO_POST, populate:
-#     * RAW_DEALS.phrase_bank (required)
-#     * RAW_DEALS.phrase_used (if column exists)
+# Changes in v4.9:
+# - REMOVED phrase_bank writing (delegated to enrich_router for better destination+theme matching)
+# - Scorer now ONLY promotes deals (NEW -> READY_TO_POST or SCORED)
+# - enrich_router handles phrase selection with sophisticated logic
 #
 # Maintains fixes:
 # - Uses ingested_at_utc (canonical) for ingest timestamp
 # - Reads RAW_DEALS_VIEW (RDV) via get_all_values() to avoid duplicate header crash
 #
 # Governance:
-# - Writes ONLY to RAW_DEALS
-# - Reads RDV and PHRASE_BANK (read-only)
+# - Writes ONLY to RAW_DEALS (status column)
+# - Reads RDV (read-only)
 # - Does not write to RDV
+# - Does not write phrase_bank or phrase_used (enrich_router handles this)
 
 from __future__ import annotations
 
 import os
 import json
 import re
-import hashlib
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -193,77 +193,6 @@ def _theme_of_day(eligible: List[str]) -> str:
 
 
 # -----------------------------
-# Phrase selection
-# -----------------------------
-
-def _sha_int(s: str) -> int:
-    return int(hashlib.sha1(s.encode("utf-8")).hexdigest(), 16)
-
-
-def _pick_phrase(
-    deal_id: str,
-    theme: str,
-    channel: str,
-    phrases: List[Dict[str, Any]],
-) -> str:
-    """
-    Deterministic selection.
-    PHRASE_BANK expected headers:
-      theme, category, phrase, approved, channel_hint, max_per_month, notes
-    """
-    th = (theme or "").strip().lower()
-    ch = (channel or "").strip().upper()
-
-    # 1) strict match: theme + channel_hint
-    strict: List[str] = []
-    for r in phrases:
-        if not _is_true(r.get("approved")):
-            continue
-        p = str(r.get("phrase") or "").strip()
-        if not p:
-            continue
-        rt = str(r.get("theme") or "").strip().lower()
-        rh = str(r.get("channel_hint") or "").strip().upper()
-        if rt == th and rh == ch:
-            strict.append(p)
-
-    if strict:
-        idx = _sha_int(f"{deal_id}|{th}|{ch}|strict") % len(strict)
-        return strict[idx]
-
-    # 2) theme-only approved
-    theme_only: List[str] = []
-    for r in phrases:
-        if not _is_true(r.get("approved")):
-            continue
-        p = str(r.get("phrase") or "").strip()
-        if not p:
-            continue
-        rt = str(r.get("theme") or "").strip().lower()
-        if rt == th:
-            theme_only.append(p)
-
-    if theme_only:
-        idx = _sha_int(f"{deal_id}|{th}|theme") % len(theme_only)
-        return theme_only[idx]
-
-    # 3) any approved fallback
-    any_ok: List[str] = []
-    for r in phrases:
-        if not _is_true(r.get("approved")):
-            continue
-        p = str(r.get("phrase") or "").strip()
-        if p:
-            any_ok.append(p)
-
-    if any_ok:
-        idx = _sha_int(f"{deal_id}|any") % len(any_ok)
-        return any_ok[idx]
-
-    return ""
-
-
-# -----------------------------
 # Main
 # -----------------------------
 
@@ -276,7 +205,6 @@ def main() -> int:
     RAW_DEALS_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
     RDV_TAB = _env("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
     ZTB_TAB = _env("ZTB_TAB", "ZTB")
-    PHRASE_BANK = _env("PHRASE_BANK", "PHRASE_BANK")
 
     MIN_INGEST_AGE_SECONDS = _env_int("MIN_INGEST_AGE_SECONDS", 30)
     MAX_AGE_HOURS = _env_int("SCORER_MAX_AGE_HOURS", 72)
@@ -296,18 +224,11 @@ def main() -> int:
     except Exception:
         ws_ztb = sh.worksheet("ZONE_THEME_BENCHMARKS")
 
-    ws_phr = sh.worksheet(PHRASE_BANK)
-
     # Theme-of-day
     ztb_rows = ws_ztb.get_all_records()
     eligible = _eligible_themes_from_ztb(ztb_rows)
     theme_today = _theme_of_day(eligible)
     log(f"✅ ZTB: eligible_today={len(eligible)} | theme_today={theme_today} | pool={sorted(eligible)}")
-
-    # Load phrase bank (this sheet should have unique headers; if it doesn't, we can harden it too)
-    phrase_rows = ws_phr.get_all_records()
-    approved_count = sum(1 for r in phrase_rows if _is_true(r.get("approved")) and str(r.get("phrase") or "").strip())
-    log(f"✅ PHRASE_BANK loaded: {len(phrase_rows)} rows | approved_with_phrase={approved_count}")
 
     # RAW headers
     raw_headers = ws_raw.row_values(1)
@@ -324,14 +245,6 @@ def main() -> int:
         log("❌ Could not find an ingest timestamp header in RAW_DEALS.")
         return 1
     log(f"🕒 Using ingest timestamp header: {ingest_header}")
-
-    # Optional write columns
-    phrase_bank_col = "phrase_bank" if "phrase_bank" in raw_idx else None
-    phrase_used_col = "phrase_used" if "phrase_used" in raw_idx else None
-
-    if not phrase_bank_col:
-        log("❌ RAW_DEALS missing required header: phrase_bank (needed to lock phrase).")
-        return 1
 
     # RDV duplicate-safe load
     rdv_values = ws_rdv.get_all_values()
@@ -479,35 +392,23 @@ def main() -> int:
     # Prepare batch updates
     updates: List[gspread.Cell] = []
     status_col = raw_idx["status"] + 1
-    phrase_bank_col_idx = raw_idx[phrase_bank_col] + 1
-    phrase_used_col_idx = (raw_idx[phrase_used_col] + 1) if phrase_used_col else None
 
     def set_status(rownum: int, v: str) -> None:
         updates.append(gspread.Cell(rownum, status_col, v))
-
-    def set_phrase(rownum: int, deal_id: str, theme: str, channel: str) -> None:
-        phrase = _pick_phrase(deal_id=deal_id, theme=theme, channel=channel, phrases=phrase_rows)
-        if phrase:
-            updates.append(gspread.Cell(rownum, phrase_bank_col_idx, phrase))
-            if phrase_used_col_idx is not None:
-                updates.append(gspread.Cell(rownum, phrase_used_col_idx, phrase))
 
     # SCORED
     for r in to_scored:
         set_status(r, "SCORED")
 
-    # READY_TO_POST + phrase lock
+    # READY_TO_POST (phrase selection delegated to enrich_router)
     for rownum, did in winners_pro:
         set_status(rownum, "READY_TO_POST")
-        set_phrase(rownum, did, theme_today, "PRO")
 
     for rownum, did in winners_vip:
         set_status(rownum, "READY_TO_POST")
-        set_phrase(rownum, did, theme_today, "VIP")
 
     for rownum, did in winners_free:
         set_status(rownum, "READY_TO_POST")
-        set_phrase(rownum, did, theme_today, "FREE")
 
     if updates:
         ws_raw.update_cells(updates, value_input_option="USER_ENTERED")
@@ -516,10 +417,7 @@ def main() -> int:
         f"✅ Promoted: PRO={len(winners_pro)} VIP={len(winners_vip)} FREE={len(winners_free)} "
         f"| Marked SCORED={len(to_scored)}"
     )
-
-    # Extra visibility
-    phrase_written = sum(1 for c in updates if c.col == phrase_bank_col_idx)
-    log(f"📝 phrase_bank written: {phrase_written}")
+    log("ℹ️ Phrase selection delegated to enrich_router (runs next in pipeline)")
 
     return 0
 

@@ -26,7 +26,8 @@ RENDER_URL = (os.getenv("RENDER_URL") or "").strip()
 
 SERVICE_ACCOUNT_JSON = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
 
-RUN_SLOT = (os.getenv("RUN_SLOT") or "").strip().upper()  # "AM" or "PM"
+# If provided, can still force. But we now self-heal from ingested_at_utc.
+RUN_SLOT_ENV = (os.getenv("RUN_SLOT") or "").strip().upper()  # "AM" or "PM" or ""
 
 STATUS_READY_TO_POST = os.getenv("STATUS_READY_TO_POST", "READY_TO_POST")
 STATUS_READY_TO_PUBLISH = os.getenv("STATUS_READY_TO_PUBLISH", "READY_TO_PUBLISH")
@@ -177,6 +178,44 @@ def _row_get(row: List[str], i: Optional[int]) -> str:
 
 
 # ============================================================
+# SLOT INFERENCE (NEW, V5-SAFE)
+# - Prefer ingested_at_utc; fallback to created_utc/timestamp/created_at
+# - Deterministic: hour < 12 UTC => AM else PM
+# ============================================================
+
+def _parse_utc_dt(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    # Accept: 2026-02-01T16:55:49Z, 2026-02-01T16:55:49+00:00, with/without micros
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dtv = datetime.fromisoformat(s)
+        if dtv.tzinfo is None:
+            dtv = dtv.replace(tzinfo=timezone.utc)
+        return dtv.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def infer_run_slot(row: Dict[str, str]) -> str:
+    # If env explicitly forces it, keep that as highest authority.
+    if RUN_SLOT_ENV in ("AM", "PM"):
+        return RUN_SLOT_ENV
+
+    # Otherwise infer from row timestamps (priority order).
+    for k in ("ingested_at_utc", "created_utc", "timestamp", "created_at"):
+        dtv = _parse_utc_dt(row.get(k, ""))
+        if dtv:
+            return "AM" if dtv.hour < 12 else "PM"
+
+    # Last resort: current UTC time
+    now = datetime.now(timezone.utc)
+    return "AM" if now.hour < 12 else "PM"
+
+
+# ============================================================
 # NORMALISERS (LOCKED PA PAYLOAD CONTRACT)
 # OUT/IN: ddmmyy
 # PRICE: £ integer (rounded up)
@@ -222,18 +261,11 @@ def normalize_date_ddmmyy(raw_date: str | None) -> str:
         y = int(m.group(3))
         return f"{d:02d}{mo:02d}{y % 100:02d}"
 
-    m = re.fullmatch(r"(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})", s)
-    if m:
-        y = int(m.group(1))
-        mo = int(m.group(2))
-        d = int(m.group(3))
-        return f"{d:02d}{mo:02d}{y % 100:02d}"
-
-    raise ValueError(f"Cannot normalize date to ddmmyy: {raw_date!r}")
+    raise ValueError(f"Unsupported date format: {raw_date!r}")
 
 
 # ============================================================
-# THEME SOURCE OF TRUTH
+# OPS MASTER THEME (LOCKED)
 # ============================================================
 
 def read_ops_theme(sh: gspread.Spreadsheet) -> str:
@@ -248,7 +280,7 @@ def read_ops_theme(sh: gspread.Spreadsheet) -> str:
 # PAYLOAD BUILDING
 # ============================================================
 
-def build_payload(row: Dict[str, str], theme_for_palette: str) -> Dict[str, str]:
+def build_payload(row: Dict[str, str], theme_for_palette: str, run_slot_effective: str) -> Dict[str, str]:
     out_raw = row.get("outbound_date", "") or row.get("out_date", "")
     in_raw = row.get("return_date", "") or row.get("in_date", "")
     price_raw = row.get("price_gbp", "") or row.get("price", "")
@@ -265,10 +297,9 @@ def build_payload(row: Dict[str, str], theme_for_palette: str) -> Dict[str, str]
     }
 
     # ✅ CRITICAL: renderer API uses "layout" (defaults to PM if missing)
-    if RUN_SLOT in ("AM", "PM"):
-        payload["layout"] = RUN_SLOT
-        # keep for logging/future-proofing
-        payload["run_slot"] = RUN_SLOT
+    if run_slot_effective in ("AM", "PM"):
+        payload["layout"] = run_slot_effective
+        payload["run_slot"] = run_slot_effective
 
     return payload
 
@@ -327,12 +358,16 @@ def render_sheet_row(sh: gspread.Spreadsheet, sheet_row: int, ops_theme: str) ->
 
     rdv_dynamic_theme_raw = ws_rdv.cell(sheet_row, RDV_DYNAMIC_THEME_COL).value
     theme_for_palette = ops_theme.strip() if ops_theme.strip() else normalize_theme(rdv_dynamic_theme_raw)
-    payload = build_payload(row, theme_for_palette)
+
+    run_slot_effective = infer_run_slot(row)
+    payload = build_payload(row, theme_for_palette, run_slot_effective)
 
     print(
-        f"Target row {sheet_row} | RUN_SLOT={RUN_SLOT!r} | "
+        f"Target row {sheet_row} | RUN_SLOT_ENV={RUN_SLOT_ENV!r} | "
+        f"run_slot_effective={run_slot_effective!r} | "
         f"layout={payload.get('layout')!r} | OPS_THEME={ops_theme!r} | "
-        f"RDV_AT={rdv_dynamic_theme_raw!r} | theme_used={payload.get('theme')!r} | payload={payload}"
+        f"RDV_AT={rdv_dynamic_theme_raw!r} | theme_used={payload.get('theme')!r} | "
+        f"ingested_at_utc={row.get('ingested_at_utc','')!r} | payload={payload}"
     )
 
     if not payload["FROM"] or not payload["TO"]:
@@ -429,7 +464,7 @@ def main() -> int:
         print(f"ℹ️ No render candidates (status={STATUS_READY_TO_POST}, graphic_url blank)")
         return 0
 
-    print(f"🎯 Render candidates (sheet rows): {candidates} | RUN_SLOT={RUN_SLOT!r}")
+    print(f"🎯 Render candidates (sheet rows): {candidates} | RUN_SLOT_ENV={RUN_SLOT_ENV!r}")
 
     ok = 0
     for sheet_row in candidates:

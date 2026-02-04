@@ -5,6 +5,7 @@ import re
 import json
 import time
 import hashlib
+import random
 import datetime as dt
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -13,27 +14,29 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ============================================================
-# TRAVELTXTER — FEEDER v5.5 FAST
+# TRAVELTXTER — FEEDER v5.6 (FAST + ENV-RULED)
 #
-# GOAL
-# - Make runtime dominated by Duffel, not Google Sheets.
-# - CONFIG is the authority for destination + intent theme + Fi/Vi.
-# - Origins are sourced from CONFIG_ORIGIN_POOLS (preferred) or ORIGIN_POOL_CSV fallback.
-#
-# NOTE
-# - City/country fields intentionally left blank (enrich_router fills from IATA_MASTER).
-# - Keeps de-dupe + caps + rotation + 90/10 + diminishing returns.
+# PRINCIPLES
+# - CONFIG is authority for destinations + intent themes + Fi/Vi.
+# - ENV is authority for origins + stops + trip/window bounds.
+# - No IATA_MASTER, no ROUTE_CAPABILITY_MAP in feeder (enrich/router handles enrichment).
+# - Bulk append to RAW_DEALS in one call.
+# - De-dupe recent searches using DUFFEL_SEARCH_DEDUPE_HOURS (lightweight, in-memory per run
+#   + optional FEEDER_LOG tab if present).
 # ============================================================
 
 
 # ------------------------
-# Logging / env
+# Logging
 # ------------------------
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
     print(f"{ts} | {msg}", flush=True)
 
 
+# ------------------------
+# Env helpers
+# ------------------------
 def env(k: str, d: str = "") -> str:
     return (os.getenv(k, d) or "").strip()
 
@@ -45,27 +48,96 @@ def env_int(k: str, d: int) -> int:
         return d
 
 
-def fnum(v: Any, d: float = 0.0) -> float:
+def env_float(k: str, d: float) -> float:
     try:
-        return float(v)
+        return float(env(k))
     except Exception:
         return d
 
 
-def tab(env_name: str, default: str) -> str:
-    v = os.getenv(env_name)
-    return default if not v or not v.strip() else v.strip()
-
-
-def safe_get(d: Dict[str, str], *keys: str) -> str:
+def first_int(*keys: str, default: int) -> int:
     for k in keys:
-        if k in d and (d.get(k) or "").strip():
-            return (d.get(k) or "").strip()
-    return ""
+        v = env(k, "")
+        if v:
+            try:
+                return int(v)
+            except Exception:
+                pass
+    return default
+
+
+def first_float(*keys: str, default: float) -> float:
+    for k in keys:
+        v = env(k, "")
+        if v:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return default
+
+
+def parse_csv_iata(s: str) -> List[str]:
+    parts = [p.strip().upper() for p in (s or "").split(",") if p.strip()]
+    out: List[str] = []
+    seen = set()
+    for p in parts:
+        if p and p not in seen and p.isalnum() and 3 <= len(p) <= 4:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
+def theme_key(theme: str) -> str:
+    t = (theme or "").strip().upper()
+    t = re.sub(r"[^A-Z0-9_]+", "_", t)
+    return t
+
+
+def get_theme_origins(theme: str) -> List[str]:
+    t = theme_key(theme)
+    s = env(f"ORIGINS_{t}", "")
+    if s:
+        return parse_csv_iata(s)
+    return parse_csv_iata(env("ORIGINS_DEFAULT", "LHR,MAN,BRS,LGW,STN"))
+
+
+def get_theme_max_stops(theme: str) -> int:
+    t = theme_key(theme)
+    return first_int(f"MAX_STOPS_{t}", "MAX_STOPS_DEFAULT", default=1)
+
+
+def parse_minmax(spec: str, default_min: int, default_max: int) -> Tuple[int, int]:
+    # Accept forms like "21 / 84" or "21/84" or "21 - 84"
+    if not spec:
+        return default_min, default_max
+    m = re.findall(r"(\d+)", spec)
+    if len(m) >= 2:
+        a, b = int(m[0]), int(m[1])
+        return min(a, b), max(a, b)
+    return default_min, default_max
+
+
+def get_theme_window_days(theme: str) -> Tuple[int, int]:
+    t = theme_key(theme)
+    spec = env(f"WINDOW_{t}_MIN/MAX", "")
+    if spec:
+        return parse_minmax(spec, 21, 84)
+    spec = env("WINDOW_DEFAULT_MIN/MAX", "21 / 84")
+    return parse_minmax(spec, 21, 84)
+
+
+def get_theme_trip_days(theme: str) -> Tuple[int, int]:
+    t = theme_key(theme)
+    spec = env(f"TRIP_{t}_MIN/MAX", "")
+    if spec:
+        return parse_minmax(spec, 4, 10)
+    spec = env("TRIP_DEFAULT_MIN/MAX", "4 / 10")
+    return parse_minmax(spec, 4, 10)
 
 
 # ------------------------
-# Robust SA JSON parsing
+# Robust SA JSON parsing (fixes the “invalid control character” issues)
 # ------------------------
 def _repair_private_key_newlines(raw: str) -> str:
     pat = re.compile(r'("private_key"\s*:\s*")(.+?)(")', re.DOTALL)
@@ -73,7 +145,7 @@ def _repair_private_key_newlines(raw: str) -> str:
     if not m:
         return raw
     prefix, pk, suffix = m.group(1), m.group(2), m.group(3)
-    pk_fixed = pk.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n").replace("\t", "\\t")
+    pk_fixed = pk.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
     return raw[: m.start()] + prefix + pk_fixed + suffix + raw[m.end():]
 
 
@@ -93,6 +165,7 @@ def _load_sa_info() -> Dict[str, Any]:
         except Exception:
             continue
 
+    # last resort (let json raise)
     return json.loads(_repair_private_key_newlines(raw))
 
 
@@ -137,7 +210,6 @@ def a1(ws, cell: str) -> str:
 
 
 def col_to_a1(col_idx_1based: int) -> str:
-    # 1 -> A, 26 -> Z, 27 -> AA ...
     n = col_idx_1based
     s = ""
     while n > 0:
@@ -150,22 +222,25 @@ def col_to_a1(col_idx_1based: int) -> str:
 # Duffel
 # ------------------------
 def duffel_headers() -> Dict[str, str]:
+    key = env("DUFFEL_API_KEY")
+    if not key:
+        raise RuntimeError("Missing DUFFEL_API_KEY")
     return {
-        "Authorization": f"Bearer {env('DUFFEL_API_KEY')}",
+        "Authorization": f"Bearer {key}",
         "Duffel-Version": "v2",
         "Content-Type": "application/json",
     }
 
 
-def normalise_airlines_csv(s: str) -> str:
+def normalise_airlines_csv(s: str) -> List[str]:
     s = (s or "").strip()
     if not s:
-        return ""
-    if s.upper() in ("ANY", "ALL", "*", "NONE", "NULL"):
-        return ""
+        return []
+    if s.upper() in ("ANY", "ALL", "*"):
+        return []
     parts = [p.strip().upper() for p in s.split(",") if p.strip()]
     parts = [p for p in parts if 1 <= len(p) <= 3 and p.isalnum()]
-    return ",".join(parts)
+    return list(dict.fromkeys(parts))
 
 
 def duffel_offer_request(
@@ -175,7 +250,7 @@ def duffel_offer_request(
     ret_date: str,
     max_connections: int,
     cabin_class: str,
-    included_airlines_csv: str = "",
+    included_airlines: List[str],
 ) -> Optional[Dict[str, Any]]:
     body: Dict[str, Any] = {
         "data": {
@@ -188,10 +263,8 @@ def duffel_offer_request(
             "max_connections": int(max_connections),
         }
     }
-
-    air = normalise_airlines_csv(included_airlines_csv)
-    if air:
-        body["data"]["included_airlines"] = [x for x in air.split(",") if x]
+    if included_airlines:
+        body["data"]["included_airlines"] = included_airlines
 
     r = requests.post(
         "https://api.duffel.com/air/offer_requests",
@@ -213,8 +286,6 @@ def best_offer(resp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def offer_stops(offer: Dict[str, Any]) -> int:
     try:
         slices = offer.get("slices") or []
-        if not slices:
-            return 0
         segs = slices[0].get("segments") or []
         return max(0, len(segs) - 1)
     except Exception:
@@ -222,7 +293,7 @@ def offer_stops(offer: Dict[str, Any]) -> int:
 
 
 # ------------------------
-# Theme match from CONFIG intent columns
+# CONFIG theme match
 # ------------------------
 THEME_COLS = ("primary_theme", "short_stay_theme", "long_stay_winter_theme", "long_stay_summer_theme")
 
@@ -235,136 +306,82 @@ def theme_matches_config_row(r: Dict[str, str], theme_today: str) -> bool:
     return False
 
 
-# ------------------------
-# Date candidates (rotating, deterministic per day)
-# ------------------------
-def date_candidates(today: dt.date, k: int, base_days_ahead: int, step_days: int) -> List[dt.date]:
-    out: List[dt.date] = []
-    k = max(1, int(k))
-    for i in range(k):
-        out.append(today + dt.timedelta(days=base_days_ahead + i * step_days))
-    return out
-
-
-def day_rotation_offset() -> int:
-    ymd = dt.datetime.utcnow().strftime("%Y%m%d")
-    return int(hashlib.md5(ymd.encode("utf-8")).hexdigest()[:6], 16)
+def fnum(v: Any, d: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return d
 
 
 # ------------------------
-# Insert / dedupe
+# Search de-dupe (in-memory per run + optional FEEDER_LOG tab)
+# ------------------------
+def search_sig(theme: str, origin: str, dest: str, out_date: str) -> str:
+    # we de-dupe per theme + origin + dest + outbound date
+    key = f"{theme}|{origin}|{dest}|{out_date}"
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
+
+
+def build_recent_sig_set(ws_log, hours: int) -> set[str]:
+    """
+    Optional: read FEEDER_LOG with headers:
+      ts_utc | sig
+    Keep only last N hours.
+    If tab missing or schema unknown, return empty set (still de-dupes in-memory).
+    """
+    if ws_log is None:
+        return set()
+
+    try:
+        rows = ws_log.get_all_values()
+        if not rows or len(rows) < 2:
+            return set()
+        hdr = rows[0]
+        if "ts_utc" not in hdr or "sig" not in hdr:
+            return set()
+        c_ts = hdr.index("ts_utc")
+        c_sig = hdr.index("sig")
+
+        now = dt.datetime.utcnow()
+        cutoff = now - dt.timedelta(hours=hours)
+
+        out = set()
+        for r in rows[1:]:
+            if c_ts >= len(r) or c_sig >= len(r):
+                continue
+            ts = (r[c_ts] or "").strip()
+            sig = (r[c_sig] or "").strip()
+            if not ts or not sig:
+                continue
+            try:
+                tsv = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                continue
+            if tsv >= cutoff:
+                out.add(sig)
+        return out
+    except Exception:
+        return set()
+
+
+def append_log_rows(ws_log, sigs: List[str]) -> None:
+    if ws_log is None or not sigs:
+        return
+    now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    values = [[now, s] for s in sigs]
+    try:
+        ws_log.append_rows(values, value_input_option="RAW")
+    except Exception:
+        # non-fatal
+        pass
+
+
+# ------------------------
+# Deal ID
 # ------------------------
 def make_deal_id(origin: str, dest: str, out_date: str, ret_date: str, cabin: str) -> str:
     key = f"{origin}|{dest}|{out_date}|{ret_date}|{cabin}"
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
-
-
-# ------------------------
-# Planning (Pi + diminishing returns)
-# ------------------------
-def diminishing_return_score(Pi: float, q_used: int) -> float:
-    Pi = max(0.0, min(1.0, Pi))
-    return Pi * ((1.0 - Pi) ** max(0, q_used))
-
-
-def build_query_plan(
-    candidates: List[Dict[str, Any]],
-    max_searches: int,
-    primary_budget: int,
-    secondary_budget: int,
-    max_queries_per_dest: int,
-) -> List[Tuple[str, Dict[str, Any]]]:
-    plan: List[Tuple[str, Dict[str, Any]]] = []
-    qcount: Dict[str, int] = {}
-
-    def pick_one() -> Optional[Dict[str, Any]]:
-        best = None
-        best_score = -1.0
-        for r in candidates:
-            dest = (r.get("destination_iata") or "").strip()
-            if not dest:
-                continue
-            used = qcount.get(dest, 0)
-            if used >= max_queries_per_dest:
-                continue
-            sc = diminishing_return_score(float(r["_Pi"]), used)
-            if used >= 2:
-                sc *= 0.85
-            if sc > best_score:
-                best_score = sc
-                best = r
-        return best
-
-    lane_seq = (["PRIMARY"] * primary_budget) + (["SECONDARY"] * secondary_budget)
-    lane_seq = lane_seq[:max_searches]
-
-    for lane in lane_seq:
-        r = pick_one()
-        if not r:
-            break
-        dest = (r.get("destination_iata") or "").strip()
-        qcount[dest] = qcount.get(dest, 0) + 1
-        plan.append((lane, r))
-
-    # ensure at least one secondary if budgeted and we still have capacity
-    if secondary_budget > 0 and all(l != "SECONDARY" for l, _ in plan) and len(plan) < max_searches:
-        r = pick_one()
-        if r:
-            plan.append(("SECONDARY", r))
-
-    return plan
-
-
-# ------------------------
-# Origin pools
-# ------------------------
-def parse_iata_csv(s: str) -> List[str]:
-    parts = [p.strip().upper() for p in (s or "").split(",") if p.strip()]
-    parts = [p for p in parts if 3 <= len(p) <= 4 and p.isalnum()]
-    # keep order, de-dupe
-    out: List[str] = []
-    seen = set()
-    for p in parts:
-        if p not in seen:
-            out.append(p)
-            seen.add(p)
-    return out
-
-
-def load_origin_pools(sh, pool_tab: str) -> Dict[str, List[str]]:
-    """
-    Preferred: CONFIG_ORIGIN_POOLS tab with:
-      destination_iata | origins_csv
-    Returns dest -> [origins...]
-    """
-    try:
-        ws = sh.worksheet(pool_tab)
-    except Exception:
-        return {}
-
-    rows = ws.get_all_values()
-    if not rows or len(rows) < 2:
-        return {}
-
-    hdr = [h.strip() for h in rows[0]]
-    try:
-        c_dest = hdr.index("destination_iata")
-        c_csv = hdr.index("origins_csv")
-    except Exception:
-        return {}
-
-    out: Dict[str, List[str]] = {}
-    for r in rows[1:]:
-        if c_dest >= len(r):
-            continue
-        dest = (r[c_dest] or "").strip().upper()
-        if not dest:
-            continue
-        csv = r[c_csv] if c_csv < len(r) else ""
-        origins = parse_iata_csv(csv)
-        if origins:
-            out[dest] = origins
-    return out
 
 
 # ------------------------
@@ -375,41 +392,32 @@ def main() -> int:
     if not sheet_id:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
 
-    RAW_TAB = tab("RAW_DEALS_TAB", "RAW_DEALS")
-    CFG_TAB = tab("FEEDER_CONFIG_TAB", "CONFIG")
-    OPS_TAB = tab("OPS_MASTER_TAB", "OPS_MASTER")
+    RAW_TAB = env("RAW_DEALS_TAB", "RAW_DEALS")
+    CFG_TAB = env("FEEDER_CONFIG_TAB", "CONFIG")
+    OPS_TAB = env("OPS_MASTER_TAB", "OPS_MASTER")
+    FEEDER_LOG_TAB = env("FEEDER_LOG_TAB", "FEEDER_LOG")
 
-    # Optional (fast) pool map; avoid ROUTE_CAPABILITY_MAP entirely
-    ORIGIN_POOLS_TAB = tab("CONFIG_ORIGIN_POOLS_TAB", "CONFIG_ORIGIN_POOLS")
-    GLOBAL_ORIGIN_POOL = parse_iata_csv(env("ORIGIN_POOL_CSV", "LHR,LGW,MAN"))
-
-    MAX_SEARCHES = env_int("DUFFEL_MAX_SEARCHES_PER_RUN", 12)
-    MAX_INSERTS = env_int("DUFFEL_MAX_INSERTS", 50)
+    # Governor precedence: DUFFEL_* first, fallback to FEEDER_*
+    MAX_SEARCHES = first_int("DUFFEL_MAX_SEARCHES_PER_RUN", "FEEDER_MAX_SEARCHES", default=12)
+    MAX_INSERTS = first_int("DUFFEL_MAX_INSERTS", "FEEDER_MAX_INSERTS", default=50)
     MAX_PER_ORIGIN = env_int("DUFFEL_MAX_INSERTS_PER_ORIGIN", 15)
     MAX_PER_ROUTE = env_int("DUFFEL_MAX_INSERTS_PER_ROUTE", 5)
 
-    DESTS_PER_RUN = env_int("DUFFEL_ROUTES_PER_RUN", 4)
-    ORIGINS_PER_DEST = env_int("ORIGINS_PER_DEST", 3)
-    K_DATES_PER_DEST = env_int("K_DATES_PER_DEST", 3)
+    DESTS_PER_RUN = env_int("DUFFEL_ROUTES_PER_RUN", 6)
+    WINNERS_PER_RUN = env_int("WINNERS_PER_RUN", 2)  # used as soft target; we still append all valid offers found
+    SLEEP = env_float("FEEDER_SLEEP_SECONDS", 0.1)
 
-    PRIMARY_PCT = env_int("SLOT_PRIMARY_PCT", 90)
-    BASE_DAYS_AHEAD = env_int("BASE_DAYS_AHEAD", 30)
-    DATE_STEP_DAYS = env_int("DATE_STEP_DAYS", 14)
+    DEDUPE_HOURS = env_int("DUFFEL_SEARCH_DEDUPE_HOURS", 4)
 
-    MAX_QUERIES_PER_DEST = env_int("MAX_QUERIES_PER_DEST", 3)
-
-    # Cabin: economy-only for now (RDV premium not ready)
-    CABIN_CLASS = env("FEEDER_CABIN_CLASS", "economy").lower() or "economy"
-
-    # Connection tolerance: simple by lane (keeps feeder independent of ZTB)
-    # If you want ZTB back later, do it in a tiny lookup, not a full table scan.
-    MAX_CONN_PRIMARY = env_int("MAX_CONN_PRIMARY", 1)
-    MAX_CONN_SECONDARY = env_int("MAX_CONN_SECONDARY", 2)
-
-    primary_budget = int(round(MAX_SEARCHES * (PRIMARY_PCT / 100.0)))
-    primary_budget = max(0, min(MAX_SEARCHES, primary_budget))
+    # 90/10
+    primary_pct = env_int("SLOT_PRIMARY_PCT", 90)
+    primary_budget = max(0, min(MAX_SEARCHES, int(round(MAX_SEARCHES * (primary_pct / 100.0)))))
     secondary_budget = max(0, MAX_SEARCHES - primary_budget)
 
+    # cabin
+    cabin_class = env("FEEDER_CABIN_CLASS", "economy").lower() or "economy"
+
+    # Sheets
     gc = gspread_client()
     sh = gc.open_by_key(sheet_id)
 
@@ -417,181 +425,182 @@ def main() -> int:
     CFG = open_ws(sh, CFG_TAB)
     OPS = open_ws(sh, OPS_TAB)
 
-    theme = a1(OPS, "B5")
-    log(f"🎯 Theme of day: {theme}")
+    ws_log = None
+    try:
+        ws_log = sh.worksheet(FEEDER_LOG_TAB)
+    except Exception:
+        ws_log = None
+
+    theme_today = a1(OPS, "B5")
+    if not theme_today:
+        theme_today = env("THEME", "DEFAULT")
+    log(f"🎯 Theme of day: {theme_today}")
+
+    origins = get_theme_origins(theme_today)
+    if not origins:
+        raise RuntimeError("No origins available (ORIGINS_* / ORIGINS_DEFAULT empty)")
+
+    max_stops = get_theme_max_stops(theme_today)
+    wmin, wmax = get_theme_window_days(theme_today)
+    tmin, tmax = get_theme_trip_days(theme_today)
+
     log(
-        f"CAPS: MAX_SEARCHES={MAX_SEARCHES} | MAX_INSERTS={MAX_INSERTS} | PER_ORIGIN={MAX_PER_ORIGIN} | "
-        f"PER_ROUTE={MAX_PER_ROUTE} | DESTS_PER_RUN={DESTS_PER_RUN} | ORIGINS_PER_DEST={ORIGINS_PER_DEST} | "
-        f"K_DATES_PER_DEST={K_DATES_PER_DEST} | PRIMARY/SECONDARY={primary_budget}/{secondary_budget} | cabin={CABIN_CLASS}"
+        f"CAPS: searches={MAX_SEARCHES} inserts={MAX_INSERTS} per_origin={MAX_PER_ORIGIN} per_route={MAX_PER_ROUTE} "
+        f"dests_per_run={DESTS_PER_RUN} winners_soft={WINNERS_PER_RUN} primary/secondary={primary_budget}/{secondary_budget}"
     )
-    log(f"LANES: max_conn_primary={MAX_CONN_PRIMARY} | max_conn_secondary={MAX_CONN_SECONDARY}")
+    log(f"RULES: origins={','.join(origins)} | max_stops={max_stops} | window={wmin}-{wmax}d | trip={tmin}-{tmax}d | cabin={cabin_class}")
+    log(f"DEDUPE: last {DEDUPE_HOURS}h")
 
-    # --- Load origin pools (fast). No RCM scan.
-    t0 = time.time()
-    origin_pools = load_origin_pools(sh, ORIGIN_POOLS_TAB)
-    log(f"✅ Origin pools loaded: {len(origin_pools)} destinations ({time.time()-t0:.1f}s)")
-
-    # --- Load CONFIG rows (small: ~200)
+    # Load CONFIG rows (small)
     cfg_all = records(CFG)
     cfg_rows = [
         r for r in cfg_all
         if (r.get("enabled") or "").strip().lower() in ("true", "1", "yes")
         and (r.get("destination_iata") or "").strip()
-        and theme_matches_config_row(r, theme)
+        and theme_matches_config_row(r, theme_today)
     ]
     if not cfg_rows:
-        log("⚠️ No CONFIG rows for theme (intent theme columns).")
+        log("⚠️ No CONFIG destinations eligible for theme.")
         return 0
 
-    # --- Best per destination by Pi (Fi×Vi)
-    best_by_dest: Dict[str, Dict[str, Any]] = {}
+    # Compute Pi = Fi * Vi (Fi from search_weight, Vi from value_score)
+    candidates: List[Dict[str, Any]] = []
     for r in cfg_rows:
         dest = (r.get("destination_iata") or "").strip().upper()
-        Fi = fnum(safe_get(r, "search_weight", "feasibility_score", "Fi"), 0.0)
-        Vi = fnum(safe_get(r, "value_score", "Vi"), 0.5)
+        Fi = fnum(r.get("search_weight") or r.get("feasibility_score") or "0", 0.0)
+        Vi = fnum(r.get("value_score") or "0.5", 0.5)
         Pi = Fi * Vi
-        rr: Dict[str, Any] = dict(r)
-        rr["_Fi"], rr["_Vi"], rr["_Pi"] = Fi, Vi, Pi
-        if dest not in best_by_dest or Pi > float(best_by_dest[dest].get("_Pi", 0.0)):
-            best_by_dest[dest] = rr
+        rr = dict(r)
+        rr["_dest"] = dest
+        rr["_Fi"] = Fi
+        rr["_Vi"] = Vi
+        rr["_Pi"] = Pi
+        candidates.append(rr)
 
-    candidates = list(best_by_dest.values())
+    # Rank and keep top N destinations
     candidates.sort(key=lambda x: float(x.get("_Pi", 0.0)), reverse=True)
-    candidates = candidates[:max(1, DESTS_PER_RUN)]
+    candidates = candidates[: max(1, DESTS_PER_RUN)]
 
-    # --- Read RAW header once
+    # Read RAW header + deal_id col once
     raw_hdr = header(RAW)
     if not raw_hdr:
         raise RuntimeError("RAW_DEALS header row is empty")
 
-    # --- Existing deal_ids: single column fetch (fast)
     existing_deal_ids = set()
     if "deal_id" in raw_hdr:
         c = raw_hdr.index("deal_id") + 1
-        col_letter = col_to_a1(c)
-        # This is much faster than col_values on large sheets in many cases
-        vals = RAW.get(f"{col_letter}2:{col_letter}")
+        col = col_to_a1(c)
+        vals = RAW.get(f"{col}2:{col}")
         for row in vals:
             if row and row[0]:
                 existing_deal_ids.add(row[0].strip())
 
-    # --- Date set + deterministic rotation
-    today = dt.date.today()
-    outs = date_candidates(today, K_DATES_PER_DEST, BASE_DAYS_AHEAD, DATE_STEP_DAYS)
-    rot = day_rotation_offset()
+    # Optional de-dupe set from FEEDER_LOG
+    recent_sigs = build_recent_sig_set(ws_log, DEDUPE_HOURS)
+    inrun_sigs = set()
 
-    # --- Insert caps bookkeeping
+    # Insert caps bookkeeping
     inserted = 0
-    inserts_by_origin: Dict[str, int] = {}
-    inserts_by_route: Dict[Tuple[str, str], int] = {}
-    used_triplets: set[Tuple[str, str, str]] = set()
+    by_origin: Dict[str, int] = {}
+    by_route: Dict[Tuple[str, str], int] = {}
 
-    def can_insert(origin_iata: str, dest_iata: str, deal_id: str) -> bool:
+    def can_insert(origin: str, dest: str, deal_id: str) -> bool:
         if inserted >= MAX_INSERTS:
             return False
         if deal_id in existing_deal_ids:
             return False
-        if inserts_by_origin.get(origin_iata, 0) >= MAX_PER_ORIGIN:
+        if by_origin.get(origin, 0) >= MAX_PER_ORIGIN:
             return False
-        if inserts_by_route.get((origin_iata, dest_iata), 0) >= MAX_PER_ROUTE:
+        if by_route.get((origin, dest), 0) >= MAX_PER_ROUTE:
             return False
         return True
 
-    # --- Build plan (PRIMARY/SECONDARY with diminishing returns)
-    plan = build_query_plan(
-        candidates=candidates,
-        max_searches=MAX_SEARCHES,
-        primary_budget=primary_budget,
-        secondary_budget=secondary_budget,
-        max_queries_per_dest=MAX_QUERIES_PER_DEST,
-    )
-    if not plan:
-        log("⚠️ No query plan could be built.")
-        return 0
+    # Pre-generate outbound dates across window, deterministic with day seed
+    seed = int(hashlib.md5(dt.datetime.utcnow().strftime("%Y%m%d").encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
 
-    log(
-        f"🧭 Query plan: {len(plan)} planned | primary={sum(1 for x in plan if x[0]=='PRIMARY')} | "
-        f"secondary={sum(1 for x in plan if x[0]=='SECONDARY')}"
-    )
+    def pick_outbound_date() -> dt.date:
+        d = rng.randint(wmin, wmax)
+        return (dt.date.today() + dt.timedelta(days=d))
+
+    def pick_trip_len() -> int:
+        return rng.randint(tmin, tmax)
+
+    # Lane planner (90/10)
+    lane_seq = (["PRIMARY"] * primary_budget) + (["SECONDARY"] * secondary_budget)
+    lane_seq = lane_seq[:MAX_SEARCHES]
+
+    # Build query sequence across candidates with light rotation + diminishing returns
+    dest_use: Dict[str, int] = {}
+
+    def pick_candidate() -> Dict[str, Any]:
+        best = None
+        best_score = -1.0
+        for r in candidates:
+            dest = r["_dest"]
+            used = dest_use.get(dest, 0)
+            # diminishing returns
+            Pi = float(r["_Pi"])
+            score = Pi * ((1.0 - min(0.95, Pi)) ** used)
+            if used >= 2:
+                score *= 0.85
+            if score > best_score:
+                best_score = score
+                best = r
+        assert best is not None
+        return best
 
     searches = 0
-    primary_used = 0
-    secondary_used = 0
-
-    # Skips
-    skipped_no_origins = 0
-    skipped_dupe_triplet = 0
-    skipped_cannot_insert = 0
-    skipped_no_offer = 0
-    skipped_non_gbp = 0
-    skipped_bad_price = 0
-    skipped_all_combos_blocked = 0
-
-    per_dest_q: Dict[str, int] = {}
+    appended_sigs: List[str] = []
     out_rows: List[Dict[str, str]] = []
 
-    for lane, r in plan:
+    # Skips
+    sk_dedupe = 0
+    sk_no_offer = 0
+    sk_non_gbp = 0
+    sk_bad_price = 0
+    sk_caps = 0
+
+    for lane in lane_seq:
         if searches >= MAX_SEARCHES or inserted >= MAX_INSERTS:
             break
 
-        dest = (r.get("destination_iata") or "").strip().upper()
-        if not dest:
+        r = pick_candidate()
+        dest = r["_dest"]
+        dest_use[dest] = dest_use.get(dest, 0) + 1
+
+        # pick origin (rotate)
+        origin = origins[(searches + seed) % len(origins)]
+
+        out_date = pick_outbound_date()
+        trip_len = pick_trip_len()
+        ret_date = out_date + dt.timedelta(days=trip_len)
+
+        sig = search_sig(theme_today, origin, dest, out_date.isoformat())
+        if sig in recent_sigs or sig in inrun_sigs:
+            sk_dedupe += 1
+            continue
+        inrun_sigs.add(sig)
+
+        # lane connections (secondary relaxes stops by +1)
+        lane_max_stops = max_stops if lane == "PRIMARY" else min(2, max_stops + 1)
+
+        # Duffel uses max_connections not max_stops: max_connections == max_stops
+        max_connections = lane_max_stops
+
+        deal_id = make_deal_id(origin, dest, out_date.isoformat(), ret_date.isoformat(), cabin_class)
+        if not can_insert(origin, dest, deal_id):
+            sk_caps += 1
             continue
 
-        max_conn = MAX_CONN_PRIMARY if lane == "PRIMARY" else MAX_CONN_SECONDARY
-
-        # Origins: prefer per-destination pool, else fallback to global
-        origins = origin_pools.get(dest) or GLOBAL_ORIGIN_POOL
-        origins = origins[:max(1, ORIGINS_PER_DEST)]
-        if not origins:
-            skipped_no_origins += 1
-            continue
-
-        q = per_dest_q.get(dest, 0)
-        per_dest_q[dest] = q + 1
-
-        # Trip length: prefer trip_length_days (RAW schema), fallback to 4
-        trip_len = int(float(safe_get(r, "trip_length_days", "trip_days") or "4"))
-        trip_len = max(2, min(21, trip_len))
-
-        included_airlines = safe_get(r, "included_airlines", "included_airlines_csv", "carriers")
-
-        combos_tried = 0
-        max_combo_tries = max(1, len(origins) * len(outs))
-        picked: Optional[Tuple[str, dt.date, dt.date, str]] = None
-
-        while combos_tried < max_combo_tries:
-            idx = (q + rot + combos_tried)
-            origin = origins[idx % len(origins)]
-            out_date = outs[(idx // len(origins)) % len(outs)]
-            ret_date = out_date + dt.timedelta(days=trip_len)
-
-            triplet = (origin, dest, out_date.isoformat())
-            if triplet in used_triplets:
-                combos_tried += 1
-                skipped_dupe_triplet += 1
-                continue
-
-            deal_id = make_deal_id(origin, dest, out_date.isoformat(), ret_date.isoformat(), CABIN_CLASS)
-            if not can_insert(origin, dest, deal_id):
-                combos_tried += 1
-                skipped_cannot_insert += 1
-                continue
-
-            picked = (origin, out_date, ret_date, deal_id)
-            break
-
-        if not picked:
-            skipped_all_combos_blocked += 1
-            log(f"⚠️ All origin/date combos blocked for dest={dest} (duplicates/caps).")
-            continue
-
-        origin, out_date, ret_date, deal_id = picked
-        used_triplets.add((origin, dest, out_date.isoformat()))
+        included_airlines = normalise_airlines_csv(env("AIRLINES", ""))
+        # You also had "included_airlines_csv" concept; if you later add per-theme/per-dest airline rules,
+        # wire it here. For now: global airline allowlist is optional.
+        # If AIRLINES is empty -> no filter -> Duffel ANY.
 
         log(
-            f"🔎 Search {searches+1}/{MAX_SEARCHES} [{lane}] {origin} → {dest} "
-            f"| Pi={float(r['_Pi']):.2f} | max_conn={max_conn} | cabin={CABIN_CLASS}"
+            f"🔎 Search {searches+1}/{MAX_SEARCHES} [{lane}] {origin}→{dest} "
+            f"| Pi={float(r['_Pi']):.2f} | max_conn={max_connections} | trip={trip_len}d | window={wmin}-{wmax}"
         )
 
         resp = duffel_offer_request(
@@ -599,32 +608,30 @@ def main() -> int:
             dest=dest,
             out_date=out_date.isoformat(),
             ret_date=ret_date.isoformat(),
-            max_connections=max_conn,
-            cabin_class=CABIN_CLASS,
-            included_airlines_csv=included_airlines,
+            max_connections=max_connections,
+            cabin_class=cabin_class,
+            included_airlines=included_airlines,
         )
-
         searches += 1
-        if lane == "PRIMARY":
-            primary_used += 1
-        else:
-            secondary_used += 1
 
         offer = best_offer(resp or {})
         if not offer:
-            skipped_no_offer += 1
+            sk_no_offer += 1
+            time.sleep(SLEEP)
             continue
 
-        total_currency = (offer.get("total_currency") or "").strip().upper()
-        total_amount = (offer.get("total_amount") or "").strip()
-        if total_currency and total_currency != "GBP":
-            skipped_non_gbp += 1
+        cur = (offer.get("total_currency") or "").strip().upper()
+        amt = (offer.get("total_amount") or "").strip()
+        if cur and cur != "GBP":
+            sk_non_gbp += 1
+            time.sleep(SLEEP)
             continue
 
         try:
-            price = float(total_amount)
+            price = float(amt)
         except Exception:
-            skipped_bad_price += 1
+            sk_bad_price += 1
+            time.sleep(SLEEP)
             continue
 
         stops = offer_stops(offer)
@@ -636,18 +643,18 @@ def main() -> int:
             "status": "NEW",
             "deal_id": deal_id,
             "price_gbp": f"{price:.2f}",
-            "origin_city": "",                 # enrich_router fills
+            "origin_city": "",
             "origin_iata": origin,
-            "destination_country": "",         # enrich_router fills
-            "destination_city": "",            # enrich_router fills
+            "destination_country": "",
+            "destination_city": "",
             "destination_iata": dest,
             "outbound_date": out_date.isoformat(),
             "return_date": ret_date.isoformat(),
             "stops": str(stops),
-            "deal_theme": theme,
+            "deal_theme": theme_today,
             "ingested_at_utc": now_utc,
             "bags_incl": "",
-            "cabin_class": CABIN_CLASS,
+            "cabin_class": cabin_class,
             "connection_type": connection_type,
             "scored_timestamp": "",
             "via_hub": "",
@@ -667,11 +674,11 @@ def main() -> int:
             "created_at": now_utc,
             "phrase_bank": "",
             "trip_length_days": str(trip_len),
-            "origin_country": "",              # enrich_router fills
+            "origin_country": "",
             "currency": "GBP",
             "carriers": "",
             "publish_window": "",
-            "theme": "",                       # leave to RDV/dynamic_theme logic
+            "theme": "",
             "age_hours": "",
             "is_fresh_24h": "",
             "publish_error": "",
@@ -679,35 +686,43 @@ def main() -> int:
             "rendered_at": "",
         }
 
-        # Bookkeeping
+        out_rows.append(row)
+
         inserted += 1
         existing_deal_ids.add(deal_id)
-        inserts_by_origin[origin] = inserts_by_origin.get(origin, 0) + 1
-        inserts_by_route[(origin, dest)] = inserts_by_route.get((origin, dest), 0) + 1
-        out_rows.append(row)
+        by_origin[origin] = by_origin.get(origin, 0) + 1
+        by_route[(origin, dest)] = by_route.get((origin, dest), 0) + 1
+
+        appended_sigs.append(sig)
+
+        # stop early if we hit your “soft winners” goal and inserts are healthy
+        if inserted >= WINNERS_PER_RUN and inserted >= 2:
+            # keep going only if you want to fill up to MAX_INSERTS; otherwise end early
+            # uncomment next line to end early:
+            # break
+            pass
+
+        time.sleep(SLEEP)
 
     if not out_rows:
         log(
             "⚠️ No rows inserted.\n"
-            f"SKIPS: no_origins={skipped_no_origins} dupe_triplet={skipped_dupe_triplet} "
-            f"cannot_insert={skipped_cannot_insert} all_combos_blocked={skipped_all_combos_blocked} "
-            f"no_offer={skipped_no_offer} non_gbp={skipped_non_gbp} bad_price={skipped_bad_price}"
+            f"SKIPS: dedupe={sk_dedupe} caps={sk_caps} no_offer={sk_no_offer} non_gbp={sk_non_gbp} bad_price={sk_bad_price}"
         )
         return 0
 
-    # --- BULK APPEND (single Sheets write)
+    # BULK append in one write
     values: List[List[str]] = []
     for r in out_rows:
         values.append([r.get(h, "") for h in raw_hdr])
 
     RAW.append_rows(values, value_input_option="RAW")
+    append_log_rows(ws_log, appended_sigs)
 
     log(f"✅ Inserted {len(out_rows)} row(s) into {RAW_TAB}.")
     log(
-        f"SUMMARY: searches={searches} | primary={primary_used} | secondary={secondary_used} | inserted={len(out_rows)}\n"
-        f"SKIPS: no_origins={skipped_no_origins} dupe_triplet={skipped_dupe_triplet} "
-        f"cannot_insert={skipped_cannot_insert} all_combos_blocked={skipped_all_combos_blocked} "
-        f"no_offer={skipped_no_offer} non_gbp={skipped_non_gbp} bad_price={skipped_bad_price}"
+        f"SUMMARY: searches={searches} inserted={len(out_rows)}\n"
+        f"SKIPS: dedupe={sk_dedupe} caps={sk_caps} no_offer={sk_no_offer} non_gbp={sk_non_gbp} bad_price={sk_bad_price}"
     )
     return 0
 

@@ -45,16 +45,21 @@ def f(v, d=0.0):
 # ------------------------
 def gspread_client():
     raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
+    if not raw:
+        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+
+    # Try as-is first (works for proper one-line JSON with \\n)
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        # Fallback for secrets where newlines were already expanded
+        info = json.loads(raw.replace("\n", "\\n"))
+
     creds = Credentials.from_service_account_info(
-        json.loads(raw.replace("\\n","\n")),
+        info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     return gspread.authorize(creds)
-
-def records(ws):
-    rows = ws.get_all_values()
-    hdr = rows[0]
-    return [dict(zip(hdr, r + [""]*(len(hdr)-len(r)))) for r in rows[1:]]
 
 # ------------------------
 # Duffel

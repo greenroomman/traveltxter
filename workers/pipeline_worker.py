@@ -61,6 +61,17 @@ def gspread_client():
     )
     return gspread.authorize(creds)
 
+def records(ws):
+    rows = ws.get_all_values()
+    if not rows:
+        return []
+    header = rows[0]
+    out = []
+    for r in rows[1:]:
+        row = r + [""] * (len(header) - len(r))
+        out.append(dict(zip(header, row)))
+    return out
+
 # ------------------------
 # Duffel
 # ------------------------

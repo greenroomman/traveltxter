@@ -58,6 +58,9 @@ def fnum(v: Any, d: float = 0.0) -> float:
     except Exception:
         return d
 
+def tab(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return default if not v or not v.strip() else v.strip()
 
 # ------------------------
 # Sheets client
@@ -251,12 +254,12 @@ def main() -> int:
     CABIN_CLASS = "economy"  # V5 economy-only lock
 
     # ===== Tabs (do not assume env blanks are safe) =====
-    RAW_TAB = env("RAW_DEALS_TAB", "RAW_DEALS")
-    CFG_TAB = env("FEEDER_CONFIG_TAB", "CONFIG")
-    ZTB_TAB = env("ZTB_TAB", "ZONE_THEME_BENCHMARKS")
-    OPS_TAB = env("OPS_MASTER_TAB", "OPS_MASTER")
-    RCM_TAB = env("ROUTE_CAPABILITY_TAB", "ROUTE_CAPABILITY_MAP")
-    IATA_TAB = env("IATA_MASTER_TAB", "IATA_MASTER")  # env may be blank; default is canonical
+    RAW_TAB  = tab("RAW_DEALS_TAB", "RAW_DEALS")
+    CFG_TAB  = tab("FEEDER_CONFIG_TAB", "CONFIG")
+    ZTB_TAB  = tab("ZTB_TAB", "ZONE_THEME_BENCHMARKS")
+    OPS_TAB  = tab("OPS_MASTER_TAB", "OPS_MASTER")
+    RCM_TAB  = tab("ROUTE_CAPABILITY_TAB", "ROUTE_CAPABILITY_MAP")
+    IATA_TAB = tab("IATA_MASTER_TAB", "IATA_MASTER")
 
     # ===== Connect =====
     gc = gspread_client()

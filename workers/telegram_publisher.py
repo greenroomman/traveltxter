@@ -1,20 +1,18 @@
 # workers/telegram_publisher.py
-# V5 — RUN_SLOT driven publishing + TRUE FREE "-1 RUN" lag + AM long-haul / PM short-haul ethos
+# V5 — Telegram Publisher (VIP + FREE) with:
+# - NEW status protocol:
+#     IG sets: PUBLISH_*  -> READY_TO_POST
+#     TG VIP sets: READY_TO_POST -> VIP_DONE
+#     TG FREE sets: VIP_DONE -> PUBLISHED
+# - Theme/ethos preserved (AM=long-haul feel, PM=short-haul feel) via heuristic
+# - Fallback selection if no READY_TO_POST (uses RAW_DEALS_VIEW tg_fallback/tg_rank + <24h freshness)
+# - TRUE “-1 run lag” for FREE when RUN_SLOT exists (canonical 07:30/16:30 UTC), else legacy lag hours
 #
-# VIP:
-#   - Runs AM + PM (via workflow schedule)
-#   - Posts ONE deal per run (deterministic selection)
-#   - AM prefers long-haul; PM prefers short-haul
-#
-# FREE:
-#   - Dictated by VIP only
-#   - TRUE -1 run lag (previous window)
-#   - Never independent theme-led posting
-#
-# Writes back:
-#   - status
-#   - posted_telegram_vip_at (if column exists)
-#   - posted_telegram_free_at (if column exists)
+# Authority rules:
+# - Writes ONLY to RAW_DEALS (status + posted timestamps + publish_error fields if present)
+# - Reads RAW_DEALS_VIEW for fallback only (never writes RDV)
+
+from __future__ import annotations
 
 import os
 import json
@@ -41,6 +39,12 @@ def env_float(k, d):
     except Exception:
         return d
 
+def env_bool(k, d=False):
+    v = env(k, "")
+    if not v:
+        return d
+    return v.lower() in ("1", "true", "yes", "y", "on")
+
 def _sa_creds():
     raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
     if not raw:
@@ -59,6 +63,9 @@ def _sa_creds():
 
 def now_utc():
     return dt.datetime.now(dt.timezone.utc)
+
+def iso_z(t: dt.datetime) -> str:
+    return t.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def parse_iso_utc(s):
     s = (s or "").strip()
@@ -106,6 +113,7 @@ def normalize_price_gbp(x):
     s = s.replace("£", "").replace(",", "").strip()
     try:
         v = float(s)
+        # keep 2dp (publisher copy uses "£{price}" already)
         return f"{v:.2f}"
     except Exception:
         return s
@@ -118,24 +126,19 @@ def get_country_flag(country_name):
         "Iceland": "🇮🇸", "Spain": "🇪🇸", "Portugal": "🇵🇹", "Greece": "🇬🇷", "Turkey": "🇹🇷",
         "Morocco": "🇲🇦", "Egypt": "🇪🇬", "UAE": "🇦🇪", "United Arab Emirates": "🇦🇪",
         "Tunisia": "🇹🇳", "Cape Verde": "🇨🇻", "Gambia": "🇬🇲", "Jordan": "🇯🇴",
-        "Madeira": "🇵🇹", "Canary Islands": "🇪🇸", "Tenerife": "🇪🇸", "Lanzarote": "🇪🇸",
-        "Fuerteventura": "🇪🇸", "Gran Canaria": "🇪🇸",
         "Croatia": "🇭🇷", "Italy": "🇮🇹", "Cyprus": "🇨🇾", "Malta": "🇲🇹", "Bulgaria": "🇧🇬",
-        "Barbados": "🇧🇧", "Jamaica": "🇯🇲", "Antigua": "🇦🇬", "St Lucia": "🇱🇨",
-        "Mexico": "🇲🇽", "Thailand": "🇹🇭", "Indonesia": "🇮🇩", "Bali": "🇮🇩", "Malaysia": "🇲🇾",
+        "Mexico": "🇲🇽", "Thailand": "🇹🇭", "Indonesia": "🇮🇩", "Malaysia": "🇲🇾",
         "Maldives": "🇲🇻", "Mauritius": "🇲🇺", "Seychelles": "🇸🇨",
-        "Azores": "🇵🇹", "Switzerland": "🇨🇭", "Austria": "🇦🇹", "France": "🇫🇷",
+        "Switzerland": "🇨🇭", "Austria": "🇦🇹", "France": "🇫🇷",
         "Norway": "🇳🇴", "Sweden": "🇸🇪", "Finland": "🇫🇮",
         "Czech Republic": "🇨🇿", "Hungary": "🇭🇺", "Poland": "🇵🇱", "Germany": "🇩🇪",
         "Belgium": "🇧🇪", "Netherlands": "🇳🇱", "Denmark": "🇩🇰",
-        "Estonia": "🇪🇪", "Latvia": "🇱🇻", "Lithuania": "🇱🇹", "Romania": "🇷🇴",
-        "Israel": "🇮🇱", "USA": "🇺🇸", "United States": "🇺🇸", "Canada": "🇨🇦",
+        "Romania": "🇷🇴",
+        "USA": "🇺🇸", "United States": "🇺🇸", "Canada": "🇨🇦",
         "Qatar": "🇶🇦", "South Africa": "🇿🇦", "Singapore": "🇸🇬", "Hong Kong": "🇭🇰",
         "India": "🇮🇳", "Japan": "🇯🇵", "South Korea": "🇰🇷", "China": "🇨🇳",
-        "Australia": "🇦🇺", "New Zealand": "🇦🇺",
-        "Brazil": "🇧🇷", "Argentina": "🇦🇷", "Colombia": "🇨🇴",
-        "Slovakia": "🇸🇰", "Bosnia": "🇧🇦", "North Macedonia": "🇲🇰",
-        "Armenia": "🇦🇲", "Georgia": "🇬🇪",
+        "Australia": "🇦🇺", "Brazil": "🇧🇷", "Argentina": "🇦🇷", "Colombia": "🇨🇴",
+        "Georgia": "🇬🇪",
     }
     return flag_map.get(country_name, "🌍")
 
@@ -153,23 +156,6 @@ def tg_send(token, chat_id, text, disable_preview=True):
     j = r.json()
     if not j.get("ok"):
         raise RuntimeError(f"Telegram send failed: {r.text}")
-
-
-# ------------------ legacy publish windows (only if RUN_SLOT missing) ------------------
-
-def in_vip_window(now):
-    am_start = env_int("VIP_WINDOW_AM_START", 6)
-    am_end = env_int("VIP_WINDOW_AM_END", 11)
-    pm_start = env_int("VIP_WINDOW_PM_START", 15)
-    pm_end = env_int("VIP_WINDOW_PM_END", 20)
-    h = now.hour
-    return (am_start <= h <= am_end) or (pm_start <= h <= pm_end)
-
-def in_free_window(now):
-    pm_start = env_int("FREE_WINDOW_PM_START", 15)
-    pm_end = env_int("FREE_WINDOW_PM_END", 20)
-    h = now.hour
-    return (pm_start <= h <= pm_end)
 
 
 # ------------------ run schedule windows (true -1 run lag) ------------------
@@ -220,8 +206,8 @@ def build_vip_message(row):
     city = get_first(row, ["destination_city"])
     origin = get_first(row, ["origin_city"])
     price = normalize_price_gbp(get_first(row, ["price_gbp", "price"]))
-    outbound = get_first(row, ["outbound_date", "dep_date", "out_date"])
-    back = get_first(row, ["inbound_date", "return_date", "ret_date", "back_date"])
+    outbound = get_first(row, ["outbound_date"])
+    back = get_first(row, ["return_date"])
     phrase = phrase_from_row(row)
     booking_link = get_first(row, ["booking_link_vip"])
     flag = get_country_flag(country)
@@ -234,10 +220,12 @@ def build_vip_message(row):
         f"BACK: {back}",
         phrase,
         "If you’ve had this place on your radar, this is one of those prices that’s worth a proper look. Routing and dates were both sensible when we checked.",
-        f'<a href="{booking_link}">Booking link</a>',
+        f'<a href="{booking_link}">Booking link</a>' if booking_link else "",
         "Shared with VIP first, as always.",
     ]).strip()
 
+    # remove accidental blank lines from missing booking link
+    msg = "\n".join([ln for ln in msg.split("\n") if ln.strip() != ""])
     return msg
 
 def build_free_message(row):
@@ -245,15 +233,15 @@ def build_free_message(row):
     city = get_first(row, ["destination_city"])
     origin = get_first(row, ["origin_city"])
     price = normalize_price_gbp(get_first(row, ["price_gbp", "price"]))
-    outbound = get_first(row, ["outbound_date", "dep_date", "out_date"])
-    back = get_first(row, ["inbound_date", "return_date", "ret_date", "back_date"])
+    outbound = get_first(row, ["outbound_date"])
+    back = get_first(row, ["return_date"])
     phrase = phrase_from_row(row)
     flag = get_country_flag(country)
 
-    monthly = env("STRIPE_LINK_MONTHLY") or env("SUBSCRIPTION_LINK_MONTHLY")
-    yearly = env("STRIPE_LINK_YEARLY") or env("SUBSCRIPTION_LINK_YEARLY")
+    monthly = env("STRIPE_LINK_MONTHLY")
+    yearly = env("STRIPE_LINK_YEARLY")
     if not monthly or not yearly:
-        raise RuntimeError("Missing STRIPE_LINK_MONTHLY / STRIPE_LINK_YEARLY (or legacy SUBSCRIPTION_LINK_*)")
+        raise RuntimeError("Missing STRIPE_LINK_MONTHLY / STRIPE_LINK_YEARLY")
 
     ig_handle = env("INSTAGRAM_HANDLE", "Traveltxter").lstrip("@").strip()
     ig_url = env("INSTAGRAM_PROFILE_URL") or env("IG_PROFILE_URL") or env("INSTAGRAM_URL")
@@ -271,7 +259,7 @@ def build_free_message(row):
         f'<a href="{monthly}">Monthly</a> | <a href="{yearly}">Yearly</a>',
         ig_line,
     ]
-    return "\n".join(lines).strip()
+    return "\n".join([ln for ln in lines if (ln or "").strip()]).strip()
 
 
 # ------------------ selection (AM long-haul / PM short-haul) ------------------
@@ -282,8 +270,8 @@ def _is_longhaul(row: dict) -> bool:
       - outbound_duration_minutes >= 360 (6h) OR
       - total_duration_hours >= 9 OR
       - via_hub truthy AND outbound_duration_minutes >= 300
-    Soft hints:
-      - deal_theme/theme contains "long_haul"
+    Soft hint:
+      - (theme or deal_theme) contains 'long_haul'
     """
     out_min = safe_int(row.get("outbound_duration_minutes"), None)
     tot_hr = safe_float(row.get("total_duration_hours"), None)
@@ -301,26 +289,54 @@ def _is_longhaul(row: dict) -> bool:
     if via_hub and out_min is not None and out_min >= 300:
         return True
     if connection_type in ("multi_stop", "connecting", "connection"):
-        # only count as long-haul if also reasonably long
         if out_min is not None and out_min >= 300:
             return True
-
     return False
 
 
-def _pick_vip_candidate(values, headers, h, run_slot: str) -> tuple:
+# ------------------ sheet utils ------------------
+
+def idx_map(headers):
+    return {k: i for i, k in enumerate(headers)}
+
+def must_have(h, name):
+    if name not in h:
+        raise RuntimeError(f"RAW_DEALS missing required header: {name}")
+
+def set_cell(ws, row_i_1, col_i_0, value):
+    ws.update_cell(row_i_1, col_i_0 + 1, value)
+
+def get_row_dict(headers, row_values):
+    return {headers[j]: (row_values[j] if j < len(row_values) else "") for j in range(len(headers))}
+
+
+# ------------------ RUN_SLOT ------------------
+
+def _run_slot():
+    s = env("RUN_SLOT", "").upper()
+    # accept legacy values
+    if s in ("AM", "PM"):
+        return s
+    return ""
+
+
+# ------------------ primary (READY_TO_POST) picker ------------------
+
+def _pick_ready_to_post(values, headers, h, run_slot: str):
     """
+    Picks ONE candidate with status READY_TO_POST.
+    Prefers newest by ingested_at_utc if available.
+    Applies ethos preference (AM long, PM short) but will fall back to any.
     Returns (row_index_1based, row_dict) or (None, None).
-    Strategy:
-      1) Collect all READY_TO_PUBLISH rows.
-      2) Partition into preferred (AM: longhaul, PM: shorthaul) and fallback.
-      3) Deterministic ordering: newest first by ingested_at_utc if present, else sheet order.
     """
     candidates = []
     for i, r in enumerate(values[1:], start=2):
-        if r[h["status"]] != "READY_TO_PUBLISH":
+        if (r[h["status"]] if h["status"] < len(r) else "") != "READY_TO_POST":
             continue
-        row = {headers[j]: r[j] for j in range(len(headers))}
+        row = get_row_dict(headers, r)
+        # must have basics for TG message
+        if not (row.get("destination_city") and row.get("origin_city") and row.get("outbound_date") and row.get("return_date")):
+            continue
         candidates.append((i, row))
 
     if not candidates:
@@ -335,7 +351,6 @@ def _pick_vip_candidate(values, headers, h, run_slot: str) -> tuple:
         t = parse_iso_utc(row.get("ingested_at_utc", ""))
         return t or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
 
-    # newest first if timestamp exists
     if has_ingested:
         candidates.sort(key=ingested_key, reverse=True)
 
@@ -349,129 +364,311 @@ def _pick_vip_candidate(values, headers, h, run_slot: str) -> tuple:
         elif run_slot == "PM":
             (preferred if (not is_long) else fallback).append(item)
         else:
-            # if RUN_SLOT missing, just prefer whatever comes first (timestamp-sorted)
             preferred.append(item)
 
-    # If no preferred exists, fall back to any READY_TO_PUBLISH
-    pick = (preferred[0] if preferred else fallback[0])
+    pick = preferred[0] if preferred else fallback[0]
     return pick
 
 
-# ------------------ sheet updates ------------------
+# ------------------ fallback (RDV tg_fallback/tg_rank + freshness) ------------------
 
-def idx_map(headers):
-    return {k: i for i, k in enumerate(headers)}
+def _safe_bool(v) -> bool:
+    s = str(v or "").strip().lower()
+    return s in ("true", "1", "yes", "y")
 
-def must_have(h, name):
-    if name not in h:
-        raise RuntimeError(f"RAW_DEALS missing required header: {name}")
+def _safe_rank(v) -> float:
+    try:
+        return float(str(v or "").strip())
+    except Exception:
+        return -1.0
 
-def set_cell(ws, row_i_1, col_i_0, value):
-    ws.update_cell(row_i_1, col_i_0 + 1, value)
+def _build_rdv_fallback_list(rdv_values: list[list[str]]) -> list[dict]:
+    """
+    Returns list of dicts with:
+      deal_id, tg_rank(float), ingested_at_utc(str), is_fresh_24h(bool), destination_city, origin_city
+    Only rows where tg_fallback TRUE.
+    """
+    if not rdv_values or len(rdv_values) < 2:
+        return []
+    hdr = rdv_values[0]
+    hi = {str(h).strip(): idx for idx, h in enumerate(hdr)}
+
+    # Required
+    if "deal_id" not in hi:
+        return []
+
+    def gv(r, key):
+        idx = hi.get(key)
+        return r[idx] if idx is not None and idx < len(r) else ""
+
+    out = []
+    for r in rdv_values[1:]:
+        did = str(gv(r, "deal_id")).strip()
+        if not did:
+            continue
+        tg_fb = _safe_bool(gv(r, "tg_fallback"))
+        if not tg_fb:
+            continue
+
+        fresh = True
+        if "is_fresh_24h" in hi:
+            fresh = _safe_bool(gv(r, "is_fresh_24h"))
+        elif "age_hours" in hi:
+            ah = safe_float(gv(r, "age_hours"), None)
+            fresh = (ah is not None and ah <= 24.0)
+        if not fresh:
+            continue
+
+        out.append({
+            "deal_id": did,
+            "tg_rank": _safe_rank(gv(r, "tg_rank")),
+            "ingested_at_utc": str(gv(r, "ingested_at_utc")).strip(),
+            "destination_city": str(gv(r, "destination_city")).strip(),
+            "origin_city": str(gv(r, "origin_city")).strip(),
+            "destination_country": str(gv(r, "destination_country")).strip(),
+            "origin_country": str(gv(r, "origin_country")).strip(),
+            "price_gbp": str(gv(r, "price_gbp")).strip(),
+            "outbound_date": str(gv(r, "outbound_date")).strip(),
+            "return_date": str(gv(r, "return_date")).strip(),
+        })
+    return out
+
+def _pick_fallback_from_rdv(raw_values, raw_headers, raw_h, rdv_values, run_slot: str):
+    """
+    Pick ONE RDV fallback item, then map it back to RAW_DEALS by deal_id.
+    Only selects if:
+      - RAW_DEALS row exists for deal_id
+      - posted_telegram_vip_at is blank (not already VIP-posted)
+      - status is NOT PUBLISHED (avoid resurfacing)
+    Returns (row_index_1based, raw_row_dict, chosen_reason) or (None, None, reason)
+    """
+    items = _build_rdv_fallback_list(rdv_values)
+    if not items:
+        return None, None, "no_rdv_fallback_items"
+
+    # sort by tg_rank desc then newest ingested
+    def ing_dt(it):
+        t = parse_iso_utc(it.get("ingested_at_utc", ""))
+        return t or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+    items.sort(key=lambda it: (it["tg_rank"], ing_dt(it)), reverse=True)
+
+    # Map raw deal_id -> row index
+    did_col = raw_h.get("deal_id")
+    status_col = raw_h.get("status")
+    vip_ts_col = raw_h.get("posted_telegram_vip_at")
+    if did_col is None or status_col is None:
+        return None, None, "raw_missing_deal_id_or_status"
+
+    for it in items:
+        did = it["deal_id"]
+        # find raw row
+        for i, r in enumerate(raw_values[1:], start=2):
+            did_raw = (r[did_col] if did_col < len(r) else "").strip()
+            if did_raw != did:
+                continue
+
+            raw_row = get_row_dict(raw_headers, r)
+
+            # already VIP-posted?
+            if vip_ts_col is not None:
+                if (raw_row.get("posted_telegram_vip_at") or "").strip():
+                    break
+
+            # avoid resurfacing completed
+            st = (raw_row.get("status") or "").strip()
+            if st in ("PUBLISHED", "POSTED_ALL"):
+                break
+
+            # ethos preference (soft): AM prefers longhaul, PM prefers shorthaul
+            is_long = _is_longhaul(raw_row)
+            if run_slot == "AM" and not is_long:
+                # keep looking for a better match, but allow fallback
+                pass
+            if run_slot == "PM" and is_long:
+                pass
+
+            return i, raw_row, f"rdv_fallback tg_rank={it['tg_rank']}"
+        # continue scanning next fallback item
+
+    return None, None, "no_mappable_raw_row"
 
 
 # ------------------ main ------------------
 
-def _run_slot():
-    s = env("RUN_SLOT", "").upper()
-    return s if s in ("AM", "PM") else ""
-
 def main():
     run_slot = _run_slot()
+    now = now_utc()
 
     print("============================================================")
-    print(f"📣 Telegram Publisher starting | RUN_SLOT={run_slot or '(missing)'}")
+    print(f"📣 Telegram Publisher — V5 | RUN_SLOT={run_slot or '(missing)'}")
+    print("STATUS FLOW: READY_TO_POST -> VIP_DONE -> PUBLISHED")
+    print("FALLBACK: RDV tg_fallback/tg_rank + <24h freshness")
     print("============================================================")
 
     gc = gspread.authorize(_sa_creds())
     sh = gc.open_by_key(env("SPREADSHEET_ID") or env("SHEET_ID"))
-    ws = sh.worksheet(env("RAW_DEALS_TAB", "RAW_DEALS"))
 
+    RAW_TAB = env("RAW_DEALS_TAB", "RAW_DEALS")
+    RDV_TAB = env("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
+
+    ws = sh.worksheet(RAW_TAB)
     values = ws.get_all_values()
     headers = values[0]
     h = idx_map(headers)
 
     must_have(h, "status")
+    must_have(h, "deal_id")
 
-    now = now_utc()
+    # optional columns (won't crash if missing)
+    has_vip_ts = "posted_telegram_vip_at" in h
+    has_free_ts = "posted_telegram_free_at" in h
+    has_pub_err = "publish_error" in h
+    has_pub_err_at = "publish_error_at" in h
 
-    # Legacy FREE lag fallback (only used if RUN_SLOT is missing)
-    free_lag_hours = env_float("FREE_LAG_HOURS", 10.0)
+    # Load RDV only once (for fallback)
+    rdv_values = []
+    try:
+        ws_rdv = sh.worksheet(RDV_TAB)
+        rdv_values = ws_rdv.get_all_values()
+    except Exception:
+        rdv_values = []
 
     # ---------------- STAGE 1: VIP ----------------
-    vip_allowed = True
-    if not run_slot:
-        vip_allowed = in_vip_window(now)
+    vip_token = env("TELEGRAM_BOT_TOKEN_VIP")
+    vip_chat = env("TELEGRAM_CHANNEL_VIP")
+    if not vip_token or not vip_chat:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN_VIP / TELEGRAM_CHANNEL_VIP")
 
-    if vip_allowed:
-        row_i, row = _pick_vip_candidate(values, headers, h, run_slot)
-        if row_i and row:
+    row_i, row = _pick_ready_to_post(values, headers, h, run_slot)
+    chosen_reason = "ready_to_post"
+
+    if not row_i:
+        # Use fallback if no READY_TO_POST
+        row_i, row, chosen_reason = _pick_fallback_from_rdv(values, headers, h, rdv_values, run_slot)
+
+    if row_i and row:
+        try:
             msg = build_vip_message(row)
-            tg_send(env("TELEGRAM_BOT_TOKEN_VIP"), env("TELEGRAM_CHANNEL_VIP"), msg, disable_preview=True)
+            tg_send(vip_token, vip_chat, msg, disable_preview=True)
 
-            set_cell(ws, row_i, h["status"], "POSTED_TELEGRAM_VIP")
-            if "posted_telegram_vip_at" in h:
-                set_cell(ws, row_i, h["posted_telegram_vip_at"], now.isoformat().replace("+00:00", "Z"))
+            # Update RAW_DEALS status + vip timestamp
+            set_cell(ws, row_i, h["status"], "VIP_DONE")
+            if has_vip_ts:
+                set_cell(ws, row_i, h["posted_telegram_vip_at"], iso_z(now))
 
-            print(f"✅ Published to Telegram VIP | selected_row={row_i} | ethos={'longhaul' if run_slot=='AM' else 'shorthaul' if run_slot=='PM' else 'auto'}")
-            return 0
+            # clear publish_error on success (optional but useful)
+            if has_pub_err:
+                set_cell(ws, row_i, h["publish_error"], "")
+            if has_pub_err_at:
+                set_cell(ws, row_i, h["publish_error_at"], "")
 
+            print(f"✅ VIP published | row={row_i} | reason={chosen_reason} | ethos={'longhaul' if run_slot=='AM' else 'shorthaul' if run_slot=='PM' else 'auto'}")
+        except Exception as e:
+            if has_pub_err:
+                set_cell(ws, row_i, h["publish_error"], str(e)[:450])
+            if has_pub_err_at:
+                set_cell(ws, row_i, h["publish_error_at"], iso_z(now))
+            raise
     else:
-        print("⏱️ VIP window closed — skipping VIP stage for this run")
+        print("⚠️ No VIP candidate found (READY_TO_POST empty and fallback empty).")
 
-    print("No VIP deals ready (status=READY_TO_PUBLISH)")
+    # ---------------- STAGE 2: FREE (dictated by VIP; -1 run lag) ----------------
+    free_token = env("TELEGRAM_BOT_TOKEN")
+    free_chat = env("TELEGRAM_CHANNEL")
+    if not free_token or not free_chat:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL")
 
-    # ---------------- STAGE 2: FREE ----------------
-    free_allowed = True
-    if not run_slot:
-        free_allowed = in_free_window(now)
-        # legacy default was 24h unless overridden
-        if env("FREE_LAG_HOURS", "").strip() == "":
-            free_lag_hours = 24.0
+    monthly = env("STRIPE_LINK_MONTHLY")
+    yearly = env("STRIPE_LINK_YEARLY")
+    if not monthly or not yearly:
+        raise RuntimeError("Missing STRIPE_LINK_MONTHLY / STRIPE_LINK_YEARLY")
 
-    if free_allowed:
-        # True -1 run window if RUN_SLOT exists; else legacy lag gate
-        win_start, win_end = (None, None)
+    # Legacy lag if RUN_SLOT missing
+    legacy_lag_hours = env_float("FREE_LAG_HOURS", 10.0)
+    if not run_slot and env("FREE_LAG_HOURS", "").strip() == "":
+        # older default
+        legacy_lag_hours = 24.0
+
+    # Decide window
+    win_start, win_end = (None, None)
+    if run_slot:
+        win_start, win_end = previous_vip_window(now, run_slot)
+        print(f"🧭 FREE window (-1 run): {win_start.isoformat()} → {win_end.isoformat()}")
+
+    # Find a FREE candidate:
+    free_pick = None
+    for i, r in enumerate(values[1:], start=2):
+        st = (r[h["status"]] if h["status"] < len(r) else "").strip()
+        if st != "VIP_DONE":
+            continue
+        row2 = get_row_dict(headers, r)
+
+        # already free-posted?
+        if has_free_ts and (row2.get("posted_telegram_free_at") or "").strip():
+            continue
+
+        vip_time = parse_iso_utc(row2.get("posted_telegram_vip_at", "")) if has_vip_ts else None
         if run_slot:
-            win_start, win_end = previous_vip_window(now, run_slot)
-            print(f"🧭 FREE window (-1 run): {win_start.isoformat()} → {win_end.isoformat()}")
-
-        for i, r in enumerate(values[1:], start=2):
-            if r[h["status"]] != "POSTED_TELEGRAM_VIP":
+            # require vip_time and within prev run window
+            if not vip_time or not (win_start <= vip_time < win_end):
                 continue
-
-            row = {headers[j]: r[j] for j in range(len(headers))}
-
-            vip_ts = row.get("posted_telegram_vip_at", "")
-            vip_time = parse_iso_utc(vip_ts)
+        else:
+            # legacy lag
             if not vip_time:
-                print("⏳ FREE blocked: missing/invalid posted_telegram_vip_at timestamp")
+                continue
+            hours = (now - vip_time).total_seconds() / 3600.0
+            if hours < legacy_lag_hours:
                 continue
 
-            if run_slot:
-                # TRUE -1 run lag: only VIP posts from the previous run window
-                if not (win_start <= vip_time < win_end):
+        free_pick = (i, row2)
+        break
+
+    # Soft fallback for FREE (still “dictated by VIP”):
+    # If none matched the strict window, publish the most recent VIP_DONE not yet free-posted,
+    # but ONLY if it’s still fresh (<24h) when is_fresh_24h exists.
+    if not free_pick:
+        for i, r in enumerate(values[1:], start=2):
+            st = (r[h["status"]] if h["status"] < len(r) else "").strip()
+            if st != "VIP_DONE":
+                continue
+            row2 = get_row_dict(headers, r)
+            if has_free_ts and (row2.get("posted_telegram_free_at") or "").strip():
+                continue
+            # freshness gate if column exists
+            if "is_fresh_24h" in h:
+                if not _safe_bool(row2.get("is_fresh_24h")):
                     continue
-            else:
-                # Legacy lag: time since VIP posting
-                hours = (now - vip_time).total_seconds() / 3600.0
-                if hours < free_lag_hours:
-                    print(f"⏳ FREE not ready: {hours:.1f}h elapsed (need {free_lag_hours:.1f}h)")
-                    continue
+            free_pick = (i, row2)
+            break
 
-            msg = build_free_message(row)
-            tg_send(env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHANNEL"), msg, disable_preview=True)
+    if free_pick:
+        i, row2 = free_pick
+        try:
+            msg = build_free_message(row2)
+            tg_send(free_token, free_chat, msg, disable_preview=True)
 
-            set_cell(ws, i, h["status"], "POSTED_ALL")
-            if "posted_telegram_free_at" in h:
-                set_cell(ws, i, h["posted_telegram_free_at"], now.isoformat().replace("+00:00", "Z"))
+            # status VIP_DONE -> PUBLISHED
+            set_cell(ws, i, h["status"], "PUBLISHED")
+            if has_free_ts:
+                set_cell(ws, i, h["posted_telegram_free_at"], iso_z(now))
 
-            print("✅ Published to Telegram FREE")
-            return 0
+            # clear publish_error on success (optional)
+            if has_pub_err:
+                set_cell(ws, i, h["publish_error"], "")
+            if has_pub_err_at:
+                set_cell(ws, i, h["publish_error_at"], "")
+
+            print(f"✅ FREE published | row={i}")
+        except Exception as e:
+            if has_pub_err:
+                set_cell(ws, i, h["publish_error"], str(e)[:450])
+            if has_pub_err_at:
+                set_cell(ws, i, h["publish_error_at"], iso_z(now))
+            raise
     else:
-        print("⏱️ FREE window closed — skipping FREE stage for this run")
+        print("⚠️ No FREE candidate ready (VIP_DONE not found / not in window).")
 
-    print("No deals ready to publish")
     return 0
 
 

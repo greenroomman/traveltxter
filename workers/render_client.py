@@ -16,10 +16,11 @@ from google.oauth2.service_account import Credentials
 # ============================================================
 # CONFIG
 # ============================================================
-# Version: V5.1 (Performance optimized)
-# - Batch load RAW_DEALS and RAW_DEALS_VIEW once (no per-row API calls)
-# - Eliminated 3 API calls per row (was 5min for 1 row, now ~10-20s)
-# - Added timing logs for diagnostics
+# Version: V5.3 (CONFIG-First Theme Priority)
+# - FIX: RDV dynamic_theme takes priority over OPS_MASTER!B5
+# - RDV contains CONFIG-based contextual themes (short/winter/summer)
+# - OPS_MASTER!B5 only used as fallback if RDV blank
+# Previous: V5.2 (Layout & Theme Integrity - timestamp source of truth)
 # ============================================================
 
 SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or "").strip()
@@ -206,19 +207,35 @@ def _parse_utc_dt(s: str) -> Optional[datetime]:
 
 
 def infer_run_slot(row: Dict[str, str]) -> str:
-    # If env explicitly forces it, keep that as highest authority.
-    if RUN_SLOT_ENV in ("AM", "PM"):
-        return RUN_SLOT_ENV
-
-    # Otherwise infer from row timestamps (priority order).
+    """
+    Infer AM or PM slot from ingested_at_utc timestamp.
+    Timestamp is SOURCE OF TRUTH - determines which layout to use.
+    
+    Logic:
+    - Hour 0-11 UTC = AM slot (minimal layout: TO/DEST/DATE only)
+    - Hour 12-23 UTC = PM slot (full layout: TO/FROM/IN/OUT/PRICE)
+    """
+    # Check timestamps (priority order)
     for k in ("ingested_at_utc", "created_utc", "timestamp", "created_at"):
         dtv = _parse_utc_dt(row.get(k, ""))
         if dtv:
-            return "AM" if dtv.hour < 12 else "PM"
-
-    # Last resort: current UTC time
-    now = datetime.now(timezone.utc)
-    return "AM" if now.hour < 12 else "PM"
+            slot = "AM" if dtv.hour < 12 else "PM"
+            
+            # Log warning if environment variable conflicts with timestamp
+            if RUN_SLOT_ENV and RUN_SLOT_ENV != slot:
+                print(
+                    f"⚠️ WARNING: RUN_SLOT_ENV={RUN_SLOT_ENV!r} conflicts with timestamp hour={dtv.hour} "
+                    f"(should be {slot!r}). Using timestamp as source of truth."
+                )
+            
+            return slot
+    
+    # No valid timestamp found - cannot determine slot
+    raise ValueError(
+        f"❌ Cannot infer run_slot: no valid timestamp found in row. "
+        f"Available keys: {list(row.keys())}. "
+        f"Required: ingested_at_utc, created_utc, timestamp, or created_at"
+    )
 
 
 # ============================================================
@@ -367,17 +384,24 @@ def render_sheet_row(
         print(f"⚠️ Skip row {sheet_row}: status={status!r}")
         return False
 
-    theme_for_palette = ops_theme.strip() if ops_theme.strip() else normalize_theme(rdv_dynamic_theme_raw)
+    # Priority: RDV dynamic_theme (CONFIG-based) > OPS_MASTER (daily theme)
+    # RDV has contextual intelligence (short/winter/summer from CONFIG)
+    # OPS_MASTER is only fallback for old deals without RDV data
+    theme_for_palette = normalize_theme(rdv_dynamic_theme_raw) if rdv_dynamic_theme_raw else (ops_theme.strip() or "adventure")
 
     run_slot_effective = infer_run_slot(row)
     payload = build_payload(row, theme_for_palette, run_slot_effective)
 
     print(
-        f"Target row {sheet_row} | RUN_SLOT_ENV={RUN_SLOT_ENV!r} | "
-        f"run_slot_effective={run_slot_effective!r} | "
-        f"layout={payload.get('layout')!r} | OPS_THEME={ops_theme!r} | "
-        f"RDV_AT={rdv_dynamic_theme_raw!r} | theme_used={payload.get('theme')!r} | "
-        f"ingested_at_utc={row.get('ingested_at_utc','')!r} | payload={payload}"
+        f"🎯 Row {sheet_row} Render Decision:\n"
+        f"  RUN_SLOT_ENV={RUN_SLOT_ENV!r} (env var - advisory only)\n"
+        f"  ingested_at_utc={row.get('ingested_at_utc','')!r}\n"
+        f"  run_slot_effective={run_slot_effective!r} (from timestamp)\n"
+        f"  layout={payload.get('layout')!r} (AM=minimal, PM=full)\n"
+        f"  RDV_dynamic_theme={rdv_dynamic_theme_raw!r} (CONFIG-based - PRIORITY)\n"
+        f"  OPS_MASTER!B5={ops_theme!r} (daily theme - fallback only)\n"
+        f"  theme_used={payload.get('theme')!r} (sent to renderer)\n"
+        f"  destination={payload.get('TO')!r}, price={payload.get('PRICE')!r}"
     )
 
     if not payload["FROM"] or not payload["TO"]:

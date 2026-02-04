@@ -14,13 +14,12 @@ from google.oauth2.service_account import Credentials
 
 
 # ============================================================
-# CONFIG
+# CONFIG (V5 — LOCKED)
 # ============================================================
-# Version: V5.3 (CONFIG-First Theme Priority)
-# - FIX: RDV dynamic_theme takes priority over OPS_MASTER!B5
-# - RDV contains CONFIG-based contextual themes (short/winter/summer)
-# - OPS_MASTER!B5 only used as fallback if RDV blank
-# Previous: V5.2 (Layout & Theme Integrity - timestamp source of truth)
+# Render rules:
+# - Layout is derived ONLY from ingested_at_utc (row-level truth)
+# - Theme is taken from RAW_DEALS_VIEW.dynamic_theme
+# - OPS_MASTER!B5 is used ONLY if RDV dynamic_theme is blank/unusable
 # ============================================================
 
 SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or "").strip()
@@ -31,20 +30,20 @@ OPS_MASTER_TAB = os.getenv("OPS_MASTER_TAB", "OPS_MASTER")
 
 RENDER_URL = (os.getenv("RENDER_URL") or "").strip()
 
-SERVICE_ACCOUNT_JSON = (os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or "").strip()
-
-# If provided, can still force. But we now self-heal from ingested_at_utc.
-RUN_SLOT_ENV = (os.getenv("RUN_SLOT") or "").strip().upper()  # "AM" or "PM" or ""
+SERVICE_ACCOUNT_JSON = (
+    os.getenv("GCP_SA_JSON_ONE_LINE")
+    or os.getenv("GCP_SA_JSON")
+    or ""
+).strip()
 
 STATUS_READY_TO_POST = os.getenv("STATUS_READY_TO_POST", "READY_TO_POST")
 STATUS_READY_TO_PUBLISH = os.getenv("STATUS_READY_TO_PUBLISH", "READY_TO_PUBLISH")
 
 RENDER_MAX_PER_RUN = int(float(os.getenv("RENDER_MAX_PER_RUN", "1") or "1"))
 
-# RDV dynamic_theme locked column AT = 46 (1-based)
+# RDV dynamic_theme column (AT = 46, 1-based)
 RDV_DYNAMIC_THEME_COL = int(float(os.getenv("RDV_DYNAMIC_THEME_COL", "46") or "46"))
 
-# OPS_MASTER theme-of-day locked cell
 OPS_THEME_CELL = os.getenv("OPS_THEME_CELL", "B5")
 
 GOOGLE_SCOPE = [
@@ -54,7 +53,7 @@ GOOGLE_SCOPE = [
 
 
 # ============================================================
-# THEME GOVERNANCE (LOCKED)
+# THEME NORMALISATION (LOCKED)
 # ============================================================
 
 AUTHORITATIVE_THEMES = {
@@ -87,49 +86,20 @@ THEME_ALIASES = {
     "unexpected": "unexpected_value",
 }
 
-THEME_PRIORITY = [
-    "luxury_value",
-    "unexpected_value",
-    "long_haul",
-    "snow",
-    "northern_lights",
-    "winter_sun",
-    "summer_sun",
-    "beach_break",
-    "surf",
-    "culture_history",
-    "city_breaks",
-    "adventure",
-]
 
-
-def normalize_theme(raw_theme: str | None) -> str:
-    if not raw_theme:
-        return "adventure"
-
-    parts = re.split(r"[,\|;]+", str(raw_theme).lower())
-    tokens: list[str] = []
-
+def normalize_theme(raw: str | None) -> str:
+    if not raw:
+        return ""
+    parts = re.split(r"[,\|;]+", str(raw).lower())
     for p in parts:
         t = p.strip()
         if not t:
             continue
-        if t in THEME_ALIASES:
-            t = THEME_ALIASES[t]
+        t = THEME_ALIASES.get(t, t)
         t = re.sub(r"[^a-z0-9_]+", "_", t).strip("_")
-        if t in THEME_ALIASES:
-            t = THEME_ALIASES[t]
         if t in AUTHORITATIVE_THEMES:
-            tokens.append(t)
-
-    if not tokens:
-        return "adventure"
-
-    for pr in THEME_PRIORITY:
-        if pr in tokens:
-            return pr
-
-    return tokens[0]
+            return t
+    return ""
 
 
 # ============================================================
@@ -142,7 +112,7 @@ def _utc_now_iso() -> str:
 
 def _sa_creds() -> Credentials:
     if not SERVICE_ACCOUNT_JSON:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
+        raise RuntimeError("Missing GCP_SA_JSON / GCP_SA_JSON_ONE_LINE")
     try:
         info = json.loads(SERVICE_ACCOUNT_JSON)
     except json.JSONDecodeError:
@@ -158,313 +128,139 @@ def _col_index(headers: list[str], name: str) -> Optional[int]:
     return None
 
 
-def _a1(col_1_based: int, row_1_based: int) -> str:
-    n = col_1_based
-    letters = ""
-    while n > 0:
+def _a1(col_1: int, row_1: int) -> str:
+    n, s = col_1, ""
+    while n:
         n, r = divmod(n - 1, 26)
-        letters = chr(65 + r) + letters
-    return f"{letters}{row_1_based}"
+        s = chr(65 + r) + s
+    return f"{s}{row_1}"
 
 
-def _batch_update(ws: gspread.Worksheet, headers: list[str], row_1_based: int, updates: Dict[str, str]) -> None:
+def _batch_update(ws: gspread.Worksheet, headers: list[str], row_1: int, updates: Dict[str, str]) -> None:
     idx = {h: i for i, h in enumerate(headers)}
-    data = []
+    payload = []
     for k, v in updates.items():
-        if k not in idx:
-            continue
-        data.append({"range": _a1(idx[k] + 1, row_1_based), "values": [[v]]})
-    if data:
-        ws.batch_update(data)
-
-
-def _row_get(row: List[str], i: Optional[int]) -> str:
-    if i is None or i < 0 or i >= len(row):
-        return ""
-    return (row[i] or "").strip()
+        if k in idx:
+            payload.append(
+                {"range": _a1(idx[k] + 1, row_1), "values": [[v]]}
+            )
+    if payload:
+        ws.batch_update(payload)
 
 
 # ============================================================
-# SLOT INFERENCE (NEW, V5-SAFE)
-# - Prefer ingested_at_utc; fallback to created_utc/timestamp/created_at
-# - Deterministic: hour < 12 UTC => AM else PM
+# SLOT INFERENCE (CANONICAL)
 # ============================================================
 
-def _parse_utc_dt(s: str) -> Optional[datetime]:
-    s = (s or "").strip()
+def _parse_utc(s: str) -> Optional[datetime]:
     if not s:
         return None
-    # Accept: 2026-02-01T16:55:49Z, 2026-02-01T16:55:49+00:00, with/without micros
     try:
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
-        dtv = datetime.fromisoformat(s)
-        if dtv.tzinfo is None:
-            dtv = dtv.replace(tzinfo=timezone.utc)
-        return dtv.astimezone(timezone.utc)
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
 
-def infer_run_slot(row: Dict[str, str]) -> str:
-    """
-    Infer AM or PM slot from ingested_at_utc timestamp.
-    Timestamp is SOURCE OF TRUTH - determines which layout to use.
-    
-    Logic:
-    - Hour 0-11 UTC = AM slot (minimal layout: TO/DEST/DATE only)
-    - Hour 12-23 UTC = PM slot (full layout: TO/FROM/IN/OUT/PRICE)
-    """
-    # Check timestamps (priority order)
+def infer_layout(row: Dict[str, str]) -> str:
     for k in ("ingested_at_utc", "created_utc", "timestamp", "created_at"):
-        dtv = _parse_utc_dt(row.get(k, ""))
-        if dtv:
-            slot = "AM" if dtv.hour < 12 else "PM"
-            
-            # Log warning if environment variable conflicts with timestamp
-            if RUN_SLOT_ENV and RUN_SLOT_ENV != slot:
-                print(
-                    f"⚠️ WARNING: RUN_SLOT_ENV={RUN_SLOT_ENV!r} conflicts with timestamp hour={dtv.hour} "
-                    f"(should be {slot!r}). Using timestamp as source of truth."
-                )
-            
-            return slot
-    
-    # No valid timestamp found - cannot determine slot
-    raise ValueError(
-        f"❌ Cannot infer run_slot: no valid timestamp found in row. "
-        f"Available keys: {list(row.keys())}. "
-        f"Required: ingested_at_utc, created_utc, timestamp, or created_at"
-    )
+        dt = _parse_utc(row.get(k, ""))
+        if dt:
+            return "AM" if dt.hour < 12 else "PM"
+    raise RuntimeError("Cannot infer AM/PM — missing valid timestamp")
 
 
 # ============================================================
-# NORMALISERS (LOCKED PA PAYLOAD CONTRACT)
-# OUT/IN: ddmmyy
-# PRICE: £ integer (rounded up)
+# PAYLOAD NORMALISATION (RENDER API CONTRACT)
 # ============================================================
 
-def normalize_price_gbp(raw_price: str | None) -> str:
-    if not raw_price:
+def normalize_price(raw: str | None) -> str:
+    if not raw:
         return ""
-    s = str(raw_price).strip()
-    if not s:
+    m = re.search(r"(\d+(?:\.\d+)?)", raw.replace(",", ""))
+    return f"£{int(math.ceil(float(m.group(1))))}" if m else ""
+
+
+def normalize_date(raw: str | None) -> str:
+    if not raw:
         return ""
-    m = re.search(r"(\d+(?:\.\d+)?)", s.replace(",", ""))
-    if not m:
-        return ""
-    val = float(m.group(1))
-    return f"£{int(math.ceil(val))}"
-
-
-def normalize_date_ddmmyy(raw_date: str | None) -> str:
-    if not raw_date:
-        return ""
-    s = str(raw_date).strip()
-    if not s:
-        return ""
-
-    if re.fullmatch(r"\d{6}", s):
-        return s
-
-    if re.fullmatch(r"\d{8}", s):
-        dd = s[0:2]
-        mm = s[2:4]
-        yy = s[6:8]
-        return f"{dd}{mm}{yy}"
-
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        y, mo, d = s.split("-")
-        return f"{int(d):02d}{int(mo):02d}{int(y) % 100:02d}"
-
-    m = re.fullmatch(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})", s)
-    if m:
-        d = int(m.group(1))
-        mo = int(m.group(2))
-        y = int(m.group(3))
-        return f"{d:02d}{mo:02d}{y % 100:02d}"
-
-    raise ValueError(f"Unsupported date format: {raw_date!r}")
+    raw = raw.strip()
+    if re.fullmatch(r"\d{6}", raw):
+        return raw
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        y, m, d = raw.split("-")
+        return f"{int(d):02d}{int(m):02d}{int(y)%100:02d}"
+    raise ValueError(f"Unsupported date format: {raw}")
 
 
 # ============================================================
-# OPS MASTER THEME (LOCKED)
+# OPS MASTER (FALLBACK ONLY)
 # ============================================================
 
 def read_ops_theme(sh: gspread.Spreadsheet) -> str:
-    ws_ops = sh.worksheet(OPS_MASTER_TAB)
-    raw = (ws_ops.acell(OPS_THEME_CELL).value or "").strip()
-    if not raw:
-        return ""
-    return normalize_theme(raw)
+    ws = sh.worksheet(OPS_MASTER_TAB)
+    return normalize_theme((ws.acell(OPS_THEME_CELL).value or "").strip())
 
 
 # ============================================================
-# PAYLOAD BUILDING
+# RENDER ONE ROW
 # ============================================================
 
-def build_payload(row: Dict[str, str], theme_for_palette: str, run_slot_effective: str) -> Dict[str, str]:
-    out_raw = row.get("outbound_date", "") or row.get("out_date", "")
-    in_raw = row.get("return_date", "") or row.get("in_date", "")
-    price_raw = row.get("price_gbp", "") or row.get("price", "")
-    from_city = row.get("origin_city", "") or row.get("from_city", "")
-    to_city = row.get("destination_city", "") or row.get("to_city", "")
-
-    payload: Dict[str, str] = {
-        "FROM": from_city,
-        "TO": to_city,
-        "OUT": normalize_date_ddmmyy(out_raw) if out_raw else "",
-        "IN": normalize_date_ddmmyy(in_raw) if in_raw else "",
-        "PRICE": normalize_price_gbp(price_raw) if price_raw else "",
-        "theme": normalize_theme(theme_for_palette),
-    }
-
-    # ✅ CRITICAL: renderer API uses "layout" (defaults to PM if missing)
-    if run_slot_effective in ("AM", "PM"):
-        payload["layout"] = run_slot_effective
-        payload["run_slot"] = run_slot_effective
-
-    return payload
-
-
-def extract_graphic_url(resp_json: Dict[str, Any]) -> str:
-    for k in ("graphic_url", "png_url", "image_url", "url"):
-        v = resp_json.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    if isinstance(resp_json.get("data"), dict):
-        return extract_graphic_url(resp_json["data"])
-    return ""
-
-
-# ============================================================
-# CANDIDATE SELECTION (ROBUST)
-# ============================================================
-
-def find_candidates_from_sheet_values(
-    sheet_values: List[List[str]],
-    status_i: int,
-    graphic_i: int,
-    max_n: int,
-) -> List[int]:
-    candidates: List[int] = []
-    for idx0 in range(1, len(sheet_values)):
-        row = sheet_values[idx0]
-        st = _row_get(row, status_i)
-        if st != STATUS_READY_TO_POST:
-            continue
-        gu = _row_get(row, graphic_i)
-        if gu:
-            continue
-        candidates.append(idx0 + 1)  # sheet row number
-        if len(candidates) >= max_n:
-            break
-    return candidates
-
-
-# ============================================================
-# RENDER ONE SHEET ROW
-# ============================================================
-
-def render_sheet_row(
+def render_row(
     sh: gspread.Spreadsheet,
-    sheet_row: int,
+    row_num: int,
+    raw_headers: list[str],
+    raw_values: list[str],
+    rdv_theme_raw: str,
     ops_theme: str,
-    raw_headers: List[str],
-    raw_values: List[str],
-    rdv_dynamic_theme_raw: str,
 ) -> bool:
-    """Render a single row using pre-loaded data (no API calls except for write-back)."""
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
-    
     row = dict(zip(raw_headers, raw_values))
 
-    status = (row.get("status") or "").strip()
-    if status != STATUS_READY_TO_POST:
-        print(f"⚠️ Skip row {sheet_row}: status={status!r}")
+    if row.get("status") != STATUS_READY_TO_POST:
         return False
 
-    # Priority: RDV dynamic_theme (CONFIG-based) > OPS_MASTER (daily theme)
-    # RDV has contextual intelligence (short/winter/summer from CONFIG)
-    # OPS_MASTER is only fallback for old deals without RDV data
-    theme_for_palette = normalize_theme(rdv_dynamic_theme_raw) if rdv_dynamic_theme_raw else (ops_theme.strip() or "adventure")
+    theme = normalize_theme(rdv_theme_raw) or ops_theme
+    if not theme:
+        raise RuntimeError("No valid theme available for render")
 
-    run_slot_effective = infer_run_slot(row)
-    payload = build_payload(row, theme_for_palette, run_slot_effective)
+    layout = infer_layout(row)
 
-    print(
-        f"🎯 Row {sheet_row} Render Decision:\n"
-        f"  RUN_SLOT_ENV={RUN_SLOT_ENV!r} (env var - advisory only)\n"
-        f"  ingested_at_utc={row.get('ingested_at_utc','')!r}\n"
-        f"  run_slot_effective={run_slot_effective!r} (from timestamp)\n"
-        f"  layout={payload.get('layout')!r} (AM=minimal, PM=full)\n"
-        f"  RDV_dynamic_theme={rdv_dynamic_theme_raw!r} (CONFIG-based - PRIORITY)\n"
-        f"  OPS_MASTER!B5={ops_theme!r} (daily theme - fallback only)\n"
-        f"  theme_used={payload.get('theme')!r} (sent to renderer)\n"
-        f"  destination={payload.get('TO')!r}, price={payload.get('PRICE')!r}"
+    payload = {
+        "FROM": row.get("origin_city", ""),
+        "TO": row.get("destination_city", ""),
+        "OUT": normalize_date(row.get("outbound_date")),
+        "IN": normalize_date(row.get("return_date")),
+        "PRICE": normalize_price(row.get("price_gbp")),
+        "theme": theme,
+        "layout": layout,
+        "run_slot": layout,
+    }
+
+    resp = requests.post(RENDER_URL, json=payload, timeout=60)
+    if not resp.ok:
+        raise RuntimeError(f"Render failed {resp.status_code}: {resp.text}")
+
+    graphic_url = resp.json().get("graphic_url")
+    if not graphic_url:
+        raise RuntimeError("Render response missing graphic_url")
+
+    ts = _utc_now_iso()
+    _batch_update(
+        ws_raw,
+        raw_headers,
+        row_num,
+        {
+            "graphic_url": graphic_url,
+            "rendered_timestamp": ts,
+            "rendered_at": ts,
+            "render_error": "",
+            "status": STATUS_READY_TO_PUBLISH,
+        },
     )
-
-    if not payload["FROM"] or not payload["TO"]:
-        raise ValueError("FROM/TO missing (origin_city/destination_city)")
-    if not re.fullmatch(r"\d{6}", payload["OUT"]):
-        raise ValueError(f"OUT must be ddmmyy (6 digits). Got {payload['OUT']!r}")
-    if not re.fullmatch(r"\d{6}", payload["IN"]):
-        raise ValueError(f"IN must be ddmmyy (6 digits). Got {payload['IN']!r}")
-    if not payload["PRICE"].startswith("£"):
-        raise ValueError(f"PRICE must be £<int>. Got {payload['PRICE']!r}")
-
-    try:
-        t_render_start = time.time()
-        resp = requests.post(RENDER_URL, json=payload, timeout=60)
-        render_elapsed = time.time() - t_render_start
-        
-        if not resp.ok:
-            raise RuntimeError(f"Render failed ({resp.status_code}): {resp.text}")
-
-        try:
-            resp_json = resp.json()
-        except Exception:
-            raise RuntimeError(f"Render returned non-JSON: {resp.text[:200]}")
-
-        graphic_url = extract_graphic_url(resp_json)
-        if not graphic_url:
-            raise RuntimeError("Render response missing graphic_url")
-
-        ts = _utc_now_iso()
-        t_write_start = time.time()
-        _batch_update(
-            ws_raw,
-            raw_headers,
-            sheet_row,
-            {
-                "graphic_url": graphic_url,
-                "rendered_timestamp": ts,
-                "rendered_at": ts,
-                "render_error": "",
-                "status": STATUS_READY_TO_PUBLISH,
-            },
-        )
-        write_elapsed = time.time() - t_write_start
-
-        print(
-            f"✅ Render OK row {sheet_row}: status {STATUS_READY_TO_POST}→{STATUS_READY_TO_PUBLISH} "
-            f"(render={render_elapsed:.1f}s, write={write_elapsed:.1f}s)"
-        )
-        return True
-
-    except Exception as e:
-        ts = _utc_now_iso()
-        _batch_update(
-            ws_raw,
-            raw_headers,
-            sheet_row,
-            {
-                "render_error": f"{type(e).__name__}: {e}",
-                "rendered_timestamp": ts,
-                "rendered_at": ts,
-            },
-        )
-        raise
+    return True
 
 
 # ============================================================
@@ -472,76 +268,47 @@ def render_sheet_row(
 # ============================================================
 
 def main() -> int:
-    if not SPREADSHEET_ID:
-        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
-    if not RENDER_URL:
-        raise RuntimeError("Missing RENDER_URL")
+    if not SPREADSHEET_ID or not RENDER_URL:
+        raise RuntimeError("Missing SPREADSHEET_ID or RENDER_URL")
 
     gc = gspread.authorize(_sa_creds())
     sh = gc.open_by_key(SPREADSHEET_ID)
 
     ops_theme = read_ops_theme(sh)
-    if ops_theme:
-        print(f"🎯 OPS_MASTER theme of the day ({OPS_THEME_CELL}): {ops_theme}")
-    else:
-        print(f"⚠️ OPS_MASTER theme of the day ({OPS_THEME_CELL}) is blank -> will fallback to RDV AT per row")
 
-    # ✅ BATCH LOAD: RAW_DEALS (all rows, once)
-    print("📥 Loading RAW_DEALS...")
-    t_start = time.time()
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
-    sheet_values_raw = ws_raw.get_all_values()
-    elapsed = time.time() - t_start
-    print(f"✅ RAW_DEALS loaded: {len(sheet_values_raw)-1} rows ({elapsed:.1f}s)")
-    
-    if len(sheet_values_raw) < 2:
-        print("ℹ️ RAW_DEALS has no data rows")
-        return 0
-
-    raw_headers = sheet_values_raw[0]
-    status_i = _col_index(raw_headers, "status")
-    graphic_i = _col_index(raw_headers, "graphic_url")
-
-    if status_i is None:
-        raise RuntimeError("RAW_DEALS missing required header: status")
-    if graphic_i is None:
-        raise RuntimeError("RAW_DEALS missing required header: graphic_url")
-
-    # ✅ BATCH LOAD: RAW_DEALS_VIEW (all rows, once)
-    print("📥 Loading RAW_DEALS_VIEW...")
-    t_start = time.time()
     ws_rdv = sh.worksheet(RAW_DEALS_VIEW_TAB)
-    sheet_values_rdv = ws_rdv.get_all_values()
-    elapsed = time.time() - t_start
-    print(f"✅ RAW_DEALS_VIEW loaded: {len(sheet_values_rdv)-1} rows ({elapsed:.1f}s)")
 
-    candidates = find_candidates_from_sheet_values(sheet_values_raw, status_i, graphic_i, RENDER_MAX_PER_RUN)
-    if not candidates:
-        print(f"ℹ️ No render candidates (status={STATUS_READY_TO_POST}, graphic_url blank)")
-        return 0
+    raw_all = ws_raw.get_all_values()
+    rdv_all = ws_rdv.get_all_values()
 
-    print(f"🎯 Render candidates (sheet rows): {candidates} | RUN_SLOT_ENV={RUN_SLOT_ENV!r}")
+    headers = raw_all[0]
+    status_i = _col_index(headers, "status")
+    graphic_i = _col_index(headers, "graphic_url")
 
-    ok = 0
-    for sheet_row in candidates:
-        # Extract pre-loaded data (0-indexed array, but sheet_row is 1-indexed)
-        row_idx = sheet_row - 1
-        
-        if row_idx >= len(sheet_values_raw):
-            print(f"⚠️ Row {sheet_row} out of bounds")
-            continue
-            
-        raw_values = sheet_values_raw[row_idx]
-        
-        # Get RDV dynamic_theme from pre-loaded data (column AT = 46, 0-indexed = 45)
-        rdv_dynamic_theme_raw = ""
-        if row_idx < len(sheet_values_rdv) and (RDV_DYNAMIC_THEME_COL - 1) < len(sheet_values_rdv[row_idx]):
-            rdv_dynamic_theme_raw = sheet_values_rdv[row_idx][RDV_DYNAMIC_THEME_COL - 1]
-        
-        if render_sheet_row(sh, sheet_row, ops_theme, raw_headers, raw_values, rdv_dynamic_theme_raw):
-            ok += 1
+    candidates = []
+    for i in range(1, len(raw_all)):
+        if raw_all[i][status_i] == STATUS_READY_TO_POST and not raw_all[i][graphic_i]:
+            candidates.append(i + 1)
+        if len(candidates) >= RENDER_MAX_PER_RUN:
+            break
 
-    print(f"✅ Render complete: {ok}/{len(candidates)}")
+    for row_num in candidates:
+        idx = row_num - 1
+        rdv_theme_raw = (
+            rdv_all[idx][RDV_DYNAMIC_THEME_COL - 1]
+            if idx < len(rdv_all) and RDV_DYNAMIC_THEME_COL - 1 < len(rdv_all[idx])
+            else ""
+        )
+        render_row(
+            sh,
+            row_num,
+            headers,
+            raw_all[idx],
+            rdv_theme_raw,
+            ops_theme,
+        )
+
     return 0
 
 

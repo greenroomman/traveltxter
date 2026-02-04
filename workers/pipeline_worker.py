@@ -14,29 +14,26 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ============================================================
-# TRAVELTXTER — FEEDER v5.6 (FAST + ENV-RULED)
+# TRAVELTXTER — FEEDER v5.7 (CONFIG-ROUTE DRIVEN)
 #
-# PRINCIPLES
-# - CONFIG is authority for destinations + intent themes + Fi/Vi.
-# - ENV is authority for origins + stops + trip/window bounds.
-# - No IATA_MASTER, no ROUTE_CAPABILITY_MAP in feeder (enrich/router handles enrichment).
-# - Bulk append to RAW_DEALS in one call.
-# - De-dupe recent searches using DUFFEL_SEARCH_DEDUPE_HOURS (lightweight, in-memory per run
-#   + optional FEEDER_LOG tab if present).
+# Uses CONFIG headers (authoritative):
+# enabled, active_in_feeder, origin_iata, destination_iata,
+# days_ahead_min, days_ahead_max, trip_length_days, max_connections,
+# included_airlines, cabin_class, search_weight, value_score,
+# primary_theme, short_stay_theme, long_stay_winter_theme, long_stay_summer_theme
+#
+# DOES NOT load IATA_MASTER / ROUTE_CAPABILITY_MAP (enrich handles).
+# Bulk append to RAW_DEALS.
+# 90/10: PRIMARY uses row max_connections, SECONDARY relaxes +1 (capped).
+# Search de-dupe: FEEDER_LOG (optional) + in-run.
 # ============================================================
 
 
-# ------------------------
-# Logging
-# ------------------------
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
     print(f"{ts} | {msg}", flush=True)
 
 
-# ------------------------
-# Env helpers
-# ------------------------
 def env(k: str, d: str = "") -> str:
     return (os.getenv(k, d) or "").strip()
 
@@ -66,78 +63,8 @@ def first_int(*keys: str, default: int) -> int:
     return default
 
 
-def first_float(*keys: str, default: float) -> float:
-    for k in keys:
-        v = env(k, "")
-        if v:
-            try:
-                return float(v)
-            except Exception:
-                pass
-    return default
-
-
-def parse_csv_iata(s: str) -> List[str]:
-    parts = [p.strip().upper() for p in (s or "").split(",") if p.strip()]
-    out: List[str] = []
-    seen = set()
-    for p in parts:
-        if p and p not in seen and p.isalnum() and 3 <= len(p) <= 4:
-            out.append(p)
-            seen.add(p)
-    return out
-
-
-def theme_key(theme: str) -> str:
-    t = (theme or "").strip().upper()
-    t = re.sub(r"[^A-Z0-9_]+", "_", t)
-    return t
-
-
-def get_theme_origins(theme: str) -> List[str]:
-    t = theme_key(theme)
-    s = env(f"ORIGINS_{t}", "")
-    if s:
-        return parse_csv_iata(s)
-    return parse_csv_iata(env("ORIGINS_DEFAULT", "LHR,MAN,BRS,LGW,STN"))
-
-
-def get_theme_max_stops(theme: str) -> int:
-    t = theme_key(theme)
-    return first_int(f"MAX_STOPS_{t}", "MAX_STOPS_DEFAULT", default=1)
-
-
-def parse_minmax(spec: str, default_min: int, default_max: int) -> Tuple[int, int]:
-    # Accept forms like "21 / 84" or "21/84" or "21 - 84"
-    if not spec:
-        return default_min, default_max
-    m = re.findall(r"(\d+)", spec)
-    if len(m) >= 2:
-        a, b = int(m[0]), int(m[1])
-        return min(a, b), max(a, b)
-    return default_min, default_max
-
-
-def get_theme_window_days(theme: str) -> Tuple[int, int]:
-    t = theme_key(theme)
-    spec = env(f"WINDOW_{t}_MIN/MAX", "")
-    if spec:
-        return parse_minmax(spec, 21, 84)
-    spec = env("WINDOW_DEFAULT_MIN/MAX", "21 / 84")
-    return parse_minmax(spec, 21, 84)
-
-
-def get_theme_trip_days(theme: str) -> Tuple[int, int]:
-    t = theme_key(theme)
-    spec = env(f"TRIP_{t}_MIN/MAX", "")
-    if spec:
-        return parse_minmax(spec, 4, 10)
-    spec = env("TRIP_DEFAULT_MIN/MAX", "4 / 10")
-    return parse_minmax(spec, 4, 10)
-
-
 # ------------------------
-# Robust SA JSON parsing (fixes the “invalid control character” issues)
+# Robust SA JSON parsing
 # ------------------------
 def _repair_private_key_newlines(raw: str) -> str:
     pat = re.compile(r'("private_key"\s*:\s*")(.+?)(")', re.DOTALL)
@@ -165,7 +92,6 @@ def _load_sa_info() -> Dict[str, Any]:
         except Exception:
             continue
 
-    # last resort (let json raise)
     return json.loads(_repair_private_key_newlines(raw))
 
 
@@ -219,6 +145,58 @@ def col_to_a1(col_idx_1based: int) -> str:
 
 
 # ------------------------
+# Value parsers
+# ------------------------
+def truthy(v: str) -> bool:
+    return (v or "").strip().lower() in ("true", "1", "yes", "y")
+
+
+def fnum(v: Any, d: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return d
+
+
+def inum(v: Any, d: int = 0) -> int:
+    try:
+        return int(float(v))
+    except Exception:
+        return d
+
+
+def parse_airlines_field(s: str) -> List[str]:
+    """
+    CONFIG.included_airlines can be:
+    - empty / ANY / ALL / *  => no filter
+    - CSV: "BA,U2,FR"
+    """
+    s = (s or "").strip()
+    if not s:
+        return []
+    if s.upper() in ("ANY", "ALL", "*"):
+        return []
+    parts = [p.strip().upper() for p in s.split(",") if p.strip()]
+    parts = [p for p in parts if 1 <= len(p) <= 3 and p.isalnum()]
+    # preserve order, unique
+    return list(dict.fromkeys(parts))
+
+
+# ------------------------
+# Theme match (CONFIG)
+# ------------------------
+THEME_COLS = ("primary_theme", "short_stay_theme", "long_stay_winter_theme", "long_stay_summer_theme")
+
+
+def theme_matches_row(r: Dict[str, str], theme_today: str) -> bool:
+    t = (theme_today or "").strip().lower()
+    for c in THEME_COLS:
+        if (r.get(c) or "").strip().lower() == t:
+            return True
+    return False
+
+
+# ------------------------
 # Duffel
 # ------------------------
 def duffel_headers() -> Dict[str, str]:
@@ -230,17 +208,6 @@ def duffel_headers() -> Dict[str, str]:
         "Duffel-Version": "v2",
         "Content-Type": "application/json",
     }
-
-
-def normalise_airlines_csv(s: str) -> List[str]:
-    s = (s or "").strip()
-    if not s:
-        return []
-    if s.upper() in ("ANY", "ALL", "*"):
-        return []
-    parts = [p.strip().upper() for p in s.split(",") if p.strip()]
-    parts = [p for p in parts if 1 <= len(p) <= 3 and p.isalnum()]
-    return list(dict.fromkeys(parts))
 
 
 def duffel_offer_request(
@@ -293,45 +260,16 @@ def offer_stops(offer: Dict[str, Any]) -> int:
 
 
 # ------------------------
-# CONFIG theme match
-# ------------------------
-THEME_COLS = ("primary_theme", "short_stay_theme", "long_stay_winter_theme", "long_stay_summer_theme")
-
-
-def theme_matches_config_row(r: Dict[str, str], theme_today: str) -> bool:
-    t = (theme_today or "").strip().lower()
-    for c in THEME_COLS:
-        if (r.get(c) or "").strip().lower() == t:
-            return True
-    return False
-
-
-def fnum(v: Any, d: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return d
-
-
-# ------------------------
-# Search de-dupe (in-memory per run + optional FEEDER_LOG tab)
+# Search de-dupe
 # ------------------------
 def search_sig(theme: str, origin: str, dest: str, out_date: str) -> str:
-    # we de-dupe per theme + origin + dest + outbound date
     key = f"{theme}|{origin}|{dest}|{out_date}"
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
 
 
 def build_recent_sig_set(ws_log, hours: int) -> set[str]:
-    """
-    Optional: read FEEDER_LOG with headers:
-      ts_utc | sig
-    Keep only last N hours.
-    If tab missing or schema unknown, return empty set (still de-dupes in-memory).
-    """
     if ws_log is None:
         return set()
-
     try:
         rows = ws_log.get_all_values()
         if not rows or len(rows) < 2:
@@ -372,7 +310,6 @@ def append_log_rows(ws_log, sigs: List[str]) -> None:
     try:
         ws_log.append_rows(values, value_input_option="RAW")
     except Exception:
-        # non-fatal
         pass
 
 
@@ -397,25 +334,21 @@ def main() -> int:
     OPS_TAB = env("OPS_MASTER_TAB", "OPS_MASTER")
     FEEDER_LOG_TAB = env("FEEDER_LOG_TAB", "FEEDER_LOG")
 
-    # Governor precedence: DUFFEL_* first, fallback to FEEDER_*
+    # Governor precedence
     MAX_SEARCHES = first_int("DUFFEL_MAX_SEARCHES_PER_RUN", "FEEDER_MAX_SEARCHES", default=12)
     MAX_INSERTS = first_int("DUFFEL_MAX_INSERTS", "FEEDER_MAX_INSERTS", default=50)
     MAX_PER_ORIGIN = env_int("DUFFEL_MAX_INSERTS_PER_ORIGIN", 15)
     MAX_PER_ROUTE = env_int("DUFFEL_MAX_INSERTS_PER_ROUTE", 5)
 
-    DESTS_PER_RUN = env_int("DUFFEL_ROUTES_PER_RUN", 6)
-    WINNERS_PER_RUN = env_int("WINNERS_PER_RUN", 2)  # used as soft target; we still append all valid offers found
     SLEEP = env_float("FEEDER_SLEEP_SECONDS", 0.1)
-
     DEDUPE_HOURS = env_int("DUFFEL_SEARCH_DEDUPE_HOURS", 4)
 
     # 90/10
     primary_pct = env_int("SLOT_PRIMARY_PCT", 90)
     primary_budget = max(0, min(MAX_SEARCHES, int(round(MAX_SEARCHES * (primary_pct / 100.0)))))
     secondary_budget = max(0, MAX_SEARCHES - primary_budget)
-
-    # cabin
-    cabin_class = env("FEEDER_CABIN_CLASS", "economy").lower() or "economy"
+    lane_seq = (["PRIMARY"] * primary_budget) + (["SECONDARY"] * secondary_budget)
+    lane_seq = lane_seq[:MAX_SEARCHES]
 
     # Sheets
     gc = gspread_client()
@@ -431,61 +364,95 @@ def main() -> int:
     except Exception:
         ws_log = None
 
-    theme_today = a1(OPS, "B5")
-    if not theme_today:
-        theme_today = env("THEME", "DEFAULT")
+    theme_today = a1(OPS, "B5") or env("THEME", "DEFAULT")
     log(f"🎯 Theme of day: {theme_today}")
 
-    origins = get_theme_origins(theme_today)
-    if not origins:
-        raise RuntimeError("No origins available (ORIGINS_* / ORIGINS_DEFAULT empty)")
-
-    max_stops = get_theme_max_stops(theme_today)
-    wmin, wmax = get_theme_window_days(theme_today)
-    tmin, tmax = get_theme_trip_days(theme_today)
-
-    log(
-        f"CAPS: searches={MAX_SEARCHES} inserts={MAX_INSERTS} per_origin={MAX_PER_ORIGIN} per_route={MAX_PER_ROUTE} "
-        f"dests_per_run={DESTS_PER_RUN} winners_soft={WINNERS_PER_RUN} primary/secondary={primary_budget}/{secondary_budget}"
-    )
-    log(f"RULES: origins={','.join(origins)} | max_stops={max_stops} | window={wmin}-{wmax}d | trip={tmin}-{tmax}d | cabin={cabin_class}")
-    log(f"DEDUPE: last {DEDUPE_HOURS}h")
-
-    # Load CONFIG rows (small)
     cfg_all = records(CFG)
-    cfg_rows = [
-        r for r in cfg_all
-        if (r.get("enabled") or "").strip().lower() in ("true", "1", "yes")
-        and (r.get("destination_iata") or "").strip()
-        and theme_matches_config_row(r, theme_today)
-    ]
+
+    # Filter: enabled AND active_in_feeder AND theme match AND has origin/dest
+    cfg_rows: List[Dict[str, str]] = []
+    for r in cfg_all:
+        if not truthy(r.get("enabled", "")):
+            continue
+        if not truthy(r.get("active_in_feeder", "")):
+            continue
+        if not (r.get("origin_iata") or "").strip():
+            continue
+        if not (r.get("destination_iata") or "").strip():
+            continue
+        if not theme_matches_row(r, theme_today):
+            continue
+        cfg_rows.append(r)
+
     if not cfg_rows:
-        log("⚠️ No CONFIG destinations eligible for theme.")
+        log("⚠️ No CONFIG routes eligible for theme (enabled+active_in_feeder+theme match).")
         return 0
 
-    # Compute Pi = Fi * Vi (Fi from search_weight, Vi from value_score)
-    candidates: List[Dict[str, Any]] = []
+    # Build route candidates with Pi = Fi*Vi (search_weight * value_score)
+    routes: List[Dict[str, Any]] = []
     for r in cfg_rows:
+        origin = (r.get("origin_iata") or "").strip().upper()
         dest = (r.get("destination_iata") or "").strip().upper()
-        Fi = fnum(r.get("search_weight") or r.get("feasibility_score") or "0", 0.0)
-        Vi = fnum(r.get("value_score") or "0.5", 0.5)
+
+        Fi = fnum(r.get("search_weight"), 0.0)
+        Vi = fnum(r.get("value_score"), 0.5)
         Pi = Fi * Vi
-        rr = dict(r)
-        rr["_dest"] = dest
-        rr["_Fi"] = Fi
-        rr["_Vi"] = Vi
-        rr["_Pi"] = Pi
-        candidates.append(rr)
 
-    # Rank and keep top N destinations
-    candidates.sort(key=lambda x: float(x.get("_Pi", 0.0)), reverse=True)
-    candidates = candidates[: max(1, DESTS_PER_RUN)]
+        # per-route rules
+        dmin = inum(r.get("days_ahead_min"), 21)
+        dmax = inum(r.get("days_ahead_max"), 84)
+        if dmax < dmin:
+            dmin, dmax = dmax, dmin
 
-    # Read RAW header + deal_id col once
+        trip_len = inum(r.get("trip_length_days"), 7)
+        max_conn = inum(r.get("max_connections"), 1)
+
+        cabin = (r.get("cabin_class") or "economy").strip().lower() or "economy"
+        included_airlines = parse_airlines_field(r.get("included_airlines", ""))
+
+        routes.append(
+            {
+                "_origin": origin,
+                "_dest": dest,
+                "_Fi": Fi,
+                "_Vi": Vi,
+                "_Pi": Pi,
+                "_dmin": dmin,
+                "_dmax": dmax,
+                "_trip": trip_len,
+                "_max_conn": max_conn,
+                "_cabin": cabin,
+                "_airlines": included_airlines,
+            }
+        )
+
+    # Rank by Pi (publishable probability proxy)
+    routes.sort(key=lambda x: float(x["_Pi"]), reverse=True)
+
+    # Soft diversity: don’t let one dest dominate
+    dest_used: Dict[str, int] = {}
+    def pick_next_route() -> Dict[str, Any]:
+        best = None
+        best_score = -1.0
+        for rr in routes:
+            dest = rr["_dest"]
+            used = dest_used.get(dest, 0)
+            Pi = float(rr["_Pi"])
+            # diminishing returns for repeated destination
+            score = Pi * ((1.0 - min(0.95, Pi)) ** used)
+            if used >= 2:
+                score *= 0.85
+            if score > best_score:
+                best_score = score
+                best = rr
+        assert best is not None
+        return best
+
     raw_hdr = header(RAW)
     if not raw_hdr:
         raise RuntimeError("RAW_DEALS header row is empty")
 
+    # Existing deal ids
     existing_deal_ids = set()
     if "deal_id" in raw_hdr:
         c = raw_hdr.index("deal_id") + 1
@@ -495,14 +462,27 @@ def main() -> int:
             if row and row[0]:
                 existing_deal_ids.add(row[0].strip())
 
-    # Optional de-dupe set from FEEDER_LOG
-    recent_sigs = build_recent_sig_set(ws_log, DEDUPE_HOURS)
-    inrun_sigs = set()
-
-    # Insert caps bookkeeping
     inserted = 0
+    searches = 0
     by_origin: Dict[str, int] = {}
     by_route: Dict[Tuple[str, str], int] = {}
+
+    recent_sigs = build_recent_sig_set(ws_log, DEDUPE_HOURS)
+    inrun_sigs = set()
+    appended_sigs: List[str] = []
+
+    out_rows: List[Dict[str, str]] = []
+
+    # skips
+    sk_dedupe = 0
+    sk_no_offer = 0
+    sk_non_gbp = 0
+    sk_bad_price = 0
+    sk_caps = 0
+
+    # deterministic-ish seed
+    seed = int(hashlib.md5(dt.datetime.utcnow().strftime("%Y%m%d").encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
 
     def can_insert(origin: str, dest: str, deal_id: str) -> bool:
         if inserted >= MAX_INSERTS:
@@ -515,65 +495,28 @@ def main() -> int:
             return False
         return True
 
-    # Pre-generate outbound dates across window, deterministic with day seed
-    seed = int(hashlib.md5(dt.datetime.utcnow().strftime("%Y%m%d").encode()).hexdigest()[:8], 16)
-    rng = random.Random(seed)
-
-    def pick_outbound_date() -> dt.date:
-        d = rng.randint(wmin, wmax)
-        return (dt.date.today() + dt.timedelta(days=d))
-
-    def pick_trip_len() -> int:
-        return rng.randint(tmin, tmax)
-
-    # Lane planner (90/10)
-    lane_seq = (["PRIMARY"] * primary_budget) + (["SECONDARY"] * secondary_budget)
-    lane_seq = lane_seq[:MAX_SEARCHES]
-
-    # Build query sequence across candidates with light rotation + diminishing returns
-    dest_use: Dict[str, int] = {}
-
-    def pick_candidate() -> Dict[str, Any]:
-        best = None
-        best_score = -1.0
-        for r in candidates:
-            dest = r["_dest"]
-            used = dest_use.get(dest, 0)
-            # diminishing returns
-            Pi = float(r["_Pi"])
-            score = Pi * ((1.0 - min(0.95, Pi)) ** used)
-            if used >= 2:
-                score *= 0.85
-            if score > best_score:
-                best_score = score
-                best = r
-        assert best is not None
-        return best
-
-    searches = 0
-    appended_sigs: List[str] = []
-    out_rows: List[Dict[str, str]] = []
-
-    # Skips
-    sk_dedupe = 0
-    sk_no_offer = 0
-    sk_non_gbp = 0
-    sk_bad_price = 0
-    sk_caps = 0
-
     for lane in lane_seq:
         if searches >= MAX_SEARCHES or inserted >= MAX_INSERTS:
             break
 
-        r = pick_candidate()
-        dest = r["_dest"]
-        dest_use[dest] = dest_use.get(dest, 0) + 1
+        rr = pick_next_route()
+        origin = rr["_origin"]
+        dest = rr["_dest"]
 
-        # pick origin (rotate)
-        origin = origins[(searches + seed) % len(origins)]
+        dest_used[dest] = dest_used.get(dest, 0) + 1
 
-        out_date = pick_outbound_date()
-        trip_len = pick_trip_len()
+        dmin = int(rr["_dmin"])
+        dmax = int(rr["_dmax"])
+        trip_len = int(rr["_trip"])
+        cabin = rr["_cabin"]
+        base_max_conn = int(rr["_max_conn"])
+
+        # 90/10 relaxation: allow +1 connection on secondary lane (capped at 2)
+        max_conn = base_max_conn if lane == "PRIMARY" else min(2, base_max_conn + 1)
+
+        # choose outbound date within per-route window
+        days_ahead = rng.randint(dmin, dmax)
+        out_date = dt.date.today() + dt.timedelta(days=days_ahead)
         ret_date = out_date + dt.timedelta(days=trip_len)
 
         sig = search_sig(theme_today, origin, dest, out_date.isoformat())
@@ -582,25 +525,14 @@ def main() -> int:
             continue
         inrun_sigs.add(sig)
 
-        # lane connections (secondary relaxes stops by +1)
-        lane_max_stops = max_stops if lane == "PRIMARY" else min(2, max_stops + 1)
-
-        # Duffel uses max_connections not max_stops: max_connections == max_stops
-        max_connections = lane_max_stops
-
-        deal_id = make_deal_id(origin, dest, out_date.isoformat(), ret_date.isoformat(), cabin_class)
+        deal_id = make_deal_id(origin, dest, out_date.isoformat(), ret_date.isoformat(), cabin)
         if not can_insert(origin, dest, deal_id):
             sk_caps += 1
             continue
 
-        included_airlines = normalise_airlines_csv(env("AIRLINES", ""))
-        # You also had "included_airlines_csv" concept; if you later add per-theme/per-dest airline rules,
-        # wire it here. For now: global airline allowlist is optional.
-        # If AIRLINES is empty -> no filter -> Duffel ANY.
-
         log(
             f"🔎 Search {searches+1}/{MAX_SEARCHES} [{lane}] {origin}→{dest} "
-            f"| Pi={float(r['_Pi']):.2f} | max_conn={max_connections} | trip={trip_len}d | window={wmin}-{wmax}"
+            f"| Pi={float(rr['_Pi']):.2f} | max_conn={max_conn} | cabin={cabin} | trip={trip_len}d | window={dmin}-{dmax}"
         )
 
         resp = duffel_offer_request(
@@ -608,9 +540,9 @@ def main() -> int:
             dest=dest,
             out_date=out_date.isoformat(),
             ret_date=ret_date.isoformat(),
-            max_connections=max_connections,
-            cabin_class=cabin_class,
-            included_airlines=included_airlines,
+            max_connections=max_conn,
+            cabin_class=cabin,
+            included_airlines=rr["_airlines"],
         )
         searches += 1
 
@@ -654,7 +586,7 @@ def main() -> int:
             "deal_theme": theme_today,
             "ingested_at_utc": now_utc,
             "bags_incl": "",
-            "cabin_class": cabin_class,
+            "cabin_class": cabin,
             "connection_type": connection_type,
             "scored_timestamp": "",
             "via_hub": "",
@@ -694,14 +626,6 @@ def main() -> int:
         by_route[(origin, dest)] = by_route.get((origin, dest), 0) + 1
 
         appended_sigs.append(sig)
-
-        # stop early if we hit your “soft winners” goal and inserts are healthy
-        if inserted >= WINNERS_PER_RUN and inserted >= 2:
-            # keep going only if you want to fill up to MAX_INSERTS; otherwise end early
-            # uncomment next line to end early:
-            # break
-            pass
-
         time.sleep(SLEEP)
 
     if not out_rows:
@@ -711,7 +635,7 @@ def main() -> int:
         )
         return 0
 
-    # BULK append in one write
+    # BULK append
     values: List[List[str]] = []
     for r in out_rows:
         values.append([r.get(h, "") for h in raw_hdr])

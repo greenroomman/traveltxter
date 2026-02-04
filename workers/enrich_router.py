@@ -1,567 +1,418 @@
-#!/usr/bin/env python3
 # workers/enrich_router.py
-"""
-TravelTxter Enrichment Router — V5.1 (Fast batch API + timing logs)
-
-Purpose (V5-compliant):
-- Fill missing origin/destination city + country in RAW_DEALS from IATA_MASTER
-- Fill missing RAW_DEALS.phrase_bank from PHRASE_BANK (approved phrases only)
-- Operate on SCORED + READY_* rows (and safe to re-run)
-- Stateless + deterministic: same row inputs -> same outputs
-- Writes ONLY enrichment columns and ONLY if blank (never overwrites)
-
-V5.1 Performance improvements:
-- Replaced get_all_records() with batch get_all_values() (single API call per sheet)
-- Added timing logs for all sheet operations
-- 8+ minute load times reduced to seconds
-
-Hard rules:
-- Never writes to RAW_DEALS_VIEW
-- Never changes status
-- Never scores
-- Never generates free-form copy (phrases are human-approved only)
-"""
-
 from __future__ import annotations
 
 import os
 import json
+import re
 import hashlib
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple, Optional
+import datetime as dt
+from typing import Dict, List, Tuple, Any, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# -------------------- ENV --------------------
-
-SPREADSHEET_ID = (os.environ.get("SPREADSHEET_ID") or os.environ.get("SHEET_ID") or "").strip()
-GCP_SA_JSON_ONE_LINE = (os.environ.get("GCP_SA_JSON_ONE_LINE") or os.environ.get("GCP_SA_JSON") or "").strip()
-
-RAW_DEALS_TAB = (os.environ.get("RAW_DEALS_TAB", "RAW_DEALS") or "RAW_DEALS").strip() or "RAW_DEALS"
-PHRASE_BANK_TAB = (os.environ.get("PHRASE_BANK_TAB", "PHRASE_BANK") or "PHRASE_BANK").strip() or "PHRASE_BANK"
-IATA_MASTER_TAB = (os.environ.get("IATA_MASTER_TAB", "IATA_MASTER") or "IATA_MASTER").strip() or "IATA_MASTER"
-
-# Which channel are we selecting phrases for? (used against PHRASE_BANK.channel_hint)
-# Typical values: "vip", "ig", "free", "pro"
-PHRASE_CHANNEL = (os.environ.get("PHRASE_CHANNEL", "vip") or "vip").strip().lower()
-
-# How many RAW_DEALS rows to enrich per run (caps runtime / API)
-MAX_ROWS_PER_RUN = int((os.environ.get("ENRICH_MAX_ROWS_PER_RUN", "60") or "60").strip() or "60")
-
-# If true, enforce per-phrase monthly caps using ingested_at_utc (if available).
-ENFORCE_MAX_PER_MONTH = (os.environ.get("ENFORCE_MAX_PER_MONTH", "true") or "true").strip().lower() == "true"
-
-# If true, require phrase selection for eligible rows; otherwise only fill if blank and candidates exist.
-REQUIRE_PHRASE = (os.environ.get("REQUIRE_PHRASE", "false") or "false").strip().lower() == "true"
-
-
-# -------------------- LOGGING --------------------
-
-def _log(msg: str) -> None:
-    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+# ----------------------------
+# Logging
+# ----------------------------
+def log(msg: str) -> None:
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"{ts} | {msg}", flush=True)
 
 
-# -------------------- GOOGLE SHEETS --------------------
+# ----------------------------
+# Env helpers
+# ----------------------------
+def _env(k: str, default: str = "") -> str:
+    return str(os.getenv(k, default) or "").strip()
 
-def _parse_sa_json(raw: str) -> dict:
-    raw = (raw or "").strip()
+
+def _env_int(k: str, default: int) -> int:
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return json.loads(raw.replace("\\n", "\n"))
+        return int(_env(k, str(default)))
+    except Exception:
+        return default
 
 
-def _gs_client() -> gspread.Client:
-    if not GCP_SA_JSON_ONE_LINE:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-    info = _parse_sa_json(GCP_SA_JSON_ONE_LINE)
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
+def _env_bool(k: str, default: bool = False) -> bool:
+    v = _env(k, "")
+    if not v:
+        return default
+    return v.lower() in ("1", "true", "yes", "y", "on")
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (s or "").strip().lower()).strip("_")
+
+
+# ----------------------------
+# Google client
+# ----------------------------
+def gspread_client() -> gspread.Client:
+    raw = _env("GCP_SA_JSON_ONE_LINE") or _env("GCP_SA_JSON")
+    if not raw:
+        raise RuntimeError("Missing GCP_SA_JSON or GCP_SA_JSON_ONE_LINE")
+
+    try:
+        info = json.loads(raw)
+    except Exception:
+        info = json.loads(raw.replace("\\\\n", "\\n"))
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
 
-def _unique_headers(headers: list[str]) -> list[str]:
-    """Make headers unique and non-empty for dict construction.
-    Handles duplicate or empty headers by creating stable synthetic names.
-    """
-    seen: dict[str, int] = {}
-    out: list[str] = []
-    for i, h in enumerate(headers):
-        base = (str(h).strip() if h is not None else "")
-        if base == "":
-            base = f"__col_{i+1}"
-        key = base
-        seen[key] = seen.get(key, 0) + 1
-        if seen[key] > 1:
-            key = f"{base}__{seen[base]}"
-        out.append(key)
-    return out
-
-
-def _get_records(ws) -> list[dict]:
-    """Fast batch read using get_all_values() - single API call per sheet.
-    Replaces get_all_records() which makes multiple slow API calls.
-    """
-    all_values = ws.get_all_values()
-    if not all_values:
-        return []
-    
-    # First row is headers
-    raw_headers = all_values[0]
-    headers = _unique_headers(raw_headers)
-    
-    records = []
-    for row in all_values[1:]:
-        # Pad row to match header length (handles short rows)
-        padded = row + [''] * (len(headers) - len(row))
-        record = dict(zip(headers, padded[:len(headers)]))
-        records.append(record)
-    
-    return records
-
-
-def _headers(ws) -> List[str]:
-    """Get headers using fast batch read (single API call)."""
-    all_values = ws.get_all_values()
-    if not all_values:
-        return []
-    return [str(h).strip() for h in all_values[0]]
-
-
-def _colmap(headers: List[str]) -> Dict[str, int]:
-    return {h: i + 1 for i, h in enumerate(headers) if h}
-
-
-def _s(v: Any) -> str:
-    return str(v or "").strip()
-
-
-def _upper(v: Any) -> str:
-    return _s(v).upper()
-
-
-def _lower(v: Any) -> str:
-    return _s(v).lower()
-
-
-def _truthy(v: Any) -> bool:
-    x = _lower(v)
-    return x in {"true", "1", "yes", "y", "approved"}
-
-
-def _safe_int(v: Any) -> Optional[int]:
+def open_ws(sh: gspread.Spreadsheet, name: str) -> gspread.Worksheet:
+    name = (name or "").strip()
+    if not name:
+        raise RuntimeError("WorksheetNotFound: '' (blank tab name)")
     try:
-        vv = _s(v)
-        if vv == "":
-            return None
-        return int(float(vv))
-    except Exception:
+        return sh.worksheet(name)
+    except Exception as e:
+        raise RuntimeError(f"WorksheetNotFound: '{name}'") from e
+
+
+# ----------------------------
+# Deterministic choice
+# ----------------------------
+def stable_pick(items: List[Dict[str, Any]], key_seed: str) -> Optional[Dict[str, Any]]:
+    if not items:
         return None
+    h = hashlib.sha256(key_seed.encode("utf-8")).hexdigest()
+    idx = int(h[:8], 16) % len(items)
+    return items[idx]
 
 
-def _batch_write(ws, updates: List[Tuple[int, Dict[str, Any]]], cm: Dict[str, int]) -> int:
-    cells: List[gspread.cell.Cell] = []
-    for row_num, payload in updates:
-        for header, value in payload.items():
-            if header not in cm:
-                continue
-            cells.append(gspread.cell.Cell(row=row_num, col=cm[header], value=value))
-    if not cells:
-        return 0
-    ws.update_cells(cells, value_input_option="RAW")
-    return len(cells)
+def month_key_utc(now: dt.datetime) -> str:
+    return now.strftime("%Y-%m")
 
 
-# -------------------- SCHEMA VALIDATION --------------------
-
-RAW_REQUIRED = [
-    "status",
-    "deal_id",
-    "origin_iata",
-    "destination_iata",
-    "theme",
-    "phrase_bank",
-]
-
-# These are the enrichment targets. We only write them if the columns exist.
-RAW_ENRICH_COLS = [
-    "origin_city",
-    "origin_country",
-    "destination_city",
-    "destination_country",
-    "phrase_bank",
-]
-
-# Eligibility: should do all incl SCORED
-ELIGIBLE_STATUSES = {"SCORED", "READY_TO_POST", "READY_TO_PUBLISH"}
-
-
-def _require_headers(cm: Dict[str, int], required: List[str], tabname: str) -> None:
-    missing = [h for h in required if h not in cm]
-    if missing:
-        raise RuntimeError(f"{tabname} missing required columns: {missing}")
-
-
-# -------------------- IATA MASTER LOOKUP --------------------
-
-def _load_iata_map(iata_ws) -> Dict[str, Tuple[str, str]]:
-    """
-    IATA_MASTER headers provided:
-      iata_code, city, country
-    """
-    import datetime as dt_mod
-    t_start = dt_mod.datetime.utcnow()
-    
-    headers = _headers(iata_ws)
-    cm = _colmap(headers)
-    _require_headers(cm, ["iata_code", "city", "country"], "IATA_MASTER")
-
-    rows = _get_records(iata_ws)
-    elapsed = (dt_mod.datetime.utcnow() - t_start).total_seconds()
-    
-    out: Dict[str, Tuple[str, str]] = {}
-
-    for r in rows:
-        code = _upper(r.get("iata_code"))
-        city = _s(r.get("city"))
-        country = _s(r.get("country"))
-        if code and (city or country):
-            out[code] = (city, country)
-    
-    _log(f"📥 IATA_MASTER: {len(rows)} rows read, {len(out)} entries indexed ({elapsed:.1f}s)")
-    return out
-
-
-# -------------------- PHRASE BANK --------------------
-
-def _load_phrase_bank(phrase_ws) -> List[Dict[str, Any]]:
-    """
-    PHRASE_BANK headers provided:
-      destination_iata, theme, category, phrase, approved, channel_hint, max_per_month, notes, context_hint
-    """
-    import datetime as dt_mod
-    t_start = dt_mod.datetime.utcnow()
-    
-    headers = _headers(phrase_ws)
-    cm = _colmap(headers)
-    _require_headers(
-        cm,
-        ["destination_iata", "theme", "category", "phrase", "approved", "channel_hint", "max_per_month"],
-        "PHRASE_BANK",
-    )
-
-    rows = _get_records(phrase_ws)
-    elapsed = (dt_mod.datetime.utcnow() - t_start).total_seconds()
-    
-    clean: List[Dict[str, Any]] = []
-
-    for r in rows:
-        phrase = _s(r.get("phrase"))
-        if not phrase:
-            continue
-        if not _truthy(r.get("approved")):
-            continue
-
-        clean.append(
-            {
-                "destination_iata": _upper(r.get("destination_iata")),
-                "theme": _lower(r.get("theme")),
-                "category": _lower(r.get("category")),
-                "phrase": phrase,
-                "channel_hint": _lower(r.get("channel_hint")),
-                "max_per_month": _safe_int(r.get("max_per_month")),
-                "context_hint": _s(r.get("context_hint")),
-            }
-        )
-
-    # stable sort for deterministic selection (no randomness)
-    clean.sort(key=lambda x: (x["destination_iata"], x["theme"], x["category"], x["phrase"]))
-    
-    _log(f"📥 PHRASE_BANK: {len(rows)} rows read, {len(clean)} approved phrases ({elapsed:.1f}s)")
-    return clean
-
-
-def _channel_allows(channel_hint: str, target_channel: str) -> bool:
-    """
-    channel_hint is a free text field; we treat it as "contains token".
-    Empty channel_hint means "allowed everywhere".
-    """
-    ch = (channel_hint or "").strip().lower()
-    if not ch:
-        return True
-    return target_channel in ch
-
-
-def _hash_mod(key: str, n: int) -> int:
-    h = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return int(h[:12], 16) % n
-
-
-def _month_key(dt: datetime) -> str:
-    return dt.strftime("%Y-%m")
-
-
-def _parse_ingested_month(raw: str) -> Optional[str]:
-    """
-    Tries to parse ingested_at_utc-like values:
-    - ISO strings e.g. 2026-02-01T16:55:53Z
-    - 'YYYY-MM-DD HH:MM:SS'
-    Returns YYYY-MM or None if unknown.
-    """
-    s = _s(raw)
-    if not s:
-        return None
-
-    # common ISO forms
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
-        try:
-            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-            return _month_key(dt)
-        except Exception:
-            continue
-
-    # best-effort: take YYYY-MM if present
-    if len(s) >= 7 and s[4] == "-" and s[7 - 1] == "-":
-        return s[:7]
-    return None
-
-
-def _build_phrase_usage_index(raw_records: List[Dict[str, Any]], has_ingested: bool) -> Dict[Tuple[str, str], int]:
-    """
-    Returns usage count by (phrase, YYYY-MM) using RAW_DEALS.phrase_bank.
-    If ingested timestamp not available, returns empty (caps cannot be enforced reliably).
-    """
-    if not has_ingested:
-        return {}
-
-    idx: Dict[Tuple[str, str], int] = {}
-    for r in raw_records:
-        phrase = _s(r.get("phrase_bank"))
-        if not phrase:
-            continue
-        mk = _parse_ingested_month(r.get("ingested_at_utc"))
-        if not mk:
-            continue
-        key = (phrase, mk)
-        idx[key] = idx.get(key, 0) + 1
-    return idx
-
-
-def _select_phrase(
-    candidates: List[Dict[str, Any]],
-    deal_id: str,
-    dest_iata: str,
-    theme: str,
-    usage_idx: Dict[Tuple[str, str], int],
-    this_month: str,
-    target_channel: str,
-) -> str:
-    """
-    Deterministic phrase selection:
-    1) filter approved candidates for channel
-    2) prioritize destination_iata match, then theme match
-    3) enforce max_per_month if possible
-    4) pick stable by hash(deal_id)
-    """
-    dest = _upper(dest_iata)
-    th = _lower(theme)
-
-    # Step 1: channel filter
-    pool = [p for p in candidates if _channel_allows(p.get("channel_hint", ""), target_channel)]
-
-    # Step 2: destination_iata preference
-    exact_dest = [p for p in pool if p["destination_iata"] == dest]
-    any_dest = [p for p in pool if p["destination_iata"] == ""]
-    pool2 = exact_dest + any_dest
-    if not pool2:
-        pool2 = pool  # last fallback: ignore destination constraint
-
-    # Step 3: theme preference
-    exact_theme = [p for p in pool2 if p["theme"] == th]
-    any_theme = [p for p in pool2 if p["theme"] in {"", "any", "all"}]
-    pool3 = exact_theme + any_theme
-    if not pool3:
-        pool3 = pool2  # last fallback: ignore theme constraint
-
-    # Step 4: enforce max_per_month if we can
-    usable: List[Dict[str, Any]] = []
-    for p in pool3:
-        mx = p.get("max_per_month")
-        if not ENFORCE_MAX_PER_MONTH or mx is None:
-            usable.append(p)
-            continue
-        used = usage_idx.get((p["phrase"], this_month), 0)
-        if used < mx:
-            usable.append(p)
-
-    if not usable:
-        return ""
-
-    idx = _hash_mod(deal_id or f"{dest}:{th}", len(usable))
-    return _s(usable[idx].get("phrase"))
-
-
-# -------------------- MAIN --------------------
-
+# ----------------------------
+# Main
+# ----------------------------
 def main() -> int:
+    log("============================================================")
+    log("🧩 TravelTxter Enrichment Router — V5 (IATA backfill + Phrase selection)")
+    log("============================================================")
+
+    SPREADSHEET_ID = _env("SPREADSHEET_ID") or _env("SHEET_ID")
     if not SPREADSHEET_ID:
-        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
+        log("❌ Missing SPREADSHEET_ID / SHEET_ID")
+        return 1
 
-    _log("============================================================")
-    _log("🧩 TravelTxter Enrichment Router — V5 (IATA backfill + Phrase Bank selection)")
-    _log("============================================================")
-    _log(f"RAW_DEALS_TAB={RAW_DEALS_TAB} | PHRASE_BANK_TAB={PHRASE_BANK_TAB} | IATA_MASTER_TAB={IATA_MASTER_TAB}")
-    _log(f"PHRASE_CHANNEL={PHRASE_CHANNEL} | MAX_ROWS_PER_RUN={MAX_ROWS_PER_RUN}")
-    _log(f"ENFORCE_MAX_PER_MONTH={ENFORCE_MAX_PER_MONTH} | REQUIRE_PHRASE={REQUIRE_PHRASE}")
-    _log(f"ELIGIBLE_STATUSES={sorted(list(ELIGIBLE_STATUSES))}")
+    RAW_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
+    PHRASE_BANK_TAB = _env("PHRASE_BANK_TAB", "PHRASE_BANK") or _env("PHRASES_TAB", "PHRASE_BANK")
+    IATA_MASTER_TAB = _env("IATA_MASTER_TAB", "IATA_MASTER")
 
-    gc = _gs_client()
+    PHRASE_CHANNEL = _env("PHRASE_CHANNEL", "vip").lower()  # vip/free/ig (bank can hint)
+    MAX_ROWS_PER_RUN = _env_int("ENRICH_MAX_ROWS_PER_RUN", 60)
+    ENFORCE_MAX_PER_MONTH = _env_bool("ENFORCE_MAX_PER_MONTH", True)
+    REQUIRE_PHRASE = _env_bool("REQUIRE_PHRASE", False)
+
+    ELIGIBLE_STATUSES = {
+        "SCORED",
+        "READY_TO_POST",
+        "READY_TO_PUBLISH",
+        "PUBLISH_AM",
+        "PUBLISH_PM",
+        "PUBLISH_BOTH",
+    }
+
+    log(f"{RAW_TAB= } | {PHRASE_BANK_TAB= } | {IATA_MASTER_TAB= }")
+    log(f"{PHRASE_CHANNEL= } | {MAX_ROWS_PER_RUN= } | {ENFORCE_MAX_PER_MONTH= } | {REQUIRE_PHRASE= }")
+    log(f"ELIGIBLE_STATUSES={sorted(ELIGIBLE_STATUSES)}")
+
+    gc = gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    raw_ws = sh.worksheet(RAW_DEALS_TAB)
-    phrase_ws = sh.worksheet(PHRASE_BANK_TAB)
-    iata_ws = sh.worksheet(IATA_MASTER_TAB)
+    ws_raw = open_ws(sh, RAW_TAB)
+    ws_iata = open_ws(sh, IATA_MASTER_TAB)
+    ws_phr = open_ws(sh, PHRASE_BANK_TAB)
 
-    raw_headers = _headers(raw_ws)
-    raw_cm = _colmap(raw_headers)
-    _require_headers(raw_cm, RAW_REQUIRED, "RAW_DEALS")
+    # ----------------------------
+    # Load IATA_MASTER
+    # ----------------------------
+    t0 = dt.datetime.now(dt.timezone.utc)
+    iata_values = ws_iata.get_all_values()
+    if not iata_values or len(iata_values) < 2:
+        log("⚠️ IATA_MASTER empty; city/country fills disabled.")
+        iata_map: Dict[str, Tuple[str, str]] = {}
+    else:
+        i_hdr = [_norm(h) for h in iata_values[0]]
+        i_idx = {h: j for j, h in enumerate(i_hdr) if h}
+        # expected: iata_code, city, country
+        c_iata = i_idx.get("iata_code")
+        c_city = i_idx.get("city")
+        c_country = i_idx.get("country")
 
-    # Optional columns
-    has_ingested = "ingested_at_utc" in raw_cm
-    has_origin_city = "origin_city" in raw_cm
-    has_origin_country = "origin_country" in raw_cm
-    has_dest_city = "destination_city" in raw_cm
-    has_dest_country = "destination_country" in raw_cm
+        iata_map = {}
+        if c_iata is not None:
+            for r in iata_values[1:]:
+                code = (r[c_iata] if c_iata < len(r) else "").strip().upper()
+                if not code:
+                    continue
+                city = (r[c_city] if c_city is not None and c_city < len(r) else "").strip()
+                country = (r[c_country] if c_country is not None and c_country < len(r) else "").strip()
+                if code not in iata_map:
+                    iata_map[code] = (city, country)
 
-    # Load external maps
-    iata_map = _load_iata_map(iata_ws)
-    _log(f"✅ IATA_MASTER loaded: {len(iata_map)} entries")
+    log(f"✅ IATA_MASTER indexed: {len(iata_map)} entries ({(dt.datetime.now(dt.timezone.utc)-t0).total_seconds():.1f}s)")
 
-    phrase_candidates = _load_phrase_bank(phrase_ws)
-    _log(f"✅ PHRASE_BANK loaded (approved): {len(phrase_candidates)} phrases")
+    # ----------------------------
+    # Load PHRASE_BANK (avoid get_all_records due to duplicate headers risk)
+    # Headers you gave earlier:
+    # destination_iata theme category phrase approved channel_hint max_per_month notes context_hint
+    # ----------------------------
+    t1 = dt.datetime.now(dt.timezone.utc)
+    phr_values = ws_phr.get_all_values()
+    phrase_rows: List[Dict[str, Any]] = []
+    if phr_values and len(phr_values) >= 2:
+        p_hdr_raw = phr_values[0]
+        p_hdr = [_norm(h) for h in p_hdr_raw]
+        p_idx = {h: j for j, h in enumerate(p_hdr) if h}
 
-    # Load RAW_DEALS records
-    _log("📥 Loading RAW_DEALS...")
-    import datetime as dt_mod
-    t_start = dt_mod.datetime.utcnow()
-    raw_records = _get_records(raw_ws)
-    elapsed = (dt_mod.datetime.utcnow() - t_start).total_seconds()
-    _log(f"✅ RAW_DEALS loaded: {len(raw_records)} rows ({elapsed:.1f}s)")
+        def pv(row: List[str], h: str) -> str:
+            j = p_idx.get(h)
+            return (row[j] if j is not None and j < len(row) else "").strip()
 
-    # Build phrase usage index (optional)
-    usage_idx: Dict[Tuple[str, str], int] = {}
-    if ENFORCE_MAX_PER_MONTH:
-        if has_ingested:
-            usage_idx = _build_phrase_usage_index(raw_records, has_ingested=True)
-            _log(f"✅ Phrase usage index built (month-aware): {len(usage_idx)} keys")
-        else:
-            _log("⚠️ ingested_at_utc not found; cannot enforce max_per_month reliably. Caps will be best-effort only.")
-            usage_idx = {}
+        for r in phr_values[1:]:
+            phrase = pv(r, "phrase")
+            if not phrase:
+                continue
+            approved = pv(r, "approved").lower()
+            if approved not in ("true", "1", "yes", "y"):
+                continue
 
-    this_month = datetime.utcnow().strftime("%Y-%m")
+            dest_iata = pv(r, "destination_iata").upper()
+            theme = pv(r, "theme").lower()
+            channel_hint = pv(r, "channel_hint").lower()
+            max_per_month = pv(r, "max_per_month")
+            try:
+                mpm = int(max_per_month) if max_per_month else 0
+            except Exception:
+                mpm = 0
 
-    updates: List[Tuple[int, Dict[str, Any]]] = []
+            phrase_rows.append(
+                {
+                    "destination_iata": dest_iata,
+                    "theme": theme,
+                    "category": pv(r, "category"),
+                    "phrase": phrase,
+                    "channel_hint": channel_hint,
+                    "max_per_month": mpm,  # 0 means unlimited
+                }
+            )
 
-    scanned = 0
+    log(f"✅ PHRASE_BANK loaded (approved): {len(phrase_rows)} phrases ({(dt.datetime.now(dt.timezone.utc)-t1).total_seconds():.1f}s)")
+
+    # Index phrases by (dest_iata, theme)
+    phrases_by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for pr in phrase_rows:
+        key = (pr["destination_iata"], pr["theme"])
+        phrases_by_key.setdefault(key, []).append(pr)
+
+    # ----------------------------
+    # Load RAW_DEALS
+    # ----------------------------
+    t2 = dt.datetime.now(dt.timezone.utc)
+    raw_values = ws_raw.get_all_values()
+    if not raw_values or len(raw_values) < 2:
+        log("❌ RAW_DEALS empty.")
+        return 1
+
+    hdr = raw_values[0]
+    hnorm = [_norm(h) for h in hdr]
+    hidx = {h: j for j, h in enumerate(hnorm) if h}
+
+    def col(name: str) -> Optional[int]:
+        return hidx.get(_norm(name))
+
+    # Required columns (by your header list)
+    c_status = col("status")
+    c_deal_id = col("deal_id")
+    c_origin_iata = col("origin_iata")
+    c_dest_iata = col("destination_iata")
+    c_origin_city = col("origin_city")
+    c_origin_country = col("origin_country")
+    c_dest_city = col("destination_city")
+    c_dest_country = col("destination_country")
+    c_theme = col("theme")
+    c_deal_theme = col("deal_theme")
+    c_phrase_bank = col("phrase_bank")
+    c_phrase_used = col("phrase_used")  # read only (for governance counts)
+
+    # Optional publish timestamps for "unpublished" gating in phrase governance (read-only)
+    c_post_vip = col("posted_telegram_vip_at")
+    c_post_free = col("posted_telegram_free_at")
+
+    # Validate minimums
+    needed = {
+        "status": c_status,
+        "deal_id": c_deal_id,
+        "origin_iata": c_origin_iata,
+        "destination_iata": c_dest_iata,
+        "phrase_bank": c_phrase_bank,
+    }
+    missing = [k for k, v in needed.items() if v is None]
+    if missing:
+        log(f"❌ RAW_DEALS missing required headers: {missing}")
+        return 1
+
+    # Build phrase usage index (month-aware) from RAW_DEALS phrase_used + phrase_bank
+    now = dt.datetime.now(dt.timezone.utc)
+    mkey = month_key_utc(now)
+    usage: Dict[str, int] = {}  # phrase -> count this month
+
+    # We treat phrase usage as any phrase that appears in phrase_used or phrase_bank on any row this month
+    # If you later add a dedicated "phrase_month" column, you can tighten this.
+    # For now, we only count by appearance (idempotent enough for max_per_month).
+    if c_phrase_used is not None or c_phrase_bank is not None:
+        for r in raw_values[1:]:
+            # If a row has created_at/posted timestamp month you want to key on later, wire it here.
+            # For now: global monthly bucket (simple & safe).
+            pu = (r[c_phrase_used] if c_phrase_used is not None and c_phrase_used < len(r) else "").strip()
+            pb = (r[c_phrase_bank] if c_phrase_bank is not None and c_phrase_bank < len(r) else "").strip()
+            for p in (pu, pb):
+                if p:
+                    usage[p] = usage.get(p, 0) + 1
+
+    log(f"✅ Phrase usage index built (month bucket {mkey}): {len(usage)} unique phrases")
+
+    # ----------------------------
+    # Enrichment loop
+    # ----------------------------
+    scanned = len(raw_values) - 1
     eligible = 0
-    enriched_rows = 0
-    city_fills = 0
-    phrase_fills = 0
-    missing_iata_lookups = 0
+    enriched = 0
+    cityfills = 0
+    phrasefills = 0
     phrase_misses = 0
 
-    for i, r in enumerate(raw_records, start=2):
-        if len(updates) >= MAX_ROWS_PER_RUN:
-            break
+    # Build list of (row_number, col_number, new_value) updates
+    updates: List[gspread.Cell] = []
 
-        scanned += 1
+    def cell(rownum: int, colnum0: int, value: str) -> None:
+        # gspread.Cell takes 1-based col, row
+        updates.append(gspread.Cell(rownum, colnum0 + 1, value))
 
-        status = _upper(r.get("status"))
+    def getv(r: List[str], c: Optional[int]) -> str:
+        if c is None:
+            return ""
+        return (r[c] if c < len(r) else "").strip()
+
+    # Deterministic phrase candidate filter
+    def phrase_candidates(dest_iata: str, theme_resolved: str) -> List[Dict[str, Any]]:
+        dest_iata = (dest_iata or "").strip().upper()
+        theme_resolved = (theme_resolved or "").strip().lower()
+        if not dest_iata or not theme_resolved:
+            return []
+        items = phrases_by_key.get((dest_iata, theme_resolved), [])
+        if not items:
+            return []
+        # channel_hint filter (soft)
+        out = []
+        for it in items:
+            ch = (it.get("channel_hint") or "").strip().lower()
+            if not ch or ch == "all" or ch == PHRASE_CHANNEL:
+                out.append(it)
+        return out or items
+
+    def governance_ok(pr: Dict[str, Any]) -> bool:
+        if not ENFORCE_MAX_PER_MONTH:
+            return True
+        mpm = int(pr.get("max_per_month") or 0)
+        if mpm <= 0:
+            return True
+        phrase = pr.get("phrase") or ""
+        return usage.get(phrase, 0) < mpm
+
+    for i, r in enumerate(raw_values[1:], start=2):  # sheet row number
+        status = getv(r, c_status)
         if status not in ELIGIBLE_STATUSES:
             continue
 
-        eligible += 1
-
-        deal_id = _s(r.get("deal_id"))
-        o = _upper(r.get("origin_iata"))
-        d = _upper(r.get("destination_iata"))
-        theme = _lower(r.get("theme"))
-
-        if not (deal_id and o and d and theme):
+        deal_id = getv(r, c_deal_id)
+        if not deal_id:
             continue
 
-        payload: Dict[str, Any] = {}
+        eligible += 1
+        if enriched >= MAX_ROWS_PER_RUN:
+            break
 
-        # ---- City/Country enrichment ----
-        if (has_origin_city or has_origin_country) and o:
-            ocity, ocountry = iata_map.get(o, ("", ""))
-            if not ocity and not ocountry:
-                missing_iata_lookups += 1
-            if has_origin_city and not _s(r.get("origin_city")) and ocity:
-                payload["origin_city"] = ocity
-                city_fills += 1
-            if has_origin_country and not _s(r.get("origin_country")) and ocountry:
-                payload["origin_country"] = ocountry
-                city_fills += 1
+        origin_iata = getv(r, c_origin_iata).upper()
+        dest_iata = getv(r, c_dest_iata).upper()
 
-        if (has_dest_city or has_dest_country) and d:
-            dcity, dcountry = iata_map.get(d, ("", ""))
-            if not dcity and not dcountry:
-                missing_iata_lookups += 1
-            if has_dest_city and not _s(r.get("destination_city")) and dcity:
-                payload["destination_city"] = dcity
-                city_fills += 1
-            if has_dest_country and not _s(r.get("destination_country")) and dcountry:
-                payload["destination_country"] = dcountry
-                city_fills += 1
+        # Resolve theme: theme first, else deal_theme
+        theme_resolved = (getv(r, c_theme) or getv(r, c_deal_theme)).strip().lower()
 
-        # ---- Phrase enrichment ----
-        current_phrase = _s(r.get("phrase_bank"))
-        if not current_phrase:
-            phrase = _select_phrase(
-                candidates=phrase_candidates,
-                deal_id=deal_id,
-                dest_iata=d,
-                theme=theme,
-                usage_idx=usage_idx,
-                this_month=this_month,
-                target_channel=PHRASE_CHANNEL,
-            )
+        # 1) City/country fills (only if blank and IATA exists)
+        if iata_map:
+            # destination city/country
+            dest_city = getv(r, c_dest_city)
+            dest_country = getv(r, c_dest_country)
+            if (not dest_city or not dest_country) and dest_iata and dest_iata in iata_map:
+                city_name, country_name = iata_map[dest_iata]
+                if c_dest_city is not None and not dest_city and city_name:
+                    cell(i, c_dest_city, city_name)
+                    cityfills += 1
+                if c_dest_country is not None and not dest_country and country_name:
+                    cell(i, c_dest_country, country_name)
+                    cityfills += 1
 
-            if phrase:
-                payload["phrase_bank"] = phrase
-                phrase_fills += 1
+            # origin city/country
+            org_city = getv(r, c_origin_city)
+            org_country = getv(r, c_origin_country)
+            if (not org_city or not org_country) and origin_iata and origin_iata in iata_map:
+                city_name, country_name = iata_map[origin_iata]
+                if c_origin_city is not None and not org_city and city_name:
+                    cell(i, c_origin_city, city_name)
+                    cityfills += 1
+                if c_origin_country is not None and not org_country and country_name:
+                    cell(i, c_origin_country, country_name)
+                    cityfills += 1
+
+        # 2) Phrase fill into phrase_bank only (never overwrite; phrase_used is downstream/publish audit)
+        existing_phrase_bank = getv(r, c_phrase_bank)
+        if not existing_phrase_bank:
+            # Select phrase only if we have theme + dest_iata
+            cands = phrase_candidates(dest_iata, theme_resolved)
+
+            # Apply max-per-month governance
+            cands_ok = [p for p in cands if governance_ok(p)]
+
+            chosen = stable_pick(cands_ok, key_seed=f"{deal_id}:{dest_iata}:{theme_resolved}") if cands_ok else None
+            if chosen:
+                phrase = chosen["phrase"]
+                cell(i, c_phrase_bank, phrase)
+                phrasefills += 1
+                # update usage index so subsequent rows in this run respect max_per_month
+                usage[phrase] = usage.get(phrase, 0) + 1
             else:
-                phrase_misses += 1
-                if REQUIRE_PHRASE:
-                    # Don't write anything; leave blank. This worker does not hard-fail unless you choose to add that policy.
-                    pass
+                # Only count as miss if we would have tried (theme+dest exist) but governance eliminated all
+                if dest_iata and theme_resolved:
+                    phrase_misses += 1
+                    if REQUIRE_PHRASE:
+                        # Do nothing else; publisher can gate on missing phrase_bank if you want
+                        pass
 
-        if payload:
-            updates.append((i, payload))
-            enriched_rows += 1
+        if updates:
+            enriched += 1
 
-    written_cells = _batch_write(raw_ws, updates, raw_cm)
+    log("------------------------------------------------------------")
+    log(f"Scanned rows: {scanned}")
+    log(f"Eligible rows ({'/'.join(sorted(ELIGIBLE_STATUSES))}): {eligible}")
+    log(f"Rows enriched: {enriched} (cap {MAX_ROWS_PER_RUN})")
+    log(f"City/Country fills: {cityfills}")
+    log(f"Phrase fills: {phrasefills} (channel={PHRASE_CHANNEL})")
+    log(f"Phrase misses (no candidate after governance): {phrase_misses}")
+    log(f"Cells written (batch): {len(updates)}")
 
-    _log("------------------------------------------------------------")
-    _log(f"Scanned rows: {scanned}")
-    _log(f"Eligible rows (SCORED/READY_*): {eligible}")
-    _log(f"Rows enriched: {enriched_rows} (cap {MAX_ROWS_PER_RUN})")
-    _log(f"City/Country fills: {city_fills}")
-    _log(f"Phrase fills: {phrase_fills} (channel={PHRASE_CHANNEL})")
-    _log(f"Phrase misses (no candidate after governance): {phrase_misses}")
-    _log(f"Missing IATA lookups encountered: {missing_iata_lookups}")
-    _log(f"Cells written (batch): {written_cells}")
-    _log("------------------------------------------------------------")
-    _log("✅ Enrichment Router complete (idempotent; safe to re-run)")
+    if updates:
+        ws_raw.update_cells(updates, value_input_option="USER_ENTERED")
+        log("✅ Batch write complete.")
+    else:
+        log("✅ No changes needed (idempotent; safe to re-run).")
 
     return 0
 

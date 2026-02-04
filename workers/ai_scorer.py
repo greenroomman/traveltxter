@@ -1,25 +1,48 @@
 # workers/ai_scorer.py
-# AI SCORER v4.10 (PERFORMANCE OPTIMIZED)
+# TRAVELTXTER — AI SCORER (V5 STATUS TRIGGERS)
 #
-# Changes in v4.10:
-# - FIXED: ZTB uses get_all_values() instead of get_all_records() (10-100x faster)
-# - FIXED: Removed duplicate RAW_DEALS API calls (was loading twice)
-# - OPTIMIZED: Single batch load for RAW_DEALS (headers + values in one call)
-# - NOTE: ZTB theme_today calculated but not used (theme comes from RDV dynamic_theme)
+# PURPOSE
+# - Deterministically promote NEW rows in RAW_DEALS into publish-intent statuses:
+#     PUBLISH_AM / PUBLISH_PM / PUBLISH_BOTH
+# - Mark everything else as SCORED (or HARD_REJECT when RDV says hard_reject=TRUE)
 #
-# Previous (v4.9):
-# - Removed phrase_bank writing (delegated to enrich_router)
-# - Scorer only promotes deals (NEW -> READY_TO_POST or SCORED)
+# AUTHORITY / GOVERNANCE (LOCKED)
+# - RAW_DEALS is the ONLY writable source of truth.
+# - RAW_DEALS_VIEW (RDV) is read-only and contains all scoring/gating formulas.
+# - This worker:
+#     - Reads RAW_DEALS + RDV (by deal_id)
+#     - Writes to RAW_DEALS only: status, scored_timestamp, publish_window
+# - It does NOT:
+#     - write phrases (enrich_router does)
+#     - render images (render_client does)
+#     - publish to channels (publishers do)
+#     - write to RDV (prohibited)
 #
-# Performance:
-# - Before v4.10: 5-7 minutes (slow ZTB + duplicate API calls)
-# - After v4.10: 30-60 seconds (batch operations only)
+# STATUS CONTRACT (V5)
+# - NEW           : inserted by feeder
+# - SCORED        : evaluated, not selected for publish intent
+# - HARD_REJECT   : evaluated, blocked by RDV hard_reject
+# - PUBLISH_AM    : eligible for AM slot (by ingest timestamp)
+# - PUBLISH_PM    : eligible for PM slot (by ingest timestamp)
+# - PUBLISH_BOTH  : eligible for either slot (failsafe within freshness window)
 #
-# Governance:
-# - Writes ONLY to RAW_DEALS (status column)
-# - Reads RDV (read-only)
-# - Does not write to RDV
-# - Does not write phrase_bank or phrase_used (enrich_router handles this)
+# PUBLISH_WINDOW COLUMN (RAW_DEALS)
+# - Header: publish_window
+# - Values: AM / PM / BOTH
+#
+# SLOT RULE (LOCKED)
+# - Slot defaults from ingested_at_utc (UTC hour):
+#     hour < 12  => AM
+#     else       => PM
+#
+# BOTH RULE (LOCKED, SIMPLE)
+# - Mark as BOTH when:
+#     - verdict starts with PRO_  OR
+#     - worthiness_score >= SCORER_BOTH_SCORE (default 80)
+#
+# PERFORMANCE
+# - Single batch load for RAW_DEALS and RDV via get_all_values()
+# - Single batch write via update_cells()
 
 from __future__ import annotations
 
@@ -54,17 +77,11 @@ def _env_int(k: str, default: int) -> int:
         return default
 
 
-def _is_true(v: Any) -> bool:
-    s = str(v or "").strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
-
-
 def _norm_header(h: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_")
 
 
 def _build_first_index(headers: List[str]) -> Dict[str, int]:
-    """Exact header -> first index (0-based). Duplicate-safe."""
     idx: Dict[str, int] = {}
     for i, h in enumerate(headers):
         hh = str(h or "").strip()
@@ -74,7 +91,6 @@ def _build_first_index(headers: List[str]) -> Dict[str, int]:
 
 
 def _build_norm_first_index(headers: List[str]) -> Dict[str, int]:
-    """Normalized header -> first index (0-based). Duplicate-safe."""
     idx: Dict[str, int] = {}
     for i, h in enumerate(headers):
         nh = _norm_header(h)
@@ -83,25 +99,24 @@ def _build_norm_first_index(headers: List[str]) -> Dict[str, int]:
     return idx
 
 
-def _get_sa_json() -> Dict[str, Any]:
+def _get_gspread_client() -> gspread.Client:
     raw = _env("GCP_SA_JSON_ONE_LINE") or _env("GCP_SA_JSON")
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON or GCP_SA_JSON_ONE_LINE")
+
+    # Robust parsing for one-line + escaped newlines
     try:
-        return json.loads(raw)
+        creds_info = json.loads(raw)
     except Exception:
-        return json.loads(raw.replace("\\n", "\n"))
+        creds_info = json.loads(raw.replace("\\\\n", "\\n"))
 
-
-def _get_gspread_client() -> gspread.Client:
-    creds_info = _get_sa_json()
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
     return gspread.authorize(creds)
 
 
 # -----------------------------
-# Date parsing / theme-of-day
+# Date parsing
 # -----------------------------
 
 def _parse_dt(val: Any) -> Optional[dt.datetime]:
@@ -120,81 +135,25 @@ def _parse_dt(val: Any) -> Optional[dt.datetime]:
         d = dt.datetime.fromisoformat(s)
         return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
     except Exception:
-        pass
-
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
-    if m:
-        try:
-            y, mo, d = map(int, m.groups())
-            return dt.datetime(y, mo, d, tzinfo=dt.timezone.utc)
-        except Exception:
-            return None
-
-    return None
+        return None
 
 
-def _find_ingest_header(raw_headers: List[str]) -> Optional[str]:
-    # Canonical first
-    candidates = [
-        "ingested_at_utc",
-        "ingested_at",
-        "ingest_ts",
-        "ingest_timestamp",
-        "created_utc",
-        "created_at",
-        "timestamp",
-    ]
+def _find_header(raw_headers: List[str], *candidates: str) -> Optional[str]:
     header_set = set(raw_headers)
     for c in candidates:
         if c in header_set:
             return c
-
     norm_map = {_norm_header(h): h for h in raw_headers}
     for c in candidates:
         nc = _norm_header(c)
         if nc in norm_map:
             return norm_map[nc]
-
-    for h in raw_headers:
-        nh = _norm_header(h)
-        if "ingest" in nh and ("utc" in nh or "at" in nh or "ts" in nh or "time" in nh):
-            return h
-
     return None
 
 
-def _mmdd(d: dt.date) -> int:
-    return int(d.strftime("%m%d"))
-
-
-def _in_window(mmdd: int, start_mmdd: int, end_mmdd: int) -> bool:
-    if start_mmdd <= end_mmdd:
-        return start_mmdd <= mmdd <= end_mmdd
-    return (mmdd >= start_mmdd) or (mmdd <= end_mmdd)
-
-
-def _eligible_themes_from_ztb(ztb_rows: List[Dict[str, Any]]) -> List[str]:
-    today_mmdd = _mmdd(dt.datetime.now(dt.timezone.utc).date())
-    themes: List[str] = []
-    for r in ztb_rows:
-        theme = str(r.get("theme") or "").strip()
-        if not theme:
-            continue
-        if not _is_true(r.get("enabled")):
-            continue
-        start_mmdd = int(r.get("start_mmdd") or 101)
-        end_mmdd = int(r.get("end_mmdd") or 1231)
-        if _in_window(today_mmdd, start_mmdd, end_mmdd):
-            themes.append(theme)
-    return list(dict.fromkeys(themes))
-
-
-def _theme_of_day(eligible: List[str]) -> str:
-    if not eligible:
-        return "unexpected_value"
-    base = dt.date(2026, 1, 1)
-    idx = (dt.datetime.now(dt.timezone.utc).date() - base).days % len(eligible)
-    return sorted(eligible)[idx]
+def _slot_from_ingest(ts: dt.datetime) -> str:
+    # UTC slot rule
+    return "AM" if ts.hour < 12 else "PM"
 
 
 # -----------------------------
@@ -209,14 +168,16 @@ def main() -> int:
 
     RAW_DEALS_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
     RDV_TAB = _env("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
-    ZTB_TAB = _env("ZTB_TAB", "ZTB")
 
     MIN_INGEST_AGE_SECONDS = _env_int("MIN_INGEST_AGE_SECONDS", 30)
     MAX_AGE_HOURS = _env_int("SCORER_MAX_AGE_HOURS", 72)
 
+    # Quotas (keep existing knobs)
     QUOTA_PRO = _env_int("SCORER_QUOTA_PRO", 1)
     QUOTA_VIP = _env_int("SCORER_QUOTA_VIP", 2)
     QUOTA_FREE = _env_int("SCORER_QUOTA_FREE", 1)
+
+    BOTH_SCORE = float(_env_int("SCORER_BOTH_SCORE", 80))
 
     gc = _get_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -224,54 +185,45 @@ def main() -> int:
     ws_raw = sh.worksheet(RAW_DEALS_TAB)
     ws_rdv = sh.worksheet(RDV_TAB)
 
-    # Theme-of-day calculation (OPTIONAL - not used in scoring logic)
-    # Theme now comes from RDV dynamic_theme (CONFIG-based formula)
-    # Keeping ZTB load for logging/debugging only
-    theme_today = "adventure"  # Default fallback
-    try:
-        ws_ztb = sh.worksheet(ZTB_TAB)
-        # OPTIMIZED: Use get_all_values() instead of get_all_records()
-        # get_all_records() is 10-100x slower due to type inference + multiple API calls
-        ztb_values = ws_ztb.get_all_values()
-        if len(ztb_values) >= 2:
-            ztb_headers = ztb_values[0]
-            ztb_rows = [dict(zip(ztb_headers, row)) for row in ztb_values[1:]]
-            eligible = _eligible_themes_from_ztb(ztb_rows)
-            theme_today = _theme_of_day(eligible)
-            log(f"✅ ZTB: eligible_today={len(eligible)} | theme_today={theme_today} | pool={sorted(eligible)}")
-        else:
-            log("⚠️ ZTB appears empty, using fallback theme")
-    except Exception as e:
-        log(f"⚠️ Could not load ZTB (non-fatal): {e}. Theme comes from RDV dynamic_theme.")
-
-    # ✅ BATCH LOAD: RAW_DEALS (single API call for headers + values)
+    # ✅ Batch load RAW_DEALS
     log("📥 Loading RAW_DEALS...")
     raw_values = ws_raw.get_all_values()
     if not raw_values or len(raw_values) < 2:
         log("❌ RAW_DEALS appears empty (no data rows).")
         return 1
-    
-    raw_headers = raw_values[0]  # Extract headers from loaded data
-    log(f"✅ RAW_DEALS loaded: {len(raw_values)-1} rows")
-    
+
+    raw_headers = raw_values[0]
     raw_idx = _build_first_index(raw_headers)
 
-    required_raw = ["status", "deal_id", "ingested_at_utc"]
+    # Required columns
     for col in ("status", "deal_id"):
         if col not in raw_idx:
             log(f"❌ RAW_DEALS missing required header: {col}")
             return 1
 
-    ingest_header = _find_ingest_header(raw_headers)
+    ingest_header = _find_header(
+        raw_headers,
+        "ingested_at_utc",
+        "ingested_at",
+        "ingest_ts",
+        "created_utc",
+        "created_at",
+        "timestamp",
+    )
     if not ingest_header:
-        log("❌ Could not find an ingest timestamp header in RAW_DEALS.")
+        log("❌ Could not find an ingest timestamp header in RAW_DEALS (expected ingested_at_utc).")
         return 1
     log(f"🕒 Using ingest timestamp header: {ingest_header}")
 
-    # RDV duplicate-safe load
+    # Optional write-back columns
+    scored_ts_header = _find_header(raw_headers, "scored_timestamp", "scored_at", "scored_at_utc")
+    publish_window_header = _find_header(raw_headers, "publish_window")
+
+    # ✅ Batch load RDV
+    log("📥 Loading RAW_DEALS_VIEW...")
     rdv_values = ws_rdv.get_all_values()
     if not rdv_values or len(rdv_values) < 2:
-        log("❌ RDV appears empty (no rows).")
+        log("❌ RAW_DEALS_VIEW appears empty (no rows).")
         return 1
 
     rdv_headers = rdv_values[0]
@@ -284,13 +236,11 @@ def main() -> int:
                 return str(row[j] or "").strip()
         return ""
 
-    # Build RDV lookup by deal_id
+    # Build RDV lookup by deal_id (duplicate-safe)
     rdv_by_id: Dict[str, Dict[str, str]] = {}
-    rdv_missing_did = 0
     for r in rdv_values[1:]:
         did = rdv_cell(r, "deal_id")
         if not did:
-            rdv_missing_did += 1
             continue
         if did in rdv_by_id:
             continue
@@ -303,24 +253,21 @@ def main() -> int:
             "dynamic_theme": rdv_cell(r, "dynamic_theme"),
         }
 
-    if rdv_missing_did:
-        log(f"⚠️ RDV rows missing deal_id: {rdv_missing_did}")
-
-    # Candidate selection (using pre-loaded raw_values from above)
-    now = dt.datetime.now(dt.timezone.utc)
-    eligible_rows: List[Tuple[int, str, Dict[str, str]]] = []
-    skipped_no_ingest_ts = 0
-    skipped_too_fresh = 0
-    skipped_too_old = 0
-    skipped_missing_rdv = 0
-    missing_ingest_ids: List[str] = []
-
     def raw_cell(row: List[str], col: str) -> str:
         j = raw_idx.get(col)
         if j is None:
             return ""
         return row[j] if j < len(row) else ""
 
+    now = dt.datetime.now(dt.timezone.utc)
+
+    eligible_rows: List[Tuple[int, str, dt.datetime, Dict[str, str]]] = []
+    skipped_too_fresh = 0
+    skipped_too_old = 0
+    skipped_no_ingest = 0
+    skipped_missing_rdv = 0
+
+    # Scan NEW rows
     for rownum in range(2, len(raw_values) + 1):
         row = raw_values[rownum - 1]
         if not row:
@@ -337,9 +284,7 @@ def main() -> int:
         ingest_val = raw_cell(row, ingest_header).strip()
         ts = _parse_dt(ingest_val)
         if not ts:
-            skipped_no_ingest_ts += 1
-            if len(missing_ingest_ids) < 10:
-                missing_ingest_ids.append(did)
+            skipped_no_ingest += 1
             continue
 
         age_s = (now - ts).total_seconds()
@@ -355,21 +300,19 @@ def main() -> int:
             skipped_missing_rdv += 1
             continue
 
-        eligible_rows.append((rownum, did, rdv))
+        eligible_rows.append((rownum, did, ts, rdv))
 
     log(
         f"Eligible NEW candidates: {len(eligible_rows)} | "
-        f"skipped_too_fresh={skipped_too_fresh} skipped_no_ingest_ts={skipped_no_ingest_ts} "
-        f"skipped_too_old={skipped_too_old} skipped_missing_raw_row={skipped_missing_rdv}"
+        f"skipped_too_fresh={skipped_too_fresh} skipped_no_ingest_ts={skipped_no_ingest} "
+        f"skipped_too_old={skipped_too_old} skipped_missing_rdv={skipped_missing_rdv}"
     )
-    if skipped_no_ingest_ts:
-        log(f"⚠️ Missing ingest ts for first {len(missing_ingest_ids)} NEW rows: {missing_ingest_ids}")
 
     if not eligible_rows:
         log("No eligible NEW rows")
         return 0
 
-    def score_of(rdv: Dict[str, str]) -> float:
+    def _score_float(rdv: Dict[str, str]) -> float:
         for k in ("priority_score", "worthiness_score"):
             v = (rdv.get(k) or "").strip()
             try:
@@ -378,65 +321,99 @@ def main() -> int:
                 continue
         return 0.0
 
-    eligible_rows.sort(key=lambda t: score_of(t[2]), reverse=True)
+    eligible_rows.sort(key=lambda t: _score_float(t[3]), reverse=True)
 
-    # Allocate winners
-    winners_pro: List[Tuple[int, str]] = []
-    winners_vip: List[Tuple[int, str]] = []
-    winners_free: List[Tuple[int, str]] = []
-    to_scored: List[int] = []
+    # Allocate winners by verdict + quotas
+    winners_pro: List[Tuple[int, str, dt.datetime, Dict[str, str]]] = []
+    winners_vip: List[Tuple[int, str, dt.datetime, Dict[str, str]]] = []
+    winners_free: List[Tuple[int, str, dt.datetime, Dict[str, str]]] = []
+    others: List[Tuple[int, str, dt.datetime, Dict[str, str]]] = []
+    hard_reject_rows: List[Tuple[int, str, dt.datetime, Dict[str, str]]] = []
 
-    for rownum, did, rdv in eligible_rows:
+    for rownum, did, ts, rdv in eligible_rows:
         verdict = (rdv.get("worthiness_verdict") or "").upper().strip()
         hard_reject = (rdv.get("hard_reject") or "").upper().strip() == "TRUE"
 
         if hard_reject:
-            to_scored.append(rownum)
+            hard_reject_rows.append((rownum, did, ts, rdv))
             continue
 
         if verdict.startswith("PRO_") and len(winners_pro) < QUOTA_PRO:
-            winners_pro.append((rownum, did))
+            winners_pro.append((rownum, did, ts, rdv))
             continue
 
         if ("VIP" in verdict or verdict.startswith("POSTABLE")) and len(winners_vip) < QUOTA_VIP:
-            winners_vip.append((rownum, did))
+            winners_vip.append((rownum, did, ts, rdv))
             continue
 
         if len(winners_free) < QUOTA_FREE:
-            winners_free.append((rownum, did))
+            winners_free.append((rownum, did, ts, rdv))
             continue
 
-        to_scored.append(rownum)
+        others.append((rownum, did, ts, rdv))
 
-    # Prepare batch updates
+    # Prepare batch updates (status + scored_timestamp + publish_window)
     updates: List[gspread.Cell] = []
+
     status_col = raw_idx["status"] + 1
+    scored_col = (raw_idx.get(scored_ts_header) + 1) if scored_ts_header and scored_ts_header in raw_idx else None
+    pubwin_col = (raw_idx.get(publish_window_header) + 1) if publish_window_header and publish_window_header in raw_idx else None
+
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    def _set(rownum: int, col: int, val: str) -> None:
+        updates.append(gspread.Cell(rownum, col, val))
 
     def set_status(rownum: int, v: str) -> None:
-        updates.append(gspread.Cell(rownum, status_col, v))
+        _set(rownum, status_col, v)
 
-    # SCORED
-    for r in to_scored:
-        set_status(r, "SCORED")
+    def set_scored_ts(rownum: int) -> None:
+        if scored_col:
+            _set(rownum, scored_col, now_iso)
 
-    # READY_TO_POST (phrase selection delegated to enrich_router)
-    for rownum, did in winners_pro:
-        set_status(rownum, "READY_TO_POST")
+    def set_publish_window(rownum: int, v: str) -> None:
+        if pubwin_col:
+            _set(rownum, pubwin_col, v)
 
-    for rownum, did in winners_vip:
-        set_status(rownum, "READY_TO_POST")
+    def decide_publish_window(ts: dt.datetime, rdv: Dict[str, str]) -> str:
+        slot = _slot_from_ingest(ts)  # AM/PM
+        verdict = (rdv.get("worthiness_verdict") or "").upper().strip()
+        score = _score_float(rdv)
+        if verdict.startswith("PRO_") or score >= BOTH_SCORE:
+            return "BOTH"
+        return slot
 
-    for rownum, did in winners_free:
-        set_status(rownum, "READY_TO_POST")
+    def promote(rows: List[Tuple[int, str, dt.datetime, Dict[str, str]]]) -> None:
+        for rownum, _did, ts, rdv in rows:
+            pw = decide_publish_window(ts, rdv)  # AM/PM/BOTH
+            set_publish_window(rownum, pw)
+            set_status(rownum, f"PUBLISH_{pw}")
+            set_scored_ts(rownum)
+
+    # Hard rejects
+    for rownum, _did, _ts, _rdv in hard_reject_rows:
+        set_status(rownum, "HARD_REJECT")
+        set_scored_ts(rownum)
+
+    # Winners -> PUBLISH_*
+    promote(winners_pro)
+    promote(winners_vip)
+    promote(winners_free)
+
+    # Everything else -> SCORED
+    for rownum, _did, _ts, _rdv in others:
+        set_status(rownum, "SCORED")
+        set_scored_ts(rownum)
 
     if updates:
         ws_raw.update_cells(updates, value_input_option="USER_ENTERED")
 
     log(
-        f"✅ Promoted: PRO={len(winners_pro)} VIP={len(winners_vip)} FREE={len(winners_free)} "
-        f"| Marked SCORED={len(to_scored)}"
+        f"✅ Status writes: PRO={len(winners_pro)} VIP={len(winners_vip)} FREE={len(winners_free)} "
+        f"HARD_REJECT={len(hard_reject_rows)} SCORED={len(others)}"
     )
-    log("ℹ️ Phrase selection delegated to enrich_router (runs next in pipeline)")
+    if not publish_window_header:
+        log("⚠️ RAW_DEALS missing 'publish_window' column (AL). Status triggers still written.")
 
     return 0
 

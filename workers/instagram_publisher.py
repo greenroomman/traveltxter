@@ -1,69 +1,68 @@
 # workers/instagram_publisher.py
-# FULL REPLACEMENT — Theme-of-the-day (OPS_MASTER!B5) + Latest-first + Variety guard
+# ============================================================
+# TravelTxter Instagram Publisher — V5 (AM/PM + publish_window)
+# ============================================================
 #
-# LOCKED:
-# - Caption wording/structure unchanged
-# - Uses graphic_url
-# - Writes posted_instagram_at in RAW_DEALS only after successful publish
-# - Idempotent (won't repost if posted_instagram_at already set)
-# - Posts max 1 per run
-# - RDV is read-only (never written)
+# INTENT (LOCKED):
+# - Instagram is ADVERTISING, not product.
+# - AM = theme-led editorial ("what's hot?")
+# - PM = deal consideration ("worth a look")
+# - Must post ONCE per run, always.
 #
-# NEW (deterministic, spreadsheet-led):
-# - TODAY_THEME source of truth: OPS_MASTER!B5
-# - Candidate pool: READY_TO_PUBLISH + instagram_ok TRUE + graphic_url present + not already posted
-# - Selection order:
-#   1) Theme-match (dynamic_theme contains TODAY_THEME) + variety guard + newest-first (ingested_at_utc)
-#   2) Any-theme + variety guard + newest-first
-#   3) Any-theme + newest-first (last resort)
+# AUTHORITY:
+# - Theme of day: OPS_MASTER!B5
+# - Timing: RUN_SLOT=AM|PM (fallback = UTC hour)
+# - Eligibility: RAW_DEALS.publish_window (column AL)
 #
-# Multi-theme support:
-# - dynamic_theme may contain multiple themes: "long_haul|snow" or "long_haul, snow"
-# - Theme-match checks membership in token set
+# publish_window semantics:
+#   AM    -> eligible only for AM
+#   PM    -> eligible only for PM
+#   BOTH  -> eligible for either (failsafe buffer, ≤12h old)
 #
-# Variety guard:
-# - Avoid repeating destination_city seen in posted_instagram_at within lookback window
-# - Lookback hours: env VARIETY_LOOKBACK_HOURS (default 120)
+# HARD RULES:
+# - RDV is READ-ONLY
+# - Requires graphic_url
+# - Writes posted_instagram_at ONLY after successful publish
+# - Never blocks on price / cheap lane / VIP logic
+# - Variety guard applies
 #
-# Quiet mode:
-# - IG_PUBLISHER_QUIET=true logs only publish + already-posted + summary
+# ============================================================
 
 from __future__ import annotations
 
 import os
 import json
 import time
-import re
 import datetime as dt
-from typing import Dict, List, Optional, Tuple
-
+import re
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
+# ------------------------
+# Helpers
+# ------------------------
 
 def env(k: str, d: str = "") -> str:
     return (os.getenv(k, d) or "").strip()
 
+def get_run_slot() -> str:
+    slot = env("RUN_SLOT").upper()
+    if slot in {"AM", "PM"}:
+        return slot
+    return "AM" if dt.datetime.utcnow().hour < 12 else "PM"
 
-def _get_int_env(name: str, default: int) -> int:
-    v = env(name)
-    if not v:
-        return default
+def parse_utc(ts: str):
+    if not ts:
+        return None
     try:
-        return int(float(v))
+        return dt.datetime.fromisoformat(ts.replace("Z", ""))
     except Exception:
-        return default
+        return None
 
-
-def _sa_creds() -> Credentials:
+def sa_creds():
     raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
-    if not raw:
-        raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
-    try:
-        info = json.loads(raw)
-    except json.JSONDecodeError:
-        info = json.loads(raw.replace("\\n", "\n"))
+    info = json.loads(raw.replace("\\n", "\n"))
     return Credentials.from_service_account_info(
         info,
         scopes=[
@@ -72,426 +71,166 @@ def _sa_creds() -> Credentials:
         ],
     )
 
-
-def phrase_from_row(row: Dict[str, str]) -> str:
-    return (row.get("phrase_used") or row.get("phrase_bank") or "").strip()
-
-
-def get_country_flag(country: str) -> str:
-    if not country:
-        return "🌍"
-    return {
-        "Iceland": "🇮🇸",
-        "Spain": "🇪🇸",
-        "Portugal": "🇵🇹",
-        "Greece": "🇬🇷",
-        "Turkey": "🇹🇷",
-        "Morocco": "🇲🇦",
-        "Jordan": "🇯🇴",
-        "Canada": "🇨🇦",
-        "USA": "🇺🇸",
-        "Indonesia": "🇮🇩",
-        "Thailand": "🇹🇭",
-        "Japan": "🇯🇵",
-        "Australia": "🇦🇺",
-        "France": "🇫🇷",
-        "Italy": "🇮🇹",
-        "Germany": "🇩🇪",
-    }.get(country, "🌍")
-
-
-def _truthy_cell(v) -> bool:
-    if v is True:
-        return True
-    if v is False or v is None:
-        return False
-    s = str(v).strip().upper()
-    return s in {"TRUE", "1", "YES", "Y"}
-
-
-def _quiet_mode() -> bool:
-    return env("IG_PUBLISHER_QUIET", "").lower() in {"1", "true", "yes", "y"}
-
-
-def _parse_iso_utc(ts: str) -> Optional[dt.datetime]:
-    s = (ts or "").strip()
-    if not s:
-        return None
-    try:
-        # accept "...Z" or without Z
-        return dt.datetime.fromisoformat(s.replace("Z", ""))
-    except Exception:
-        return None
-
-
-# =========================
-# THEME NORMALISATION (LOCKED)
-# =========================
+# ------------------------
+# Theme normalisation
+# ------------------------
 
 AUTHORITATIVE_THEMES = {
-    "winter_sun",
-    "summer_sun",
-    "beach_break",
-    "snow",
-    "northern_lights",
-    "surf",
-    "adventure",
-    "city_breaks",
-    "culture_history",
-    "long_haul",
-    "luxury_value",
-    "unexpected_value",
+    "winter_sun","summer_sun","beach_break","snow","northern_lights",
+    "surf","adventure","city_breaks","culture_history",
+    "long_haul","luxury_value","unexpected_value"
 }
 
-THEME_ALIASES = {
-    "winter sun": "winter_sun",
-    "summer sun": "summer_sun",
-    "beach break": "beach_break",
-    "northern lights": "northern_lights",
-    "city breaks": "city_breaks",
-    "culture / history": "culture_history",
-    "culture & history": "culture_history",
-    "culture": "culture_history",
-    "history": "culture_history",
-    "long haul": "long_haul",
-    "luxury": "luxury_value",
-    "unexpected": "unexpected_value",
-    # If anything "pro" leaks in, hard-map to a real palette theme
-    "pro": "luxury_value",
-    "pro+": "luxury_value",
-    "vip pro": "luxury_value",
-}
-
-
-def normalize_theme(raw_theme: str | None) -> str:
-    raw = (raw_theme or "").strip()
-    if not raw:
+def normalize_theme(t: str) -> str:
+    if not t:
         return "adventure"
+    t = t.lower().strip()
+    t = re.sub(r"[^a-z0-9_]+", "_", t)
+    return t if t in AUTHORITATIVE_THEMES else "adventure"
 
-    t = raw.lower().strip()
-    if t in THEME_ALIASES:
-        t = THEME_ALIASES[t]
-
-    t = re.sub(r"[^a-z0-9_]+", "_", t).strip("_")
-    if t in THEME_ALIASES:
-        t = THEME_ALIASES[t]
-
-    if t in AUTHORITATIVE_THEMES:
-        return t
-
-    return "adventure"
-
-
-def theme_tokens(raw_theme: str | None) -> List[str]:
-    """
-    Return list of authoritative theme tokens from a (possibly multi) theme string.
-    Supports separators: comma, pipe, semicolon.
-    """
-    if not raw_theme:
+def theme_tokens(raw: str):
+    if not raw:
         return []
-    parts = re.split(r"[,\|;]+", str(raw_theme))
-    out: List[str] = []
+    parts = re.split(r"[,\|;]+", raw)
+    out = []
     for p in parts:
         t = normalize_theme(p)
         if t in AUTHORITATIVE_THEMES:
             out.append(t)
-    # de-dup while preserving order
-    seen = set()
-    uniq = []
-    for t in out:
-        if t not in seen:
-            uniq.append(t)
-            seen.add(t)
-    return uniq
+    return list(dict.fromkeys(out))
 
+# ------------------------
+# Main
+# ------------------------
 
-# =========================
-# SELECTION LOGIC
-# =========================
+def main():
+    run_slot = get_run_slot()            # AM / PM
+    now = dt.datetime.utcnow()
+    freshness_cutoff = now - dt.timedelta(hours=12)
+    variety_hours = int(env("VARIETY_LOOKBACK_HOURS", "120"))
 
-def _best_candidate(
-    candidates: List[dict],
-    posted_recent_cities: set,
-    enforce_variety: bool,
-) -> Optional[dict]:
-    """
-    candidates should already be sorted newest-first.
-    """
-    if not candidates:
-        return None
-    if not enforce_variety:
-        return candidates[0]
+    gc = gspread.authorize(sa_creds())
+    sh = gc.open_by_key(env("SPREADSHEET_ID") or env("SHEET_ID"))
 
-    for c in candidates:
-        city = (c.get("destination_city") or "").strip()
-        if not city:
-            return c
-        if city not in posted_recent_cities:
-            return c
-    return None
-
-
-def main() -> int:
-    quiet = _quiet_mode()
-    variety_lookback_hours = _get_int_env("VARIETY_LOOKBACK_HOURS", 120)
-
-    gc = gspread.authorize(_sa_creds())
-
-    sheet_id = env("SPREADSHEET_ID") or env("SHEET_ID")
-    if not sheet_id:
-        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
-
-    sh = gc.open_by_key(sheet_id)
-
-    ws_view = sh.worksheet("RAW_DEALS_VIEW")
     ws_raw = sh.worksheet("RAW_DEALS")
+    ws_rdv = sh.worksheet("RAW_DEALS_VIEW")
     ws_ops = sh.worksheet("OPS_MASTER")
 
-    # TODAY_THEME from OPS_MASTER!B5 (authoritative)
-    today_theme_raw = ws_ops.acell("B5").value
-    today_theme = normalize_theme(today_theme_raw)
-
-    values = ws_view.get_all_values()
-    if len(values) < 2:
-        print("No rows in RAW_DEALS_VIEW")
-        return 0
-
-    headers = values[0]
-    h = {k: i for i, k in enumerate(headers)}
-
-    # ---- REQUIRED RDV HEADERS (HARD FAIL) ----
-    required = [
-        "deal_id",
-        "status",
-        "graphic_url",
-        "destination_country",
-        "destination_city",
-        "origin_city",
-        "price_gbp",
-        "outbound_date",
-        "return_date",
-        "instagram_ok",
-    ]
-    for col in required:
-        if col not in h:
-            raise RuntimeError(f"RAW_DEALS_VIEW missing required header: {col}")
-
-    # ---- OPTIONAL RDV HEADERS (SOFT) ----
-    has_dynamic_theme = "dynamic_theme" in h
-    has_ig_gate_reason = "ig_gate_reason" in h
-    has_block_reason = "block_reason" in h
-
-    ig_user_id = env("IG_USER_ID")
-    ig_access_token = env("IG_ACCESS_TOKEN")
-    api_ver = env("GRAPH_API_VERSION", "v20.0")
-
-    if not ig_user_id or not ig_access_token:
-        raise RuntimeError("Missing Instagram credentials")
+    today_theme = normalize_theme(ws_ops.acell("B5").value)
 
     raw_vals = ws_raw.get_all_values()
-    if len(raw_vals) < 2:
-        print("No rows in RAW_DEALS")
-        return 0
+    rdv_vals = ws_rdv.get_all_values()
 
-    raw_headers = raw_vals[0]
-    raw_h = {k: i for i, k in enumerate(raw_headers)}
+    raw_h = {h:i for i,h in enumerate(raw_vals[0])}
+    rdv_h = {h:i for i,h in enumerate(rdv_vals[0])}
 
-    # Required RAW columns
-    for col in ("deal_id", "posted_instagram_at", "ingested_at_utc"):
-        if col not in raw_h:
-            raise RuntimeError(f"RAW_DEALS missing required column: {col}")
+    REQUIRED_RAW = ["deal_id","graphic_url","ingested_at_utc","posted_instagram_at","publish_window"]
+    REQUIRED_RDV = ["deal_id","destination_city","destination_country","dynamic_theme"]
 
-    # Build RAW maps for fast lookup
-    deal_to_raw_row: Dict[str, int] = {}
-    deal_to_posted_at: Dict[str, str] = {}
-    deal_to_ingested_at: Dict[str, Optional[dt.datetime]] = {}
+    for c in REQUIRED_RAW:
+        if c not in raw_h:
+            raise RuntimeError(f"RAW_DEALS missing {c}")
+    for c in REQUIRED_RDV:
+        if c not in rdv_h:
+            raise RuntimeError(f"RAW_DEALS_VIEW missing {c}")
 
-    for raw_i, raw_r in enumerate(raw_vals[1:], start=2):
-        did = (raw_r[raw_h["deal_id"]] or "").strip()
-        if not did:
-            continue
-        deal_to_raw_row[did] = raw_i
-        deal_to_posted_at[did] = (raw_r[raw_h["posted_instagram_at"]] or "").strip()
-        deal_to_ingested_at[did] = _parse_iso_utc(raw_r[raw_h["ingested_at_utc"]] or "")
-
-    # Map deal_id -> destination_city (from RDV) for variety history
-    deal_to_city: Dict[str, str] = {}
-    for r in values[1:]:
-        did = (r[h["deal_id"]] or "").strip()
+    # Map RDV by deal_id
+    rdv_map = {}
+    for r in rdv_vals[1:]:
+        did = r[rdv_h["deal_id"]]
         if did:
-            deal_to_city[did] = (r[h["destination_city"]] or "").strip()
+            rdv_map[did] = r
 
-    # Determine posted_recent_cities (within lookback)
-    now = dt.datetime.utcnow()
-    cutoff = now - dt.timedelta(hours=variety_lookback_hours)
-    posted_recent_cities: set = set()
-    for did, posted_ts in deal_to_posted_at.items():
-        if not posted_ts:
-            continue
-        posted_dt = _parse_iso_utc(posted_ts)
-        if not posted_dt:
-            continue
-        if posted_dt >= cutoff:
-            c = (deal_to_city.get(did) or "").strip()
-            if c:
-                posted_recent_cities.add(c)
+    # Build recent-city variety block
+    recent_cities = set()
+    cutoff = now - dt.timedelta(hours=variety_hours)
+    for r in raw_vals[1:]:
+        ts = parse_utc(r[raw_h["posted_instagram_at"]])
+        if ts and ts >= cutoff:
+            did = r[raw_h["deal_id"]]
+            if did in rdv_map:
+                city = rdv_map[did][rdv_h["destination_city"]]
+                if city:
+                    recent_cities.add(city)
 
-    if not quiet:
-        print("=" * 70)
-        print("📣 Instagram Publisher — Theme-first + Latest-first + Variety Guard")
-        print("SOURCE: RAW_DEALS_VIEW (read-only) + RAW_DEALS (posted/ingested)")
-        print(f"TODAY_THEME (OPS_MASTER!B5): {today_theme_raw!r} -> {today_theme}")
-        print(f"VARIETY_LOOKBACK_HOURS: {variety_lookback_hours}")
-        print("=" * 70)
+    candidates = []
 
-    # Build candidate list (RDV gate + not already posted + graphic_url present)
-    ready = 0
-    blocked = 0
-    skipped_posted = 0
-    missing_graphic = 0
-    missing_raw = 0
-
-    candidates: List[dict] = []
-    for idx, r in enumerate(values[1:], start=2):
-        status = (r[h["status"]] or "").strip()
-        if status != "READY_TO_PUBLISH":
+    for idx, r in enumerate(raw_vals[1:], start=2):
+        did = r[raw_h["deal_id"]]
+        if not did or did not in rdv_map:
             continue
 
-        ready += 1
-
-        instagram_ok_raw = r[h["instagram_ok"]]
-        if not _truthy_cell(instagram_ok_raw):
-            blocked += 1
-            if quiet:
-                continue
-
-            reason = None
-            if has_ig_gate_reason:
-                reason = (r[h["ig_gate_reason"]] or "").strip()
-            if not reason and has_block_reason:
-                reason = (r[h["block_reason"]] or "").strip()
-            if not reason:
-                reason = f"instagram_ok={instagram_ok_raw}"
-
-            print(
-                f"⛔ BLOCKED {r[h['deal_id']]} — "
-                f"{r[h['destination_city']]} £{r[h['price_gbp']]} — {reason}"
-            )
+        if r[raw_h["posted_instagram_at"]]:
             continue
 
-        image_url = (r[h["graphic_url"]] or "").strip()
-        if not image_url:
-            missing_graphic += 1
+        img = r[raw_h["graphic_url"]]
+        if not img:
             continue
 
-        deal_id = (r[h["deal_id"]] or "").strip()
-        if not deal_id:
+        pub_window = (r[raw_h["publish_window"]] or "").upper()
+        if pub_window not in {"AM","PM","BOTH"}:
             continue
 
-        raw_row = deal_to_raw_row.get(deal_id)
-        if not raw_row:
-            missing_raw += 1
+        ingested = parse_utc(r[raw_h["ingested_at_utc"]])
+        if not ingested or ingested < freshness_cutoff:
             continue
 
-        if deal_to_posted_at.get(deal_id):
-            skipped_posted += 1
-            if not quiet:
-                print(f"↩️  Skipping already posted: {deal_id}")
+        # Window eligibility
+        if pub_window != "BOTH" and pub_window != run_slot:
             continue
 
-        ingested_dt = deal_to_ingested_at.get(deal_id) or dt.datetime.min
+        rdv = rdv_map[did]
+        dyn_tokens = theme_tokens(rdv[rdv_h["dynamic_theme"]])
 
-        dyn_raw = (r[h["dynamic_theme"]] or "").strip() if has_dynamic_theme else ""
-        dyn_tokens = theme_tokens(dyn_raw)
-
-        candidates.append(
-            {
-                "rdv_row": idx,
-                "raw_row": raw_row,
-                "deal_id": deal_id,
-                "destination_country": (r[h["destination_country"]] or "").strip(),
-                "destination_city": (r[h["destination_city"]] or "").strip(),
-                "origin_city": (r[h["origin_city"]] or "").strip(),
-                "price_gbp": (r[h["price_gbp"]] or "").strip(),
-                "outbound_date": (r[h["outbound_date"]] or "").strip(),
-                "return_date": (r[h["return_date"]] or "").strip(),
-                "graphic_url": image_url,
-                "dyn_raw": dyn_raw,
-                "dyn_tokens": dyn_tokens,
-                "ingested_dt": ingested_dt,
-                "phrase": phrase_from_row(dict(zip(headers, r))),
-            }
-        )
+        candidates.append({
+            "raw_row": idx,
+            "deal_id": did,
+            "image": img,
+            "city": rdv[rdv_h["destination_city"]],
+            "country": rdv[rdv_h["destination_country"]],
+            "themes": dyn_tokens,
+            "ingested": ingested,
+        })
 
     if not candidates:
-        print("=" * 70)
-        print(f"READY_TO_PUBLISH: {ready}")
-        if not quiet:
-            print(f"BLOCKED BY GATE: {blocked}")
-        print(f"MISSING_GRAPHIC_URL: {missing_graphic}")
-        print(f"MISSING_RAW_MATCH: {missing_raw}")
-        print(f"ALREADY_POSTED_SKIPS: {skipped_posted}")
-        print("PUBLISHED THIS RUN: 0")
-        print("=" * 70)
+        print("⚠️ No eligible Instagram candidates (this should be rare).")
         return 0
 
-    # Newest-first sort by ingested_at_utc (fallback: rdv_row for stability)
-    candidates.sort(key=lambda c: (c["ingested_dt"], -c["rdv_row"]), reverse=True)
+    # Sort newest first
+    candidates.sort(key=lambda x: x["ingested"], reverse=True)
 
-    # Pool 1: theme-match (candidate dyn_tokens contains today_theme) if dynamic_theme exists
-    if has_dynamic_theme:
-        themed = [c for c in candidates if today_theme in (c["dyn_tokens"] or [])]
-    else:
-        themed = []
+    # Selection ladder
+    themed = [c for c in candidates if today_theme in c["themes"]]
+    pool = themed or candidates
 
-    # Select candidate deterministically with fallback ladder
     chosen = None
-    chosen = _best_candidate(themed, posted_recent_cities, enforce_variety=True) if themed else None
-    if chosen is None:
-        chosen = _best_candidate(candidates, posted_recent_cities, enforce_variety=True)
-    if chosen is None:
-        chosen = _best_candidate(candidates, posted_recent_cities, enforce_variety=False)
-
+    for c in pool:
+        if c["city"] not in recent_cities:
+            chosen = c
+            break
     if not chosen:
-        # Should never happen, but keep safe
-        print("No candidate could be selected.")
-        return 0
+        chosen = pool[0]
 
-    # Publish chosen
-    deal_id = chosen["deal_id"]
-    country = chosen["destination_country"]
-    city = chosen["destination_city"]
-    price = chosen["price_gbp"]
-    outbound = chosen["outbound_date"]
-    ret = chosen["return_date"]
-    phrase = chosen["phrase"]
-    image_url = chosen["graphic_url"]
+    # Publish
+    ig_user = env("IG_USER_ID")
+    token = env("IG_ACCESS_TOKEN")
+    api = env("GRAPH_API_VERSION","v20.0")
 
-    flag = get_country_flag(country)
+    caption = f"""{chosen['country']}
+London → {chosen['city']}
 
-    # DO NOT CHANGE CAPTION STRUCTURE (LOCKED)
-    caption = "\n".join(
-        [
-            f"{country} {flag}",
-            "",
-            f"London to {city} from £{price}",
-            f"Out: {outbound}",
-            f"Return: {ret}",
-            "",
-            phrase,
-            "",
-            "VIP members saw this first. We post here later, and the free channel gets it after that.",
-            "",
-            "Link in bio.",
-        ]
-    ).strip()
+What’s hot for {today_theme.replace('_',' ')} right now.
+
+VIP sees deals first.
+Link in bio.
+"""
 
     create = requests.post(
-        f"https://graph.facebook.com/{api_ver}/{ig_user_id}/media",
+        f"https://graph.facebook.com/{api}/{ig_user}/media",
         data={
-            "image_url": image_url,
+            "image_url": chosen["image"],
             "caption": caption,
-            "access_token": ig_access_token,
+            "access_token": token,
         },
         timeout=30,
     ).json()
@@ -503,10 +242,10 @@ def main() -> int:
     time.sleep(2)
 
     pub = requests.post(
-        f"https://graph.facebook.com/{api_ver}/{ig_user_id}/media_publish",
+        f"https://graph.facebook.com/{api}/{ig_user}/media_publish",
         data={
             "creation_id": cid,
-            "access_token": ig_access_token,
+            "access_token": token,
         },
         timeout=30,
     ).json()
@@ -517,28 +256,10 @@ def main() -> int:
     ws_raw.update_cell(
         chosen["raw_row"],
         raw_h["posted_instagram_at"] + 1,
-        dt.datetime.utcnow().isoformat() + "Z",
+        now.isoformat() + "Z"
     )
 
-    print(f"✅ Published {deal_id} — {city} £{price}")
-    if not quiet:
-        if has_dynamic_theme:
-            print(f"   dynamic_theme: {chosen['dyn_raw']!r} -> tokens={chosen['dyn_tokens']} | today_theme={today_theme}")
-        print(f"   picked_by: {'theme+variety+newest' if (has_dynamic_theme and chosen in themed) else 'variety+newest/fallback'}")
-        if posted_recent_cities:
-            print(f"   variety_blocked_recent_cities_count: {len(posted_recent_cities)}")
-
-    # Summary (always)
-    print("=" * 70)
-    print(f"READY_TO_PUBLISH: {ready}")
-    if not quiet:
-        print(f"BLOCKED BY GATE: {blocked}")
-    print(f"MISSING_GRAPHIC_URL: {missing_graphic}")
-    print(f"MISSING_RAW_MATCH: {missing_raw}")
-    print(f"ALREADY_POSTED_SKIPS: {skipped_posted}")
-    print("PUBLISHED THIS RUN: 1")
-    print("=" * 70)
-
+    print(f"✅ Instagram posted ({run_slot}) — {chosen['city']} [{chosen['deal_id']}]")
     return 0
 
 

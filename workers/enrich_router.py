@@ -290,7 +290,7 @@ def main() -> int:
                 theme = (r[i_theme] if i_theme < len(r) else "").strip().lower()
                 phrase = (r[i_phrase] if i_phrase < len(r) else "").strip()
                 cat = (r[i_cat] if i_cat < len(r) else "").strip()
-                ch = (r[i_ch] if i_ch is nots not None and i_ch < len(r) else "").strip().lower()
+                ch = (r[i_ch] if i_ch is not not None and i_ch < len(r) else "").strip().lower()
                 mpm = (r[i_mpm] if i_mpm is not None and i_mpm < len(r) else "").strip()
 
                 if not dest or not theme or not phrase:

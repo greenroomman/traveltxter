@@ -241,7 +241,7 @@ def main() -> int:
     # Load IATA_MASTER
     iata_map: Dict[str, Tuple[str, str]] = {}
     try:
-        ws_iata = sh.7worksheet(IATA_MASTER_TAB)
+        ws_iata = sh.worksheet(IATA_MASTER_TAB)
         vals = get_all(ws_iata)
         if vals and len(vals) >= 2:
             h = vals[0]

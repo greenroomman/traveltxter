@@ -211,4 +211,204 @@ def build_rdv_map(rdv_values: List[List[str]]) -> Dict[str, Dict[str, str]]:
     i_verdict = col_i(headers, "worthiness_verdict")
     i_reject = col_i(headers, "hard_reject")
 
-    out: Dict[str]()
+    out: Dict[str, Dict[str, str]] = {}
+    for row in rdv_values[1:]:
+        did = (row[i_deal] if i_deal < len(row) else "").strip()
+        if not did:
+            continue
+        out[did] = {
+            "score": (row[i_score] if i_score is not None and i_score < len(row) else "").strip(),
+            "verdict": (row[i_verdict] if i_verdict is not None and i_verdict < len(row) else "").strip(),
+            "hard_reject": (row[i_reject] if i_reject is not None and i_reject < len(row) else "").strip(),
+        }
+    return out
+
+
+def truthy(v: str) -> bool:
+    x = (v or "").strip().lower()
+    return x in ("true", "1", "yes", "y", "hard_reject", "reject")
+
+
+def safe_float(v: str) -> Optional[float]:
+    v = (v or "").strip()
+    if not v:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Scoring fallback (cheap)
+# -----------------------------
+def fallback_score(price_gbp: str, stops: str) -> float:
+    """
+    A deliberately simple, deterministic fallback if RDV isn't available.
+    Higher is better. Range ~0-100.
+    """
+    p = safe_float(price_gbp) or 9999.0
+    s = safe_float(stops) or 0.0
+
+    # price component (very rough)
+    if p <= 120:
+        price_part = 85
+    elif p <= 180:
+        price_part = 75
+    elif p <= 260:
+        price_part = 65
+    elif p <= 350:
+        price_part = 55
+    else:
+        price_part = 40
+
+    # friction penalty
+    friction = 10 * min(2.0, s)  # stops 0..2 => 0..20
+    return max(0.0, min(100.0, price_part - friction))
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> int:
+    RAW_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
+    RDV_TAB = _env("RAW_DEALS_VIEW_TAB", _env("RAW_DEALS_VIEW", "RAW_DEALS_VIEW"))
+
+    BOTH_SCORE = _env_float("SCORER_BOTH_SCORE", 80.0)
+    MIN_AGE = _env_int("MIN_INGEST_AGE_SECONDS", 90)
+
+    gc = gspread_client()
+    sh = open_sheet(gc)
+
+    ws_raw = sh.worksheet(RAW_TAB)
+    raw_values = get_all(ws_raw)
+    if not raw_values or len(raw_values) < 2:
+        log("RAW_DEALS empty. Nothing to score.")
+        return 0
+
+    headers = raw_values[0]
+    idx_status = col_i(headers, "status")
+    idx_deal = col_i(headers, "deal_id")
+    idx_ingest = col_i(headers, "ingested_at_utc")
+    idx_price = col_i(headers, "price_gbp")
+    idx_stops = col_i(headers, "stops")
+
+    idx_publish_window = col_i(headers, "publish_window")
+    idx_score = col_i(headers, "score")
+    idx_scored_ts = col_i(headers, "scored_timestamp")
+
+    missing_core = [n for n, i in [
+        ("deal_id", idx_deal),
+        ("status", idx_status),
+        ("ingested_at_utc", idx_ingest),
+    ] if i is None]
+    if missing_core:
+        raise RuntimeError(f"RAW_DEALS missing required headers: {missing_core}")
+
+    # Optional RDV read
+    rdv_map: Dict[str, Dict[str, str]] = {}
+    try:
+        ws_rdv = sh.worksheet(RDV_TAB)
+        rdv_values = get_all(ws_rdv)
+        rdv_map = build_rdv_map(rdv_values)
+        if rdv_map:
+            log(f"✅ RDV loaded for scoring signals: {len(rdv_map)} deal_ids indexed")
+        else:
+            log("ℹ️ RDV present but no usable mapping found (missing deal_id/score columns). Using fallback scoring.")
+    except Exception:
+        log("⚠️ RDV not available (non-fatal). Using fallback scoring.")
+
+    now = dt.datetime.now(dt.timezone.utc)
+    serial_now = sheets_serial(now)
+
+    # Build updates
+    cells: List[gspread.cell.Cell] = []
+    scanned = 0
+    eligible = 0
+    wrote_publish = 0
+    wrote_scored = 0
+    wrote_reject = 0
+
+    for r_i, row in enumerate(raw_values[1:], start=2):  # sheet row number
+        scanned += 1
+
+        status = (row[idx_status] if idx_status < len(row) else "").strip().upper()
+        if status != "NEW":
+            continue
+
+        deal_id = (row[idx_deal] if idx_deal < len(row) else "").strip()
+        if not deal_id:
+            continue
+
+        ing = (row[idx_ingest] if idx_ingest < len(row) else "").strip()
+        ts = parse_iso_utc(ing)
+        if not ts:
+            continue
+
+        # too fresh guard
+        if (now - ts).total_seconds() < MIN_AGE:
+            continue
+
+        eligible += 1
+
+        # resolve score/verdict
+        rdv = rdv_map.get(deal_id, {})
+        rdv_score = safe_float(rdv.get("score", ""))
+        rdv_verdict = (rdv.get("verdict", "") or "").strip().upper()
+        hard_reject = truthy(rdv.get("hard_reject", "")) or rdv_verdict.startswith("HARD REJECT")
+
+        price = (row[idx_price] if idx_price is not None and idx_price < len(row) else "").strip()
+        stops = (row[idx_stops] if idx_stops is not None and idx_stops < len(row) else "").strip()
+
+        score = rdv_score if rdv_score is not None else fallback_score(price, stops)
+
+        # window
+        slot = infer_slot_from_ingest(ing)  # AM/PM
+        publish_window = slot
+
+        # status decision
+        if hard_reject:
+            new_status = "HARD_REJECT"
+            wrote_reject += 1
+        else:
+            if score >= BOTH_SCORE:
+                new_status = "PUBLISH_BOTH"
+                publish_window = "BOTH"
+                wrote_publish += 1
+            elif score >= 65:
+                new_status = "PUBLISH_" + slot
+                wrote_publish += 1
+            else:
+                new_status = "SCORED"
+                wrote_scored += 1
+
+        # write-back (only if columns exist)
+        def set_cell(idx: Optional[int], value: Any) -> None:
+            if idx is None:
+                return
+            cells.append(gspread.cell.Cell(row=r_i, col=idx + 1, value=value))
+
+        set_cell(idx_status, new_status)
+        set_cell(idx_publish_window, publish_window)
+        set_cell(idx_score, f"{score:.1f}")
+        if idx_scored_ts is not None:
+            # numeric serial for formula math
+            set_cell(idx_scored_ts, f"{serial_now:.8f}")
+
+    log(
+        f"Eligible NEW candidates: {eligible} | "
+        f"PUBLISH={wrote_publish} SCORED={wrote_scored} HARD_REJECT={wrote_reject}"
+    )
+
+    if not cells:
+        log("✅ No status changes needed (idempotent).")
+        return 0
+
+    # Batch write
+    ws_raw.update_cells(cells, value_input_option="USER_ENTERED")
+    log(f"✅ Wrote {len(cells)} cell updates to RAW_DEALS.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

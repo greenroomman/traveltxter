@@ -52,7 +52,7 @@ def gspread_client() -> gspread.Client:
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON or GCP_SA_JSON_ONE_LINE")
 
-    # Be robust to either raw JSON or escaped-newline variants
+    # Robust to either raw JSON or escaped-newline variants
     try:
         info = json.loads(raw)
     except Exception:
@@ -84,8 +84,25 @@ def stable_pick(items: List[Dict[str, Any]], key_seed: str) -> Optional[Dict[str
     return items[idx]
 
 
-def month_key_utc(now: dt.datetime) -> str:
-    return now.strftime("%Y-%m")
+# ----------------------------
+# Headers
+# ----------------------------
+def build_header_index(headers: List[str]) -> Tuple[Dict[str, int], Dict[str, List[int]]]:
+    """
+    Returns:
+      primary_idx: norm_header -> first index
+      dups: norm_header -> all indices (len>1)
+    """
+    normed = [_norm(h) for h in headers]
+    all_idx: Dict[str, List[int]] = {}
+    for j, h in enumerate(normed):
+        if not h:
+            continue
+        all_idx.setdefault(h, []).append(j)
+
+    primary_idx = {h: idxs[0] for h, idxs in all_idx.items()}
+    dups = {h: idxs for h, idxs in all_idx.items() if len(idxs) > 1}
+    return primary_idx, dups
 
 
 # ----------------------------
@@ -105,19 +122,22 @@ def main() -> int:
     PHRASE_BANK_TAB = _env("PHRASE_BANK_TAB", "PHRASE_BANK") or _env("PHRASES_TAB", "PHRASE_BANK")
     IATA_MASTER_TAB = _env("IATA_MASTER_TAB", "IATA_MASTER")
 
-    # "Channel" is optional governance. Your sample "Destination-specific" should NOT filter anything.
     PHRASE_CHANNEL = _env("PHRASE_CHANNEL", "vip").lower()  # vip/free/ig
     MAX_ROWS_PER_RUN = _env_int("ENRICH_MAX_ROWS_PER_RUN", 60)
     ENFORCE_MAX_PER_MONTH = _env_bool("ENFORCE_MAX_PER_MONTH", True)
     REQUIRE_PHRASE = _env_bool("REQUIRE_PHRASE", False)
 
+    # ✅ V5 contract: enrich happens AFTER scorer marks publishability.
+    # Include legacy + new minimal states.
     ELIGIBLE_STATUSES = {
-        "SCORED",
-        "READY_TO_POST",
-        "READY_TO_PUBLISH",
-        "PUBLISH_AM",
-        "PUBLISH_PM",
-        "PUBLISH_BOTH",
+        "PUBLISH_READY",      # V5 minimal publishable state
+        "SCORED",             # if you still use this
+        "READY_TO_POST",      # legacy
+        "READY_TO_PUBLISH",   # legacy
+        "PUBLISH_AM",         # legacy
+        "PUBLISH_PM",         # legacy
+        "PUBLISH_BOTH",       # legacy
+        "VIP_DONE",           # optional: allow phrase fills even after VIP post
     }
 
     log(f"{RAW_TAB= } | {PHRASE_BANK_TAB= } | {IATA_MASTER_TAB= }")
@@ -138,22 +158,28 @@ def main() -> int:
     t0 = dt.datetime.now(dt.timezone.utc)
     iata_values = ws_iata.get_all_values()
     iata_map: Dict[str, Tuple[str, str]] = {}
+
     if iata_values and len(iata_values) >= 2:
-        i_hdr = [_norm(h) for h in iata_values[0]]
-        i_idx = {h: j for j, h in enumerate(i_hdr) if h}
+        i_idx, i_dups = build_header_index(iata_values[0])
+        if i_dups:
+            log(f"⚠️ IATA_MASTER duplicate headers (normed): {i_dups}")
+
         c_iata = i_idx.get("iata_code")
         c_city = i_idx.get("city")
         c_country = i_idx.get("country")
 
-        if c_iata is not None:
-            for r in iata_values[1:]:
-                code = (r[c_iata] if c_iata < len(r) else "").strip().upper()
-                if not code:
-                    continue
-                city = (r[c_city] if c_city is not None and c_city < len(r) else "").strip()
-                country = (r[c_country] if c_country is not None and c_country < len(r) else "").strip()
-                if code not in iata_map:
-                    iata_map[code] = (city, country)
+        if c_iata is None:
+            log("❌ IATA_MASTER missing required header: iata_code")
+            return 1
+
+        for r in iata_values[1:]:
+            code = (r[c_iata] if c_iata < len(r) else "").strip().upper()
+            if not code:
+                continue
+            city = (r[c_city] if c_city is not None and c_city < len(r) else "").strip()
+            country = (r[c_country] if c_country is not None and c_country < len(r) else "").strip()
+            if code not in iata_map:
+                iata_map[code] = (city, country)
 
     log(f"✅ IATA_MASTER indexed: {len(iata_map)} entries ({(dt.datetime.now(dt.timezone.utc)-t0).total_seconds():.1f}s)")
 
@@ -167,11 +193,12 @@ def main() -> int:
     phrase_rows: List[Dict[str, Any]] = []
 
     if phr_values and len(phr_values) >= 2:
-        p_hdr = [_norm(h) for h in phr_values[0]]
-        p_idx = {h: j for j, h in enumerate(p_hdr) if h}
+        p_idx, p_dups = build_header_index(phr_values[0])
+        if p_dups:
+            log(f"⚠️ PHRASE_BANK duplicate headers (normed): {p_dups}")
 
         def pv(row: List[str], h: str) -> str:
-            j = p_idx.get(h)
+            j = p_idx.get(_norm(h))
             return (row[j] if j is not None and j < len(row) else "").strip()
 
         for r in phr_values[1:]:
@@ -185,8 +212,9 @@ def main() -> int:
 
             dest_iata = pv(r, "destination_iata").upper()
             theme = pv(r, "theme").lower()
-            channel_hint = pv(r, "channel_hint").strip()  # do NOT force lower; may be descriptive
+            channel_hint = pv(r, "channel_hint").strip()
             max_per_month = pv(r, "max_per_month")
+
             try:
                 mpm = int(max_per_month) if max_per_month else 0
             except Exception:
@@ -212,66 +240,59 @@ def main() -> int:
     # ----------------------------
     # Load RAW_DEALS
     # ----------------------------
-    t2 = dt.datetime.now(dt.timezone.utc)
     raw_values = ws_raw.get_all_values()
     if not raw_values or len(raw_values) < 2:
         log("❌ RAW_DEALS empty.")
         return 1
 
     hdr = raw_values[0]
-    hnorm = [_norm(h) for h in hdr]
-    hidx = {h: j for j, h in enumerate(hnorm) if h}
+    hidx, hdups = build_header_index(hdr)
+    if hdups:
+        log(f"⚠️ RAW_DEALS duplicate headers detected (normed): {hdups}")
 
     def col(name: str) -> Optional[int]:
         return hidx.get(_norm(name))
 
+    # required
     c_status = col("status")
     c_deal_id = col("deal_id")
     c_origin_iata = col("origin_iata")
     c_dest_iata = col("destination_iata")
 
-    c_origin_city = col("origin_city")
-    c_dest_city = col("destination_city")
-    c_dest_country = col("destination_country")
-
-    # Theme resolution: prefer theme (new V5), else deal_theme (legacy)
-    c_theme = col("theme")
-    c_deal_theme = col("deal_theme")
-
-    # Phrase destination column: prefer phrase_bank (if you keep it), else phrase_used (your new header list)
-    c_phrase_bank = col("phrase_bank")
-    c_phrase_used = col("phrase_used")
-
-    # For monthly governance counting (read-only)
-    c_post_vip = col("posted_vip_at") or col("posted_telegram_vip_at")
-    c_post_free = col("posted_free_at") or col("posted_telegram_free_at")
-    c_post_ig = col("posted_instagram_at")
-
-    needed = {"status": c_status, "deal_id": c_deal_id, "origin_iata": c_origin_iata, "destination_iata": c_dest_iata}
-    missing = [k for k, v in needed.items() if v is None]
+    missing = [n for n, c in [("status", c_status), ("deal_id", c_deal_id), ("origin_iata", c_origin_iata), ("destination_iata", c_dest_iata)] if c is None]
     if missing:
         log(f"❌ RAW_DEALS missing required headers: {missing}")
         return 1
 
-    # Choose phrase write target
-    phrase_target_name = "phrase_bank" if c_phrase_bank is not None else ("phrase_used" if c_phrase_used is not None else "")
-    phrase_target_col = c_phrase_bank if c_phrase_bank is not None else c_phrase_used
+    # optional enrich targets
+    c_origin_city = col("origin_city")
+    c_dest_city = col("destination_city")
+    c_dest_country = col("destination_country")
+
+    c_theme = col("theme")
+
+    # phrase outputs
+    c_phrase_used = col("phrase_used")
+    c_phrase_bank = col("phrase_bank")
+    c_phrase_category = col("phrase_category")
+
+    # choose write targets deterministically
+    phrase_target_col = c_phrase_used if c_phrase_used is not None else c_phrase_bank
+    phrase_target_name = "phrase_used" if c_phrase_used is not None else ("phrase_bank" if c_phrase_bank is not None else "")
+
     if not phrase_target_name:
-        log("⚠️ RAW_DEALS has no phrase_bank or phrase_used column. Phrase fill disabled.")
+        log("⚠️ RAW_DEALS has no phrase_used or phrase_bank column. Phrase fill disabled.")
     else:
         log(f"🧩 Phrase write target: {phrase_target_name}")
 
-    # Monthly usage index: count phrases already used (simple, cheap, deterministic)
-    now = dt.datetime.now(dt.timezone.utc)
-    mkey = month_key_utc(now)
+    # monthly usage index (simple: count phrases already present in the sheet)
     usage: Dict[str, int] = {}
     if c_phrase_used is not None:
         for r in raw_values[1:]:
             pu = (r[c_phrase_used] if c_phrase_used < len(r) else "").strip()
             if pu:
                 usage[pu] = usage.get(pu, 0) + 1
-
-    log(f"✅ Phrase usage index built (month bucket {mkey}): {len(usage)} unique phrases")
+    log(f"✅ Phrase usage index built: {len(usage)} unique phrases")
 
     # ----------------------------
     # Enrichment loop (batch updates)
@@ -281,6 +302,7 @@ def main() -> int:
     enriched_rows = 0
     cityfills = 0
     phrasefills = 0
+    phrasecatfills = 0
     phrase_misses = 0
 
     updates: List[gspread.Cell] = []
@@ -302,9 +324,8 @@ def main() -> int:
         if not items:
             return []
 
-        # Only treat channel_hint as a "real channel filter" if it's one of these.
+        # Only treat channel_hint as a strict filter if it's a real channel keyword.
         real_channels = {"vip", "free", "ig", "all"}
-
         out: List[Dict[str, Any]] = []
         for it in items:
             ch = (it.get("channel_hint") or "").strip().lower()
@@ -312,9 +333,7 @@ def main() -> int:
                 if ch == "all" or ch == PHRASE_CHANNEL:
                     out.append(it)
             else:
-                # Descriptive hint (e.g. "Destination-specific") → do not filter.
-                out.append(it)
-
+                out.append(it)  # descriptive label, not a filter
         return out or items
 
     def governance_ok(pr: Dict[str, Any]) -> bool:
@@ -341,36 +360,31 @@ def main() -> int:
 
         origin_iata = getv(r, c_origin_iata).upper()
         dest_iata = getv(r, c_dest_iata).upper()
-        theme_resolved = (getv(r, c_theme) or getv(r, c_deal_theme)).strip().lower()
+        theme_resolved = getv(r, c_theme).strip().lower()
 
         row_had_update = False
 
         # 1) City/country fills
         if iata_map:
-            # destination
-            dest_city = getv(r, c_dest_city)
-            dest_country = getv(r, c_dest_country)
             if dest_iata and dest_iata in iata_map:
                 city_name, country_name = iata_map[dest_iata]
-                if c_dest_city is not None and not dest_city and city_name:
+                if c_dest_city is not None and not getv(r, c_dest_city) and city_name:
                     queue_cell(i, c_dest_city, city_name)
                     cityfills += 1
                     row_had_update = True
-                if c_dest_country is not None and not dest_country and country_name:
+                if c_dest_country is not None and not getv(r, c_dest_country) and country_name:
                     queue_cell(i, c_dest_country, country_name)
                     cityfills += 1
                     row_had_update = True
 
-            # origin city only (your IATA_MASTER doesn't include origin country as a RAW_DEALS field in your new schema)
-            org_city = getv(r, c_origin_city)
-            if origin_iata and origin_iata in iata_map and c_origin_city is not None and not org_city:
-                city_name, _country_name = iata_map[origin_iata]
-                if city_name:
+            if origin_iata and origin_iata in iata_map:
+                city_name, _country = iata_map[origin_iata]
+                if c_origin_city is not None and not getv(r, c_origin_city) and city_name:
                     queue_cell(i, c_origin_city, city_name)
                     cityfills += 1
                     row_had_update = True
 
-        # 2) Phrase fill
+        # 2) Phrase fill (+ phrase_category)
         if phrase_target_col is not None:
             existing_phrase = getv(r, phrase_target_col)
             if not existing_phrase:
@@ -384,12 +398,18 @@ def main() -> int:
                     phrasefills += 1
                     usage[phrase] = usage.get(phrase, 0) + 1
                     row_had_update = True
+
+                    # also write phrase_category if the column exists and it's empty
+                    if c_phrase_category is not None and not getv(r, c_phrase_category):
+                        cat = (chosen.get("category") or "").strip()
+                        if cat:
+                            queue_cell(i, c_phrase_category, cat)
+                            phrasecatfills += 1
+                            row_had_update = True
                 else:
                     if dest_iata and theme_resolved:
                         phrase_misses += 1
-                        if REQUIRE_PHRASE:
-                            # leave blank; downstream can gate if you choose
-                            pass
+                        # if REQUIRE_PHRASE, downstream can gate; we do not change status here
 
         if row_had_update:
             enriched_rows += 1
@@ -400,6 +420,7 @@ def main() -> int:
     log(f"Rows enriched: {enriched_rows} (cap {MAX_ROWS_PER_RUN})")
     log(f"City/Country fills: {cityfills}")
     log(f"Phrase fills: {phrasefills} (channel={PHRASE_CHANNEL})")
+    log(f"Phrase category fills: {phrasecatfills}")
     log(f"Phrase misses: {phrase_misses}")
     log(f"Cells written (batch): {len(updates)}")
 

@@ -22,7 +22,7 @@
 # NEVER WRITES
 # - status / publish_window / score / posted timestamps / RDV
 #
-# IDPOTENT
+# IDEMPOTENT
 # - does not overwrite existing non-empty cells
 
 from __future__ import annotations
@@ -78,9 +78,7 @@ def _norm_header(h: str) -> str:
 
 
 def header_map_first(headers: List[str]) -> Dict[str, int]:
-    """
-    Duplicate header safe: first occurrence wins.
-    """
+    """Duplicate-header-safe: first occurrence wins."""
     m: Dict[str, int] = {}
     for i, h in enumerate(headers):
         nh = _norm_header(h)
@@ -112,8 +110,15 @@ def _strip_control_chars(s: str) -> str:
 
 
 def _maybe_b64_decode(s: str) -> Optional[str]:
+    """
+    If secret is base64, decode it.
+    If it isn't, return None.
+    """
     t = (s or "").strip()
     if not t:
+        return None
+    # fast reject: if it contains obvious JSON markers, it's not base64
+    if t.startswith("{") and '"private_key"' in t:
         return None
     if not re.fullmatch(r"[A-Za-z0-9+/=\s]+", t):
         return None
@@ -128,14 +133,18 @@ def _maybe_b64_decode(s: str) -> Optional[str]:
 
 def _repair_private_key_field(raw: str) -> str:
     """
-    If private_key contains literal newlines inside the JSON string, re-escape as \\n.
+    Make private_key safe for json.loads:
+    - If the JSON has literal line breaks inside the private_key string,
+      convert them to \\n escapes.
     """
     pat = re.compile(r'("private_key"\s*:\s*")(.+?)(")', re.DOTALL)
     m = pat.search(raw)
     if not m:
         return raw
     prefix, pk, suffix = m.group(1), m.group(2), m.group(3)
+
     pk_fixed = pk.replace("\r\n", "\n").replace("\r", "\n")
+    # escape backslashes then escape newlines
     pk_fixed = pk_fixed.replace("\\", "\\\\").replace("\n", "\\n")
     return raw[: m.start()] + prefix + pk_fixed + suffix + raw[m.end() :]
 
@@ -153,27 +162,30 @@ def load_sa_info() -> Dict[str, Any]:
 
     raw = _repair_private_key_field(raw)
 
-    # strict parse
+    # Attempt 1: strict JSON
     try:
-        return json.loads(raw)
+        info = json.loads(raw)
+        return info
     except json.JSONDecodeError:
         pass
 
-    # try converting \\n to real newlines (common secret style)
+    # Attempt 2: common pattern where key contains \\n and code needs real \n
     try:
-        return json.loads(raw.replace("\\n", "\n"))
+        info = json.loads(raw.replace("\\n", "\n"))
+        return info
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Service account JSON could not be parsed: {e}") from e
 
 
 def gspread_client() -> gspread.Client:
     info = load_sa_info()
-
     pk = (info.get("private_key") or "").strip()
+
+    # Hard guard: this is the exact failure you were seeing.
     if "BEGIN PRIVATE KEY" not in pk:
         raise RuntimeError(
             "Service account JSON loaded but private_key looks malformed. "
-            "Use ONE-LINE JSON (recommended) or ensure private_key contains \\n escapes."
+            "Ensure GitHub secret contains the full JSON with a valid private_key."
         )
 
     creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPE)
@@ -223,6 +235,7 @@ def main() -> int:
     log(f"RAW_TAB='{RAW_TAB}' | PHRASE_BANK_TAB='{PHRASE_BANK_TAB}' | IATA_MASTER_TAB='{IATA_MASTER_TAB}'")
     log(f"PHRASE_CHANNEL='{PHRASE_CHANNEL}' | MAX_ROWS_PER_RUN={MAX_ROWS}")
     log(f"ENFORCE_MAX_PER_MONTH={ENFORCE_MAX_PER_MONTH} | REQUIRE_PHRASE={REQUIRE_PHRASE}")
+    log(f"ELIGIBLE_STATUSES={sorted(ELIGIBLE_STATUSES)}")
 
     sid = env("SPREADSHEET_ID") or env("SHEET_ID")
     if not sid:
@@ -241,7 +254,8 @@ def main() -> int:
     h = header_map_first(headers)
 
     # Required reads
-    for req in ["deal_id", "status", "origin_iata", "destination_iata", "theme"]:
+    required_reads = ["deal_id", "status", "origin_iata", "destination_iata", "theme"]
+    for req in required_reads:
         if _norm_header(req) not in h:
             raise RuntimeError(f"RAW_DEALS missing required header for enrich: {req}")
 
@@ -307,7 +321,6 @@ def main() -> int:
             for r in vals[1:]:
                 if not truthy(getv(r, i_appr)):
                     continue
-
                 dest = getv(r, i_dest).upper()
                 th = getv(r, i_th).lower()
                 phr = getv(r, i_phrase)
@@ -330,13 +343,19 @@ def main() -> int:
     usage: Dict[str, int] = {}
     now = dt.datetime.now(dt.timezone.utc)
     month_prefix = now.strftime("%Y-%m")  # matches ISO timestamps
-    posted_cols = [h.get("posted_vip_at"), h.get("posted_free_at"), h.get("posted_instagram_at")]
+
+    posted_cols = [
+        h.get("posted_vip_at"),
+        h.get("posted_free_at"),
+        h.get("posted_instagram_at"),
+    ]
 
     if c_phrase_used is not None:
         for r in data[1:]:
             phrase_text = getv(r, c_phrase_used)
             if not phrase_text:
                 continue
+
             ts = ""
             for ci in posted_cols:
                 if ci is None:
@@ -344,14 +363,16 @@ def main() -> int:
                 ts = getv(r, ci)
                 if ts:
                     break
+
             if ts.startswith(month_prefix):
                 usage[phrase_text] = usage.get(phrase_text, 0) + 1
 
     def channel_ok(p: Dict[str, Any]) -> bool:
         ch = (p.get("channel_hint") or "").strip().lower()
+        # Only enforce when it is explicitly a channel gate
         if ch in ("vip", "free", "ig", "all"):
             return ch == "all" or ch == PHRASE_CHANNEL
-        return True  # treat descriptive hints as non-blocking
+        return True
 
     def governance_ok(p: Dict[str, Any]) -> bool:
         if not ENFORCE_MAX_PER_MONTH:
@@ -379,9 +400,11 @@ def main() -> int:
 
     for row_num, r in enumerate(data[1:], start=2):
         scanned += 1
+
         status = getv(r, c_status).upper()
         if status not in ELIGIBLE_STATUSES:
             continue
+
         deal_id = getv(r, c_deal_id)
         if not deal_id:
             continue
@@ -431,9 +454,9 @@ def main() -> int:
                         queue(row_num, c_phrase_cat + 1, cat)
                         row_changed = True
             else:
-                if REQUIRE_PHRASE:
-                    # Do not write anything; upstream policy can handle missing phrase.
-                    pass
+                # If phrase is mandatory, we still don't write status here.
+                # Upstream can decide what to do with missing phrase.
+                pass
 
         if row_changed:
             changed_rows += 1

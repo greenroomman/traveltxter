@@ -7,13 +7,17 @@ PURPOSE
 - Assign a numeric score (0–99).
 - Promote up to WINNERS_PER_RUN to status=READY_TO_POST.
 - Mark remaining NEW rows as SCORED.
-- Optionally HARD_REJECT invalid rows (non-GBP, missing price/dates/timestamps).
+- Optionally HARD_REJECT invalid rows (non-GBP, missing price/dates, etc).
 
 CONTRACT (V5 MINIMAL)
 - RAW_DEALS is the single writable truth.
 - RAW_DEALS_VIEW is read-only; scorer may read it (optional) but must never write to it.
 - Downstream workers READ status.
 - Publishers change status after posting (not scorer).
+
+KEY FIX (2026-02-05)
+- Scorer no longer requires ingested_at_utc to be parseable to score a NEW row.
+- MIN_INGEST_AGE_SECONDS is best-effort: applied only when ingested_at_utc parses.
 """
 
 from __future__ import annotations
@@ -241,7 +245,7 @@ class DealRow:
     price_gbp: Optional[float]
     currency: str
     stops: Optional[int]
-    ingested_at_utc: str
+    ingested_at_utc: str  # stored, but NOT required to be parseable
 
 
 def _compute_scores_by_price(prices: List[float]) -> Dict[float, float]:
@@ -263,7 +267,6 @@ def _compute_scores_by_price(prices: List[float]) -> Dict[float, float]:
         z = (p - q1) / span
         score = 85.0 - (z * 30.0)
         score = max(1.0, min(99.0, score))
-        # keep best score for same price
         out[p] = max(out.get(p, 0.0), score)
     return out
 
@@ -281,7 +284,8 @@ OPS_SLOT_CELL = os.environ.get("OPS_SLOT_CELL", "A2")    # V5: AM/PM label
 def main() -> int:
     log("📥 TravelTxter V5 — AI_SCORER start")
 
-    min_age_seconds = _env_int("MIN_INGEST_AGE_SECONDS", 90)
+    # Best-effort freshness gate (applied only when ingest parses)
+    min_age_seconds = _env_int("MIN_INGEST_AGE_SECONDS", 0)
     winners_per_run = _env_int("WINNERS_PER_RUN", 2)
 
     gc = gspread_client()
@@ -306,7 +310,6 @@ def main() -> int:
         "price_gbp",
         "currency",
         "stops",
-        "ingested_at_utc",
         "publish_window",
         "score",
     ]
@@ -315,9 +318,12 @@ def main() -> int:
         raise RuntimeError(f"{RAW_TAB} schema missing required columns: {missing}")
 
     has_theme_col = "theme" in hmap
+    has_ingest_col = "ingested_at_utc" in hmap
     has_scored_ts = "scored_timestamp" in hmap
     if not has_scored_ts:
         log(f"ℹ️ {RAW_TAB} missing 'scored_timestamp' column. Timestamp write-back will be skipped.")
+    if not has_ingest_col:
+        log(f"ℹ️ {RAW_TAB} missing 'ingested_at_utc' column. Freshness gate disabled.")
 
     # Optional RDV theme signal
     rdv_theme_by_id = _load_rdv_dynamic_theme_index(sh, RDV_TAB)
@@ -339,9 +345,9 @@ def main() -> int:
     seen_new = 0
     skipped_status_not_new = 0
     skipped_missing_deal_id = 0
-    skipped_missing_ingest = 0
-    skipped_unparseable_ingest = 0
-    skipped_too_fresh = 0
+    ingest_blank = 0
+    ingest_unparseable = 0
+    skipped_too_fresh = 0  # only when ingest parses
 
     new_rows: List[DealRow] = []
 
@@ -363,20 +369,24 @@ def main() -> int:
             skipped_missing_deal_id += 1
             continue
 
-        ing = col("ingested_at_utc")
-        if not ing:
-            skipped_missing_ingest += 1
-            continue
+        ing = col("ingested_at_utc") if has_ingest_col else ""
+        if has_ingest_col and not ing:
+            ingest_blank += 1
 
-        dt = _parse_iso_utc(ing)
-        if not dt:
-            skipped_unparseable_ingest += 1
-            continue
-
-        age_s = (now - dt).total_seconds()
-        if age_s < float(min_age_seconds):
-            skipped_too_fresh += 1
-            continue
+        # Best-effort freshness gate: ONLY if we can parse ingest
+        if min_age_seconds > 0 and ing:
+            dt_ing = _parse_iso_utc(ing)
+            if not dt_ing:
+                ingest_unparseable += 1
+            else:
+                age_s = (now - dt_ing).total_seconds()
+                if age_s < float(min_age_seconds):
+                    skipped_too_fresh += 1
+                    continue
+        elif has_ingest_col and ing:
+            # track parseability for forensics, but never block
+            if not _parse_iso_utc(ing):
+                ingest_unparseable += 1
 
         theme_row = (col("theme") if has_theme_col else "").strip()
         theme_signal = (rdv_theme_by_id.get(deal_id) or "").strip()
@@ -401,8 +411,7 @@ def main() -> int:
         f"eligible={len(new_rows)} "
         f"skipped_status_not_new={skipped_status_not_new} "
         f"skipped_missing_deal_id={skipped_missing_deal_id} "
-        f"skipped_missing_ingest={skipped_missing_ingest} "
-        f"skipped_unparseable_ingest={skipped_unparseable_ingest} "
+        f"ingest_blank={ingest_blank} ingest_unparseable={ingest_unparseable} "
         f"skipped_too_fresh={skipped_too_fresh}"
     )
 
@@ -434,7 +443,6 @@ def main() -> int:
     scored_items: List[Tuple[DealRow, float]] = []
     for d in promotable:
         base = float(price_scores.get(d.price_gbp or 0.0, 50.0))
-        # small friction penalty for stops
         if d.stops is not None:
             base -= float(d.stops) * 5.0
         base = max(1.0, min(99.0, base))
@@ -455,6 +463,9 @@ def main() -> int:
     hard_ct = 0
     off_theme_ct = 0
 
+    # Pre-map winner scores for O(1) lookup
+    winner_score_map: Dict[str, float] = {d.deal_id: sc for d, sc in winners}
+
     for d in new_rows:
         if d in hard_reject:
             set_cell(d.row_idx, "status", "HARD_REJECT")
@@ -465,18 +476,11 @@ def main() -> int:
             hard_ct += 1
             continue
 
-        # default score if not in promotable set
-        score_val = 50.0
         if d.deal_id in winner_ids:
-            # winner score
-            # look up computed score from scored_items
-            for row_obj, sc in winners:
-                if row_obj.deal_id == d.deal_id:
-                    score_val = sc
-                    break
+            sc = float(winner_score_map.get(d.deal_id, 75.0))
             set_cell(d.row_idx, "status", "READY_TO_POST")
             set_cell(d.row_idx, "publish_window", slot)
-            set_cell(d.row_idx, "score", round(score_val, 2))
+            set_cell(d.row_idx, "score", round(sc, 2))
             if has_scored_ts:
                 set_cell(d.row_idx, "scored_timestamp", now_iso)
             publish_ct += 1
@@ -484,8 +488,9 @@ def main() -> int:
             # non-winners become SCORED (even if off-theme); score is informative only
             if d.theme != theme_today:
                 off_theme_ct += 1
+
+            score_val = 50.0
             if d.price_gbp is not None:
-                # cheapness relative to nothing => keep stable mid-score with small price influence
                 score_val = max(1.0, min(99.0, 60.0 - (d.price_gbp / 50.0)))
             if d.stops is not None:
                 score_val -= float(d.stops) * 3.0

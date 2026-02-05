@@ -14,29 +14,26 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-
 # ============================================================
 # TRAVELTXTTER V5 — FEEDER (MINIMAL, CONFIG-DRIVEN)
-# PURPOSE:
-#   Insert NEW raw inventory rows into RAW_DEALS using Duffel.
 #
-# READS:
-#   - OPS_MASTER!B2 (theme_of_the_day)
-#   - CONFIG (route constraints + Pi inputs)
-#   - RAW_DEALS (dedupe + caps)
+# GOAL:
+#   Insert NEW raw inventory into RAW_DEALS using Duffel.
+#
+# READS (Sheets):
+#   - OPS_MASTER!B2            theme_of_the_day
+#   - OPS_MASTER!C2:C          active_themes (optional, for 90/10 drift)
+#   - CONFIG                   enabled,destination_iata,theme,weight
+#   - RAW_DEALS                dedupe (recent) + schema check
 #
 # WRITES:
-#   - RAW_DEALS: append NEW rows (status="NEW", ingested_at_utc ISO)
+#   - RAW_DEALS: append NEW rows
 #
 # DOES NOT:
-#   - score
-#   - enrich
-#   - render
-#   - publish
+#   - score, enrich, render, publish
 # ============================================================
 
 DUFFEL_API = "https://api.duffel.com"
-
 
 # ------------------------- ENV -------------------------
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or ""
@@ -50,16 +47,19 @@ MAX_SEARCHES = int(os.getenv("DUFFEL_MAX_SEARCHES_PER_RUN", "12"))
 MAX_INSERTS = int(os.getenv("DUFFEL_MAX_INSERTS", "50"))
 DESTS_PER_RUN = int(os.getenv("DUFFEL_ROUTES_PER_RUN", "6"))
 
-# When CONFIG has multiple eligible rows, we sample some variety
-RANDOM_SEED = os.getenv("FEEDER_RANDOM_SEED", "")
-SLEEP_SECONDS = float(os.getenv("FEEDER_SLEEP_SECONDS", "0.05"))
+# 90/10 drift (secondary theme budget). Set to 0 to fully lock.
+PRIMARY_PCT = float(os.getenv("FEEDER_PRIMARY_PCT", "0.90"))  # 0.90 -> 90/10
+PRIMARY_PCT = min(1.0, max(0.0, PRIMARY_PCT))
 
-# Cabin default if CONFIG blank
-DEFAULT_CABIN = os.getenv("DEFAULT_CABIN_CLASS", "economy")
+# Dedupe window: only look at the most recent N rows to avoid reading thousands
+DEDUP_READ_ROWS = int(os.getenv("FEEDER_DEDUP_READ_ROWS", "1500"))
+
+SLEEP_SECONDS = float(os.getenv("FEEDER_SLEEP_SECONDS", "0.05"))
+RANDOM_SEED = os.getenv("FEEDER_RANDOM_SEED", "")
+DEFAULT_CABIN = os.getenv("DEFAULT_CABIN_CLASS", "economy").lower().strip() or "economy"
 
 # ------------------------- RAW_DEALS CONTRACT -------------------------
-# Must exist as headers in row 1 of RAW_DEALS.
-RAW_DEALS_HEADERS = [
+RAW_DEALS_HEADERS_REQUIRED = [
     "deal_id",
     "origin_iata",
     "destination_iata",
@@ -83,16 +83,31 @@ RAW_DEALS_HEADERS = [
     "posted_free_at",
     "posted_instagram_at",
     "ingested_at_utc",
-    # NOTE: do NOT include duplicate headers like phrasse_used, etc.
 ]
 
-# ------------------------- CONFIG CONTRACT -------------------------
-# Your CONFIG headers (you pasted these) are supported:
-# enabled,priority,origin_iata,destination_iata,days_ahead_min,days_ahead_max,
-# trip_length_days,max_connections,included_airlines,cabin_class,search_weight,
-# audience_type,content_priority,seasonality_boost,active_in_feeder,gateway_type,
-# is_long_haul,primary_theme,slot_hint,reachability,short_stay_theme,
-# long_stay_winter_theme,long_stay_summer_theme,value_score
+# ------------------------- CONFIG CONTRACT (MINIMAL) -------------------------
+# enabled, destination_iata, theme, weight
+CONFIG_HEADERS_REQUIRED = ["enabled", "destination_iata", "theme", "weight"]
+
+
+# ------------------------- THEME DEFAULTS (minimal “brain”) -------------------------
+# If you want to tune these later, do it here (or move to ZTB later),
+# but keep CONFIG minimal.
+THEME_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "adventure": {"window": (21, 84), "trip": (6, 31), "max_conn": 1, "cabin": "economy"},
+    "beach_break": {"window": (21, 84), "trip": (5, 7), "max_conn": 0, "cabin": "economy"},
+    "city_breaks": {"window": (10, 84), "trip": (2, 5), "max_conn": 0, "cabin": "economy"},
+    "culture_history": {"window": (21, 84), "trip": (4, 7), "max_conn": 0, "cabin": "economy"},
+    "long_haul": {"window": (21, 84), "trip": (7, 14), "max_conn": 1, "cabin": "economy"},
+    "luxury_value": {"window": (21, 84), "trip": (4, 14), "max_conn": 1, "cabin": "economy"},
+    "northern_lights": {"window": (21, 84), "trip": (4, 8), "max_conn": 1, "cabin": "economy"},
+    "snow": {"window": (14, 84), "trip": (4, 8), "max_conn": 1, "cabin": "economy"},
+    "summer_sun": {"window": (21, 84), "trip": (5, 14), "max_conn": 1, "cabin": "economy"},
+    "surf": {"window": (21, 84), "trip": (5, 15), "max_conn": 1, "cabin": "economy"},
+    "unexpected_value": {"window": (7, 84), "trip": (3, 14), "max_conn": 1, "cabin": "economy"},
+    "winter_sun": {"window": (14, 84), "trip": (4, 10), "max_conn": 1, "cabin": "economy"},
+    "default": {"window": (21, 84), "trip": (4, 10), "max_conn": 1, "cabin": "economy"},
+}
 
 
 def log(msg: str) -> None:
@@ -100,24 +115,13 @@ def log(msg: str) -> None:
 
 
 def _normalize_sa_json(raw: str) -> Dict[str, Any]:
-    """
-    Robustly parse service account JSON from GitHub Secrets.
-    Handles either:
-      - one-line JSON
-      - JSON with escaped newlines \\n in private_key
-      - JSON with literal newlines in private_key
-    """
     raw = (raw or "").strip()
     if not raw:
         raise RuntimeError("Missing service account JSON (GCP_SA_JSON or GCP_SA_JSON_ONE_LINE).")
-
-    # Try as-is first
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-
-    # Try replacing escaped newlines
     try:
         return json.loads(raw.replace("\\n", "\n"))
     except json.JSONDecodeError as e:
@@ -142,209 +146,49 @@ def open_sheet(gc: gspread.Client) -> gspread.Spreadsheet:
     return gc.open_by_key(SPREADSHEET_ID)
 
 
-def get_ops_theme(sh: gspread.Spreadsheet) -> str:
-    ws = sh.worksheet(OPS_TAB)
-    theme = (ws.acell("B2").value or "").strip()
-    if not theme:
-        raise RuntimeError("OPS_MASTER!B2 (theme_of_the_day) is blank.")
-    return theme
-
-
-def _header_map(headers: List[str]) -> Dict[str, int]:
-    # maps header -> 0-based index
+def _hm(headers: List[str]) -> Dict[str, int]:
     return {h.strip(): i for i, h in enumerate(headers) if h and h.strip()}
 
 
-def read_table(ws: gspread.Worksheet) -> Tuple[List[str], List[List[Any]]]:
-    values = ws.get_all_values()
-    if not values or not values[0]:
-        return [], []
-    headers = [h.strip() for h in values[0]]
-    rows = values[1:]
-    return headers, rows
+def _is_true(v: Any) -> bool:
+    return str(v).strip().upper() == "TRUE"
 
 
-def ensure_raw_deals_headers(ws: gspread.Worksheet) -> Dict[str, int]:
-    headers, _ = read_table(ws)
-    if not headers:
-        raise RuntimeError("RAW_DEALS is empty. Row 1 must contain headers.")
-    hm = _header_map(headers)
-
-    missing = [h for h in RAW_DEALS_HEADERS if h not in hm]
-    if missing:
-        raise RuntimeError(f"RAW_DEALS missing required headers: {missing}")
-
-    # Also protect against accidental duplicate “phrase” columns etc.
-    if len(set(headers)) != len(headers):
-        raise RuntimeError("RAW_DEALS header row contains duplicates. Fix before running workers.")
-
-    return hm
-
-
-def build_existing_keys(raw_rows: List[List[Any]], hm: Dict[str, int]) -> set:
-    """
-    Dedupe key: origin|dest|out|in|cabin
-    """
-    keys = set()
-    for r in raw_rows:
-        try:
-            o = (r[hm["origin_iata"]] or "").strip()
-            d = (r[hm["destination_iata"]] or "").strip()
-            outd = (r[hm["outbound_date"]] or "").strip()
-            ind = (r[hm["return_date"]] or "").strip()
-            cab = (r[hm["cabin_class"]] or "").strip()
-        except Exception:
-            continue
-        if o and d and outd and ind and cab:
-            keys.add(f"{o}|{d}|{outd}|{ind}|{cab}")
-    return keys
-
-
-@dataclass
-class ConfigRoute:
-    origin: str
-    dest: str
-    days_min: int
-    days_max: int
-    trip_len: int
-    max_conn: int
-    included_airlines: str
-    cabin: str
-    search_weight: float   # Fi
-    value_score: float     # Vi
-    slot_hint: str
-    primary_theme: str
-    short_stay_theme: str
-    long_winter_theme: str
-    long_summer_theme: str
-
-    @property
-    def pi(self) -> float:
-        return float(self.search_weight) * float(self.value_score)
-
-
-def _to_int(x: Any, default: int) -> int:
+def _safe_float(v: Any, default: float) -> float:
     try:
-        if x is None or str(x).strip() == "":
+        if v is None or str(v).strip() == "":
             return default
-        return int(float(str(x).strip()))
+        return float(str(v).strip())
     except Exception:
         return default
 
 
-def _to_float(x: Any, default: float) -> float:
-    try:
-        if x is None or str(x).strip() == "":
-            return default
-        return float(str(x).strip())
-    except Exception:
-        return default
+def _theme_key(s: str) -> str:
+    return (s or "").strip().lower()
 
 
-def load_config_routes(sh: gspread.Spreadsheet, theme_today: str) -> List[ConfigRoute]:
-    ws = sh.worksheet(CONFIG_TAB)
-    headers, rows = read_table(ws)
-    if not headers:
-        raise RuntimeError("CONFIG is empty / missing headers.")
-
-    hm = _header_map(headers)
-
-    def col(name: str) -> int:
-        if name not in hm:
-            raise RuntimeError(f"CONFIG missing required header: {name}")
-        return hm[name]
-
-    eligible: List[ConfigRoute] = []
-
-    for r in rows:
-        # Guard: rows can be shorter than headers
-        if len(r) < len(headers):
-            r = r + [""] * (len(headers) - len(r))
-
-        enabled = str(r[col("enabled")]).strip().upper() == "TRUE"
-        active = str(r[col("active_in_feeder")]).strip().upper() == "TRUE"
-        if not (enabled and active):
-            continue
-
-        origin = str(r[col("origin_iata")]).strip()
-        dest = str(r[col("destination_iata")]).strip()
-        if not origin or not dest:
-            continue  # CONFIG is the brain: if origin/dest missing, route doesn't exist
-
-        # Theme match: accept if theme_today matches any of the theme columns.
-        primary_theme = str(r[col("primary_theme")]).strip()
-        short_theme = str(r[col("short_stay_theme")]).strip()
-        winter_theme = str(r[col("long_stay_winter_theme")]).strip()
-        summer_theme = str(r[col("long_stay_summer_theme")]).strip()
-
-        theme_match = theme_today in {primary_theme, short_theme, winter_theme, summer_theme}
-        if not theme_match:
-            continue
-
-        days_min = _to_int(r[col("days_ahead_min")], 21)
-        days_max = _to_int(r[col("days_ahead_max")], 84)
-        trip_len = _to_int(r[col("trip_length_days")], 7)
-        max_conn = _to_int(r[col("max_connections")], 1)
-
-        inc_air = str(r[col("included_airlines")]).strip()  # "ANY" or "BA,U2,FR"
-        cabin = str(r[col("cabin_class")]).strip().lower() or DEFAULT_CABIN
-
-        Fi = _to_float(r[col("search_weight")], 0.5)
-        Vi = _to_float(r[col("value_score")], 0.5)
-
-        slot_hint = str(r[col("slot_hint")]).strip().upper()  # optional: AM/PM/BOTH/blank
-
-        eligible.append(
-            ConfigRoute(
-                origin=origin,
-                dest=dest,
-                days_min=days_min,
-                days_max=days_max,
-                trip_len=trip_len,
-                max_conn=max_conn,
-                included_airlines=inc_air,
-                cabin=cabin,
-                search_weight=Fi,
-                value_score=Vi,
-                slot_hint=slot_hint or "BOTH",
-                primary_theme=primary_theme,
-                short_stay_theme=short_theme,
-                long_winter_theme=winter_theme,
-                long_summer_theme=summer_theme,
-            )
-        )
-
-    return eligible
-
-
-def mmdd_now_utc() -> int:
-    return int(datetime.now(timezone.utc).strftime("%m%d"))
-
-
-def pick_dates(days_min: int, days_max: int, trip_len: int, k: int = 1) -> List[Tuple[str, str]]:
+def get_origins_for_theme(theme: str) -> List[str]:
     """
-    Deterministic date picks: evenly spaced within window.
-    Returns ISO yyyy-mm-dd for out/in.
+    Origins live in ENV (your variables). Example: ORIGINS_NORTHERN_LIGHTS.
+    If missing, fall back to ORIGINS_DEFAULT.
     """
-    today = datetime.now(timezone.utc).date()
-    days_min = max(1, days_min)
-    days_max = max(days_min, days_max)
-    span = days_max - days_min
+    t = theme.upper()
+    key = f"ORIGINS_{t}"
+    raw = os.getenv(key) or os.getenv("ORIGINS_DEFAULT") or "LHR,MAN,LGW"
+    origins = [o.strip().upper() for o in raw.split(",") if o.strip()]
+    # de-dupe while preserving order
+    seen = set()
+    out: List[str] = []
+    for o in origins:
+        if o not in seen:
+            seen.add(o)
+            out.append(o)
+    return out
 
-    outs: List[int] = []
-    if k <= 1 or span == 0:
-        outs = [days_min + span // 2]
-    else:
-        step = max(1, span // (k - 1))
-        outs = [days_min + i * step for i in range(k)]
-        outs = [min(days_max, x) for x in outs]
 
-    pairs: List[Tuple[str, str]] = []
-    for d in outs:
-        out_date = today + timedelta(days=int(d))
-        in_date = out_date + timedelta(days=int(trip_len))
-        pairs.append((out_date.isoformat(), in_date.isoformat()))
-    return pairs
+def get_theme_defaults(theme: str) -> Dict[str, Any]:
+    t = _theme_key(theme)
+    return THEME_DEFAULTS.get(t, THEME_DEFAULTS["default"])
 
 
 def duffel_headers() -> Dict[str, str]:
@@ -357,12 +201,42 @@ def duffel_headers() -> Dict[str, str]:
     }
 
 
-def duffel_search_offer(origin: str, dest: str, out_date: str, in_date: str,
-                        cabin: str, max_conn: int, included_airlines: str) -> Optional[Dict[str, Any]]:
+def pick_dates(days_min: int, days_max: int, trip_len: int, k: int = 1) -> List[Tuple[str, str]]:
     """
-    Returns the cheapest offer dict (Duffel offer) or None.
+    Deterministic date picks: evenly spaced within the window.
     """
-    # 1) create offer request
+    today = datetime.now(timezone.utc).date()
+    days_min = max(1, days_min)
+    days_max = max(days_min, days_max)
+    span = days_max - days_min
+
+    if k <= 1 or span == 0:
+        outs = [days_min + span // 2]
+    else:
+        step = max(1, span // (k - 1))
+        outs = [min(days_max, days_min + i * step) for i in range(k)]
+
+    pairs: List[Tuple[str, str]] = []
+    for d in outs:
+        out_date = today + timedelta(days=int(d))
+        in_date = out_date + timedelta(days=int(trip_len))
+        pairs.append((out_date.isoformat(), in_date.isoformat()))
+    return pairs
+
+
+def duffel_search_offer(
+    origin: str,
+    dest: str,
+    out_date: str,
+    in_date: str,
+    cabin: str,
+    max_conn: int,
+    included_airlines_csv: str = "ANY",
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns cheapest offer dict or None.
+    We enforce max_conn by filtering returned offers.
+    """
     payload: Dict[str, Any] = {
         "data": {
             "slices": [
@@ -374,22 +248,18 @@ def duffel_search_offer(origin: str, dest: str, out_date: str, in_date: str,
         }
     }
 
-    # Airline filters: if "ANY" or blank, omit it
-    inc = (included_airlines or "").strip().upper()
+    inc = (included_airlines_csv or "").strip().upper()
     if inc and inc != "ANY":
-        # Duffel supports "allowed_carriers" on offer requests in some shapes; keep minimal:
-        # We'll pass it via "carrier_filter" if present; if Duffel rejects, it will fail and we treat as no-offer.
-        payload["data"]["carrier_filter"] = {"allowed_carriers": [c.strip() for c in inc.split(",") if c.strip()]}
+        payload["data"]["carrier_filter"] = {
+            "allowed_carriers": [c.strip() for c in inc.split(",") if c.strip()]
+        }
 
-    # max connections: Duffel does not support a strict "max_conn" parameter universally.
-    # We enforce it post-filter by counting stops on returned offers.
     r = requests.post(f"{DUFFEL_API}/air/offer_requests", headers=duffel_headers(), json=payload, timeout=60)
     if r.status_code >= 300:
         return None
 
     offer_request_id = r.json()["data"]["id"]
 
-    # 2) list offers
     r2 = requests.get(
         f"{DUFFEL_API}/air/offers",
         headers=duffel_headers(),
@@ -403,29 +273,20 @@ def duffel_search_offer(origin: str, dest: str, out_date: str, in_date: str,
     if not offers:
         return None
 
-    # Filter by max_conn (stops)
-    filtered: List[Dict[str, Any]] = []
-    for off in offers:
-        try:
-            slices = off.get("slices", [])
-            # stops per slice = segments-1; total stops = max over slices or sum; we use max(slice stops)
-            slice_stops = []
-            for s in slices:
-                segs = s.get("segments", []) or []
-                slice_stops.append(max(0, len(segs) - 1))
-            stops = max(slice_stops) if slice_stops else 99
-            if stops <= max_conn:
-                filtered.append(off)
-        except Exception:
-            continue
+    def stops_of(offer: Dict[str, Any]) -> int:
+        slice_stops = []
+        for s in offer.get("slices", []) or []:
+            segs = s.get("segments", []) or []
+            slice_stops.append(max(0, len(segs) - 1))
+        return max(slice_stops) if slice_stops else 99
 
+    filtered = [o for o in offers if stops_of(o) <= max_conn]
     if not filtered:
         return None
 
-    # Cheapest by total_amount (string)
-    def price(off: Dict[str, Any]) -> float:
+    def price(o: Dict[str, Any]) -> float:
         try:
-            return float(off.get("total_amount", "999999"))
+            return float(o.get("total_amount", "999999"))
         except Exception:
             return 999999.0
 
@@ -439,16 +300,20 @@ def safe_deal_id(origin: str, dest: str, out_date: str, in_date: str, cabin: str
     return f"d_{out_date.replace('-','')}_{h}"
 
 
-def parse_offer_to_row(offer: Dict[str, Any], theme: str, publish_window: str, ingested_iso: str) -> Optional[List[Any]]:
+def offer_to_row(
+    offer: Dict[str, Any],
+    theme: str,
+    publish_window: str,
+    ingested_iso: str,
+) -> Optional[List[Any]]:
     """
-    Convert Duffel offer to RAW_DEALS row.
-    We keep enrichment minimal: city/country blank (enrich fills later if you want).
+    Convert offer -> RAW_DEALS row. Keep city/country blank (enrich later).
+    NOTE: currency must be GBP for pipeline simplicity.
     """
     try:
         total_amount = float(offer["total_amount"])
-        currency = offer.get("total_currency", "") or offer.get("total_currency", "")
-        # We only want GBP rows. If Duffel returns non-GBP, skip.
-        if str(currency).upper() != "GBP":
+        currency = (offer.get("total_currency") or "").upper()
+        if currency != "GBP":
             return None
 
         origin = offer["slices"][0]["origin"]["iata_code"]
@@ -456,28 +321,26 @@ def parse_offer_to_row(offer: Dict[str, Any], theme: str, publish_window: str, i
         out_date = offer["slices"][0]["segments"][0]["departing_at"][:10]
         in_date = offer["slices"][1]["segments"][0]["departing_at"][:10]
 
-        # Stops (max stops across slices)
-        slice_stops = []
         carriers = set()
-        for s in offer.get("slices", []):
+        slice_stops = []
+        for s in offer.get("slices", []) or []:
             segs = s.get("segments", []) or []
             slice_stops.append(max(0, len(segs) - 1))
             for seg in segs:
-                carrier = (seg.get("marketing_carrier") or {}).get("iata_code")
-                if carrier:
-                    carriers.add(carrier)
-        stops = max(slice_stops) if slice_stops else 0
+                c = (seg.get("marketing_carrier") or {}).get("iata_code")
+                if c:
+                    carriers.add(c)
 
+        stops = max(slice_stops) if slice_stops else 0
         cabin = (offer.get("cabin_class") or DEFAULT_CABIN).lower()
         price_gbp = int(math.ceil(total_amount))
-
         deal_id = safe_deal_id(origin, dest, out_date, in_date, cabin, price_gbp)
 
-        row = [
+        return [
             deal_id,
             origin,
             dest,
-            "",  # origin_city (enrich later)
+            "",  # origin_city
             "",  # destination_city
             "",  # destination_country
             out_date,
@@ -490,22 +353,142 @@ def parse_offer_to_row(offer: Dict[str, Any], theme: str, publish_window: str, i
             theme,
             "NEW",
             publish_window,
-            "",   # score (scorer owns)
-            "",   # phrase_used (enrich owns)
-            "",   # graphic_url (render owns)
-            "",   # posted_vip_at
-            "",   # posted_free_at
-            "",   # posted_instagram_at
+            "",  # score
+            "",  # phrase_used
+            "",  # graphic_url
+            "",  # posted_vip_at
+            "",  # posted_free_at
+            "",  # posted_instagram_at
             ingested_iso,
         ]
-        return row
     except Exception:
         return None
 
 
 def bulk_append(ws: gspread.Worksheet, rows: List[List[Any]]) -> None:
-    # gspread v6: append_rows is fast
+    # Fast append (gspread v6)
     ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+
+def ensure_headers(headers: List[str], required: List[str], tab_name: str) -> Dict[str, int]:
+    if not headers:
+        raise RuntimeError(f"{tab_name} is empty. Row 1 must contain headers.")
+    if len(set(headers)) != len(headers):
+        raise RuntimeError(f"{tab_name} header row contains duplicates. Fix before running workers.")
+    hm = _hm(headers)
+    missing = [h for h in required if h not in hm]
+    if missing:
+        raise RuntimeError(f"{tab_name} missing required headers: {missing}")
+    return hm
+
+
+def build_dedupe_keys(raw_headers: List[str], raw_rows: List[List[Any]]) -> set:
+    hm = _hm(raw_headers)
+    # key: origin|dest|out|in|cabin
+    need = ["origin_iata", "destination_iata", "outbound_date", "return_date", "cabin_class"]
+    if any(k not in hm for k in need):
+        return set()
+
+    keys = set()
+    for r in raw_rows:
+        if len(r) < len(raw_headers):
+            r = r + [""] * (len(raw_headers) - len(r))
+        o = str(r[hm["origin_iata"]]).strip()
+        d = str(r[hm["destination_iata"]]).strip()
+        outd = str(r[hm["outbound_date"]]).strip()
+        ind = str(r[hm["return_date"]]).strip()
+        cab = str(r[hm["cabin_class"]]).strip().lower()
+        if o and d and outd and ind and cab:
+            keys.add(f"{o}|{d}|{outd}|{ind}|{cab}")
+    return keys
+
+
+@dataclass
+class DestCandidate:
+    dest: str
+    theme: str
+    weight: float  # “Fi-ish” ranking weight from CONFIG
+
+    @property
+    def pi(self) -> float:
+        # Minimal Pi: weight is the only ranking signal in this ultra-min config.
+        # If you later re-add value_score, change this to Fi*Vi.
+        return float(self.weight)
+
+
+def read_ops_and_config_and_raw(sh: gspread.Spreadsheet) -> Tuple[str, List[str], List[str], List[List[Any]], List[str], List[List[Any]]]:
+    """
+    One batch_get call to reduce Sheets API latency.
+    Returns:
+      theme_today,
+      active_themes,
+      raw_headers, raw_recent_rows,
+      config_headers, config_rows
+    """
+    # RAW_DEALS: grab headers + last N rows (fast + dedupe-safe enough)
+    # We don’t know last row index without extra call; simplest is to read a reasonably bounded range.
+    # If your sheet grows beyond this, increase DEDUP_READ_ROWS or move dedupe to a FEEDER_LOG tab later.
+    raw_max = 1 + DEDUP_READ_ROWS
+    ranges = [
+        f"{OPS_TAB}!B2",             # theme_of_the_day
+        f"{OPS_TAB}!C2:C",           # active_themes list (optional)
+        f"{RAW_DEALS_TAB}!A1:W{raw_max}",  # headers + recent
+        f"{CONFIG_TAB}!A1:D",        # minimal config
+    ]
+    res = sh.values_batch_get(ranges=ranges)
+    value_ranges = res.get("valueRanges", [])
+
+    # Unpack safely by index
+    ops_theme_vals = (value_ranges[0].get("values") or [[""]])
+    theme_today = (ops_theme_vals[0][0] if ops_theme_vals and ops_theme_vals[0] else "").strip()
+
+    active_vals = value_ranges[1].get("values") or []
+    active_themes = [str(r[0]).strip() for r in active_vals if r and str(r[0]).strip()]
+
+    raw_vals = value_ranges[2].get("values") or []
+    raw_headers = [h.strip() for h in (raw_vals[0] if raw_vals else [])]
+    raw_rows = raw_vals[1:] if len(raw_vals) > 1 else []
+
+    cfg_vals = value_ranges[3].get("values") or []
+    cfg_headers = [h.strip() for h in (cfg_vals[0] if cfg_vals else [])]
+    cfg_rows = cfg_vals[1:] if len(cfg_vals) > 1 else []
+
+    return theme_today, active_themes, raw_headers, raw_rows, cfg_headers, cfg_rows
+
+
+def load_candidates(theme_today: str, cfg_headers: List[str], cfg_rows: List[List[Any]]) -> List[DestCandidate]:
+    hm = ensure_headers(cfg_headers, CONFIG_HEADERS_REQUIRED, "CONFIG")
+
+    cands: List[DestCandidate] = []
+    for r in cfg_rows:
+        if len(r) < len(cfg_headers):
+            r = r + [""] * (len(cfg_headers) - len(r))
+
+        if not _is_true(r[hm["enabled"]]):
+            continue
+
+        dest = str(r[hm["destination_iata"]]).strip().upper()
+        theme = _theme_key(str(r[hm["theme"]]))
+        if not dest or not theme:
+            continue
+        if theme != _theme_key(theme_today):
+            continue
+
+        w = _safe_float(r[hm["weight"]], 1.0)
+        cands.append(DestCandidate(dest=dest, theme=theme, weight=w))
+
+    cands.sort(key=lambda c: c.pi, reverse=True)
+    return cands
+
+
+def pick_secondary_themes(theme_today: str, active_themes: List[str]) -> List[str]:
+    t = _theme_key(theme_today)
+    out = []
+    for x in active_themes:
+        k = _theme_key(x)
+        if k and k != t:
+            out.append(k)
+    return out
 
 
 def main() -> int:
@@ -513,108 +496,165 @@ def main() -> int:
         random.seed(RANDOM_SEED)
 
     log("===============================================================================")
-    log("TRAVELTXTTER V5 — FEEDER START (CONFIG-DRIVEN, Pi RANKING)")
+    log("TRAVELTXTTER V5 — FEEDER START (MIN CONFIG, WEIGHT RANKING)")
     log("===============================================================================")
 
     gc = gspread_client()
     sh = open_sheet(gc)
 
-    theme_today = get_ops_theme(sh)
+    theme_today, active_themes, raw_headers, raw_rows, cfg_headers, cfg_rows = read_ops_and_config_and_raw(sh)
+
+    if not theme_today:
+        raise RuntimeError("OPS_MASTER!B2 (theme_of_the_day) is blank.")
+    theme_today = _theme_key(theme_today)
     log(f"🎯 Theme of day: {theme_today}")
 
-    ws_raw = sh.worksheet(RAW_DEALS_TAB)
-    hm_raw = ensure_raw_deals_headers(ws_raw)
+    # Validate RAW_DEALS headers
+    ensure_headers(raw_headers, RAW_DEALS_HEADERS_REQUIRED, "RAW_DEALS")
+    existing_keys = build_dedupe_keys(raw_headers, raw_rows)
 
-    # Load RAW_DEALS for dedupe
-    _, raw_rows = read_table(ws_raw)
-    existing = build_existing_keys(raw_rows, hm_raw)
-
-    # Load config candidates
-    routes = load_config_routes(sh, theme_today)
-    if not routes:
-        log("⚠️ No CONFIG routes eligible for theme (enabled+active_in_feeder+theme match).")
+    # Load config candidates for theme
+    candidates = load_candidates(theme_today, cfg_headers, cfg_rows)
+    if not candidates:
+        log("⚠️ No CONFIG routes eligible for theme (enabled + theme match).")
         return 0
 
-    # Rank by Pi and keep top pool for variety
-    routes.sort(key=lambda r: r.pi, reverse=True)
-    top_pool = routes[: max(DESTS_PER_RUN * 3, DESTS_PER_RUN)]
-    # Variety: sample from top_pool but preserve Pi bias
-    chosen = top_pool[:DESTS_PER_RUN]
+    # Determine budgets
+    primary_budget = max(1, int(round(MAX_SEARCHES * PRIMARY_PCT)))
+    secondary_budget = max(0, MAX_SEARCHES - primary_budget)
+
+    # If no drift desired, set secondary_budget = 0
+    if PRIMARY_PCT >= 1.0:
+        secondary_budget = 0
 
     log(f"CAPS: MAX_SEARCHES={MAX_SEARCHES} | MAX_INSERTS={MAX_INSERTS} | DESTS_PER_RUN={DESTS_PER_RUN}")
-    log(f"Eligible CONFIG routes: {len(routes)} | using: {len(chosen)} (top-ranked by Pi)")
+    log(f"Budget: primary={primary_budget} secondary={secondary_budget}")
 
+    # Pick top destinations (variety)
+    chosen_primary = candidates[: max(1, min(DESTS_PER_RUN, len(candidates)))]
+
+    # Optional secondary drift: pick from other active themes (OPS_MASTER column C)
+    secondary_themes = pick_secondary_themes(theme_today, active_themes)
+    chosen_secondary: List[DestCandidate] = []
+    if secondary_budget > 0 and secondary_themes:
+        # Build secondary pool from CONFIG (enabled rows with theme in secondary_themes)
+        hm = ensure_headers(cfg_headers, CONFIG_HEADERS_REQUIRED, "CONFIG")
+        pool: List[DestCandidate] = []
+        for r in cfg_rows:
+            if len(r) < len(cfg_headers):
+                r = r + [""] * (len(cfg_headers) - len(r))
+            if not _is_true(r[hm["enabled"]]):
+                continue
+            dest = str(r[hm["destination_iata"]]).strip().upper()
+            theme = _theme_key(str(r[hm["theme"]]))
+            if not dest or not theme:
+                continue
+            if theme not in set(secondary_themes):
+                continue
+            w = _safe_float(r[hm["weight"]], 1.0)
+            pool.append(DestCandidate(dest=dest, theme=theme, weight=w))
+        pool.sort(key=lambda c: c.pi, reverse=True)
+        chosen_secondary = pool[: max(1, min(2, len(pool)))] if pool else []
+
+    # Build search plan: (theme, origin, dest, out_date, in_date, max_conn, cabin, publish_window)
     ingested_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
     inserts: List[List[Any]] = []
-    searches = 0
-    skips_dedupe = 0
-    skips_no_offer = 0
 
-    # For each selected route, try 1 date-pair (simple and cheap).
-    # (You can raise K later if budget allows.)
-    for route in chosen:
-        if searches >= MAX_SEARCHES or len(inserts) >= MAX_INSERTS:
-            break
+    def run_searches(chosen: List[DestCandidate], budget: int, lane: str) -> Tuple[int, int, int]:
+        searches = 0
+        dedupe_skips = 0
+        no_offer_skips = 0
 
-        # Publish window: if CONFIG gives AM/PM/BOTH use it; else BOTH.
-        publish_window = route.slot_hint if route.slot_hint in {"AM", "PM", "BOTH"} else "BOTH"
+        for cand in chosen:
+            if searches >= budget or len(inserts) >= MAX_INSERTS:
+                break
 
-        (out_date, in_date) = pick_dates(route.days_min, route.days_max, route.trip_len, k=1)[0]
+            # Theme defaults drive constraints
+            defaults = get_theme_defaults(cand.theme)
+            days_min, days_max = defaults["window"]
+            trip_min, trip_max = defaults["trip"]
+            max_conn = int(defaults["max_conn"])
+            cabin = str(defaults.get("cabin") or DEFAULT_CABIN).lower()
 
-        key = f"{route.origin}|{route.dest}|{out_date}|{in_date}|{route.cabin}"
-        if key in existing:
-            skips_dedupe += 1
-            continue
+            # deterministic “middle” trip length
+            trip_len = int(round((trip_min + trip_max) / 2))
 
-        searches += 1
-        log(
-            f"🔎 Search {searches}/{MAX_SEARCHES}: {route.origin}→{route.dest} "
-            f"| Pi={route.pi:.2f} | max_conn={route.max_conn} | cabin={route.cabin} "
-            f"| trip={route.trip_len}d | window={route.days_min}-{route.days_max}"
-        )
+            # origins are ENV-driven
+            origins = get_origins_for_theme(cand.theme)
+            if not origins:
+                origins = get_origins_for_theme("default")
 
-        offer = duffel_search_offer(
-            origin=route.origin,
-            dest=route.dest,
-            out_date=out_date,
-            in_date=in_date,
-            cabin=route.cabin,
-            max_conn=route.max_conn,
-            included_airlines=route.included_airlines,
-        )
+            # Choose 1 origin per destination (rotate for variety)
+            origin = origins[searches % len(origins)]
 
-        if not offer:
-            skips_no_offer += 1
+            out_date, in_date = pick_dates(days_min, days_max, trip_len, k=1)[0]
+            key = f"{origin}|{cand.dest}|{out_date}|{in_date}|{cabin}"
+            if key in existing_keys:
+                dedupe_skips += 1
+                continue
+
+            searches += 1
+            publish_window = "BOTH"  # minimal contract; publishers can route by slot later
+
+            log(
+                f"🔎 Search {searches}/{budget} [{lane}] {origin}→{cand.dest} "
+                f"| weight={cand.weight:.2f} | max_conn={max_conn} | cabin={cabin} "
+                f"| trip={trip_len}d | window={days_min}-{days_max}"
+            )
+
+            offer = duffel_search_offer(
+                origin=origin,
+                dest=cand.dest,
+                out_date=out_date,
+                in_date=in_date,
+                cabin=cabin,
+                max_conn=max_conn,
+                included_airlines_csv="ANY",  # you said this is set to ANY
+            )
+            if not offer:
+                no_offer_skips += 1
+                time.sleep(SLEEP_SECONDS)
+                continue
+
+            row = offer_to_row(
+                offer=offer,
+                theme=cand.theme,
+                publish_window=publish_window,
+                ingested_iso=ingested_iso,
+            )
+            if not row:
+                no_offer_skips += 1
+                time.sleep(SLEEP_SECONDS)
+                continue
+
+            existing_keys.add(key)
+            inserts.append(row)
             time.sleep(SLEEP_SECONDS)
-            continue
 
-        row = parse_offer_to_row(
-            offer=offer,
-            theme=theme_today,
-            publish_window=publish_window,
-            ingested_iso=ingested_iso,
-        )
-        if not row:
-            skips_no_offer += 1
-            time.sleep(SLEEP_SECONDS)
-            continue
+        return searches, dedupe_skips, no_offer_skips
 
-        # update dedupe set for run-local duplicates
-        existing.add(key)
-        inserts.append(row)
+    # Primary lane (theme locked)
+    p_searches, p_dedupe, p_no_offer = run_searches(chosen_primary, primary_budget, "PRIMARY")
 
-        time.sleep(SLEEP_SECONDS)
+    # Secondary lane (drift)
+    s_searches, s_dedupe, s_no_offer = (0, 0, 0)
+    if secondary_budget > 0 and chosen_secondary:
+        s_searches, s_dedupe, s_no_offer = run_searches(chosen_secondary, secondary_budget, "SECONDARY")
+
+    total_searches = p_searches + s_searches
+    total_dedupe = p_dedupe + s_dedupe
+    total_no_offer = p_no_offer + s_no_offer
 
     if not inserts:
         log("⚠️ No rows inserted.")
-        log(f"SKIPS: dedupe={skips_dedupe} no_offer={skips_no_offer}")
+        log(f"SKIPS: dedupe={total_dedupe} no_offer={total_no_offer}")
         return 0
 
     # Bulk append
+    ws_raw = sh.worksheet(RAW_DEALS_TAB)
     bulk_append(ws_raw, inserts)
     log(f"✅ Inserted {len(inserts)} row(s) into {RAW_DEALS_TAB}.")
-    log(f"SUMMARY: searches={searches} inserted={len(inserts)} dedupe_skips={skips_dedupe} no_offer_skips={skips_no_offer}")
+    log(f"SUMMARY: searches={total_searches} inserted={len(inserts)} dedupe_skips={total_dedupe} no_offer_skips={total_no_offer}")
     return 0
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # workers/enrich_router.py
 #
-# TRAVELTXTTER V5 — ENRICH ROUTER (MINIMAL CONTRACT)
+# TRAVELTXTER V5 — ENRICH ROUTER (MINIMAL CONTRACT)
 #
 # PURPOSE
 # - Fill missing city/country fields via IATA_MASTER lookup
@@ -109,44 +109,69 @@ def _strip_control_chars(s: str) -> str:
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
 
 
+def _looks_like_json(s: str) -> bool:
+    t = (s or "").lstrip()
+    return t.startswith("{") and ("private_key" in t or "client_email" in t)
+
+
 def _maybe_b64_decode(s: str) -> Optional[str]:
-    """
-    If secret is base64, decode it.
-    If it isn't, return None.
-    """
     t = (s or "").strip()
-    if not t:
+    if not t or _looks_like_json(t):
         return None
-    # fast reject: if it contains obvious JSON markers, it's not base64
-    if t.startswith("{") and '"private_key"' in t:
-        return None
+    # quick heuristic: base64-ish
     if not re.fullmatch(r"[A-Za-z0-9+/=\s]+", t):
         return None
     try:
         raw = base64.b64decode(t.encode("utf-8"), validate=False).decode("utf-8", "ignore").strip()
     except Exception:
         return None
-    if raw.startswith("{") and '"private_key"' in raw:
-        return raw
-    return None
+    return raw if _looks_like_json(raw) else None
 
 
-def _repair_private_key_field(raw: str) -> str:
+def _normalise_private_key(pk: str) -> str:
     """
-    Make private_key safe for json.loads:
-    - If the JSON has literal line breaks inside the private_key string,
-      convert them to \\n escapes.
+    Ensure PEM has real newlines and correct BEGIN/END placement.
+    Handles literal '\\n' sequences and flattened keys.
     """
-    pat = re.compile(r'("private_key"\s*:\s*")(.+?)(")', re.DOTALL)
-    m = pat.search(raw)
+    s = (pk or "").strip()
+
+    # Convert literal backslash-n into actual newlines
+    if "\\n" in s:
+        s = s.replace("\\n", "\n")
+
+    # Normalise line endings
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Ensure BEGIN/END are on their own lines
+    s = s.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
+    s = s.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----")
+
+    # Collapse accidental double newlines
+    s = re.sub(r"\n{3,}", "\n\n", s).strip() + "\n"
+    return s
+
+
+def _repair_json_private_key_newlines(raw: str) -> str:
+    """
+    If someone pasted raw JSON but the private_key value contains *actual* newlines
+    (unescaped) then json.loads will throw "Invalid control character".
+    This function rewrites only the private_key value to use \\n escapes.
+    """
+    # Match "private_key" : " ... " including newlines inside the string
+    m = re.search(r'("private_key"\s*:\s*")(.+?)("\s*,\s*")', raw, flags=re.DOTALL)
     if not m:
         return raw
-    prefix, pk, suffix = m.group(1), m.group(2), m.group(3)
 
-    pk_fixed = pk.replace("\r\n", "\n").replace("\r", "\n")
-    # escape backslashes then escape newlines
-    pk_fixed = pk_fixed.replace("\\", "\\\\").replace("\n", "\\n")
-    return raw[: m.start()] + prefix + pk_fixed + suffix + raw[m.end() :]
+    prefix = raw[: m.start(2)]
+    body = raw[m.start(2) : m.end(2)]
+    suffix = raw[m.end(2) :]
+
+    # Escape backslashes first, then convert real newlines to \n
+    body = body.replace("\\", "\\\\")
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    body = body.replace("\n", "\\n")
+
+    return prefix + body + suffix
 
 
 def load_sa_info() -> Dict[str, Any]:
@@ -156,39 +181,49 @@ def load_sa_info() -> Dict[str, Any]:
 
     raw = _strip_control_chars(raw.strip())
 
-    b64 = _maybe_b64_decode(raw)
-    if b64:
-        raw = b64
+    decoded = _maybe_b64_decode(raw)
+    if decoded:
+        raw = _strip_control_chars(decoded.strip())
 
-    raw = _repair_private_key_field(raw)
-
-    # Attempt 1: strict JSON
+    # Try parse JSON; if it fails due to control chars/newlines in private_key, repair then retry
     try:
         info = json.loads(raw)
-        return info
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 2: common pattern where key contains \\n and code needs real \n
-    try:
-        info = json.loads(raw.replace("\\n", "\n"))
-        return info
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Service account JSON could not be parsed: {e}") from e
+        raw2 = _repair_json_private_key_newlines(raw)
+        try:
+            info = json.loads(raw2)
+        except Exception as e2:
+            raise RuntimeError(f"Service account JSON could not be parsed: {e2}") from e
+
+    if not isinstance(info, dict):
+        raise RuntimeError("Service account JSON parsed but is not an object")
+
+    pk_norm = _normalise_private_key(info.get("private_key", ""))
+    info["private_key"] = pk_norm
+
+    if "-----BEGIN PRIVATE KEY-----" not in pk_norm or "-----END PRIVATE KEY-----" not in pk_norm:
+        raise RuntimeError(
+            "Service account JSON loaded but private_key is missing BEGIN/END markers. "
+            "Fix the GitHub secret value for GCP_SA_JSON(_ONE_LINE)."
+        )
+
+    return info
 
 
 def gspread_client() -> gspread.Client:
     info = load_sa_info()
-    pk = (info.get("private_key") or "").strip()
-
-    # Hard guard: this is the exact failure you were seeing.
-    if "BEGIN PRIVATE KEY" not in pk:
+    try:
+        creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPE)
+    except Exception as e:
+        pk = (info.get("private_key") or "")
+        has_begin = "BEGIN PRIVATE KEY" in pk
+        has_end = "END PRIVATE KEY" in pk
+        has_nl = "\n" in pk
         raise RuntimeError(
-            "Service account JSON loaded but private_key looks malformed. "
-            "Ensure GitHub secret contains the full JSON with a valid private_key."
-        )
-
-    creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPE)
+            "Google auth failed to build credentials. "
+            f"private_key markers: begin={has_begin} end={has_end} newline_present={has_nl}. "
+            f"Original error: {e}"
+        ) from e
     return gspread.authorize(creds)
 
 
@@ -216,7 +251,6 @@ def main() -> int:
     ENFORCE_MAX_PER_MONTH = env_bool("ENFORCE_MAX_PER_MONTH", True)
     REQUIRE_PHRASE = env_bool("REQUIRE_PHRASE", False)
 
-    # Contract: enrichment can run at multiple points; never changes status.
     ELIGIBLE_STATUSES = {
         "NEW",
         "SCORED",
@@ -253,7 +287,6 @@ def main() -> int:
     headers = data[0]
     h = header_map_first(headers)
 
-    # Required reads
     required_reads = ["deal_id", "status", "origin_iata", "destination_iata", "theme"]
     for req in required_reads:
         if _norm_header(req) not in h:
@@ -272,7 +305,7 @@ def main() -> int:
     c_dest_iata = h["destination_iata"]
     c_theme = h["theme"]
 
-    # ---- Load IATA_MASTER into map ----
+    # ---- Load IATA_MASTER ----
     iata: Dict[str, Tuple[str, str]] = {}
     try:
         ws_iata = sh.worksheet(IATA_MASTER_TAB)
@@ -289,15 +322,12 @@ def main() -> int:
                 code = getv(r, i_code).upper()
                 if not code:
                     continue
-                city = getv(r, i_city)
-                country = getv(r, i_country)
-                iata[code] = (city, country)
-
+                iata[code] = (getv(r, i_city), getv(r, i_country))
         log(f"✅ IATA_MASTER loaded: {len(iata)} entries")
     except Exception as e:
         log(f"⚠️ IATA_MASTER load failed (non-fatal): {e}")
 
-    # ---- Load PHRASE_BANK into map: (dest, theme) -> list ----
+    # ---- Load PHRASE_BANK ----
     phrases: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     try:
         ws_pb = sh.worksheet(PHRASE_BANK_TAB)
@@ -312,8 +342,7 @@ def main() -> int:
             i_ch = hp.get("channel_hint")
             i_mpm = hp.get("max_per_month")
 
-            needed = [i_dest, i_th, i_cat, i_phrase, i_appr]
-            if any(x is None for x in needed):
+            if any(x is None for x in [i_dest, i_th, i_cat, i_phrase, i_appr]):
                 raise RuntimeError(
                     "PHRASE_BANK must have headers: destination_iata, theme, category, phrase, approved"
                 )
@@ -325,7 +354,7 @@ def main() -> int:
                 th = getv(r, i_th).lower()
                 phr = getv(r, i_phrase)
                 cat = getv(r, i_cat)
-                ch = getv(r, i_ch).lower() if i_ch is not None else ""
+                ch = getv(r, i_ch).strip().lower() if i_ch is not None else ""
                 mpm = getv(r, i_mpm) if i_mpm is not None else ""
 
                 if not dest or not th or not phr:
@@ -334,28 +363,21 @@ def main() -> int:
                 phrases.setdefault((dest, th), []).append(
                     {"phrase": phr, "category": cat, "channel_hint": ch, "max_per_month": mpm}
                 )
-
         log(f"✅ PHRASE_BANK loaded: {len(phrases)} keys")
     except Exception as e:
         log(f"⚠️ PHRASE_BANK load failed (non-fatal): {e}")
 
-    # ---- Build month-aware usage counts (only if phrase_used exists) ----
+    # ---- Phrase usage index (month-aware) ----
     usage: Dict[str, int] = {}
     now = dt.datetime.now(dt.timezone.utc)
-    month_prefix = now.strftime("%Y-%m")  # matches ISO timestamps
-
-    posted_cols = [
-        h.get("posted_vip_at"),
-        h.get("posted_free_at"),
-        h.get("posted_instagram_at"),
-    ]
+    month_prefix = now.strftime("%Y-%m")
+    posted_cols = [h.get("posted_vip_at"), h.get("posted_free_at"), h.get("posted_instagram_at")]
 
     if c_phrase_used is not None:
         for r in data[1:]:
             phrase_text = getv(r, c_phrase_used)
             if not phrase_text:
                 continue
-
             ts = ""
             for ci in posted_cols:
                 if ci is None:
@@ -363,13 +385,11 @@ def main() -> int:
                 ts = getv(r, ci)
                 if ts:
                     break
-
             if ts.startswith(month_prefix):
                 usage[phrase_text] = usage.get(phrase_text, 0) + 1
 
     def channel_ok(p: Dict[str, Any]) -> bool:
         ch = (p.get("channel_hint") or "").strip().lower()
-        # Only enforce when it is explicitly a channel gate
         if ch in ("vip", "free", "ig", "all"):
             return ch == "all" or ch == PHRASE_CHANNEL
         return True
@@ -454,9 +474,9 @@ def main() -> int:
                         queue(row_num, c_phrase_cat + 1, cat)
                         row_changed = True
             else:
-                # If phrase is mandatory, we still don't write status here.
-                # Upstream can decide what to do with missing phrase.
-                pass
+                # Enrich never changes status; downstream can decide what to do if REQUIRED.
+                if REQUIRE_PHRASE:
+                    pass
 
         if row_changed:
             changed_rows += 1

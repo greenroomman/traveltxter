@@ -133,8 +133,7 @@ def headers_map(ws: gspread.Worksheet) -> Dict[str, int]:
     return {h.strip(): i for i, h in enumerate(header_row) if h.strip()}
 
 
-def get_cell(ws: gspread.Wor
-ksheet, a1: str) -> str:
+def get_cell(ws: gspread.Worksheet, a1: str) -> str:
     try:
         return str(ws.acell(a1).value or "").strip()
     except Exception:

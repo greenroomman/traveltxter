@@ -4,28 +4,27 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run mode"
+        description: "Run mode: full or feeder_only"
         required: true
         default: "full"
         type: choice
         options:
           - full
           - feeder_only
-      slot:
-        description: "Override RUN_SLOT (optional). If blank, auto-detect from schedule."
-        required: false
-        default: ""
   schedule:
-    - cron: "30 7 * * *"   # 07:30 UTC (AM)
-    - cron: "30 16 * * *"  # 16:30 UTC (PM)
+    - cron: "30 7 * * *"
+    - cron: "30 16 * * *"
 
 concurrency:
   group: traveltxter-v5-pipeline
   cancel-in-progress: false
 
 jobs:
-  run:
+  pipeline:
     runs-on: ubuntu-latest
+    env:
+      MODE: ${{ inputs.mode || 'full' }}
+      RUN_SLOT: ${{ github.event.schedule == '30 7 * * *' && 'AM' || 'PM' }}
 
     steps:
       - name: Checkout
@@ -38,114 +37,72 @@ jobs:
 
       - name: Install deps
         run: |
+          set -e
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Decide RUN_SLOT + MODE
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Default mode
-          MODE="full"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${{ inputs.mode }}"
-          fi
-
-          # Slot override (manual)
-          SLOT_OVERRIDE=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            SLOT_OVERRIDE="${{ inputs.slot }}"
-          fi
-
-          # Auto slot detection (schedule)
-          # GitHub writes the trigger payload JSON to $GITHUB_EVENT_PATH.
-          # For schedule events, the payload includes ".schedule" (cron string) in most repos.
-          SCHEDULE_CRON="$(jq -r '.schedule // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
-
-          RUN_SLOT=""
-          if [ -n "$SLOT_OVERRIDE" ]; then
-            RUN_SLOT="$(echo "$SLOT_OVERRIDE" | tr '[:lower:]' '[:upper:]')"
-          else
-            if [ "$SCHEDULE_CRON" = "30 7 * * *" ]; then
-              RUN_SLOT="AM"
-            elif [ "$SCHEDULE_CRON" = "30 16 * * *" ]; then
-              RUN_SLOT="PM"
-            else
-              # Fallback: infer from current UTC hour (safe if schedule field missing)
-              H="$(date -u +%H)"
-              if [ "$H" -lt 12 ]; then RUN_SLOT="AM"; else RUN_SLOT="PM"; fi
-            fi
-          fi
-
-          echo "MODE=$MODE" >> $GITHUB_ENV
-          echo "RUN_SLOT=$RUN_SLOT" >> $GITHUB_ENV
-
-          echo "=============================="
-          echo "TravelTxter V5 Pipeline"
-          echo "EVENT=${{ github.event_name }}"
-          echo "SCHEDULE_CRON=${SCHEDULE_CRON:-'(none)'}"
-          echo "MODE=$MODE"
-          echo "RUN_SLOT=$RUN_SLOT"
-          echo "=============================="
-
-      - name: Run FEEDER (always)
+      # =========================
+      # 1) FEEDER
+      # =========================
+      - name: Feeder (pipeline_worker.py)
         env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          RAW_DEALS_VIEW_TAB: RAW_DEALS_VIEW
-          OPS_MASTER_TAB: OPS_MASTER
           FEEDER_CONFIG_TAB: CONFIG
-          THEMES_TAB: THEMES
-          PHRASE_BANK_TAB: PHRASE_BANK
-          IATA_MASTER_TAB: IATA_MASTER
-          CONFIG_CARRIER_BIAS_TAB: CONFIG_CARRIER_BIAS
-          ROUTE_CAPABILITY_MAP_TAB: ROUTE_CAPABILITY_MAP
-          ZONE_THEME_BENCHMARKS_TAB: ZONE_THEME_BENCHMARKS
-
+          OPS_MASTER_TAB: OPS_MASTER
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          DUFFEL_BUDGET_GBP: ${{ vars.DUFFEL_BUDGET_GBP }}
-          DUFFEL_EXCESS_SEARCH_USD: ${{ vars.DUFFEL_EXCESS_SEARCH_USD }}
-          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS }}
-          DUFFEL_MAX_INSERTS_PER_ORIGIN: ${{ vars.DUFFEL_MAX_INSERTS_PER_ORIGIN }}
-          DUFFEL_MAX_INSERTS_PER_ROUTE: ${{ vars.DUFFEL_MAX_INSERTS_PER_ROUTE }}
-          DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN }}
-          DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN }}
+          # feeder caps
+          DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN || '12' }}
+          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS || '50' }}
+          DUFFEL_MAX_INSERTS_PER_ORIGIN: ${{ vars.DUFFEL_MAX_INSERTS_PER_ORIGIN || '15' }}
+          DUFFEL_MAX_INSERTS_PER_ROUTE: ${{ vars.DUFFEL_MAX_INSERTS_PER_ROUTE || '5' }}
+          DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN || '6' }}
+          MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS || '90' }}
+          VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS || '120' }}
         run: |
           set -e
           python workers/pipeline_worker.py
 
-      - name: STOP after feeder (test mode)
-        if: ${{ env.MODE == 'feeder_only' }}
+      # If you dispatch feeder_only, we stop right here.
+      - name: Stop after feeder (feeder_only)
+        if: ${{ (inputs.mode || 'full') == 'feeder_only' }}
         run: |
-          echo "✅ feeder_only mode: stopping pipeline here."
+          echo "MODE=feeder_only -> stopping after feeder."
           exit 0
 
-      # ---------------- V5 ORDER (FULL MODE) ----------------
+      # =========================
+      # PAUSE (IMPORTANT)
+      # =========================
+      - name: Pause 30s for Sheets consistency
+        run: |
+          echo "Sleeping 30 seconds to allow Sheets to settle before scoring..."
+          sleep 30
 
-      - name: Scorer (NEW -> PUBLISH_* / SCORED)
-        if: ${{ env.MODE == 'full' }}
+      # =========================
+      # 2) SCORER
+      # =========================
+      - name: Scorer (ai_scorer.py)
         env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           RAW_DEALS_VIEW_TAB: RAW_DEALS_VIEW
+          OPS_MASTER_TAB: OPS_MASTER
+          MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS || '90' }}
         run: |
           set -e
           python workers/ai_scorer.py
 
-      - name: Enrich Router (IATA backfill + phrase_bank; no status)
-        if: ${{ env.MODE == 'full' }}
+      # =========================
+      # 3) ENRICH
+      # =========================
+      - name: Enrich (enrich_router.py)
         env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
@@ -153,17 +110,20 @@ jobs:
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           PHRASE_BANK_TAB: PHRASE_BANK
           IATA_MASTER_TAB: IATA_MASTER
-          PHRASE_CHANNEL: vip
-          ENRICH_MAX_ROWS_PER_RUN: ${{ vars.ENRICH_MAX_ROWS_PER_RUN }}
-          ENFORCE_MAX_PER_MONTH: ${{ vars.ENFORCE_MAX_PER_MONTH }}
-          REQUIRE_PHRASE: false
+          PHRASE_CHANNEL: ${{ vars.PHRASE_CHANNEL || 'vip' }}
+          ENRICH_MAX_ROWS_PER_RUN: ${{ vars.ENRICH_MAX_ROWS_PER_RUN || '60' }}
+          ENFORCE_MAX_PER_MONTH: ${{ vars.ENFORCE_MAX_PER_MONTH || 'true' }}
+          REQUIRE_PHRASE: ${{ vars.REQUIRE_PHRASE || 'false' }}
         run: |
           set -e
           python workers/enrich_router.py
 
-      - name: Render Client (graphic_url + timestamps; no status)
-        if: ${{ env.MODE == 'full' }}
+      # =========================
+      # 4) RENDER
+      # =========================
+      - name: Render (render_client.py)
         env:
+          MODE: full
           RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -171,14 +131,20 @@ jobs:
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           RAW_DEALS_VIEW_TAB: RAW_DEALS_VIEW
+          OPS_MASTER_TAB: OPS_MASTER
           RENDER_URL: ${{ secrets.RENDER_URL }}
+          RENDER_MAX_ROWS: ${{ vars.RENDER_MAX_ROWS || '2' }}
         run: |
           set -e
           python workers/render_client.py
 
-      - name: Instagram Publisher (PUBLISH_* -> READY_TO_POST)
-        if: ${{ env.MODE == 'full' }}
+      # =========================
+      # 5) INSTAGRAM (marketing; must not block TG)
+      # =========================
+      - name: Instagram Publisher (instagram_publisher.py)
+        continue-on-error: true
         env:
+          MODE: full
           RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -189,32 +155,38 @@ jobs:
           OPS_MASTER_TAB: OPS_MASTER
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          GRAPH_API_VERSION: ${{ vars.GRAPH_API_VERSION }}
-          VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS }}
-          MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS }}
+          GRAPH_API_VERSION: ${{ vars.GRAPH_API_VERSION || 'v20.0' }}
+          VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS || '120' }}
+          MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS || '90' }}
         run: |
           set -e
           python workers/instagram_publisher.py
 
-      - name: Link Router (booking_link_vip; no status)
-        if: ${{ env.MODE == 'full' }}
+      # =========================
+      # 6) LINK ROUTER
+      # =========================
+      - name: Link Router (link_router.py)
+        continue-on-error: true
         env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
+          FALLBACK_STRATEGY: ${{ vars.FALLBACK_STRATEGY || 'google' }}
+          DUFFEL_LINKS_ENABLED: ${{ vars.DUFFEL_LINKS_ENABLED || 'false' }}
           REDIRECT_BASE_URL: ${{ secrets.REDIRECT_BASE_URL }}
+          TRAVELUP_ENABLED: ${{ vars.TRAVELUP_ENABLED || 'true' }}
+          TRAVELUP_CJ_CLICK_BASE: ${{ secrets.TRAVELUP_CJ_CLICK_BASE }}
         run: |
           set -e
           python workers/link_router.py
 
-      - name: Telegram Publisher (READY_TO_POST -> VIP_DONE -> PUBLISHED + fallback)
-        if: ${{ env.MODE == 'full' }}
+      # =========================
+      # 7) TELEGRAM (VIP first, then FREE)
+      # =========================
+      - name: Telegram Publisher (telegram_publisher.py)
         env:
-          RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}

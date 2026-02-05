@@ -4,16 +4,16 @@ TRAVELTXTTER V5 — AI_SCORER (Deterministic, Spreadsheet-led)
 
 PURPOSE
 - Read RAW_DEALS rows with status=NEW.
-- Assign a numeric score.
-- Promote a small number of winners to status=READY_TO_POST (publishable).
-- Mark remaining NEW rows as SCORED (seen, but not publish-worthy right now).
-- Optionally HARD_REJECT clearly invalid rows (non-GBP, missing dates, etc).
+- Assign a numeric score (0–99).
+- Promote up to WINNERS_PER_RUN to status=READY_TO_POST.
+- Mark remaining NEW rows as SCORED.
+- Optionally HARD_REJECT invalid rows (non-GBP, missing price/dates/timestamps).
 
 CONTRACT (V5 MINIMAL)
 - RAW_DEALS is the single writable truth.
-- RAW_DEALS_VIEW is read-only; scorer may *read* it but must not write to it.
-- Downstream workers (enrich/render/publishers) READ status; they do not change it
-  except publishers changing status after posting.
+- RAW_DEALS_VIEW is read-only; scorer may read it (optional) but must never write to it.
+- Downstream workers READ status.
+- Publishers change status after posting (not scorer).
 """
 
 from __future__ import annotations
@@ -65,6 +65,7 @@ def load_service_account_info() -> dict:
     - raw JSON
     - JSON with escaped newlines
     - base64-encoded JSON (common in CI)
+    - secrets wrapped with literal newlines
     """
     raw = os.environ.get("GCP_SA_JSON_ONE_LINE") or os.environ.get("GCP_SA_JSON") or ""
     if not raw:
@@ -92,7 +93,7 @@ def load_service_account_info() -> dict:
     except Exception:
         pass
 
-    # 4) last resort: remove literal newlines and retry (some secrets get wrapped)
+    # 4) last resort: remove literal newlines and retry
     compact = raw.replace("\n", "")
     obj = _try_json_loads(compact)
     if obj:
@@ -132,7 +133,8 @@ def headers_map(ws: gspread.Worksheet) -> Dict[str, int]:
     return {h.strip(): i for i, h in enumerate(header_row) if h.strip()}
 
 
-def get_cell(ws: gspread.Worksheet, a1: str) -> str:
+def get_cell(ws: gspread.Wor
+ksheet, a1: str) -> str:
     try:
         return str(ws.acell(a1).value or "").strip()
     except Exception:
@@ -142,7 +144,7 @@ def get_cell(ws: gspread.Worksheet, a1: str) -> str:
 def _parse_iso_utc(ts: str) -> Optional[datetime]:
     if not ts:
         return None
-    s = ts.strip()
+    s = str(ts).strip()
     try:
         if s.endswith("Z"):
             return datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -171,20 +173,6 @@ def _safe_int(x: str) -> Optional[int]:
         return None
 
 
-# ------------------------------ Scoring ----------------------------
-
-@dataclass
-class DealRow:
-    row_idx: int
-    deal_id: str
-    theme: str
-    status: str
-    price_gbp: Optional[float]
-    currency: str
-    stops: Optional[int]
-    ingested_at_utc: str
-
-
 def _env_int(name: str, default: int) -> int:
     v = (os.environ.get(name) or "").strip()
     if not v:
@@ -206,20 +194,78 @@ def _max_stops_for_theme(theme: str) -> int:
     return 1
 
 
-def _compute_relative_scores(prices: List[float]) -> List[float]:
+# ------------------------------ RDV optional ------------------------
+
+def _load_rdv_dynamic_theme_index(
+    sh: gspread.Spreadsheet,
+    rdv_tab: str,
+) -> Dict[str, str]:
+    """
+    Optional. If RDV exists and has columns:
+      deal_id, dynamic_theme
+    build dict for scoring/theme match.
+
+    If not available, return {}.
+    """
+    try:
+        ws = sh.worksheet(rdv_tab)
+    except Exception:
+        return {}
+
+    try:
+        vals = ws.get_all_values()
+        if len(vals) < 2:
+            return {}
+        hdr = [h.strip() for h in vals[0]]
+        hmap = {h: i for i, h in enumerate(hdr) if h}
+        if "deal_id" not in hmap or "dynamic_theme" not in hmap:
+            return {}
+        out: Dict[str, str] = {}
+        for r in vals[1:]:
+            did = (r[hmap["deal_id"]] if hmap["deal_id"] < len(r) else "").strip()
+            th = (r[hmap["dynamic_theme"]] if hmap["dynamic_theme"] < len(r) else "").strip()
+            if did and th:
+                out[did] = th
+        return out
+    except Exception:
+        return {}
+
+
+# ------------------------------ Scoring ----------------------------
+
+@dataclass
+class DealRow:
+    row_idx: int
+    deal_id: str
+    theme: str
+    status: str
+    price_gbp: Optional[float]
+    currency: str
+    stops: Optional[int]
+    ingested_at_utc: str
+
+
+def _compute_scores_by_price(prices: List[float]) -> Dict[float, float]:
+    """
+    Cheapness relative score: cheapest ~ high score.
+    Uses robust quartile span to avoid outliers.
+    """
     if not prices:
-        return []
+        return {}
+
     sp = sorted(prices)
     n = len(sp)
     q1 = sp[max(0, int(0.25 * (n - 1)))]
     q3 = sp[max(0, int(0.75 * (n - 1)))]
     span = max(1.0, (q3 - q1))
-    out: List[float] = []
+
+    out: Dict[float, float] = {}
     for p in prices:
         z = (p - q1) / span
         score = 85.0 - (z * 30.0)
         score = max(1.0, min(99.0, score))
-        out.append(score)
+        # keep best score for same price
+        out[p] = max(out.get(p, 0.0), score)
     return out
 
 
@@ -227,6 +273,7 @@ def _compute_relative_scores(prices: List[float]) -> List[float]:
 
 RAW_TAB = os.environ.get("RAW_DEALS_TAB", "RAW_DEALS")
 OPS_TAB = os.environ.get("OPS_MASTER_TAB", "OPS_MASTER")
+RDV_TAB = os.environ.get("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
 
 OPS_THEME_CELL = os.environ.get("OPS_THEME_CELL", "B2")  # V5: theme of day
 OPS_SLOT_CELL = os.environ.get("OPS_SLOT_CELL", "A2")    # V5: AM/PM label
@@ -253,14 +300,32 @@ def main() -> int:
     log(f"🕒 Slot: {slot} | MIN_INGEST_AGE_SECONDS={min_age_seconds} | WINNERS_PER_RUN={winners_per_run}")
 
     hmap = headers_map(ws_raw)
-    required = ["deal_id", "theme", "status", "price_gbp", "currency", "stops", "ingested_at_utc", "publish_window", "score"]
+
+    required = [
+        "deal_id",
+        "status",
+        "price_gbp",
+        "currency",
+        "stops",
+        "ingested_at_utc",
+        "publish_window",
+        "score",
+    ]
     missing = [h for h in required if h not in hmap]
     if missing:
         raise RuntimeError(f"{RAW_TAB} schema missing required columns: {missing}")
 
+    has_theme_col = "theme" in hmap
     has_scored_ts = "scored_timestamp" in hmap
     if not has_scored_ts:
         log(f"ℹ️ {RAW_TAB} missing 'scored_timestamp' column. Timestamp write-back will be skipped.")
+
+    # Optional RDV theme signal
+    rdv_theme_by_id = _load_rdv_dynamic_theme_index(sh, RDV_TAB)
+    if rdv_theme_by_id:
+        log(f"✅ RDV loaded for scoring signals: {len(rdv_theme_by_id)} deal_ids indexed")
+    else:
+        log("ℹ️ RDV not used for scoring signals (missing tab or columns).")
 
     values = ws_raw.get_all_values()
     if len(values) < 2:
@@ -268,24 +333,45 @@ def main() -> int:
         return 0
 
     now = datetime.now(timezone.utc)
+    now_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    rows: List[DealRow] = []
+    # Forensic counters
+    seen_rows = len(values) - 1
+    seen_new = 0
+    skipped_status_not_new = 0
+    skipped_missing_deal_id = 0
+    skipped_missing_ingest = 0
+    skipped_unparseable_ingest = 0
     skipped_too_fresh = 0
-    skipped_no_ts = 0
+
+    new_rows: List[DealRow] = []
 
     for sheet_i, r in enumerate(values[1:], start=2):
+
         def col(name: str) -> str:
             j = hmap.get(name)
             return (r[j] if (j is not None and j < len(r)) else "").strip()
 
         status = col("status").upper()
         if status != "NEW":
+            skipped_status_not_new += 1
+            continue
+
+        seen_new += 1
+
+        deal_id = col("deal_id")
+        if not deal_id:
+            skipped_missing_deal_id += 1
             continue
 
         ing = col("ingested_at_utc")
+        if not ing:
+            skipped_missing_ingest += 1
+            continue
+
         dt = _parse_iso_utc(ing)
         if not dt:
-            skipped_no_ts += 1
+            skipped_unparseable_ingest += 1
             continue
 
         age_s = (now - dt).total_seconds()
@@ -293,15 +379,15 @@ def main() -> int:
             skipped_too_fresh += 1
             continue
 
-        deal_id = col("deal_id")
-        if not deal_id:
-            continue
+        theme_row = (col("theme") if has_theme_col else "").strip()
+        theme_signal = (rdv_theme_by_id.get(deal_id) or "").strip()
+        resolved_theme = (theme_row or theme_signal or theme_today).strip() or theme_today
 
-        rows.append(
+        new_rows.append(
             DealRow(
                 row_idx=sheet_i,
                 deal_id=deal_id,
-                theme=(col("theme") or theme_today).strip() or theme_today,
+                theme=resolved_theme,
                 status=status,
                 price_gbp=_safe_float(col("price_gbp")),
                 currency=col("currency").upper(),
@@ -310,19 +396,28 @@ def main() -> int:
             )
         )
 
-    log(f"Eligible NEW candidates: {len(rows)} | skipped_too_fresh={skipped_too_fresh} skipped_no_ingest_ts={skipped_no_ts}")
+    log(
+        "Forensics: "
+        f"rows={seen_rows} NEW={seen_new} "
+        f"eligible={len(new_rows)} "
+        f"skipped_status_not_new={skipped_status_not_new} "
+        f"skipped_missing_deal_id={skipped_missing_deal_id} "
+        f"skipped_missing_ingest={skipped_missing_ingest} "
+        f"skipped_unparseable_ingest={skipped_unparseable_ingest} "
+        f"skipped_too_fresh={skipped_too_fresh}"
+    )
 
-    if not rows:
+    if not new_rows:
         log("✅ No status changes needed (idempotent).")
         return 0
 
     max_stops = _max_stops_for_theme(theme_today)
 
     hard_reject: List[DealRow] = []
-    scored_pool: List[DealRow] = []
     promotable: List[DealRow] = []
 
-    for d in rows:
+    # Basic validation + promotable filtering
+    for d in new_rows:
         if d.currency and d.currency != "GBP":
             hard_reject.append(d)
             continue
@@ -330,22 +425,21 @@ def main() -> int:
             hard_reject.append(d)
             continue
 
-        scored_pool.append(d)
-
-        if d.theme == theme_today and (d.stops is None or d.stops <= max_stops):
+        # promotable = matches theme_today AND stops within tolerance
+        if (d.theme == theme_today) and (d.stops is None or d.stops <= max_stops):
             promotable.append(d)
 
-    prices = [d.price_gbp for d in promotable if d.price_gbp is not None]
-    rel = _compute_relative_scores(prices)
-
-    price_to_best: Dict[float, float] = {}
-    for p, s in zip(prices, rel):
-        if (p not in price_to_best) or (s > price_to_best[p]):
-            price_to_best[p] = s
+    # Price-based scoring within promotable only (so “cheap within theme” wins)
+    price_scores = _compute_scores_by_price([d.price_gbp for d in promotable if d.price_gbp is not None])
 
     scored_items: List[Tuple[DealRow, float]] = []
     for d in promotable:
-        scored_items.append((d, float(price_to_best.get(d.price_gbp or 0.0, 50.0))))
+        base = float(price_scores.get(d.price_gbp or 0.0, 50.0))
+        # small friction penalty for stops
+        if d.stops is not None:
+            base -= float(d.stops) * 5.0
+        base = max(1.0, min(99.0, base))
+        scored_items.append((d, base))
 
     scored_items.sort(key=lambda t: t[1], reverse=True)
     winners = scored_items[: max(0, winners_per_run)]
@@ -357,13 +451,12 @@ def main() -> int:
         col_idx = hmap[header] + 1
         updates.append(gspread.Cell(row_idx, col_idx, value))
 
-    now_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
-
     publish_ct = 0
     scored_ct = 0
     hard_ct = 0
+    off_theme_ct = 0
 
-    for d in rows:
+    for d in new_rows:
         if d in hard_reject:
             set_cell(d.row_idx, "status", "HARD_REJECT")
             set_cell(d.row_idx, "publish_window", "")
@@ -373,21 +466,34 @@ def main() -> int:
             hard_ct += 1
             continue
 
-        base_score = 50.0
-        if d.theme == theme_today and d.price_gbp is not None:
-            base_score = float(price_to_best.get(d.price_gbp, 50.0))
-
+        # default score if not in promotable set
+        score_val = 50.0
         if d.deal_id in winner_ids:
+            # winner score
+            # look up computed score from scored_items
+            for row_obj, sc in winners:
+                if row_obj.deal_id == d.deal_id:
+                    score_val = sc
+                    break
             set_cell(d.row_idx, "status", "READY_TO_POST")
             set_cell(d.row_idx, "publish_window", slot)
-            set_cell(d.row_idx, "score", round(base_score, 2))
+            set_cell(d.row_idx, "score", round(score_val, 2))
             if has_scored_ts:
                 set_cell(d.row_idx, "scored_timestamp", now_iso)
             publish_ct += 1
         else:
+            # non-winners become SCORED (even if off-theme); score is informative only
+            if d.theme != theme_today:
+                off_theme_ct += 1
+            if d.price_gbp is not None:
+                # cheapness relative to nothing => keep stable mid-score with small price influence
+                score_val = max(1.0, min(99.0, 60.0 - (d.price_gbp / 50.0)))
+            if d.stops is not None:
+                score_val -= float(d.stops) * 3.0
+
             set_cell(d.row_idx, "status", "SCORED")
             set_cell(d.row_idx, "publish_window", "")
-            set_cell(d.row_idx, "score", round(base_score, 2))
+            set_cell(d.row_idx, "score", round(score_val, 2))
             if has_scored_ts:
                 set_cell(d.row_idx, "scored_timestamp", now_iso)
             scored_ct += 1
@@ -395,7 +501,10 @@ def main() -> int:
     if updates:
         ws_raw.update_cells(updates, value_input_option="USER_ENTERED")
 
-    log(f"✅ Status writes: READY_TO_POST={publish_ct} SCORED={scored_ct} HARD_REJECT={hard_ct}")
+    log(
+        f"✅ Status writes: READY_TO_POST={publish_ct} SCORED={scored_ct} "
+        f"HARD_REJECT={hard_ct} off_theme_scored={off_theme_ct}"
+    )
     return 0
 
 

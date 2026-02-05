@@ -2,7 +2,7 @@
 # V5 — Instagram Publisher
 #
 # Reads:
-# - OPS_MASTER!B5 (theme of the day)
+# - OPS_MASTER!B2 (theme of the day)
 # - RAW_DEALS_VIEW (read-only) OPTIONAL (not required for posting)
 # - RAW_DEALS (source of truth; writable)
 #
@@ -351,7 +351,7 @@ def main() -> int:
     sh = gc.open_by_key(env("SPREADSHEET_ID") or env("SHEET_ID"))
 
     ws_ops = sh.worksheet(OPS_TAB)
-    theme_today = normalize_theme(ws_ops.acell("B5").value or "")
+    theme_today = normalize_theme(ws_ops.acell("B2").value or "")
     if not theme_today:
         theme_today = "adventure"
 

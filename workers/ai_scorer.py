@@ -1,34 +1,33 @@
 # workers/ai_scorer.py
-# TRAVELTXTTER — AI SCORER (V5, MINIMAL SHEET CONTRACT)
+# TRAVELTXTTER — SCORER (V5, MINIMAL SHEET CONTRACT)
 #
 # PURPOSE
 # - Deterministically evaluate NEW rows in RAW_DEALS using RAW_DEALS_VIEW (RDV) formulas.
 # - Write publish-intent triggers into RAW_DEALS:
-#     PUBLISH_AM / PUBLISH_PM / PUBLISH_BOTH
-# - Mark everything else as SCORED (or HARD_REJECT when RDV hard_reject=TRUE)
+#     status = PUBLISH_AM / PUBLISH_PM / PUBLISH_BOTH
+#     publish_window = AM / PM / BOTH
+#     score = numeric (from RDV priority_score / worthiness_score)
+#     scored_timestamp = Google Sheets serial number (NOT ISO string) to keep RDV math happy.
 #
 # GOVERNANCE (LOCKED)
-# - RAW_DEALS is the ONLY writable source of truth.
-# - RAW_DEALS_VIEW is read-only (formulas only).
-# - This worker writes to RAW_DEALS only:
-#     - status
-#     - publish_window (AM/PM/BOTH)
-#     - score (numeric, from RDV worthiness/priority)
-#     - scored_timestamp (if column exists)
+# - RAW_DEALS is the ONLY writable DB.
+# - RAW_DEALS_VIEW is read-only.
+# - Scorer touches ONLY:
+#     status, publish_window, score, scored_timestamp (if present)
 #
 # SLOT RULE (LOCKED)
-# - Slot defaults from ingested_at_utc (UTC hour):
+# - Slot defaults from ingested_at_utc hour (UTC):
 #     hour < 12 => AM
 #     else      => PM
 #
 # BOTH RULE (LOCKED)
 # - Mark as BOTH when:
 #     - worthiness_verdict starts with "PRO_" OR
-#     - worthiness_score >= SCORER_BOTH_SCORE (default 80)
+#     - score >= SCORER_BOTH_SCORE (default 80)
 #
-# PERFORMANCE
-# - Single batch load for RAW_DEALS + RDV via get_all_values()
-# - Single batch write via update_cells()
+# PERF
+# - Batch reads via get_all_values()
+# - Batch write via update_cells()
 
 from __future__ import annotations
 
@@ -63,11 +62,20 @@ def _env_int(k: str, default: int) -> int:
         return default
 
 
+def _env_float(k: str, default: float) -> float:
+    v = _env(k, "")
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
 def _norm_header(h: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_")
 
 
 def _build_first_index(headers: List[str]) -> Dict[str, int]:
+    """First occurrence wins (immune to duplicate headers)."""
     idx: Dict[str, int] = {}
     for i, h in enumerate(headers):
         hh = str(h or "").strip()
@@ -77,6 +85,7 @@ def _build_first_index(headers: List[str]) -> Dict[str, int]:
 
 
 def _build_norm_first_index(headers: List[str]) -> Dict[str, int]:
+    """First occurrence wins, normalized (immune to minor header variations)."""
     idx: Dict[str, int] = {}
     for i, h in enumerate(headers):
         nh = _norm_header(h)
@@ -86,7 +95,7 @@ def _build_norm_first_index(headers: List[str]) -> Dict[str, int]:
 
 
 def _strip_control_chars(s: str) -> str:
-    # Remove ASCII control chars except \n \r \t to avoid JSONDecodeError invalid control character
+    # Remove ASCII control chars except \n \r \t (prevents JSONDecodeError invalid control character)
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
 
 
@@ -97,17 +106,13 @@ def _get_gspread_client() -> gspread.Client:
 
     raw = _strip_control_chars(raw)
 
-    # Robust parsing for:
-    # - one-line JSON
-    # - JSON with escaped newlines
-    # - JSON with literal newlines
+    # Robust parsing for one-line JSON, escaped newlines, or literal newlines
     try:
         creds_info = json.loads(raw)
     except Exception:
         try:
             creds_info = json.loads(raw.replace("\\n", "\n"))
         except Exception:
-            # last resort: collapse literal newlines to escaped newlines
             creds_info = json.loads(raw.replace("\n", "\\n"))
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -116,10 +121,18 @@ def _get_gspread_client() -> gspread.Client:
 
 
 # -----------------------------
-# Timestamp parsing
+# Timestamp parsing + Sheets serial
 # -----------------------------
 
 _GOOGLE_SHEETS_EPOCH = dt.datetime(1899, 12, 30, tzinfo=dt.timezone.utc)
+
+def _dt_to_sheets_serial(ts: dt.datetime) -> float:
+    """Google Sheets serial day number (fractional days)."""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    delta = ts - _GOOGLE_SHEETS_EPOCH
+    return delta.total_seconds() / 86400.0
+
 
 def _parse_dt(val: Any) -> Optional[dt.datetime]:
     """
@@ -142,15 +155,11 @@ def _parse_dt(val: Any) -> Optional[dt.datetime]:
     # numeric?
     try:
         f = float(s)
-        # epoch ms
-        if f >= 1_000_000_000_000:
+        if f >= 1_000_000_000_000:  # epoch ms
             return dt.datetime.fromtimestamp(f / 1000.0, tz=dt.timezone.utc)
-        # epoch sec
-        if f >= 1_000_000_000:
+        if f >= 1_000_000_000:  # epoch sec
             return dt.datetime.fromtimestamp(f, tz=dt.timezone.utc)
-        # google sheets serial days
-        # typical modern serials are > 40000
-        if f >= 20000:
+        if f >= 20000:  # sheets serial days
             return _GOOGLE_SHEETS_EPOCH + dt.timedelta(days=f)
     except Exception:
         pass
@@ -166,6 +175,7 @@ def _parse_dt(val: Any) -> Optional[dt.datetime]:
 
 
 def _find_header(raw_headers: List[str], *candidates: str) -> Optional[str]:
+    """Find exact header, else normalized match."""
     header_set = set(raw_headers)
     for c in candidates:
         if c in header_set:
@@ -193,16 +203,24 @@ def main() -> int:
         return 1
 
     RAW_DEALS_TAB = _env("RAW_DEALS_TAB", "RAW_DEALS")
-    RDV_TAB = _env("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")  # IMPORTANT: set this env in workflow
+
+    # RDV tab: support multiple env names to avoid workflow breakage
+    RDV_TAB = (
+        _env("RAW_DEALS_VIEW_TAB")
+        or _env("RAW_DEALS_VIEW")
+        or _env("RAW_DEALS_VIEW_NAME")
+        or _env("***_VIEW_TAB")  # legacy workflow pattern
+        or "RAW_DEALS_VIEW"
+    ).strip()
 
     MIN_INGEST_AGE_SECONDS = _env_int("MIN_INGEST_AGE_SECONDS", 90)
-    MAX_AGE_HOURS = _env_int("SCORER_MAX_AGE_HOURS", 24)  # keep tight unless you explicitly widen it
+    MAX_AGE_HOURS = _env_int("SCORER_MAX_AGE_HOURS", 24)
 
     QUOTA_PRO = _env_int("SCORER_QUOTA_PRO", 1)
     QUOTA_VIP = _env_int("SCORER_QUOTA_VIP", 2)
     QUOTA_FREE = _env_int("SCORER_QUOTA_FREE", 1)
 
-    BOTH_SCORE = float(_env_int("SCORER_BOTH_SCORE", 80))
+    BOTH_SCORE = _env_float("SCORER_BOTH_SCORE", 80.0)
 
     gc = _get_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -220,13 +238,12 @@ def main() -> int:
     raw_headers = raw_values[0]
     raw_idx = _build_first_index(raw_headers)
 
-    # Required columns
+    # Required
     for col in ("status", "deal_id"):
         if col not in raw_idx:
             log(f"❌ RAW_DEALS missing required header: {col}")
             return 1
 
-    # Ingest timestamp header (new sheet should be ingested_at_utc)
     ingest_header = _find_header(
         raw_headers,
         "ingested_at_utc",
@@ -242,9 +259,10 @@ def main() -> int:
         return 1
     log(f"🕒 Using ingest timestamp header: {ingest_header}")
 
-    # Optional write-back columns (new contract: publish_window, score)
     publish_window_header = _find_header(raw_headers, "publish_window")
     score_header = _find_header(raw_headers, "score")
+
+    # scored_timestamp MUST be numeric for RDV math
     scored_ts_header = _find_header(raw_headers, "scored_timestamp", "scored_at", "scored_at_utc")
 
     if not publish_window_header:
@@ -271,7 +289,7 @@ def main() -> int:
                 return str(row[j] or "").strip()
         return ""
 
-    # Build RDV lookup by deal_id (first occurrence wins)
+    # RDV lookup by deal_id
     rdv_by_id: Dict[str, Dict[str, str]] = {}
     for r in rdv_values[1:]:
         did = rdv_cell(r, "deal_id")
@@ -285,8 +303,8 @@ def main() -> int:
             "worthiness_score": rdv_cell(r, "worthiness_score"),
         }
 
-    def raw_cell(row: List[str], col: str) -> str:
-        j = raw_idx.get(col)
+    def raw_cell(row: List[str], header: str) -> str:
+        j = raw_idx.get(header)
         if j is None:
             return ""
         return row[j] if j < len(row) else ""
@@ -373,7 +391,6 @@ def main() -> int:
             winners_pro.append((rownum, did, ts, rdv))
             continue
 
-        # Treat POSTABLE/VIP as VIP bucket
         if (("VIP" in verdict) or verdict.startswith("POSTABLE")) and len(winners_vip) < QUOTA_VIP:
             winners_vip.append((rownum, did, ts, rdv))
             continue
@@ -384,7 +401,7 @@ def main() -> int:
 
         others.append((rownum, did, ts, rdv))
 
-    # Prepare batch updates (RAW_DEALS only)
+    # Batch updates (RAW_DEALS only)
     updates: List[gspread.Cell] = []
 
     status_col = raw_idx["status"] + 1
@@ -392,7 +409,7 @@ def main() -> int:
     score_col = (raw_idx[score_header] + 1) if score_header and score_header in raw_idx else None
     scored_col = (raw_idx[scored_ts_header] + 1) if scored_ts_header and scored_ts_header in raw_idx else None
 
-    now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    now_serial = _dt_to_sheets_serial(now)
 
     def set_cell(r: int, c: int, v: str) -> None:
         updates.append(gspread.Cell(r, c, v))
@@ -406,12 +423,13 @@ def main() -> int:
 
     def set_score(r: int, v: float) -> None:
         if score_col:
-            # keep it numeric for RDV
+            # keep numeric (string form, but USER_ENTERED makes it a number)
             set_cell(r, score_col, f"{v:.2f}".rstrip("0").rstrip("."))
 
     def set_scored_ts(r: int) -> None:
         if scored_col:
-            set_cell(r, scored_col, now_iso)
+            # IMPORTANT: numeric serial timestamp so RDV can subtract
+            set_cell(r, scored_col, f"{now_serial:.10f}".rstrip("0").rstrip("."))
 
     def decide_publish_window(ts: dt.datetime, rdv: Dict[str, str]) -> str:
         slot = _slot_from_ingest(ts)  # AM/PM

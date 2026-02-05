@@ -18,7 +18,7 @@ from google.oauth2.service_account import Credentials
 # AUTHORITY / GOVERNANCE
 # - RAW_DEALS is the only writable source of truth.
 # - RAW_DEALS_VIEW is read-only.
-# - Theme MUST be read from RDV.dynamic_theme (fallback OPS_MASTER!B5 only if blank).
+# - Theme MUST be read from RDV.dynamic_theme (fallback OPS_MASTER!B2 only if blank).
 # - Layout is derived ONLY from ingested_at_utc timestamp (UTC):
 #       hour < 12  => AM
 #       else       => PM
@@ -55,7 +55,7 @@ RDV_DYNAMIC_THEME_COL = int(float(os.getenv("RDV_DYNAMIC_THEME_COL", "46") or "4
 RDV_DYNAMIC_THEME_HEADER = (os.getenv("RDV_DYNAMIC_THEME_HEADER") or "dynamic_theme").strip()
 
 # OPS_MASTER theme-of-day locked cell
-OPS_THEME_CELL = (os.getenv("OPS_THEME_CELL") or "B5").strip() or "B5"
+OPS_THEME_CELL = (os.getenv("OPS_THEME_CELL") or "B2").strip() or "B2"
 
 GOOGLE_SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",

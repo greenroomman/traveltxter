@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-# TRAVELTXTTER V5 — FEEDER
-# Minimal, CONFIG-driven, revenue-safe
+# TRAVELTXTTER V5 — FEEDER (CREDENTIAL-SAFE)
 # ============================================================
 
 import os
@@ -10,6 +9,7 @@ import time
 import json
 import re
 import uuid
+import base64
 from datetime import datetime, timezone
 from typing import List, Dict
 
@@ -34,7 +34,7 @@ def log(msg: str):
     print(f"{ts} | {msg}", flush=True)
 
 # ------------------------------------------------------------
-# HEADER NORMALISATION (CRITICAL FIX)
+# HEADER NORMALISATION
 # ------------------------------------------------------------
 def _norm(h: str) -> str:
     if not h:
@@ -48,8 +48,7 @@ def header_map(headers: List[str]) -> Dict[str, int]:
 
 def ensure_headers(headers: List[str], required: List[str], tab_name: str):
     hm = header_map(headers)
-    req = [_norm(h) for h in required]
-    missing = [h for h in req if h not in hm]
+    missing = [_norm(h) for h in required if _norm(h) not in hm]
     if missing:
         raise RuntimeError(
             f"{tab_name} missing required headers: {missing}\n"
@@ -58,12 +57,44 @@ def ensure_headers(headers: List[str], required: List[str], tab_name: str):
     return hm
 
 # ------------------------------------------------------------
-# GOOGLE CLIENT
+# SAFE GOOGLE AUTH (FIX)
 # ------------------------------------------------------------
+def load_service_account():
+    raw = (
+        os.environ.get("GCP_SA_JSON_ONE_LINE")
+        or os.environ.get("GCP_SA_JSON")
+    )
+    if not raw:
+        raise RuntimeError("Missing GCP service account secret")
+
+    # 1) Try raw JSON
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # 2) Try newline repair
+    try:
+        return json.loads(raw.replace("\\n", "\n"))
+    except Exception:
+        pass
+
+    # 3) Try base64
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+        return json.loads(decoded)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Failed to parse GCP service account JSON. "
+        "Secret is malformed or incorrectly escaped."
+    )
+
 def gspread_client():
-    raw = os.environ.get("GCP_SA_JSON_ONE_LINE") or os.environ["GCP_SA_JSON"]
+    info = load_service_account()
     creds = Credentials.from_service_account_info(
-        json.loads(raw.replace("\\n", "\n")),
+        info,
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return gspread.authorize(creds)
@@ -74,6 +105,7 @@ def gspread_client():
 def load_config(ws, theme: str):
     rows = ws.get_all_values()
     headers = rows[0]
+
     hm = ensure_headers(
         headers,
         ["enabled", "destination_iata", "theme", "weight"],
@@ -88,18 +120,12 @@ def load_config(ws, theme: str):
             continue
         if r[hm["theme"]] not in (theme, "DEFAULT"):
             continue
-
         try:
             weight = float(r[hm["weight"]])
         except Exception:
             weight = 1.0
 
-        cfg.append(
-            {
-                "dest": r[hm["destination_iata"]],
-                "weight": weight,
-            }
-        )
+        cfg.append({"dest": r[hm["destination_iata"]], "weight": weight})
 
     cfg.sort(key=lambda x: x["weight"], reverse=True)
     return cfg[:DESTS_PER_RUN]
@@ -108,9 +134,7 @@ def load_config(ws, theme: str):
 # INSERT DEAL
 # ------------------------------------------------------------
 def insert_deal(ws, hm, dest_iata: str, theme: str):
-    now_utc = datetime.now(timezone.utc)
-    ts_numeric = now_utc.timestamp()  # REQUIRED: numeric, not ISO
-
+    ts = datetime.now(timezone.utc).timestamp()
     row = [""] * len(hm)
 
     def setv(col, val):
@@ -121,8 +145,7 @@ def insert_deal(ws, hm, dest_iata: str, theme: str):
     setv("destination_iata", dest_iata)
     setv("theme", theme)
     setv("status", "NEW")
-    setv("publish_window", "")
-    setv("ingested_at_utc", ts_numeric)
+    setv("ingested_at_utc", ts)
 
     ws.append_row(row, value_input_option="USER_ENTERED")
 
@@ -159,7 +182,7 @@ def main():
     for item in cfg:
         if inserted >= MAX_SEARCHES:
             break
-        log(f"🔎 Ingesting destination {item['dest']} (weight={item['weight']})")
+        log(f"🔎 Ingesting {item['dest']} (weight={item['weight']})")
         insert_deal(ws_raw, raw_hm, item["dest"], THEME)
         inserted += 1
         time.sleep(0.05)

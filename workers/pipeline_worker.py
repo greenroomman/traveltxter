@@ -190,8 +190,10 @@ def extract_stops(offer: Dict[str, Any]) -> int:
     return max_stops
 
 def extract_bags_included(offer: Dict[str, Any]) -> str:
-    # Best-effort, deterministic
-    for svc in offer.get("available_services", []):
+    services = offer.get("available_services")
+    if not isinstance(services, list):
+        return ""
+    for svc in services:
         if svc.get("type") == "baggage":
             return "YES"
     return ""

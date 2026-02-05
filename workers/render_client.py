@@ -136,21 +136,16 @@ def _utc_now_iso() -> str:
 
 def _normalize_render_url(url: str) -> str:
     """
-    PA endpoint must be https://greenroomman.pythonanywhere.com/api/render
-    If env gives base host or wrong path, fix safely.
+    RENDER_URL must already point to the renderer endpoint.
+    Example:
+      https://greenroomman.pythonanywhere.com/api/render
+    Do NOT mutate it.
     """
     u = (url or "").strip()
     if not u:
-        return ""
-    # If someone set it to base host
-    if u.endswith("/"):
-        u = u[:-1]
-    # If they set /render (old) or just host, force /api/render
-    if u.endswith("/render"):
-        u = u[:-7]
-    if not u.endswith("/api/render"):
-        u = u + "/api/render"
-    return u
+        raise RuntimeError("RENDER_URL is empty")
+    return u.rstrip("/")
+
 
 
 def _repair_private_key_json(raw: str) -> str:

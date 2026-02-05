@@ -26,7 +26,7 @@
 # - No status changes. Ever.
 # - Idempotent: never overwrites existing filled values.
 # - Duplicate header safe: first occurrence wins.
-# - Robust SA JSON handling: fixes "Invalid control character" failures.
+# - Robust SA JSON handling: fixes "Invalid control character" AND "No key could be detected." failures.
 
 from __future__ import annotations
 
@@ -39,7 +39,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
-
 
 GOOGLE_SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -91,16 +90,20 @@ def _strip_control_chars(s: str) -> str:
 def _repair_private_key_field(raw: str) -> str:
     """
     If a secret accidentally contains literal newlines inside the JSON string for "private_key",
-    json.loads() can fail. Convert literal newlines in that value to escaped \\n.
+    json.loads() can fail OR the key can be unreadable. Convert literal newlines in that value to escaped \\n.
     """
     pat = re.compile(r'("private_key"\s*:\s*")(.+?)(")', re.DOTALL)
     m = pat.search(raw)
     if not m:
         return raw
+
     prefix, pk, suffix = m.group(1), m.group(2), m.group(3)
+
     pk_fixed = pk.replace("\r\n", "\n").replace("\r", "\n")
+
     # Ensure it's a valid JSON string: escape backslashes and newlines
     pk_fixed = pk_fixed.replace("\\", "\\\\").replace("\n", "\\n")
+
     return raw[: m.start()] + prefix + pk_fixed + suffix + raw[m.end() :]
 
 
@@ -109,10 +112,12 @@ def _load_service_account_info() -> Dict[str, Any]:
     Robustly load SA JSON from either:
       - GCP_SA_JSON_ONE_LINE (preferred)
       - GCP_SA_JSON
+
     Handles:
       - stray control characters
       - private_key newline issues
       - common GitHub Secrets escaping
+      - already-escaped \\n sequences
     """
     raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
     if not raw:
@@ -124,19 +129,30 @@ def _load_service_account_info() -> Dict[str, Any]:
 
     # Attempt 1: direct json
     try:
-        return json.loads(raw)
+        info = json.loads(raw)
+        return info
     except json.JSONDecodeError:
         pass
 
-    # Attempt 2: common escaping pattern (\\n)
+    # Attempt 2: treat \\n as newline (some secrets are stored with escapes)
     try:
-        return json.loads(raw.replace("\\n", "\n"))
+        info = json.loads(raw.replace("\\n", "\n"))
+        return info
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Service account JSON could not be parsed: {e}") from e
 
 
 def gspread_client() -> gspread.Client:
     info = _load_service_account_info()
+
+    # Extra guard: google-auth throws "No key could be detected." if private_key is present but malformed
+    pk = (info.get("private_key") or "").strip()
+    if "BEGIN PRIVATE KEY" not in pk:
+        raise RuntimeError(
+            "Service account JSON loaded but private_key looks malformed (missing 'BEGIN PRIVATE KEY'). "
+            "Re-save the secret as ONE LINE JSON or ensure private_key contains \\n escapes."
+        )
+
     creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPE)
     return gspread.authorize(creds)
 
@@ -173,17 +189,17 @@ def main() -> int:
     ENFORCE_MAX_PER_MONTH = env_bool("ENFORCE_MAX_PER_MONTH", True)
     REQUIRE_PHRASE = env_bool("REQUIRE_PHRASE", False)
 
-    # Eligible statuses (V5). Enrich is allowed to run early; it still won't touch status.
+    # Enrich may run at multiple points; still: NO status writes.
     ELIGIBLE = {
         "NEW",
         "SCORED",
-        "PUBLISH_AM",
-        "PUBLISH_PM",
-        "PUBLISH_BOTH",
         "READY_TO_POST",
         "READY_TO_PUBLISH",
         "READY_FREE",
         "VIP_DONE",
+        "PUBLISH_AM",
+        "PUBLISH_PM",
+        "PUBLISH_BOTH",
     }
 
     log("============================================================")
@@ -209,7 +225,6 @@ def main() -> int:
     headers = raw[0]
     idx = _first_norm_index(headers)
 
-    # Required minimal fields to function
     need = ["status", "deal_id", "origin_iata", "destination_iata", "theme"]
     missing = [n for n in need if _norm_header(n) not in idx]
     if missing:
@@ -217,16 +232,16 @@ def main() -> int:
 
     # Targets (write only if present)
     c_origin_city = idx.get("origin_city")
-    c_origin_country = idx.get("origin_country")  # optional (may not exist in RD)
+    c_origin_country = idx.get("origin_country")  # optional
     c_dest_city = idx.get("destination_city")
     c_dest_country = idx.get("destination_country")
     c_phrase_used = idx.get("phrase_used")
     c_phrase_cat = idx.get("phrase_category")
 
-    # Load IATA_MASTER (required for city/country fills; non-fatal if missing tab)
+    # Load IATA_MASTER
     iata_map: Dict[str, Tuple[str, str]] = {}
     try:
-        ws_iata = sh.worksheet(IATA_MASTER_TAB)
+        ws_iata = sh.7worksheet(IATA_MASTER_TAB)
         vals = get_all(ws_iata)
         if vals and len(vals) >= 2:
             h = vals[0]
@@ -248,7 +263,7 @@ def main() -> int:
     except Exception as e:
         log(f"⚠️ Could not load IATA_MASTER (non-fatal): {e}")
 
-    # Load PHRASE_BANK (approved, keyed by (dest, theme))
+    # Load PHRASE_BANK
     phrases_by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     try:
         ws_pb = sh.worksheet(PHRASE_BANK_TAB)
@@ -263,9 +278,10 @@ def main() -> int:
             i_ch = col_i(h, "channel_hint")
             i_mpm = col_i(h, "max_per_month")
 
-            req = [i_dest, i_theme, i_cat, i_phrase, i_appr]
-            if any(x is None for x in req):
-                raise RuntimeError("PHRASE_BANK missing required headers: destination_iata, theme, category, phrase, approved")
+            if any(x is None for x in [i_dest, i_theme, i_cat, i_phrase, i_appr]):
+                raise RuntimeError(
+                    "PHRASE_BANK missing required headers: destination_iata, theme, category, phrase, approved"
+                )
 
             for r in vals[1:]:
                 if not truthy(r[i_appr] if i_appr < len(r) else ""):
@@ -274,7 +290,7 @@ def main() -> int:
                 theme = (r[i_theme] if i_theme < len(r) else "").strip().lower()
                 phrase = (r[i_phrase] if i_phrase < len(r) else "").strip()
                 cat = (r[i_cat] if i_cat < len(r) else "").strip()
-                ch = (r[i_ch] if i_ch is not None and i_ch < len(r) else "").strip().lower()
+                ch = (r[i_ch] if i_ch is nots not None and i_ch < len(r) else "").strip().lower()
                 mpm = (r[i_mpm] if i_mpm is not None and i_mpm < len(r) else "").strip()
 
                 if not dest or not theme or not phrase:
@@ -288,7 +304,7 @@ def main() -> int:
     except Exception as e:
         log(f"⚠️ Could not load PHRASE_BANK (non-fatal): {e}")
 
-    # Phrase usage index (month-aware) based on phrase_used + posted timestamps, to enforce max_per_month.
+    # Phrase usage (month-aware) — simple enforcement
     usage: Dict[str, int] = {}
     now = dt.datetime.now(dt.timezone.utc)
     month_key = now.strftime("%Y-%m")
@@ -323,12 +339,11 @@ def main() -> int:
 
     def channel_ok(p: Dict[str, Any]) -> bool:
         ch = (p.get("channel_hint") or "").strip().lower()
-        # If channel_hint is descriptive ("Destination-specific"), treat as not a filter.
+        # If channel_hint is descriptive (e.g., "Destination-specific"), do not treat as a filter.
         if ch in ("vip", "free", "ig", "all"):
             return ch == "all" or ch == PHRASE_CHANNEL
         return True
 
-    # Helpers
     c_status = idx["status"]
     c_deal_id = idx["deal_id"]
     c_origin_iata = idx["origin_iata"]
@@ -350,7 +365,6 @@ def main() -> int:
     enriched_rows = 0
     cityfills = 0
     phrasefills = 0
-    phrase_misses = 0
 
     for row_num, r in enumerate(raw[1:], start=2):
         scanned += 1
@@ -372,7 +386,7 @@ def main() -> int:
 
         row_changed = False
 
-        # City/country fills (origin + destination)
+        # IATA backfill
         if iata_map:
             if c_origin_city is not None and not getv(r, c_origin_city) and origin in iata_map:
                 ocity, ocountry = iata_map[origin]
@@ -380,7 +394,6 @@ def main() -> int:
                     queue(row_num, c_origin_city + 1, ocity)
                     cityfills += 1
                     row_changed = True
-                # origin_country only if column exists
                 if c_origin_country is not None and not getv(r, c_origin_country) and ocountry:
                     queue(row_num, c_origin_country + 1, ocountry)
                     cityfills += 1
@@ -397,31 +410,23 @@ def main() -> int:
                     cityfills += 1
                     row_changed = True
 
-        # Phrase fill (phrase_used + phrase_category)
+        # Phrase selection
         if c_phrase_used is not None and not getv(r, c_phrase_used):
             cands = phrases_by_key.get((dest, theme), [])
             cands = [p for p in cands if channel_ok(p)]
             cands = [p for p in cands if governance_ok(p)]
-
             chosen = stable_pick(cands, seed=f"{did}:{dest}:{theme}")
             if chosen:
                 phrase = (chosen.get("phrase") or "").strip()
                 cat = (chosen.get("category") or "").strip()
                 if phrase:
                     queue(row_num, c_phrase_used + 1, phrase)
-                    phrasefills += 1
                     usage[phrase] = usage.get(phrase, 0) + 1
+                    phrasefills += 1
                     row_changed = True
                     if c_phrase_cat is not None and not getv(r, c_phrase_cat) and cat:
                         queue(row_num, c_phrase_cat + 1, cat)
                         row_changed = True
-            else:
-                # Only count a miss if we actually had a key (dest/theme) to try.
-                if dest and theme:
-                    phrase_misses += 1
-                    if REQUIRE_PHRASE:
-                        # Leave blank; downstream can gate if you choose.
-                        pass
 
         if row_changed:
             enriched_rows += 1
@@ -432,7 +437,6 @@ def main() -> int:
     log(f"Rows enriched: {enriched_rows} (cap {MAX_ROWS})")
     log(f"City/Country fills: {cityfills}")
     log(f"Phrase fills: {phrasefills} (channel={PHRASE_CHANNEL})")
-    log(f"Phrase misses: {phrase_misses}")
     log(f"Cells queued: {len(updates)}")
 
     if not updates:

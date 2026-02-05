@@ -5,7 +5,7 @@ import json
 import os
 import random
 import time
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import gspread
 import requests
@@ -46,7 +46,7 @@ def truthy(v: Any) -> bool:
 
 
 # ==============================================================================
-# Google auth (robust)
+# Google auth
 # ==============================================================================
 
 def _parse_sa_json(raw: str) -> Dict[str, Any]:
@@ -54,20 +54,13 @@ def _parse_sa_json(raw: str) -> Dict[str, Any]:
     if not raw:
         raise RuntimeError("Missing GCP service account JSON")
 
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
+    for attempt in (raw, raw.replace("\\n", "\n"), raw.replace("\n", "\\n")):
+        try:
+            return json.loads(attempt)
+        except json.JSONDecodeError:
+            continue
 
-    try:
-        return json.loads(raw.replace("\\n", "\n"))
-    except json.JSONDecodeError:
-        pass
-
-    try:
-        return json.loads(raw.replace("\n", "\\n"))
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Cannot parse GCP_SA_JSON: {e}") from e
+    raise RuntimeError("Cannot parse GCP_SA_JSON")
 
 
 def gspread_client() -> gspread.Client:
@@ -96,22 +89,6 @@ def open_ws(sh: gspread.Spreadsheet, name: str) -> gspread.Worksheet:
         return sh.worksheet(name)
     except Exception as e:
         raise RuntimeError(f"WorksheetNotFound: {name}") from e
-
-def get_all_records(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
-    values = ws.get_all_values()
-    if len(values) < 2:
-        return []
-    headers = [h.strip() for h in values[0]]
-    out = []
-    for row in values[1:]:
-        if not any(c.strip() for c in row):
-            continue
-        d = {}
-        for i, h in enumerate(headers):
-            if h:
-                d[h] = row[i] if i < len(row) else ""
-        out.append(d)
-    return out
 
 def header_map(headers: List[str]) -> Dict[str, int]:
     return {h: i for i, h in enumerate(headers) if h}
@@ -192,6 +169,35 @@ def duffel_search(origin, dest, depart, ret, max_conn):
 
 
 # ==============================================================================
+# Offer extractors (RESTORED)
+# ==============================================================================
+
+def extract_carriers(offer: Dict[str, Any]) -> str:
+    carriers = set()
+    for s in offer.get("slices", []):
+        for seg in s.get("segments", []):
+            mc = seg.get("marketing_carrier", {})
+            if mc.get("iata_code"):
+                carriers.add(mc["iata_code"])
+    return ",".join(sorted(carriers))
+
+def extract_stops(offer: Dict[str, Any]) -> int:
+    # Max stops across slices
+    max_stops = 0
+    for s in offer.get("slices", []):
+        segs = s.get("segments", [])
+        max_stops = max(max_stops, max(0, len(segs) - 1))
+    return max_stops
+
+def extract_bags_included(offer: Dict[str, Any]) -> str:
+    # Best-effort, deterministic
+    for svc in offer.get("available_services", []):
+        if svc.get("type") == "baggage":
+            return "YES"
+    return ""
+
+
+# ==============================================================================
 # Main
 # ==============================================================================
 
@@ -222,7 +228,7 @@ def main() -> int:
     log(f"🎯 Theme of day: {theme}")
 
     cfg = [
-        r for r in get_all_records(ws_cfg)
+        r for r in ws_cfg.get_all_records()
         if truthy(r.get("enabled"))
         and str(r.get("theme","")).lower() == theme.lower()
     ]
@@ -278,6 +284,9 @@ def main() -> int:
             setv("currency", "GBP")
             setv("theme", theme)
             setv("status", "NEW")
+            setv("carriers", extract_carriers(offer))
+            setv("stops", extract_stops(offer))
+            setv("bags_incl", extract_bags_included(offer))
             setv("ingested_at_utc", iso(now_utc()))
 
             rows.append(row)

@@ -1,0 +1,44 @@
+name: Reddit Content Generator
+
+on:
+  schedule:
+    - cron: '0 21 * * 0'  # Every Sunday at 9 PM UTC
+  workflow_dispatch:  # Manual trigger also available
+
+jobs:
+  generate_reddit_content:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install openai gspread oauth2client
+      
+      - name: Run Reddit Content Generator
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: |
+          python reddit_content_generator.py
+      
+      - name: Upload logs (if failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reddit-generator-logs
+          path: |
+            *.log
+            *.txt
+          retention-days: 7

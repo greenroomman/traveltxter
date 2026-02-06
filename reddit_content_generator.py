@@ -41,25 +41,39 @@ TARGET_SUBREDDITS = ['TravelHacks', 'Shoestring', 'digitalnomad']
 
 # Voice guidance (locked)
 VOICE_GUIDE = """
-TravelTxter Reddit voice (Huckberry tone for community):
-- Conversational, helpful, anti-tourist
-- Share knowledge like a well-travelled friend, not a guru
-- Avoid hype: no "hidden gems", "bucket list", "life-changing"
-- Avoid sales language: no "check out", "sign up", "follow me"
-- Use specific examples: "I flew Lisbon for £180 in March" > "Europe is cheap"
-- Acknowledge trade-offs: "You'll sacrifice direct flights but save £200"
-- Cite seasonal patterns: "November is shoulder season for Thailand"
-- Sound like you've actually been there, not like you read a blog
+TravelTxter Reddit voice (natural, helpful, experienced):
+
+You're the traveler who's figured out the patterns. Helpful, not preachy. Knowledgeable, not guru.
+
+Write like you're typing quickly:
+- Short sentences. Use commas for flow, full stops for separation.
+- Use & instead of and where natural
+- Casual shortcuts: convo, vs, tho, tbh, imo, demo
+- First person experience: "I've tracked prices for 2 years"
+- Specific details with numbers: "Jan to Mar & Oct to Nov"
+- Honest trade offs: "You sacrifice X but gain Y"
+- Invite discussion at the end: "Anyone else seeing this?"
+
+Never:
+- Vent or complain about bad trips
+- Ask for help or validation  
+- Show struggle or uncertainty
+- Use bullet points with dashes
+- Use hype language: "hidden gem", "bucket list", "life changing"
+- Use sales language: "check out", "sign up", "follow me"
+- Sound like a content writer or blog post
 
 Good Reddit comment examples:
-- "March/April is the move for Morocco. Warm enough for coast, cool enough for desert. Summer crowds haven't hit Marrakech yet."
-- "I've flown Lisbon 4 times in the last 2 years. Best prices are Jan-Mar and Oct-Nov. TAP runs sales every 6 weeks or so."
-- "If you're flexible on dates, I'd skip peak summer and go shoulder season. Greece in May > August, half the price, no queues."
+"March & April is the move for Morocco. Warm enough for coast, cool enough for desert. Summer crowds haven't hit Marrakech yet. I usually see flights from London around £180 in that window."
+
+"I've flown Lisbon 4 times in 2 years. Best prices are Jan to Mar & Oct to Nov. TAP runs sales every 6 weeks or so. You sacrifice direct flights sometimes but save 30 to 40%. Anyone else tracking airline patterns?"
+
+"If you're flexible on dates I'd skip peak summer & go shoulder season. Greece in May is half the price of August, no queues. Flew Athens for £120 last May vs £280 in July."
 
 Bad Reddit comment examples:
-- "OMG you MUST visit this hidden gem! It's absolutely life-changing!" (hype, cringe)
-- "Check out my travel blog for more amazing tips!" (spam, self-promotion)
-- "DM me for the secret!" (sketchy, unhelpful)
+"OMG you MUST visit this hidden gem! It's absolutely life changing!" (hype, cringe)
+"Check out my travel blog for more amazing tips!" (spam, self promotion)
+"Here are 5 tips for booking flights: - Book early - Be flexible - Use comparison sites" (blog post format, not natural)
 """
 
 # Campaign calendar structure (12 weeks)
@@ -72,7 +86,7 @@ CAMPAIGN_CALENDAR = [
         'post_frequency': '3-5 comments',
         'brand_mention_allowed': False,
         'focus_topic': 'Winter sun destinations (Jan-Mar)',
-        'tone_guidance': 'Helpful lurker who actually knows their stuff',
+        'tone_guidance': 'Helpful friend who knows the patterns',
         'success_metric': 'Upvotes + replies'
     },
     {
@@ -82,7 +96,7 @@ CAMPAIGN_CALENDAR = [
         'post_frequency': '3-5 comments',
         'brand_mention_allowed': False,
         'focus_topic': 'Shoulder season tactics',
-        'tone_guidance': 'Experienced traveler sharing patterns',
+        'tone_guidance': 'Pattern spotter, not deal pusher',
         'success_metric': 'Upvotes + replies'
     },
     {
@@ -92,7 +106,7 @@ CAMPAIGN_CALENDAR = [
         'post_frequency': '3-5 comments',
         'brand_mention_allowed': False,
         'focus_topic': 'Flight deal patterns (airline sales cycles)',
-        'tone_guidance': 'Pattern-spotter, not deal-pusher',
+        'tone_guidance': 'Pattern spotter, not deal pusher',
         'success_metric': 'Upvotes + replies'
     },
     {
@@ -102,7 +116,7 @@ CAMPAIGN_CALENDAR = [
         'post_frequency': '3-5 comments',
         'brand_mention_allowed': False,
         'focus_topic': 'Budget carrier hacks',
-        'tone_guidance': 'Pragmatic advisor on trade-offs',
+        'tone_guidance': 'Pragmatic advisor on trade offs',
         'success_metric': 'Upvotes + replies'
     },
     # PHASE 2: Original Value (Week 5-8) - Establish authority through posts
@@ -174,7 +188,7 @@ CAMPAIGN_CALENDAR = [
         'post_frequency': '3-5 comments',
         'brand_mention_allowed': True,
         'focus_topic': 'Continue value-add + soft mentions',
-        'tone_guidance': 'Remain helpful first, promotional last',
+        'tone_guidance': 'Helpful first, promotional last',
         'success_metric': 'Authority maintained'
     },
     {
@@ -332,20 +346,17 @@ Brand mentions allowed: {brand_ok}
 {VOICE_GUIDE}
 
 Requirements:
-1. Title: Catchy but not clickbait (8-12 words)
-2. Body: 150-300 words
-3. Format: Conversational paragraphs (no bullet points unless essential)
-4. Include 1-2 specific examples with numbers/dates
-5. Acknowledge trade-offs (build trust)
-6. End with open question to encourage comments
-7. NO self-promotion unless brand_ok=True, and even then make it subtle
+1. Title: Catchy but not clickbait (8 to 12 words)
+2. Body: 150 to 300 words
+3. Format: Conversational paragraphs, no bullet points
+4. Include 1 or 2 specific examples with numbers & dates
+5. Acknowledge trade offs honestly
+6. End with open question to invite comments
+7. NO self promotion unless brand_ok is True, and even then make it subtle
+8. Write like you're typing quickly. Short sentences. Use & not and. Use commas for flow.
 
-Example structure:
-- Hook: Contrarian observation
-- Context: Why this matters now
-- Evidence: Specific examples
-- Trade-off: What you sacrifice
-- Question: Invite community input
+Structure:
+Hook with contrarian observation. Why this matters now. Specific examples with numbers. What you sacrifice. Question to invite community input.
 
 Generate the post:"""
 
@@ -361,11 +372,12 @@ Brand mentions allowed: {brand_ok}
 Imagine replying to: "Anyone have tips for cheap flights to warm places this winter?"
 
 Requirements:
-1. Length: 50-150 words
-2. Be specific: mention destinations, months, price ranges
-3. Sound like personal experience, not a guide
-4. Acknowledge downsides/trade-offs
-5. NO self-promotion unless brand_ok=True
+1. Length: 50 to 150 words
+2. Be specific with destinations, months, price ranges
+3. Sound like personal experience, not a guidebook
+4. Acknowledge downsides & trade offs
+5. NO self promotion unless brand_ok is True
+6. Write like typing quickly. Short sentences. Use & not and. Use commas for flow.
 
 Generate the comment:"""
 
@@ -375,7 +387,7 @@ Generate the comment:"""
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an experienced traveler who frequents Reddit travel communities. You're helpful, specific, and never pushy."
+                    "content": "You are an experienced traveler who frequents Reddit travel communities. You're helpful, specific, never pushy. Write like you're typing quickly in a comment box. Short sentences. Use & instead of and. Use commas for flow. Sound natural, not like a content writer."
                 },
                 {"role": "user", "content": prompt}
             ],

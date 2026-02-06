@@ -164,7 +164,7 @@ CAMPAIGN_CALENDAR = [
         'post_frequency': '1 post',
         'brand_mention_allowed': True,
         'focus_topic': 'Case study: Real deals from winter',
-        'tone_guidance': 'Show, don't sell',
+        'tone_guidance': 'Show, do not sell',
         'success_metric': 'Engagement + TravelTxter clicks'
     },
     {

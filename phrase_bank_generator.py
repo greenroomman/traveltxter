@@ -104,10 +104,49 @@ def get_iata_mapping(sheet):
             print("❌ IATA_MASTER is empty")
             sys.exit(1)
         
-        headers = rows[0]
-        iata_idx = headers.index('iata')
-        city_idx = headers.index('city')
-        country_idx = headers.index('country')
+        headers = [h.strip().lower() for h in rows[0]]
+        print(f"   Found headers: {headers}")
+        
+        # Try common variations for each column
+        iata_variations = ['iata', 'iata_code', 'code', 'airport_code']
+        city_variations = ['city', 'city_name', 'destination_city']
+        country_variations = ['country', 'country_name', 'destination_country']
+        
+        iata_idx = None
+        city_idx = None
+        country_idx = None
+        
+        for var in iata_variations:
+            if var in headers:
+                iata_idx = headers.index(var)
+                break
+        
+        for var in city_variations:
+            if var in headers:
+                city_idx = headers.index(var)
+                break
+        
+        for var in country_variations:
+            if var in headers:
+                country_idx = headers.index(var)
+                break
+        
+        if iata_idx is None:
+            print(f"❌ Could not find IATA column. Tried: {iata_variations}")
+            print(f"   Available headers: {rows[0]}")
+            sys.exit(1)
+        
+        if city_idx is None:
+            print(f"❌ Could not find city column. Tried: {city_variations}")
+            print(f"   Available headers: {rows[0]}")
+            sys.exit(1)
+        
+        if country_idx is None:
+            print(f"❌ Could not find country column. Tried: {country_variations}")
+            print(f"   Available headers: {rows[0]}")
+            sys.exit(1)
+        
+        print(f"   Using: iata={rows[0][iata_idx]}, city={rows[0][city_idx]}, country={rows[0][country_idx]}")
         
         mapping = {}
         for row in rows[1:]:
@@ -122,6 +161,8 @@ def get_iata_mapping(sheet):
         return mapping
     except Exception as e:
         print(f"❌ Failed to read IATA_MASTER: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 def get_covered_destinations(sheet):

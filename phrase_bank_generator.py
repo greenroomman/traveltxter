@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TravelTxter V5 - Phrase Bank Generator
+TravelTxter V5 - Phrase Bank Generator (IMPROVED)
 Purpose: Generate editorial phrase candidates for destinations lacking PHRASE_BANK coverage
 Contract: Reads CONFIG + PHRASE_BANK, writes to PHRASE_BANK_CANDIDATES only
 Human loop: Richard reviews candidates → manually approves → moves to PHRASE_BANK
@@ -35,26 +35,54 @@ PHRASE_BANK_TAB = 'PHRASE_BANK'
 CANDIDATES_TAB = 'PHRASE_BANK_CANDIDATES'
 IATA_MASTER_TAB = 'IATA_MASTER'
 
-# Voice guidance (locked)
+# Voice guidance (IMPROVED - based on actual review feedback)
 VOICE_GUIDE = """
-TravelTxter editorial voice (Huckberry tone):
-- Conversational, knowledgeable, anti-tourist
-- Avoid hype language: "hidden gem", "bucket list", "must-see", "paradise"
-- Reference specific seasonal, cultural, or geographical hooks
-- Length: 8-15 words maximum
-- Factual observations, not marketing claims
-- Well-travelled friend sharing an insight, not a guidebook selling a destination
+TravelTxter editorial voice - two friends chatting over coffee:
 
-Good examples:
-- "Kyoto's maple tunnels turn red in November, and tourists vanish by December"
-- "Iceland's winter geothermal pools while everyone else is in Bali"
-- "Porto's port lodges are empty on weekday mornings in February"
+PREFER:
+- Specific foods, drinks, activities (churros, chai, oysters, samosas, coffee, beer)
+- Concrete time references (Sunday mornings, weekday afternoons, before sunset)
+- Simple active sentences that you'd actually say out loud
+- Local routines and rhythms (markets opening, locals gathering, ferries departing)
+- Directness: "Grab a...", "Try the...", "Catch the..."
 
-Bad examples:
-- "Discover the hidden gems of magical Santorini!" (hype, generic)
-- "A bucket list destination you absolutely must visit" (cliché, pushy)
-- "Paradise awaits in this stunning location" (marketing nonsense)
+AVOID:
+- Poetic personification: "whispers", "echoes", "dance", "hug", "kiss"
+- Nature metaphors: "ablaze", "paints", "glows golden", "melts into"
+- Fragment sentences missing verbs
+- Trying to sound clever or literary
+- Any word you wouldn't use talking to a mate
+- Overused travel words: "hidden gem", "stunning", "paradise", "breathtaking"
+
+Length: 8-15 words maximum
+
+Test: Would you actually say this to a friend? If not, rewrite it.
+
+Good examples (these sound human):
+- "Grab a summer beer in Unirii Square, when locals outnumber tourists"
+- "Winter evenings in Faisalabad call for chai and street-side samosas"
+- "Fresh churros and hot chocolate after a stroll in Coyoacán's autumn air"
+- "Coastal walks and local oysters before summer's influx"
+- "Cherry blossoms bloom along the Han River while locals sip Makgeolli"
+- "Early morning ferry to Zanzibar before the city wakes up"
+
+Bad examples (nobody talks like this):
+- "Northern Lights dance over the ice hotel" (poetic personification)
+- "Yukon River's icy whispers join Northern Lights" (overwrought metaphor)
+- "Lake Macquarie sunsets set the sky ablaze" (trying too hard)
+- "Bagamoyo town history whispers on weekday afternoons" (personification)
+- "Catch pelicans preening when winter mist hugs the shore" (forced cuteness)
 """
+
+# Forbidden words/phrases that trigger rejection
+FORBIDDEN_PHRASES = [
+    'whisper', 'whispers', 'dance', 'dances', 'echo', 'echoes',
+    'hug', 'hugs', 'kiss', 'kisses', 'ablaze', 'paint', 'paints',
+    'glow golden', 'glows golden', 'glowing golden',
+    'melts into', 'melt into',
+    'hidden gem', 'bucket list', 'must-see', 'paradise', 'stunning',
+    'breathtaking', 'magical', 'discover the'
+]
 
 # ============================================================================
 # HELPERS
@@ -246,24 +274,35 @@ def get_sample_phrases(sheet, limit=10):
         print(f"⚠️  Could not load samples: {e}")
         return []
 
-def generate_phrase_candidates(openai_client, destination_city, destination_country, sample_phrases):
-    """Generate 3 phrase candidates using OpenAI"""
+def contains_forbidden_phrase(text):
+    """Check if text contains any forbidden phrases"""
+    text_lower = text.lower()
+    for forbidden in FORBIDDEN_PHRASES:
+        if forbidden in text_lower:
+            return True, forbidden
+    return False, None
+
+def generate_phrase_candidates(openai_client, destination_city, destination_country, sample_phrases, max_attempts=3):
+    """Generate 3 phrase candidates using OpenAI with quality filtering"""
     
-    samples_text = "\n".join([f"- {p}" for p in sample_phrases]) if sample_phrases else "No samples available - use voice guide."
+    samples_text = "\n".join([f"- {p}" for p in sample_phrases]) if sample_phrases else "No samples available - use voice guide strictly."
     
     prompt = f"""Generate 3 editorial travel phrases for {destination_city}, {destination_country}.
 
 {VOICE_GUIDE}
 
-Sample approved phrases (learn the style):
+CRITICAL: These phrases will be rejected if they contain:
+{', '.join(FORBIDDEN_PHRASES)}
+
+Sample approved phrases (match this conversational style):
 {samples_text}
 
 Requirements:
 1. Return EXACTLY 3 phrases, one per line
 2. Each phrase must be 8-15 words
-3. Focus on seasonal timing, cultural observations, or geographical facts
-4. Avoid tourist clichés and hype language
-5. Sound like a well-travelled friend sharing an insight
+3. Mention specific foods, drinks, or activities where possible
+4. Use simple, active sentences you'd say to a friend
+5. Test each phrase: "Would I actually say this?" If no, rewrite it
 
 Format your response as:
 1. [phrase one]
@@ -273,40 +312,61 @@ Format your response as:
 Destination: {destination_city}, {destination_country}
 Generate phrases:"""
 
-    try:
-        response = openai_client.chat.completions.create(
-            model=os.getenv('OPENAI_MODEL'),
-            messages=[
-                {"role": "system", "content": "You are an expert travel writer creating concise, anti-tourist editorial phrases in the style of Huckberry or Monocle magazine."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.8,
-            max_tokens=200
-        )
+    for attempt in range(max_attempts):
+        try:
+            response = openai_client.chat.completions.create(
+                model=os.getenv('OPENAI_MODEL'),
+                messages=[
+                    {"role": "system", "content": "You are a friend recommending travel destinations in natural, conversational language. Never use poetic metaphors or personification. Stick to concrete, specific details like foods, drinks, and activities."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,  # Reduced from 0.8 for more consistent quality
+                max_tokens=200
+            )
+            
+            content = response.choices[0].message.content.strip()
+            
+            # Parse numbered lines
+            lines = [l.strip() for l in content.split('\n') if l.strip()]
+            phrases = []
+            rejected_phrases = []
+            
+            for line in lines:
+                # Remove numbering (1., 2., etc)
+                cleaned = line
+                if line[0].isdigit() and '. ' in line:
+                    cleaned = line.split('. ', 1)[1]
+                
+                # Check for forbidden phrases
+                is_forbidden, forbidden_word = contains_forbidden_phrase(cleaned)
+                if is_forbidden:
+                    rejected_phrases.append((cleaned, forbidden_word))
+                    print(f"   ⚠️  REJECTED (contains '{forbidden_word}'): {cleaned}")
+                else:
+                    phrases.append(cleaned)
+            
+            # If we got 3 good phrases, we're done
+            if len(phrases) >= 3:
+                return phrases[:3]
+            
+            # If we rejected some, try again
+            if rejected_phrases and attempt < max_attempts - 1:
+                print(f"   🔄 Attempt {attempt + 2}/{max_attempts}: Regenerating due to forbidden phrases...")
+                continue
+            
+            # Pad if needed (last attempt)
+            if len(phrases) < 3:
+                print(f"   ⚠️  Only got {len(phrases)} valid phrases after {max_attempts} attempts, padding with empty")
+                phrases.extend([''] * (3 - len(phrases)))
+            
+            return phrases[:3]
         
-        content = response.choices[0].message.content.strip()
-        
-        # Parse numbered lines
-        lines = [l.strip() for l in content.split('\n') if l.strip()]
-        phrases = []
-        
-        for line in lines:
-            # Remove numbering (1., 2., etc)
-            cleaned = line
-            if line[0].isdigit() and '. ' in line:
-                cleaned = line.split('. ', 1)[1]
-            phrases.append(cleaned)
-        
-        # Ensure exactly 3
-        if len(phrases) < 3:
-            print(f"⚠️  Only got {len(phrases)} phrases for {destination_city}, padding with empty")
-            phrases.extend([''] * (3 - len(phrases)))
-        
-        return phrases[:3]
+        except Exception as e:
+            print(f"   ❌ OpenAI call failed (attempt {attempt + 1}): {e}")
+            if attempt == max_attempts - 1:
+                return ['', '', '']
     
-    except Exception as e:
-        print(f"❌ OpenAI call failed for {destination_city}: {e}")
-        return ['', '', '']
+    return ['', '', '']
 
 def write_candidates(sheet, candidates_data):
     """Write candidates to PHRASE_BANK_CANDIDATES tab"""
@@ -360,7 +420,7 @@ def write_candidates(sheet, candidates_data):
 # ============================================================================
 
 def main():
-    print("🚀 TravelTxter V5 - Phrase Bank Generator")
+    print("🚀 TravelTxter V5 - Phrase Bank Generator (IMPROVED)")
     print("=" * 60)
     
     # Validate environment
@@ -402,6 +462,7 @@ def main():
             print(f"⚠️  {iata} not in IATA_MASTER, skipping")
     
     print(f"\n🎯 Generating phrases for {len(uncovered_with_data)} destinations...")
+    print(f"🚫 Active filters: {len(FORBIDDEN_PHRASES)} forbidden phrases")
     
     # Generate candidates
     candidates_data = []
@@ -422,9 +483,9 @@ def main():
             'phrases': phrases
         })
         
-        print(f"   1. {phrases[0]}")
-        print(f"   2. {phrases[1]}")
-        print(f"   3. {phrases[2]}")
+        print(f"   ✅ 1. {phrases[0]}")
+        print(f"   ✅ 2. {phrases[1]}")
+        print(f"   ✅ 3. {phrases[2]}")
     
     # Write to candidates tab
     write_candidates(sheet, candidates_data)
@@ -432,6 +493,7 @@ def main():
     print("\n" + "=" * 60)
     print("✅ PHRASE_BANK_GENERATOR COMPLETE")
     print(f"✅ {len(candidates_data)} candidate sets written to {CANDIDATES_TAB}")
+    print(f"✅ Filtered out forbidden phrases automatically")
     print(f"✅ Next step: Review tab → approve phrases → manually copy to PHRASE_BANK")
     print("=" * 60)
 

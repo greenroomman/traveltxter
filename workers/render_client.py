@@ -1,42 +1,45 @@
-#!/usr/bin/env bash
-set -euo pipefail
+jobs:
+  test-render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install requests
+      
+      - name: Test renderer
+        run: python workers/render_client.py
+```
 
-BASE="https://greenroomman.pythonanywhere.com"
-ENDPOINT="$BASE/api/render"   # <-- if your PA mount is /api
-# ENDPOINT="$BASE/render"     # <-- if NOT mounted under /api
+---
 
-echo "Testing health..."
-curl -sS "$BASE/api/health" || curl -sS "$BASE/health"
-echo
-echo "----------------------------------------"
+## VERIFICATION
 
-test_render () {
-  local layout="$1"
-  local theme="$2"
-  local from_city="$3"
-  local to_city="$4"
-  local out_date="$5"   # ddmmyy
-  local in_date="$6"    # ddmmyy
-  local price="$7"      # e.g. £159
-  
-  echo "Rendering layout=$layout theme=$theme $from_city -> $to_city $out_date/$in_date $price"
-  
-  curl -sS -X POST "$ENDPOINT" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"TO\":\"$to_city\",
-      \"FROM\":\"$from_city\",
-      \"OUT\":\"$out_date\",
-      \"IN\":\"$in_date\",
-      \"PRICE\":\"$price\",
-      \"layout\":\"$layout\",
-      \"theme\":\"$theme\"
-    }"
-  
-  echo
-  echo "----------------------------------------"
+After pushing, confirm logs show:
+```
+Testing health...
+{'ok': True}
+----------------------------------------
+Rendering layout=AM theme=northern_lights London -> Keflavik 120326/180326 £159
+{
+    "graphic_url": "https://...",
+    "layout": "AM",
+    "ok": true,
+    "theme": "northern_lights"
 }
+----------------------------------------
+Rendering layout=PM theme=northern_lights London -> Keflavik 120326/180326 £159
+{
+    "graphic_url": "https://...",
+    "layout": "PM",
+    "ok": true,
+    "theme": "northern_lights"
+}
+----------------------------------------
 
-# Test calls
-test_render "AM" "northern_lights" "London" "Keflavik" "120326" "180326" "£159"
-test_render "PM" "northern_lights" "London" "Keflavik" "120326" "180326" "£159"
+✅ All render tests passed

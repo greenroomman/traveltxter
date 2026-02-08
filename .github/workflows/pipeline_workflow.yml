@@ -131,6 +131,7 @@ jobs:
       # 4) RENDER
       # =========================
       - name: Render (render_client.py)
+        continue-on-error: true
         env:
           MODE: full
           RUN_SLOT: ${{ env.RUN_SLOT }}

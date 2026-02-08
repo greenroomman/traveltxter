@@ -1,13 +1,14 @@
-# workers/pipeline_worker.py
-# FULL FILE REPLACEMENT — TRAVELTXTTER V5 FEEDER
-#
-# Fixes:
-# - bags_incl crash when offer["available_services"] is None (now safe)
-# - writes carriers, stops, cabin_class, bags_incl from Duffel (best-effort)
-# - bulk append to RAW_DEALS to reduce Google API lag
-# - theme read from OPS_MASTER!B2
-# - CONFIG schema: enabled,destination_iata,theme,weight
-#
+#!/usr/bin/env python3
+"""
+workers/pipeline_worker.py
+TRAVELTXTTER V5 FEEDER
+
+Fixes in this version:
+- ISO timestamp format for ingested_at_utc (was epoch int, now ISO string)
+- Enhanced logging to see dedupe skips and destination progression
+- Preserved all other V5 contract requirements
+"""
+
 from __future__ import annotations
 
 import os
@@ -16,6 +17,7 @@ import time
 import math
 import hashlib
 import random
+import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -127,6 +129,18 @@ def get_cell(ws: gspread.Worksheet, a1: str) -> str:
 
 
 # ----------------------------
+# Timestamp helper (ISO format)
+# ----------------------------
+
+def _utc_iso() -> str:
+    """
+    CRITICAL FIX: Return ISO format timestamp string (not epoch int)
+    IG Publisher expects: "2026-02-08T07:34:52Z"
+    """
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+# ----------------------------
 # Duffel
 # ----------------------------
 
@@ -143,10 +157,6 @@ def duffel_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-
-
-def _utc_epoch() -> int:
-    return int(time.time())
 
 
 def _hash_trip(origin: str, dest: str, out_date: str, ret_date: str) -> str:
@@ -232,9 +242,7 @@ def extract_cabin_class(offer: Dict[str, Any], fallback: str = "economy") -> str
 
 def extract_bags_included(offer: Dict[str, Any]) -> str:
     """
-    Fix for your crash:
-      offer.get("available_services") can be None -> treat as empty list.
-    Best-effort: returns "" (unknown) or a numeric string.
+    Fix for crash: offer.get("available_services") can be None
     """
     try:
         services = offer.get("available_services") or []
@@ -421,7 +429,7 @@ RAW_HEADERS_REQUIRED = [
 
 def main() -> int:
     print("======================================================================")
-    print("TRAVELTXTTER V5 — FEEDER START (MIN CONFIG, VOLUME)")
+    print("TRAVELTXTTER V5 — FEEDER START (FIXED: ISO TIMESTAMPS)")
     print("======================================================================")
 
     run_slot = env_str("RUN_SLOT", "PM").upper()
@@ -462,12 +470,20 @@ def main() -> int:
 
     cabin = env_str("CABIN_CLASS", "economy").lower()
 
+    print(f"📍 Origins: {origins}")
+    print(f"📍 Destinations (top {len(chosen)}): {[d.destination_iata for d in chosen]}")
+    print(f"📍 Max searches: {max_searches} | Max inserts: {max_inserts}")
+    print("=" * 60)
+
     searches = 0
     no_offer = 0
     dedupe_skips = 0
     pending_rows: List[List[Any]] = []
 
     for d in chosen:
+        if searches >= max_searches or len(pending_rows) >= max_inserts:
+            break
+
         for o in origins:
             if searches >= max_searches or len(pending_rows) >= max_inserts:
                 break
@@ -478,20 +494,24 @@ def main() -> int:
             trip_key = (o, d.destination_iata, out_date, ret_date)
             if trip_key in dedupe:
                 dedupe_skips += 1
+                print(f"⏭️  Dedupe skip: {o}→{d.destination_iata} {out_date}/{ret_date}")
                 continue
 
             searches += 1
-            print(f"🔎 Search {searches}/{max_searches} {o}→{d.destination_iata}")
+            print(f"🔎 Search {searches}/{max_searches} {o}→{d.destination_iata} {out_date}/{ret_date}")
 
             offer = duffel_search(o, d.destination_iata, out_date, ret_date, cabin=cabin, max_connections=max_conn)
             if not offer:
                 no_offer += 1
+                print(f"   ❌ No offer found")
                 time.sleep(sleep_s)
                 continue
 
             total_amount = float(offer.get("total_amount") or 0.0)
             price_gbp = int(math.ceil(total_amount))
             currency = (offer.get("total_currency") or "GBP").upper()
+
+            print(f"   ✅ Found offer: £{price_gbp}")
 
             row_map: Dict[str, Any] = {h: "" for h in RAW_HEADERS_REQUIRED}
             row_map.update({
@@ -518,7 +538,7 @@ def main() -> int:
                 "posted_vip_at": "",
                 "posted_free_at": "",
                 "posted_instagram_at": "",
-                "ingested_at_utc": _utc_epoch(),
+                "ingested_at_utc": _utc_iso(),  # FIXED: ISO format
                 "phrase_used": "",
                 "phrase_category": "",
                 "scored_timestamp": "",
@@ -528,16 +548,14 @@ def main() -> int:
             dedupe.add(trip_key)
             time.sleep(sleep_s)
 
-        if searches >= max_searches or len(pending_rows) >= max_inserts:
-            break
-
+    print("=" * 60)
     if pending_rows:
         append_rows_bulk(ws_raw, pending_rows)
         print(f"✅ Inserted {len(pending_rows)} row(s) into {raw_tab}.")
     else:
         print("⚠️ No rows inserted.")
 
-    print(f"SUMMARY: searches={searches} inserted={len(pending_rows)} dedupe_skips={dedupe_skips} no_offer={no_offer}")
+    print(f"📊 SUMMARY: searches={searches} inserted={len(pending_rows)} dedupe_skips={dedupe_skips} no_offer={no_offer}")
     return 0
 
 

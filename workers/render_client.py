@@ -2,8 +2,7 @@
 set -euo pipefail
 
 BASE="https://greenroomman.pythonanywhere.com"
-ENDPOINT="$BASE/api/render"   # <-- if your PA mount is /api
-# ENDPOINT="$BASE/render"     # <-- if NOT mounted under /api
+ENDPOINT="$BASE/api/render"
 
 echo "Testing health..."
 curl -sS "$BASE/api/health" || curl -sS "$BASE/health"
@@ -15,9 +14,9 @@ test_render () {
   local theme="$2"
   local from_city="$3"
   local to_city="$4"
-  local out_date="$5"   # ddmmyy
-  local in_date="$6"    # ddmmyy
-  local price="$7"      # e.g. £159
+  local out_date="$5"
+  local in_date="$6"
+  local price="$7"
   
   echo "Rendering layout=$layout theme=$theme $from_city -> $to_city $out_date/$in_date $price"
   
@@ -37,6 +36,5 @@ test_render () {
   echo "----------------------------------------"
 }
 
-# Test calls
 test_render "AM" "northern_lights" "London" "Keflavik" "120326" "180326" "£159"
 test_render "PM" "northern_lights" "London" "Keflavik" "120326" "180326" "£159"

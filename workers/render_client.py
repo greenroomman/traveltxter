@@ -18,9 +18,9 @@ test_render () {
   local out_date="$5"   # ddmmyy
   local in_date="$6"    # ddmmyy
   local price="$7"      # e.g. £159
-
+  
   echo "Rendering layout=$layout theme=$theme $from_city -> $to_city $out_date/$in_date $price"
-
+  
   curl -sS -X POST "$ENDPOINT" \
     -H "Content-Type: application/json" \
     -d "{
@@ -30,24 +30,13 @@ test_render () {
       \"IN\":\"$in_date\",
       \"PRICE\":\"$price\",
       \"layout\":\"$layout\",
-test_render "PM" "northern_lights" "London" "Keflavik" "120326" "180326" "£159"
-Testing health...
-{"ok":true}
+      \"theme\":\"$theme\"
+    }"
+  
+  echo
+  echo "----------------------------------------"
+}
 
-----------------------------------------
-Rendering layout=AM theme=northern_lights London -> Keflavik 120326/180326 £159
-{
-    "graphic_url": "https://greenroomman.pythonanywhere.com/static/renders/deal_london_keflavik_120326_180326_260206_082946_8dcb123c.png",
-    "layout": "AM",
-    "ok": true,
-    "theme": "northern_lights"
-}
-----------------------------------------
-Rendering layout=PM theme=northern_lights London -> Keflavik 120326/180326 £159
-{
-    "graphic_url": "https://greenroomman.pythonanywhere.com/static/renders/deal_london_keflavik_120326_180326_260206_082947_bda590a0.png",
-    "layout": "PM",
-    "ok": true,
-    "theme": "northern_lights"
-}
--------------
+# Test calls
+test_render "AM" "northern_lights" "London" "Keflavik" "120326" "180326" "£159"
+test_render "PM" "northern_lights" "London" "Keflavik" "120326" "180326" "£159"

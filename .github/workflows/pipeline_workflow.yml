@@ -11,9 +11,17 @@ on:
         options:
           - full
           - feeder_only
+      run_slot:
+        description: "Time slot: AM or PM (for manual testing)"
+        required: true
+        default: "PM"
+        type: choice
+        options:
+          - AM
+          - PM
   schedule:
-    - cron: "30 7 * * *"
-    - cron: "30 16 * * *"
+    - cron: "30 7 * * *"   # 07:30 UTC = AM
+    - cron: "30 16 * * *"  # 16:30 UTC = PM
 
 concurrency:
   group: traveltxter-v5-pipeline
@@ -24,7 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MODE: ${{ inputs.mode || 'full' }}
-      RUN_SLOT: ${{ github.event.schedule == '30 7 * * *' && 'AM' || 'PM' }}
+      # FIXED: Manual override via input, schedule-based auto-detection as fallback
+      RUN_SLOT: ${{ inputs.run_slot || (github.event.schedule == '30 7 * * *' && 'AM' || 'PM') }}
 
     steps:
       - name: Checkout
@@ -132,7 +141,8 @@ jobs:
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           RAW_DEALS_VIEW_TAB: RAW_DEALS_VIEW
           OPS_MASTER_TAB: OPS_MASTER
-          RENDER_URL: ${{ secrets.RENDER_URL }}
+          # FIXED: Variable name mismatch
+          RENDER_BASE_URL: ${{ secrets.RENDER_URL }}
           RENDER_MAX_ROWS: ${{ vars.RENDER_MAX_ROWS || '2' }}
         run: |
           set -e
@@ -193,12 +203,16 @@ jobs:
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           RAW_DEALS_VIEW_TAB: RAW_DEALS_VIEW
+          # FIXED: Added missing OPS_MASTER_TAB
+          OPS_MASTER_TAB: OPS_MASTER
           TELEGRAM_BOT_TOKEN_VIP: ${{ secrets.TELEGRAM_BOT_TOKEN_VIP }}
           TELEGRAM_CHANNEL_VIP: ${{ secrets.TELEGRAM_CHANNEL_VIP }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           STRIPE_LINK_MONTHLY: ${{ secrets.STRIPE_LINK_MONTHLY }}
           STRIPE_LINK_YEARLY: ${{ secrets.STRIPE_LINK_YEARLY }}
+          # FIXED: Added missing MIN_INGEST_AGE_SECONDS
+          MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS || '90' }}
           AM_RUN_TIME_UTC: "07:30"
           PM_RUN_TIME_UTC: "16:30"
         run: |

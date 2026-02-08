@@ -238,52 +238,80 @@ def fmt_money(price_gbp: str) -> str:
 
 
 def build_vip_message(row: Dict[str, str]) -> str:
+    """VIP = Product. Shows deal + booking link."""
     to_city = row.get("destination_city") or row.get("destination_iata")
     from_city = row.get("origin_city") or row.get("origin_iata")
+    country = row.get("destination_country", "")
     out_date = fmt_date(row.get("outbound_date", ""))
     in_date = fmt_date(row.get("return_date", ""))
     price = fmt_money(row.get("price_gbp", ""))
-
-    theme = (row.get("theme") or "").strip()
+    
     phrase = (row.get("phrase_used") or "").strip()
     link = (row.get("booking_link_vip") or "").strip()
-
-    lines = []
-    if theme:
-        lines.append(f"<b>{theme.replace('_',' ').title()}</b>")
-    lines.append(f"<b>{from_city} → {to_city}</b>")
-    if out_date and in_date:
-        lines.append(f"{out_date} → {in_date}")
-    if price:
-        lines.append(f"{price} return")
+    
+    # Country flag emoji (optional enhancement)
+    flag = ""  # Could add flag mapping if desired
+    
+    lines = [
+        f"{price} to {country} {flag}".strip(),
+        "",
+        f"TO: {to_city}",
+        f"FROM: {from_city}",
+        f"OUT:  {out_date}",
+        f"BACK: {in_date}",
+    ]
+    
     if phrase:
-        lines.append(f"\n{phrase}")
+        lines.append("")
+        lines.append(phrase)
+    
     if link:
-        lines.append(f"\n<a href=\"{link}\">Book / check dates</a>")
-
+        lines.append("")
+        lines.append(f'<a href="{link}">Booking link</a>')
+    
+    lines.append("")
+    lines.append("Shared with VIP first, as always.")
+    
     return "\n".join(lines).strip()
 
 
 def build_free_message(row: Dict[str, str]) -> str:
-    # FREE is advertising: keep it lighter, still include link.
+    """FREE = VIP subscription advertising. No booking link."""
     to_city = row.get("destination_city") or row.get("destination_iata")
     from_city = row.get("origin_city") or row.get("origin_iata")
+    country = row.get("destination_country", "")
     out_date = fmt_date(row.get("outbound_date", ""))
     in_date = fmt_date(row.get("return_date", ""))
-
-    theme = (row.get("theme") or "").strip()
-    link = (row.get("booking_link_vip") or "").strip()
-
-    lines = []
-    if theme:
-        lines.append(f"<b>{theme.replace('_',' ').title()}</b>")
-    lines.append(f"{from_city} → {to_city}")
-    if out_date and in_date:
-        lines.append(f"{out_date} → {in_date}")
-    if link:
-        lines.append(f"\n<a href=\"{link}\">Check the deal</a>")
-    lines.append("\nWant these first? VIP gets early access.")
-
+    price = fmt_money(row.get("price_gbp", ""))
+    
+    # Get subscription links from env vars
+    monthly_link = os.getenv("STRIPE_LINK_MONTHLY", "").strip()
+    yearly_link = os.getenv("STRIPE_LINK_YEARLY", "").strip()
+    
+    # Country flag emoji (optional enhancement)
+    flag = ""  # Could add flag mapping if desired
+    
+    lines = [
+        f"{price} to {country} {flag}".strip(),
+        "",
+        f"TO: {to_city}",
+        f"FROM: {from_city}",
+        f"OUT:  {out_date}",
+        f"BACK: {in_date}",
+        "",
+        " Our Nomads saw this first. We share deals with them early so they get a bit of breathing room to decide, rather than rushing it.",
+        "",
+        "If you'd like that early access, to Nomad tier is £3 per month or £30 per year.",
+    ]
+    
+    # Add subscription links if available
+    if monthly_link and yearly_link:
+        lines.append("")
+        lines.append(f'<a href="{monthly_link}">Monthly</a> | <a href="{yearly_link}">Yearly</a>')
+    
+    lines.append("")
+    lines.append("Instagram: @Traveltxter")
+    
     return "\n".join(lines).strip()
 
 

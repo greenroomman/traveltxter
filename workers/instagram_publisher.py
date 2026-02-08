@@ -1,20 +1,19 @@
 # workers/instagram_publisher.py
-# V5 — Instagram Publisher
+# V5 — Instagram Publisher (90/10 Rotation Buffer)
 #
 # Reads:
 # - OPS_MASTER!B2 (theme of the day)
-# - RAW_DEALS_VIEW (read-only) OPTIONAL (not required for posting)
 # - RAW_DEALS (source of truth; writable)
 #
 # Writes (RAW_DEALS only):
 # - posted_instagram_at (timestamp)
-# - status: PUBLISH_AM / PUBLISH_PM / PUBLISH_BOTH  -> READY_TO_POST   (ONLY these)
+# - status: Only transitions PUBLISH_* statuses to READY_TO_POST
 # - publish_error / publish_error_at (if columns exist)
 #
-# Posting rule:
-# - IG must always advertise: if no publish_window candidate exists, fallback to latest fresh rendered deal
-#   for today theme (graphic_url present, not already posted) even if status isn't PUBLISH_*.
-#   In that case: DO NOT change status.
+# 90/10 Rotation Strategy:
+# - 90%: Prefer deals from current slot (AM during AM run, PM during PM run)
+# - 10%: Fallback to opposite slot if current slot is empty (rotation buffer)
+# - Caption always uses CURRENT slot language, regardless of graphic slot
 
 from __future__ import annotations
 
@@ -81,19 +80,13 @@ def _repair_private_key_newlines(raw: str) -> str:
     but private_key contains literal newlines (invalid in JSON strings).
     Converts those literal newlines inside the private_key field to \\n.
     """
-    # Locate "private_key": "...."
-    # DOTALL is required because the private key may contain literal newlines.
     pat = re.compile(r'("private_key"\s*:\s*")(.+?)(")', re.DOTALL)
     m = pat.search(raw)
     if not m:
         return raw
 
     prefix, pk, suffix = m.group(1), m.group(2), m.group(3)
-
-    # Convert real newlines to \n escape sequences
     pk_fixed = pk.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
-
-    # Also ensure any stray unescaped tabs are escaped
     pk_fixed = pk_fixed.replace("\t", "\\t")
 
     return raw[: m.start()] + prefix + pk_fixed + suffix + raw[m.end():]
@@ -209,7 +202,7 @@ def ig_publish_container(version: str, ig_user_id: str, access_token: str, creat
     return j["id"]
 
 
-# ------------------ selection logic ------------------
+# ------------------ selection logic (90/10 rotation buffer) ------------------
 
 def run_slot() -> str:
     s = env("RUN_SLOT", "").upper()
@@ -232,18 +225,19 @@ def pick_candidate(rows: List[Tuple[int, Dict[str, str]]],
                    slot: str,
                    ref: dt.datetime) -> Optional[Tuple[int, Dict[str, str], str]]:
     """
+    90/10 Rotation Buffer Strategy:
+    - 90%: Prefer deals from current slot (AM during AM run, PM during PM run)
+    - 10%: Fallback to opposite slot if current slot is empty
+    - Always respect freshness (<24h) and theme match
+    
     Returns (row_index_1based, row, reason) or None
     """
-    # Primary: publish_window matches slot
-    want_windows = []
-    if slot == "AM":
-        want_windows = ["PUBLISH_AM", "PUBLISH_BOTH"]
-    elif slot == "PM":
-        want_windows = ["PUBLISH_PM", "PUBLISH_BOTH"]
-    else:
-        want_windows = ["PUBLISH_BOTH", "PUBLISH_AM", "PUBLISH_PM"]
-
-    # Filter: must have graphic_url and not already IG posted and be fresh
+    
+    # Define current and fallback slots
+    current_slot = slot  # "AM" or "PM"
+    opposite_slot = "PM" if slot == "AM" else "AM"
+    
+    # Filter: must have graphic_url, not already posted, fresh <24h
     eligible = []
     for i, r in rows:
         if not get_cell(r, "graphic_url"):
@@ -252,52 +246,64 @@ def pick_candidate(rows: List[Tuple[int, Dict[str, str]]],
             continue
         if not is_fresh_24h(r, ref):
             continue
-
-        # theme match (prefer column theme, then deal_theme)
+        
+        # Theme match (prefer column theme, then deal_theme)
         rt = normalize_theme(get_cell(r, "theme") or get_cell(r, "deal_theme"))
         match = (rt == theme_today) if rt else True  # if blank, don't block
         eligible.append((i, r, match))
-
+    
     if not eligible:
         return None
-
-    # Window-matching candidates first
-    window_hits = []
-    for i, r, match in eligible:
-        pw = get_cell(r, "publish_window").upper()
-        if pw in want_windows:
-            window_hits.append((i, r, match))
-
+    
     def sort_key(item):
         i, r, match = item
         ing = parse_iso_utc(get_cell(r, "ingested_at_utc")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
         # Prefer theme match, newest ingest
         return (1 if match else 0, ing)
-
-    if window_hits:
-        window_hits.sort(key=sort_key, reverse=True)
-        i, r, match = window_hits[0]
-        return i, r, f"publish_window={get_cell(r,'publish_window')} theme_match={match}"
-
-    # Fallback: any fresh rendered for theme_today
+    
+    # 90% PATH: Current slot deals (primary)
+    current_slot_deals = []
+    for i, r, match in eligible:
+        pw = get_cell(r, "publish_window").upper()
+        if pw == current_slot or pw == "BOTH":
+            current_slot_deals.append((i, r, match))
+    
+    if current_slot_deals:
+        current_slot_deals.sort(key=sort_key, reverse=True)
+        i, r, match = current_slot_deals[0]
+        return i, r, f"primary_slot={current_slot} theme_match={match}"
+    
+    # 10% PATH: Opposite slot deals (rotation buffer fallback)
+    opposite_slot_deals = []
+    for i, r, match in eligible:
+        pw = get_cell(r, "publish_window").upper()
+        if pw == opposite_slot:
+            opposite_slot_deals.append((i, r, match))
+    
+    if opposite_slot_deals:
+        opposite_slot_deals.sort(key=sort_key, reverse=True)
+        i, r, match = opposite_slot_deals[0]
+        return i, r, f"rotation_fallback={opposite_slot} theme_match={match}"
+    
+    # LAST RESORT: Any theme-matched fresh deal
     theme_hits = [(i, r, m) for (i, r, m) in eligible if m]
     if theme_hits:
         theme_hits.sort(key=sort_key, reverse=True)
         i, r, match = theme_hits[0]
-        return i, r, f"fallback_theme_latest theme_match={match}"
-
-    # Last fallback: latest fresh rendered regardless of theme (still advertising)
+        return i, r, f"fallback_theme_any theme_match={match}"
+    
+    # ABSOLUTE LAST: Any fresh deal (still advertising)
     eligible.sort(key=sort_key, reverse=True)
     i, r, match = eligible[0]
-    return i, r, f"fallback_any_latest theme_match={match}"
+    return i, r, f"fallback_any theme_match={match}"
 
 
-# ------------------ caption ------------------
+# ------------------ caption (always uses current slot) ------------------
 
-def build_caption(row: Dict[str, str], theme_today: str, slot: str) -> str:
+def build_caption(row: Dict[str, str], theme_today: str, current_slot: str) -> str:
     """
-    IG is marketing: keep it light, not price-led.
-    Use what we have without failing if blanks.
+    IG caption uses CURRENT slot language, regardless of graphic's original slot.
+    This ensures PM language softens AM graphics when rotation fallback occurs.
     """
     to_city = get_cell(row, "destination_city") or get_cell(row, "destination_iata")
     from_city = get_cell(row, "origin_city") or get_cell(row, "origin_iata")
@@ -308,7 +314,7 @@ def build_caption(row: Dict[str, str], theme_today: str, slot: str) -> str:
     if phrase:
         phrase = phrase.strip()
 
-    # Keep it consistent with your IG rules: no hype, light CTA
+    # Build caption
     lines = [
         f"Theme today: {theme_today.replace('_',' ')}",
         f"TO: {to_city}",
@@ -320,11 +326,11 @@ def build_caption(row: Dict[str, str], theme_today: str, slot: str) -> str:
     if phrase:
         lines.append(phrase)
 
-    # Slot hint (AM = “what’s hot”, PM = “deal worth a look”)
-    if slot == "AM":
-        lines.append("AM radar: what’s looking interesting right now. Link in bio for the full feed.")
-    elif slot == "PM":
-        lines.append("PM shortlist: one worth a look if you’re in the mood for it. Link in bio for the full feed.")
+    # Slot language ALWAYS uses current_slot (not graphic's slot)
+    if current_slot == "AM":
+        lines.append("AM radar: what's looking interesting right now. Link in bio for the full feed.")
+    elif current_slot == "PM":
+        lines.append("PM shortlist: one worth a look if you're in the mood for it. Link in bio for the full feed.")
     else:
         lines.append("Link in bio for the full feed.")
 
@@ -383,9 +389,11 @@ def main() -> int:
 
     row_i, row, reason = pick
     print("======================================================================")
-    print("📣 Instagram Publisher — V5 (publish_window + fallback)")
-    print(f"TODAY_THEME: '{theme_today}' | RUN_SLOT: '{slot or '(auto)'}'")
-    print(f"SELECTED row={row_i} | deal_id={get_cell(row,'deal_id')} | reason={reason}")
+    print("📣 Instagram Publisher — V5 (90/10 Rotation Buffer)")
+    print(f"TODAY_THEME: '{theme_today}' | CURRENT_SLOT: '{slot or '(auto)'}'")
+    print(f"SELECTED row={row_i} | deal_id={get_cell(row,'deal_id')}")
+    print(f"SELECTION: {reason}")
+    print(f"GRAPHIC_SLOT: {get_cell(row, 'publish_window')} | CAPTION_SLOT: {slot}")
     print("======================================================================")
 
     caption = build_caption(row, theme_today, slot)
@@ -393,8 +401,7 @@ def main() -> int:
 
     try:
         creation_id = ig_create_container(version, ig_user_id, ig_token, image_url, caption)
-        # small wait improves publish reliability
-        time.sleep(2)
+        time.sleep(2)  # small wait improves publish reliability
         media_id = ig_publish_container(version, ig_user_id, ig_token, creation_id)
         print(f"✅ IG published media_id={media_id}")
 

@@ -1,0 +1,55 @@
+name: Export Published Deals
+
+# Runs AFTER publishers complete
+on:
+  workflow_dispatch:  # Manual trigger for testing
+  schedule:
+    # 15 minutes after AM/PM runs (9:15 AM, 9:15 PM UTC)
+    - cron: '15 9,21 * * *'
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install gspread oauth2client pytz
+      
+      - name: Export published deals to JSON
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python workers/export_published_deals.py
+      
+      - name: Commit and push JSON file
+        run: |
+          git config user.name "TravelTxter Export Bot"
+          git config user.email "bot@traveltxter.com"
+          git add public/deals.json
+          
+          # Only commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to published deals"
+          else
+            git commit -m "Update published deals [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git push
+          fi
+      
+      - name: Log export summary
+        run: |
+          echo "✅ Published deals export complete"
+          if [ -f public/deals.json ]; then
+            echo "📊 Deals exported: $(cat public/deals.json | grep -o '"id"' | wc -l)"
+          fi

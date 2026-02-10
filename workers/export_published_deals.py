@@ -6,10 +6,8 @@ Export Published Deals Worker
 Purpose:
   Export deals for the landing page into a static JSON file consumed by the React app.
 
-Canonical rule (LOCKED):
+LOCKED rule:
   Landing page visibility is driven by publish_window (AM/PM), NOT channel status.
-  - Eligible iff publish_window ∈ {"AM","PM"}
-  - Status is ignored (decouples homepage from publisher internals)
 
 Reads:
   - Google Sheet: RAW_DEALS (read-only)
@@ -38,8 +36,11 @@ SCOPES = [
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-# The file the frontend ultimately serves as /deals.json
+# React ultimately serves frontend/public/deals.json, but we write canonical here
 OUTPUT_FILE = "public/deals.json"
+
+# Only show this many deals on the landing page
+MAX_DEALS = 3
 
 # =============================================================================
 # GOOGLE SHEETS
@@ -62,15 +63,11 @@ def get_sheet() -> gspread.Spreadsheet:
 
 
 # =============================================================================
-# EXPORT LOGIC (CANONICAL)
+# EXPORT LOGIC
 # =============================================================================
 
 
 def calculate_next_run() -> str:
-    """
-    Conservative display helper for UI.
-    (You can replace with your real scheduler times if you want; not critical.)
-    """
     now_utc = datetime.now(timezone.utc)
     h = now_utc.hour
     # Approx slots: AM ~09:00 UTC, PM ~21:00 UTC
@@ -82,9 +79,6 @@ def calculate_next_run() -> str:
 
 
 def is_exportable_by_window(row: Dict[str, Any]) -> bool:
-    """
-    LOCKED: Landing page eligibility is based on publish_window.
-    """
     window = str(row.get("publish_window", "")).strip().upper()
     return window in {"AM", "PM"}
 
@@ -104,7 +98,6 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 
 def _signal_strength(score: float) -> int:
-    # Keep your original vibe: 3–5 bars
     if score >= 9.0:
         return 5
     if score >= 8.5:
@@ -113,14 +106,6 @@ def _signal_strength(score: float) -> int:
 
 
 def transform_deal(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Transform a RAW_DEALS row into the landing page schema.
-    This stays compatible with your current UI pattern.
-
-    Expected-ish columns (best effort; blanks tolerated):
-      deal_id, origin_city, destination_city, origin_iata, destination_iata,
-      price_gbp, score, publish_window
-    """
     try:
         score = _safe_float(row.get("score"), 0.0)
         price = _safe_float(row.get("price_gbp"), 0.0)
@@ -132,10 +117,10 @@ def transform_deal(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         window = str(row.get("publish_window", "")).strip().upper() or "AM"
 
-        # Minimum sanity: must have a route label
-        if not origin_city and not origin_iata:
+        # Minimum route sanity
+        if not (origin_city or origin_iata):
             return None
-        if not dest_city and not dest_iata:
+        if not (dest_city or dest_iata):
             return None
 
         name = f"{origin_city or origin_iata} → {dest_city or dest_iata}"
@@ -147,7 +132,7 @@ def transform_deal(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "name": name,
             "price": price,
             "currency": "GBP",
-            "theme": window,  # <-- canonical: the trigger is AM/PM
+            "theme": window,  # AM or PM
             "vi_score": round(score, 1),
             "signal_strength": _signal_strength(score),
         }
@@ -174,14 +159,18 @@ def export_published_deals() -> None:
     deals: List[Dict[str, Any]] = []
     for r in eligible:
         d = transform_deal(r)
-        if d:
+        if d and d.get("id"):
             deals.append(d)
 
-    # Sort best-first for UI
-    deals.sort(key=lambda d: d.get("vi_score", 0), reverse=True)
+    # Dedupe by id (prevents React key collisions + repeated entries)
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for d in deals:
+        deduped[d["id"]] = d
+    deals = list(deduped.values())
 
-    # Keep the homepage lightweight
-    deals = deals[:10]
+    # Sort best-first then cap to MAX_DEALS
+    deals.sort(key=lambda d: d.get("vi_score", 0), reverse=True)
+    deals = deals[:MAX_DEALS]
 
     output = {
         "deals": deals,
@@ -196,12 +185,12 @@ def export_published_deals() -> None:
 
     print("\n✅ Export complete")
     print(f"   Output: {OUTPUT_FILE}")
-    print(f"   Deals exported: {len(deals)}")
+    print(f"   Deals exported: {len(deals)} (max {MAX_DEALS})")
     print(f"   Next run: {output['next_run']}")
 
     if deals:
-        print("\n📊 Top deals:")
-        for d in deals[:5]:
+        print("\n📊 Deals:")
+        for d in deals:
             print(f"   • {d['name']} — £{d['price']:.0f} (Vi {d['vi_score']}) [{d['theme']}]")
     else:
         print("\n🔇 No eligible deals (publish_window not AM/PM or missing route fields)")

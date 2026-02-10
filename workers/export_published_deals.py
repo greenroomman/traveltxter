@@ -5,7 +5,7 @@ Export Published Deals Worker
 
 LOCKED:
 - Landing page visibility is driven by publish_window (AM/PM), NOT channel status.
-- Export a small, deterministic set of deals for the landing page.
+- Export a small deterministic set for the landing page (MAX_DEALS).
 
 Reads:
 - Google Sheet: RAW_DEALS (read-only)
@@ -22,44 +22,68 @@ from typing import Any, Dict, List, Optional
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ============================================================================
-# CONFIG
-# ============================================================================
+# =============================================================================
+# CONFIG (ENV CONTRACT)
+# =============================================================================
 
 SCOPES = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
 
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_SHEET_ID".upper())
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+# ✅ Use your real GitHub secrets first, then legacy fallbacks
+SHEET_ID = (
+    os.getenv("SPREADSHEET_ID")
+    or os.getenv("SHEET_ID")
+    or os.getenv("GOOGLE_SHEET_ID")
+)
+
+SERVICE_ACCOUNT_JSON = (
+    os.getenv("GCP_SA_JSON_ONE_LINE")
+    or os.getenv("GCP_SA_JSON")
+    or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+)
+
+RAW_DEALS_TAB = os.getenv("RAW_DEALS_TAB") or "RAW_DEALS"
 
 OUTPUT_FILE = "public/deals.json"
 
-# ✅ Hard cap for landing page
+# ✅ You want 3 deals max
 MAX_DEALS = 3
 
-# ============================================================================
+
+# =============================================================================
 # GOOGLE SHEETS
-# ============================================================================
+# =============================================================================
+
+def _parse_sa_json(raw: str) -> Dict[str, Any]:
+    """
+    Accepts either:
+    - a normal JSON string
+    - a one-line JSON string (with escaped newlines)
+    """
+    raw = raw.strip()
+    # Sometimes secrets are stored with surrounding quotes; strip gently
+    if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
+        raw = raw[1:-1]
+    return json.loads(raw)
 
 
 def get_sheet() -> gspread.Spreadsheet:
     if not SHEET_ID:
-        raise ValueError("GOOGLE_SHEET_ID environment variable not set")
+        raise ValueError("Missing sheet id. Set SPREADSHEET_ID or SHEET_ID (or legacy GOOGLE_SHEET_ID).")
     if not SERVICE_ACCOUNT_JSON:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable not set")
+        raise ValueError("Missing service account JSON. Set GCP_SA_JSON_ONE_LINE or GCP_SA_JSON (or legacy GOOGLE_SERVICE_ACCOUNT_JSON).")
 
-    creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
+    creds_dict = _parse_sa_json(SERVICE_ACCOUNT_JSON)
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPES)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID)
 
 
-# ============================================================================
+# =============================================================================
 # EXPORT LOGIC
-# ============================================================================
-
+# =============================================================================
 
 def calculate_next_run() -> str:
     now_utc = datetime.now(timezone.utc)
@@ -100,6 +124,10 @@ def _signal_strength(score: float) -> int:
 
 
 def transform_deal(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    deal_id = row.get("deal_id")
+    if not deal_id:
+        return None
+
     score = _safe_float(row.get("score"), 0.0)
     price = _safe_float(row.get("price_gbp"), 0.0)
 
@@ -110,14 +138,9 @@ def transform_deal(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     window = str(row.get("publish_window", "")).strip().upper() or "AM"
 
-    # Minimum route sanity
     if not (origin_city or origin_iata):
         return None
     if not (dest_city or dest_iata):
-        return None
-
-    deal_id = row.get("deal_id")
-    if not deal_id:
         return None
 
     name = f"{origin_city or origin_iata} → {dest_city or dest_iata}"
@@ -129,7 +152,7 @@ def transform_deal(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "name": name,
         "price": price,
         "currency": "GBP",
-        "theme": window,  # AM/PM is the trigger
+        "theme": window,  # AM/PM trigger
         "vi_score": round(score, 1),
         "signal_strength": _signal_strength(score),
     }
@@ -141,10 +164,10 @@ def export_published_deals() -> None:
     print("=" * 72 + "\n")
 
     sheet = get_sheet()
-    ws = sheet.worksheet("RAW_DEALS")
+    ws = sheet.worksheet(RAW_DEALS_TAB)
 
     records: List[Dict[str, Any]] = ws.get_all_records()
-    print(f"📖 RAW_DEALS rows: {len(records)}")
+    print(f"📖 {RAW_DEALS_TAB} rows: {len(records)}")
 
     eligible = [r for r in records if is_exportable_by_window(r)]
     print(f"✅ Eligible (publish_window AM/PM): {len(eligible)}")
@@ -155,13 +178,13 @@ def export_published_deals() -> None:
         if d:
             deals.append(d)
 
-    # Dedupe by id (prevents React key collisions and repeats)
+    # Dedupe by id
     deduped: Dict[str, Dict[str, Any]] = {}
     for d in deals:
         deduped[d["id"]] = d
     deals = list(deduped.values())
 
-    # Sort best-first and cap to MAX_DEALS
+    # Sort best-first and cap
     deals.sort(key=lambda d: d.get("vi_score", 0), reverse=True)
     deals = deals[:MAX_DEALS]
 
@@ -178,11 +201,9 @@ def export_published_deals() -> None:
 
     print(f"\n✅ Wrote {OUTPUT_FILE}")
     print(f"📦 Deals exported: {len(deals)} (max {MAX_DEALS})")
-    if deals:
-        for d in deals:
-            print(f"  • {d['name']} — £{d['price']:.0f} (Vi {d['vi_score']}) [{d['theme']}]")
-    else:
-        print("🔇 No deals exported")
+    for d in deals:
+        print(f"  • {d['name']} — £{d['price']:.0f} (Vi {d['vi_score']}) [{d['theme']}]")
+    print("\n" + "=" * 72 + "\n")
 
 
 def _write_error_stub(err: Exception) -> None:

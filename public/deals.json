@@ -32,86 +32,9 @@
       "theme": "AM",
       "vi_score": 99.0,
       "signal_strength": 5
-    },
-    {
-      "id": "LHR_KEF_20260411_20260421",
-      "origin": "LHR",
-      "destination": "KEF",
-      "name": "London \u2192 Keflavik",
-      "price": 158.95,
-      "currency": "GBP",
-      "theme": "PM",
-      "vi_score": 95.5,
-      "signal_strength": 5
-    },
-    {
-      "id": "LHR_KEF_20260411_20260421",
-      "origin": "LHR",
-      "destination": "KEF",
-      "name": "London \u2192 Keflavik",
-      "price": 158.95,
-      "currency": "GBP",
-      "theme": "PM",
-      "vi_score": 95.5,
-      "signal_strength": 5
-    },
-    {
-      "id": "LHR_KEF_20260411_20260421",
-      "origin": "LHR",
-      "destination": "KEF",
-      "name": "London \u2192 Keflavik",
-      "price": 158.95,
-      "currency": "GBP",
-      "theme": "PM",
-      "vi_score": 95.5,
-      "signal_strength": 5
-    },
-    {
-      "id": "LGW_KEF_20260411_20260421",
-      "origin": "LGW",
-      "destination": "KEF",
-      "name": "London \u2192 Keflavik",
-      "price": 180.63,
-      "currency": "GBP",
-      "theme": "PM",
-      "vi_score": 89.2,
-      "signal_strength": 5
-    },
-    {
-      "id": "off_0000B338iRhn0kH7c4W75m",
-      "origin": "LGW",
-      "destination": "GVA",
-      "name": "London \u2192 Geneva",
-      "price": 58.0,
-      "currency": "GBP",
-      "theme": "PM",
-      "vi_score": 88.8,
-      "signal_strength": 5
-    },
-    {
-      "id": "off_0000B33E17yobEpdmg7oEs",
-      "origin": "LGW",
-      "destination": "GVA",
-      "name": "London \u2192 Geneva",
-      "price": 104.0,
-      "currency": "GBP",
-      "theme": "PM",
-      "vi_score": 88.3,
-      "signal_strength": 5
-    },
-    {
-      "id": "LHR_KEF_20260411_20260421",
-      "origin": "LHR",
-      "destination": "KEF",
-      "name": "London \u2192 Keflavik",
-      "price": 158.95,
-      "currency": "GBP",
-      "theme": "PM",
-      "vi_score": 86.7,
-      "signal_strength": 5
     }
   ],
-  "updated_at": "2026-02-10T16:49:04.288408+00:00",
+  "updated_at": "2026-02-10T17:07:48.178282+00:00",
   "next_run": "21:00 UTC",
-  "count": 10
+  "count": 3
 }

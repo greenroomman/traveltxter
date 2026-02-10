@@ -41,8 +41,8 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
-GOOGLE_SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SA_JSON }}
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 # Published statuses (from V5 lifecycle)
 PUBLISHED_STATUSES = [

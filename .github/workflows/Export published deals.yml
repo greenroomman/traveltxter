@@ -1,55 +1,73 @@
-name: Export Published Deals
+name: Export published deals (Landing Page Feed)
 
-# Runs AFTER publishers complete
 on:
-  workflow_dispatch:  # Manual trigger for testing
+  workflow_dispatch:
   schedule:
-    # 15 minutes after AM/PM runs (9:15 AM, 9:15 PM UTC)
-    - cron: '15 9,21 * * *'
+    # Runs after PM slot completes
+    - cron: "50 16 * * *"   # 16:50 UTC
+    # Optional AM refresh
+    - cron: "50 06 * * *"   # 06:50 UTC
 
 jobs:
   export:
     runs-on: ubuntu-latest
-    
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      
-      - name: Install dependencies
+          python-version: "3.11"
+
+      - name: Install Python dependencies
         run: |
-          pip install gspread oauth2client pytz
-      
-      - name: Export published deals to JSON
+          python -m pip install --upgrade pip
+          pip install gspread google-auth oauth2client
+
+      - name: Export published deals (max 3)
         env:
-          GOOGLE_SHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SA_JSON }}
+          # Google / Sheets
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+
         run: |
+          echo "▶ Running exporter"
           python workers/export_published_deals.py
-      
-      - name: Commit and push JSON file
+
+          echo "▶ Verifying outputs"
+          test -f public/deals.json || (echo "❌ public/deals.json missing" && exit 1)
+
+          # Ensure frontend public exists
+          mkdir -p frontend/public
+
+          # HARD SYNC: frontend always mirrors root
+          cp public/deals.json frontend/public/deals.json
+
+          echo "▶ Deal counts:"
+          python - <<'PY'
+          import json
+          r = json.load(open("public/deals.json"))
+          f = json.load(open("frontend/public/deals.json"))
+          print("root count:", r.get("count"))
+          print("frontend count:", f.get("count"))
+          assert r.get("count") == f.get("count"), "❌ frontend feed out of sync"
+          PY
+
+      - name: Commit updated feeds
         run: |
           git config user.name "TravelTxter Export Bot"
           git config user.email "bot@traveltxter.com"
-          git add public/deals.json
-          
-          # Only commit if there are changes
-          if git diff --staged --quiet; then
-            echo "No changes to published deals"
+
+          git add public/deals.json frontend/public/deals.json
+
+          # Only commit if something actually changed
+          if git diff --cached --quiet; then
+            echo "ℹ️ No feed changes to commit"
           else
-            git commit -m "Update published deals [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git commit -m "Update landing page deals feed (max 3)"
             git push
-          fi
-      
-      - name: Log export summary
-        run: |
-          echo "✅ Published deals export complete"
-          if [ -f public/deals.json ]; then
-            echo "📊 Deals exported: $(cat public/deals.json | grep -o '"id"' | wc -l)"
           fi

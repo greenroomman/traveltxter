@@ -1,6 +1,17 @@
 {
+  "headers": [
+    {
+      "source": "/deals.json",
+      "headers": [
+        { "key": "Content-Type", "value": "application/json; charset=utf-8" },
+        { "key": "Cache-Control", "value": "no-store" }
+      ]
+    }
+  ],
   "rewrites": [
     { "source": "/deals.json", "destination": "/deals.json" },
+    { "source": "/manifest.json", "destination": "/manifest.json" },
+    { "source": "/favicon.ico", "destination": "/favicon.ico" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }

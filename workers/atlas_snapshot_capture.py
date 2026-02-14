@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_capture.py
-ATLAS SNAPSHOT CAPTURE — v0
-
-Captures daily price snapshots for RegretRisk model training.
-Writes to SNAPSHOT_LOG tab. Never touches RAW_DEALS.
-
-Run daily at fixed UTC time (07:10 recommended).
-Config: config/atlas_snapshot_config.json
+ATLAS SNAPSHOT CAPTURE - v0
 """
 
 from __future__ import annotations
@@ -22,42 +16,27 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-
-# ----------------------------
-# LCC registry (proxy for lcc_present feature)
-# ----------------------------
-
 LCC_IATA_CODES = {
-    # UK / Europe LCC
     "FR", "U2", "W6", "VY", "PC", "HV", "LS", "BE", "EN",
     "WX", "ZB", "TOM", "BY", "X3", "4U", "DE", "EW", "HG",
-    # Nordic carriers (MAN routes)
     "DY", "D8", "SK", "FI", "WF", "DX",
-    # US LCC (future proofing)
     "F9", "G4", "NK", "B6", "WN", "WS", "G3", "VT", "NX",
 }
 
 
-# ----------------------------
-# Env helpers
-# ----------------------------
-
-def env_int(name: str, default: int) -> int:
+def env_int(name, default):
     try:
         return int(str(os.getenv(name, default)).strip())
     except Exception:
         return default
 
-def env_str(name: str, default: str = "") -> str:
+
+def env_str(name, default=""):
     v = os.getenv(name)
     return default if v is None else str(v).strip()
 
 
-# ----------------------------
-# GSpread auth
-# ----------------------------
-
-def _sanitize_sa_json(raw: str) -> str:
+def _sanitize_sa_json(raw):
     raw = (raw or "").strip()
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE or GCP_SA_JSON.")
@@ -95,7 +74,8 @@ def _sanitize_sa_json(raw: str) -> str:
     json.loads(raw2)
     return raw2
 
-def gspread_client() -> gspread.Client:
+
+def gspread_client():
     raw = os.getenv("GCP_SA_JSON_ONE_LINE") or os.getenv("GCP_SA_JSON") or ""
     raw = _sanitize_sa_json(raw)
     info = json.loads(raw)
@@ -104,45 +84,34 @@ def gspread_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-# ----------------------------
-# Time helpers
-# ----------------------------
-
-def _utc_now() -> dt.datetime:
+def _utc_now():
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
-def _utc_date() -> str:
+
+def _utc_date():
     return _utc_now().strftime("%Y-%m-%d")
 
-def _utc_time() -> str:
+
+def _utc_time():
     return _utc_now().strftime("%H:%M")
 
 
-# ----------------------------
-# Duffel
-# ----------------------------
-
 DUFFEL_API = "https://api.duffel.com/air/offer_requests"
 
-def duffel_headers() -> Dict[str, str]:
+
+def duffel_headers():
     key = env_str("DUFFEL_API_KEY")
     if not key:
         raise RuntimeError("Missing DUFFEL_API_KEY.")
     return {
-        "Authorization": f"Bearer {key}",
+        "Authorization": "Bearer " + key,
         "Duffel-Version": "v2",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
-def duffel_search(
-    origin: str,
-    dest: str,
-    out_date: str,
-    ret_date: str,
-    cabin: str = "economy",
-    max_connections: int = 1,
-) -> Optional[Dict[str, Any]]:
+
+def duffel_search(origin, dest, out_date, ret_date, cabin="economy", max_connections=1):
     payload = {
         "data": {
             "slices": [
@@ -172,12 +141,8 @@ def duffel_search(
         return None
 
 
-# ----------------------------
-# Offer extraction
-# ----------------------------
-
-def extract_carriers(offer: Dict[str, Any]) -> List[str]:
-    carriers: List[str] = []
+def extract_carriers(offer):
+    carriers = []
     try:
         for sl in offer.get("slices") or []:
             for seg in sl.get("segments") or []:
@@ -189,7 +154,8 @@ def extract_carriers(offer: Dict[str, Any]) -> List[str]:
         pass
     return carriers
 
-def extract_stops(offer: Dict[str, Any]) -> int:
+
+def extract_stops(offer):
     try:
         stops = 0
         for sl in offer.get("slices") or []:
@@ -200,46 +166,20 @@ def extract_stops(offer: Dict[str, Any]) -> int:
         return 0
 
 
-# ----------------------------
-# Snapshot key
-# ----------------------------
-
-def make_snapshot_key(
-    origin: str,
-    dest: str,
-    out_date: str,
-    ret_date: str,
-    snapshot_date: str,
-    capture_time: str,
-) -> str:
+def make_snapshot_key(origin, dest, out_date, ret_date, snapshot_date, capture_time):
     t = capture_time.replace(":", "")
-    return f"{origin}_{dest}_{out_date}_{ret_date}_{snapshot_date}_{t}"
+    return origin + "_" + dest + "_" + out_date + "_" + ret_date + "_" + snapshot_date + "_" + t
 
 
-# ----------------------------
-# Config
-# ----------------------------
-
-def load_config(path: str) -> Dict[str, Any]:
+def load_config(path):
     with open(path, "r") as f:
         return json.load(f)
 
 
-# ----------------------------
-# Date generation
-# ----------------------------
-
-def generate_target_dates(
-    lookahead_min: int,
-    lookahead_max: int,
-    outbound_weekdays: List[int],
-    trip_lengths: List[int],
-    max_per_dest: int = 2,
-) -> List[Tuple[str, str, int]]:
+def generate_target_dates(lookahead_min, lookahead_max, outbound_weekdays, trip_lengths, max_per_dest=2):
     today = _utc_now().date()
-    results: List[Tuple[str, str, int]] = []
+    results = []
     weekday_hits = 0
-
     for delta in range(lookahead_min, lookahead_max + 1):
         candidate = today + dt.timedelta(days=delta)
         if candidate.weekday() not in outbound_weekdays:
@@ -254,13 +194,8 @@ def generate_target_dates(
                 ret.strftime("%Y-%m-%d"),
                 delta,
             ))
-
     return results
 
-
-# ----------------------------
-# SNAPSHOT_LOG schema
-# ----------------------------
 
 SNAPSHOT_HEADERS = [
     "snapshot_date", "capture_time_utc", "origin_iata", "destination_iata",
@@ -269,13 +204,15 @@ SNAPSHOT_HEADERS = [
     "price_t7", "price_t14", "rose_10pct", "fell_10pct", "snapshot_key", "notes",
 ]
 
-def ensure_snapshot_headers(ws: gspread.Worksheet) -> None:
+
+def ensure_snapshot_headers(ws):
     first_row = ws.row_values(1)
     if not first_row or first_row[0] != "snapshot_date":
         ws.update("A1", [SNAPSHOT_HEADERS])
-        print("📋 SNAPSHOT_LOG headers written.")
+        print("SNAPSHOT_LOG headers written.")
 
-def load_existing_keys(ws: gspread.Worksheet) -> set:
+
+def load_existing_keys(ws):
     values = ws.get_all_values()
     if len(values) < 2:
         return set()
@@ -287,11 +224,7 @@ def load_existing_keys(ws: gspread.Worksheet) -> set:
     return {row[key_col] for row in values[1:] if len(row) > key_col and row[key_col]}
 
 
-# ----------------------------
-# Main
-# ----------------------------
-
-def main() -> int:
+def main():
     print("=" * 70)
     print("ATLAS SNAPSHOT CAPTURE v0")
     print("=" * 70)
@@ -299,18 +232,18 @@ def main() -> int:
     config_path = env_str("ATLAS_CONFIG_PATH", "config/atlas_snapshot_config.json")
     snapshot_tab = env_str("SNAPSHOT_LOG_TAB", "SNAPSHOT_LOG")
     sleep_s = float(env_str("FEEDER_SLEEP_SECONDS", "0.5"))
-    max_searches = env_int("ATLAS_MAX_SEARCHES", 30)
+    max_searches = env_int("ATLAS_MAX_SEARCHES", 90)
 
     cfg = load_config(config_path)
-    origins: List[str] = cfg.get("origins", ["MAN"])
-    destinations: List[str] = cfg.get("destinations", [])
-    trip_lengths: List[int] = cfg.get("trip_length_days", [3, 4, 5])
-    outbound_weekdays: List[int] = cfg.get("outbound_weekdays", [3, 5])
-    lookahead_min: int = cfg.get("lookahead_min_days", 45)
-    lookahead_max: int = cfg.get("lookahead_max_days", 140)
-    cabin: str = cfg.get("cabin_class", "economy")
-    max_connections: int = cfg.get("max_connections", 1)
-    max_per_dest: int = cfg.get("max_date_combos_per_dest", 2)
+    origins = cfg.get("origins", ["MAN"])
+    destinations = cfg.get("destinations", [])
+    trip_lengths = cfg.get("trip_length_days", [3, 4, 5])
+    outbound_weekdays = cfg.get("outbound_weekdays", [3, 5])
+    lookahead_min = cfg.get("lookahead_min_days", 45)
+    lookahead_max = cfg.get("lookahead_max_days", 140)
+    cabin = cfg.get("cabin_class", "economy")
+    max_connections = cfg.get("max_connections", 1)
+    max_per_dest = cfg.get("max_date_combos_per_dest", 2)
 
     if not destinations:
         raise RuntimeError("No destinations in atlas_snapshot_config.json.")
@@ -328,17 +261,17 @@ def main() -> int:
         lookahead_min, lookahead_max, outbound_weekdays, trip_lengths, max_per_dest
     )
 
-    print(f"📅 Date combos per dest: {len(date_combos)}")
-    print(f"🌍 Destinations ({len(destinations)}): {destinations}")
-    print(f"📍 Origins: {origins}")
-    print(f"🔢 Max searches this run: {max_searches}")
+    print("Date combos per dest: " + str(len(date_combos)))
+    print("Destinations: " + str(destinations))
+    print("Origins: " + str(origins))
+    print("Max searches: " + str(max_searches))
     print("-" * 70)
 
     searches = 0
     captured = 0
     skipped = 0
     no_offer = 0
-    pending: List[List[Any]] = []
+    pending = []
 
     for origin in origins:
         for dest in destinations:
@@ -354,15 +287,18 @@ def main() -> int:
                     continue
 
                 searches += 1
-                print(f"🔎 [{searches}/{max_searches}] {origin}→{dest}  "
-                      f"{out_date}/{ret_date}  DTD={dtd}")
+                print(
+                    "[" + str(searches) + "/" + str(max_searches) + "] "
+                    + origin + "->" + dest + "  "
+                    + out_date + "/" + ret_date + "  DTD=" + str(dtd)
+                )
 
                 offer = duffel_search(
                     origin, dest, out_date, ret_date,
                     cabin=cabin, max_connections=max_connections
                 )
 
-                row: Dict[str, Any] = {h: "" for h in SNAPSHOT_HEADERS}
+                row = {h: "" for h in SNAPSHOT_HEADERS}
                 row.update({
                     "snapshot_date": snapshot_date,
                     "capture_time_utc": capture_time,
@@ -377,13 +313,12 @@ def main() -> int:
                 if not offer:
                     no_offer += 1
                     row["notes"] = "no_offer"
-                    print(f"   ❌ No offer — logging null row")
+                    print("   no offer - logging null row")
                 else:
                     carriers = extract_carriers(offer)
                     stops = extract_stops(offer)
                     lcc_present = any(c in LCC_IATA_CODES for c in carriers)
                     price_gbp = round(float(offer.get("total_amount") or 0), 2)
-
                     row.update({
                         "price_gbp": price_gbp,
                         "currency": "GBP",
@@ -395,30 +330,37 @@ def main() -> int:
                         "notes": "",
                     })
                     captured += 1
-                    print(f"   ✅ £{price_gbp} | {','.join(carriers)} | direct={stops == 0}")
+                    print("   GBP " + str(price_gbp) + " | " + ",".join(carriers) + " | direct=" + str(stops == 0))
 
                 pending.append([row[h] for h in SNAPSHOT_HEADERS])
                 existing_keys.add(snap_key)
                 time.sleep(sleep_s)
 
-   print("-" * 70)
+    print("-" * 70)
+
     if pending:
         for attempt in range(1, 4):
             try:
                 ws.append_rows(pending, value_input_option="USER_ENTERED")
-                print(f"✅ Written {len(pending)} rows to {snapshot_tab}.")
+                print("Written " + str(len(pending)) + " rows to " + snapshot_tab + ".")
                 break
             except Exception as e:
-                print(f"⚠️ append_rows attempt {attempt}/3 failed: {e}")
+                print("append_rows attempt " + str(attempt) + "/3 failed: " + str(e))
                 if attempt < 3:
                     time.sleep(10 * attempt)
                 else:
                     raise
     else:
-        print("⚠️ No rows written.")
+        print("No rows written.")
 
     print(
-        f"📊 SUMMARY: searches={searches} captured={captured} "
-        f"no_offer={no_offer} skipped={skipped}"
+        "SUMMARY: searches=" + str(searches)
+        + " captured=" + str(captured)
+        + " no_offer=" + str(no_offer)
+        + " skipped=" + str(skipped)
     )
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

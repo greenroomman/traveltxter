@@ -28,8 +28,12 @@ from google.oauth2.service_account import Credentials
 # ----------------------------
 
 LCC_IATA_CODES = {
+    # UK / Europe LCC
     "FR", "U2", "W6", "VY", "PC", "HV", "LS", "BE", "EN",
     "WX", "ZB", "TOM", "BY", "X3", "4U", "DE", "EW", "HG",
+    # Nordic carriers (MAN routes)
+    "DY", "D8", "SK", "FI", "WF", "DX",
+    # US LCC (future proofing)
     "F9", "G4", "NK", "B6", "WN", "WS", "G3", "VT", "NX",
 }
 

@@ -401,8 +401,8 @@ def main() -> int:
                 existing_keys.add(snap_key)
                 time.sleep(sleep_s)
 
-    print("-" * 70)
-   if pending:
+   print("-" * 70)
+    if pending:
         for attempt in range(1, 4):
             try:
                 ws.append_rows(pending, value_input_option="USER_ENTERED")
@@ -422,7 +422,3 @@ def main() -> int:
         f"no_offer={no_offer} skipped={skipped}"
     )
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

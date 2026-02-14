@@ -402,9 +402,18 @@ def main() -> int:
                 time.sleep(sleep_s)
 
     print("-" * 70)
-    if pending:
-        ws.append_rows(pending, value_input_option="USER_ENTERED")
-        print(f"✅ Written {len(pending)} rows to {snapshot_tab}.")
+   if pending:
+        for attempt in range(1, 4):
+            try:
+                ws.append_rows(pending, value_input_option="USER_ENTERED")
+                print(f"✅ Written {len(pending)} rows to {snapshot_tab}.")
+                break
+            except Exception as e:
+                print(f"⚠️ append_rows attempt {attempt}/3 failed: {e}")
+                if attempt < 3:
+                    time.sleep(10 * attempt)
+                else:
+                    raise
     else:
         print("⚠️ No rows written.")
 

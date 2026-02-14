@@ -1,0 +1,17 @@
+{
+  "origins": ["MAN"],
+  "destinations": [
+    "OSL", "BGO", "KEF",
+    "ARN", "HEL", "CPH",
+    "AMS", "BRU", "LIS",
+    "OPO", "BCN", "VIE",
+    "PRG", "KRK", "DUB"
+  ],
+  "trip_length_days": [3, 4, 5],
+  "outbound_weekdays": [3, 5],
+  "lookahead_min_days": 45,
+  "lookahead_max_days": 140,
+  "max_date_combos_per_dest": 2,
+  "cabin_class": "economy",
+  "max_connections": 1
+}

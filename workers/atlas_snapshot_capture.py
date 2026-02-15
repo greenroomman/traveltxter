@@ -10,6 +10,7 @@ import os
 import json
 import time
 import datetime as dt
+from uuid import uuid4
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -22,6 +23,56 @@ LCC_IATA_CODES = {
     "DY", "D8", "SK", "FI", "WF", "DX",
     "F9", "G4", "NK", "B6", "WN", "WS", "G3", "VT", "NX",
 }
+
+
+# ── UK School Holiday Windows (England) ───────────────────────────────────────
+UK_SCHOOL_HOLIDAYS = [
+    ("2025-02-17", "2025-02-21"),  # February half term
+    ("2025-04-11", "2025-04-25"),  # Easter
+    ("2025-05-26", "2025-05-30"),  # May half term
+    ("2025-07-22", "2025-09-03"),  # Summer
+    ("2025-10-27", "2025-10-31"),  # Autumn half term
+    ("2025-12-20", "2026-01-05"),  # Christmas / New Year
+    ("2026-02-16", "2026-02-20"),  # February half term
+    ("2026-04-02", "2026-04-17"),  # Easter
+    ("2026-05-25", "2026-05-29"),  # May half term
+    ("2026-07-21", "2026-09-02"),  # Summer
+    ("2026-10-26", "2026-10-30"),  # Autumn half term
+    ("2026-12-21", "2027-01-04"),  # Christmas / New Year
+]
+
+# ── UK Bank Holidays ───────────────────────────────────────────────────────────
+UK_BANK_HOLIDAYS = {
+    "2025-04-18", "2025-04-21",  # Good Friday / Easter Monday
+    "2025-05-05", "2025-05-26",  # Early May / Spring bank holiday
+    "2025-08-25",                # Summer bank holiday
+    "2025-12-25", "2025-12-26",  # Christmas
+    "2026-01-01",                # New Year
+    "2026-04-03", "2026-04-06",  # Good Friday / Easter Monday
+    "2026-05-04", "2026-05-25",  # Early May / Spring bank holiday
+    "2026-08-31",                # Summer bank holiday
+    "2026-12-25", "2026-12-26",  # Christmas
+    "2027-01-01",                # New Year
+}
+
+
+def check_school_holiday(departure_date: dt.date) -> bool:
+    """Return True if departure_date falls within an England school holiday window."""
+    for start_str, end_str in UK_SCHOOL_HOLIDAYS:
+        start = dt.date.fromisoformat(start_str)
+        end   = dt.date.fromisoformat(end_str)
+        if start <= departure_date <= end:
+            return True
+    return False
+
+
+def check_bank_holiday_adjacent(departure_date: dt.date) -> bool:
+    """Return True if departure_date is a bank holiday or within 1 day of one."""
+    for delta in (-1, 0, 1):
+        candidate = (departure_date + dt.timedelta(days=delta)).isoformat()
+        if candidate in UK_BANK_HOLIDAYS:
+            return True
+    return False
 
 
 def env_int(name, default):
@@ -198,16 +249,24 @@ def generate_target_dates(lookahead_min, lookahead_max, outbound_weekdays, trip_
 
 
 SNAPSHOT_HEADERS = [
-    "snapshot_date", "capture_time_utc", "origin_iata", "destination_iata",
-    "outbound_date", "return_date", "dtd", "price_gbp", "currency",
+    "snapshot_id",
+    "snapshot_date", "capture_time_utc",
+    "origin_iata", "destination_iata",
+    "outbound_date", "return_date",
+    "dtd",
+    "day_of_week_departure", "day_of_week_snapshot",
+    "is_school_holiday_window", "is_bank_holiday_adjacent",
+    "price_gbp", "currency",
     "carrier_count", "lcc_present", "direct", "stops", "cabin_class",
-    "price_t7", "price_t14", "rose_10pct", "fell_10pct", "snapshot_key", "notes",
+    "seats_remaining",
+    "price_t7", "price_t14", "rose_10pct", "fell_10pct",
+    "snapshot_key", "notes",
 ]
 
 
 def ensure_snapshot_headers(ws):
     first_row = ws.row_values(1)
-    if not first_row or first_row[0] != "snapshot_date":
+    if not first_row or first_row[0] != "snapshot_id":
         ws.update("A1", [SNAPSHOT_HEADERS])
         print("SNAPSHOT_LOG headers written.")
 
@@ -299,7 +358,12 @@ def main():
                 )
 
                 row = {h: "" for h in SNAPSHOT_HEADERS}
+
+                out_date_obj = dt.date.fromisoformat(out_date)
+                snap_date_obj = dt.date.fromisoformat(snapshot_date)
+
                 row.update({
+                    "snapshot_id": str(uuid4()),
                     "snapshot_date": snapshot_date,
                     "capture_time_utc": capture_time,
                     "origin_iata": origin,
@@ -307,6 +371,10 @@ def main():
                     "outbound_date": out_date,
                     "return_date": ret_date,
                     "dtd": dtd,
+                    "day_of_week_departure": out_date_obj.strftime("%A"),
+                    "day_of_week_snapshot": snap_date_obj.strftime("%A"),
+                    "is_school_holiday_window": str(check_school_holiday(out_date_obj)).upper(),
+                    "is_bank_holiday_adjacent": str(check_bank_holiday_adjacent(out_date_obj)).upper(),
                     "snapshot_key": snap_key,
                 })
 
@@ -319,6 +387,14 @@ def main():
                     stops = extract_stops(offer)
                     lcc_present = any(c in LCC_IATA_CODES for c in carriers)
                     price_gbp = round(float(offer.get("total_amount") or 0), 2)
+                    seats_remaining = None
+                    try:
+                        slices = offer.get("slices") or []
+                        if slices:
+                            first_seg = (slices[0].get("segments") or [{}])[0]
+                            seats_remaining = first_seg.get("available_seats")
+                    except Exception:
+                        seats_remaining = None
                     row.update({
                         "price_gbp": price_gbp,
                         "currency": "GBP",
@@ -327,6 +403,7 @@ def main():
                         "direct": str(stops == 0).upper(),
                         "stops": stops,
                         "cabin_class": cabin,
+                        "seats_remaining": seats_remaining if seats_remaining is not None else "",
                         "notes": "",
                     })
                     captured += 1

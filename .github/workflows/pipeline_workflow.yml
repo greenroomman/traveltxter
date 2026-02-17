@@ -248,3 +248,23 @@ jobs:
         run: |
           set -e
           python workers/telegram_publisher.py
+
+      # =========================
+      # 8) TRAVELR SYNC
+      # Runs after full pipeline completion.
+      # Reads POSTED_ALL from RAW_DEALS, writes to Supabase deals_cache.
+      # continue-on-error: true — a Travelr failure must never block V5.
+      # =========================
+      - name: Travelr Sync (travelr_sync.py)
+        continue-on-error: true
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GCP_SA_JSON }}
+          TRAVELR_SUPABASE_URL: ${{ secrets.TRAVELR_SUPABASE_URL }}
+          TRAVELR_SERVICE_ROLE_KEY: ${{ secrets.TRAVELR_SERVICE_ROLE_KEY }}
+        run: |
+          set -e
+          python workers/travelr_sync.py

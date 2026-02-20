@@ -1,16 +1,29 @@
 {
   "origins": ["MAN", "LGW"],
-  "destinations": [
-    "PMI", "AGP", "ALC", "BCN", "FCO", "ACE", "TFS", "FAO",
-    "LIS", "NAP", "IBZ", "AMS", "DUB", "CDG", "FRA", "BRU",
-    "GVA", "ZRH", "CPH", "ARN", "OSL", "WAW", "BUD", "PRG",
-    "MAD", "MXP"
-  ],
-  "trip_length_days": [3, 4, 5, 7],
+
+  "destinations_by_origin": {
+    "MAN": [
+      "PMI", "AGP", "ALC", "ACE", "TFS", "FAO", "IBZ", "NAP",
+      "BCN", "FCO", "LIS", "MAD",
+      "DUB", "AMS", "CDG", "FRA", "BRU", "GVA", "ZRH",
+      "CPH", "OSL", "WAW", "BUD", "PRG"
+    ],
+    "LGW": [
+      "PMI", "AGP", "ALC", "ACE", "TFS", "FAO", "IBZ", "NAP",
+      "BCN", "FCO", "LIS", "MAD", "MXP",
+      "DUB", "AMS", "CDG", "FRA", "GVA", "ZRH",
+      "CPH", "OSL", "ARN", "WAW", "BUD", "PRG"
+    ]
+  },
+
+  "trip_length_days": [4, 7, 14],
+
   "outbound_weekdays": [3, 5],
-  "lookahead_min_days": 45,
+
+  "lookahead_min_days": 14,
   "lookahead_max_days": 84,
+
   "cabin_class": "economy",
   "max_connections": 1,
-  "max_date_combos_per_dest": 2
+  "max_date_combos_per_dest": 1
 }

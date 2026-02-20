@@ -27,7 +27,7 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SNAPSHOT_LOG_TAB: SNAPSHOT_LOG
           ATLAS_CONFIG_PATH: config/atlas_snapshot_config.json
-          ATLAS_MAX_SEARCHES: 90 
+          ATLAS_MAX_SEARCHES: 157 
           FEEDER_SLEEP_SECONDS: 0.5
         run: python workers/atlas_snapshot_capture.py
 

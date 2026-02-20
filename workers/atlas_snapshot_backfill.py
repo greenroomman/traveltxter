@@ -301,10 +301,13 @@ def main() -> int:
 
     if updates:
         print("-" * 70)
-        print(f"📝 Applying {len(updates)} cell updates…")
-        for (r, c), val in updates.items():
-            ws.update_cell(r, c, val)
-            time.sleep(0.1)
+        print(f"📝 Applying {len(updates)} cell updates (batch)…")
+        # One API call instead of one per cell — critical for Sheets write quota.
+        batch = [
+            {"range": gspread.utils.rowcol_to_a1(r, c), "values": [[val]]}
+            for (r, c), val in updates.items()
+        ]
+        ws.batch_update(batch, value_input_option="USER_ENTERED")
         print("✅ All updates applied.")
     else:
         print("\n⚠️ No updates to apply.")

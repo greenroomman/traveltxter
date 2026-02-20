@@ -261,7 +261,25 @@ SNAPSHOT_HEADERS = [
     "seats_remaining",
     "price_t7", "price_t14", "rose_10pct", "fell_10pct",
     "snapshot_key", "notes",
+    "origin_type", "shi_variance_flag",
 ]
+
+# Route category lookup — used as a model feature and SHI context.
+# LGW skews business/mixed; MAN skews leisure. Extend as routes expand.
+ROUTE_CATEGORY: Dict[str, str] = {
+    # LGW business-dominant routes
+    "LGW-GVA": "business", "LGW-ZRH": "business", "LGW-MXP": "business",
+    "LGW-FRA": "business", "LGW-AMS": "business", "LGW-CDG": "business",
+    "LGW-MAD": "mixed",    "LGW-FCO": "mixed",    "LGW-BCN": "mixed",
+    "LGW-DUB": "mixed",    "LGW-LIS": "mixed",
+    # MAN corporate-adjacent
+    "MAN-AMS": "mixed",    "MAN-DUB": "mixed",    "MAN-CDG": "mixed",
+    "MAN-FRA": "business", "MAN-BRU": "business", "MAN-GVA": "business",
+    "MAN-ZRH": "business",
+}
+
+def route_category(origin: str, dest: str) -> str:
+    return ROUTE_CATEGORY.get(f"{origin}-{dest}", "leisure")
 
 
 def ensure_snapshot_headers(ws):
@@ -274,13 +292,63 @@ def ensure_snapshot_headers(ws):
 def load_existing_keys(ws):
     values = ws.get_all_values()
     if len(values) < 2:
-        return set()
+        return set(), {}
     try:
         hdr = values[0]
         key_col = hdr.index("snapshot_key")
     except (ValueError, IndexError):
-        return set()
-    return {row[key_col] for row in values[1:] if len(row) > key_col and row[key_col]}
+        return set(), {}
+
+    # Build 7-day price history per route from the same read — zero extra API calls.
+    # Used by shi_variance_flag() to detect fare-class drift during capture.
+    today = _utc_now().date()
+    cutoff = (today - dt.timedelta(days=7)).isoformat()
+    price_history: Dict[str, List[float]] = {}
+    try:
+        snap_col  = hdr.index("snapshot_date")
+        orig_col  = hdr.index("origin_iata")
+        dest_col  = hdr.index("destination_iata")
+        price_col = hdr.index("price_gbp")
+        for row in values[1:]:
+            def _get(col):
+                return row[col].strip() if col < len(row) else ""
+            snap_d = _get(snap_col)
+            if snap_d < cutoff:
+                continue
+            route_k = _get(orig_col) + "-" + _get(dest_col)
+            try:
+                p = float(_get(price_col))
+                if p > 0:
+                    price_history.setdefault(route_k, []).append(p)
+            except ValueError:
+                pass
+    except (ValueError, IndexError):
+        pass
+
+    keys = {row[key_col] for row in values[1:] if len(row) > key_col and row[key_col]}
+    return keys, price_history
+
+
+def shi_variance_flag(route_key: str, today_price: float, history: Dict[str, List[float]]) -> str:
+    """
+    Returns 'FLAG' if today's price suggests variance collapse (fare-class drift).
+    Returns 'OK' if within normal range. Returns 'INSUFFICIENT_DATA' if <5 baseline points.
+    Variance collapse = today's price is an outlier relative to recent distribution,
+    suggesting the scraper may be sampling a different fare bucket.
+    """
+    import statistics
+    baseline = history.get(route_key, [])
+    if len(baseline) < 5:
+        return "INSUFFICIENT_DATA"
+    try:
+        mean = statistics.mean(baseline)
+        stdev = statistics.stdev(baseline)
+        if stdev == 0:
+            return "FLAG"  # zero variance in baseline = already collapsed
+        z = abs(today_price - mean) / stdev
+        return "FLAG" if z > 2.5 else "OK"
+    except Exception:
+        return "INSUFFICIENT_DATA"
 
 
 def main():
@@ -311,7 +379,7 @@ def main():
     sh = gc.open_by_key(env_str("SPREADSHEET_ID") or env_str("SHEET_ID"))
     ws = sh.worksheet(snapshot_tab)
     ensure_snapshot_headers(ws)
-    existing_keys = load_existing_keys(ws)
+    existing_keys, price_history = load_existing_keys(ws)
 
     snapshot_date = _utc_date()
     capture_time = _utc_time()
@@ -381,6 +449,8 @@ def main():
                 if not offer:
                     no_offer += 1
                     row["notes"] = "no_offer"
+                    row["origin_type"] = route_category(origin, dest)
+                    row["shi_variance_flag"] = ""
                     print("   no offer - logging null row")
                 else:
                     carriers = extract_carriers(offer)
@@ -395,6 +465,10 @@ def main():
                             seats_remaining = first_seg.get("available_seats")
                     except Exception:
                         seats_remaining = None
+                    rkey = origin + "-" + dest
+                    shi_flag = shi_variance_flag(rkey, price_gbp, price_history)
+                    if shi_flag == "FLAG":
+                        print("   ⚠️  SHI variance FLAG — price may be drift/outlier")
                     row.update({
                         "price_gbp": price_gbp,
                         "currency": "GBP",
@@ -405,6 +479,8 @@ def main():
                         "cabin_class": cabin,
                         "seats_remaining": seats_remaining if seats_remaining is not None else "",
                         "notes": "",
+                        "origin_type": route_category(origin, dest),
+                        "shi_variance_flag": shi_flag,
                     })
                     captured += 1
                     print("   GBP " + str(price_gbp) + " | " + ",".join(carriers) + " | direct=" + str(stops == 0))

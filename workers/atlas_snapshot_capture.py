@@ -363,16 +363,19 @@ def main():
 
     cfg = load_config(config_path)
     origins = cfg.get("origins", ["MAN"])
-    destinations = cfg.get("destinations", [])
-    trip_lengths = cfg.get("trip_length_days", [3, 4, 5])
+    # Per-origin destinations — only search routes that actually operate.
+    # Falls back to flat "destinations" list for backwards compatibility.
+    destinations_by_origin: Dict[str, List[str]] = cfg.get("destinations_by_origin", {})
+    destinations_fallback: List[str] = cfg.get("destinations", [])
+    trip_lengths = cfg.get("trip_length_days", [4, 7, 14])
     outbound_weekdays = cfg.get("outbound_weekdays", [3, 5])
-    lookahead_min = cfg.get("lookahead_min_days", 45)
-    lookahead_max = cfg.get("lookahead_max_days", 140)
+    lookahead_min = cfg.get("lookahead_min_days", 14)
+    lookahead_max = cfg.get("lookahead_max_days", 84)   # Duffel hard limit
     cabin = cfg.get("cabin_class", "economy")
     max_connections = cfg.get("max_connections", 1)
-    max_per_dest = cfg.get("max_date_combos_per_dest", 2)
+    max_per_dest = cfg.get("max_date_combos_per_dest", 1)
 
-    if not destinations:
+    if not destinations_by_origin and not destinations_fallback:
         raise RuntimeError("No destinations in atlas_snapshot_config.json.")
 
     gc = gspread_client()
@@ -388,9 +391,11 @@ def main():
         lookahead_min, lookahead_max, outbound_weekdays, trip_lengths, max_per_dest
     )
 
+    total_routes = sum(len(destinations_by_origin.get(o, destinations_fallback)) for o in origins)
     print("Date combos per dest: " + str(len(date_combos)))
-    print("Destinations: " + str(destinations))
     print("Origins: " + str(origins))
+    print("Total route combinations: " + str(total_routes))
+    print("Max potential searches: " + str(total_routes * len(date_combos)))
     print("Max searches: " + str(max_searches))
     print("-" * 70)
 
@@ -401,7 +406,9 @@ def main():
     pending = []
 
     for origin in origins:
-        for dest in destinations:
+        # Use per-origin destination list if defined, else fallback to flat list
+        dests = destinations_by_origin.get(origin, destinations_fallback)
+        for dest in dests:
             for out_date, ret_date, dtd in date_combos:
                 if searches >= max_searches:
                     break
@@ -517,3 +524,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+    

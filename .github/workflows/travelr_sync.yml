@@ -1,0 +1,43 @@
+name: Travelr Sync
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 8 * * *"    # 08:00 UTC — after AM pipeline (07:30)
+    - cron: "0 17 * * *"   # 17:00 UTC — after PM pipeline (16:30)
+
+concurrency:
+  group: travelr-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Travelr Sync (travelr_sync.py)
+        env:
+          TRAVELR_SUPABASE_URL: ${{ secrets.TRAVELR_SUPABASE_URL }}
+          TRAVELR_SERVICE_ROLE_KEY: ${{ secrets.TRAVELR_SERVICE_ROLE_KEY }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+        run: |
+          set -e
+          python workers/travelr_sync.py

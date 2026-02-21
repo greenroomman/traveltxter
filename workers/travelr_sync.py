@@ -94,6 +94,21 @@ def read_ready_deals(sheet) -> list[dict]:
     return ready
 
 
+def safe_timestamp(val) -> str | None:
+    """Handle both ISO timestamps and Excel serial numbers."""
+    if not val:
+        return None
+    val = str(val).strip()
+    try:
+        serial = float(val)
+        if 40000 < serial < 60000:
+            from datetime import datetime, timedelta
+            return (datetime(1899, 12, 30) + timedelta(days=serial)).isoformat()
+    except ValueError:
+        pass
+    return val or None
+
+
 def build_payload(deal: dict) -> dict | None:
     deal_id = str(deal.get("deal_id", "")).strip()
     if not deal_id:
@@ -145,8 +160,8 @@ def build_payload(deal: dict) -> dict | None:
         "booking_url":       str(deal.get("booking_link_vip", deal.get("booking_url", ""))).strip() or None,
         "status":            "READY_TO_PUBLISH",
         "is_active":         True,
-        "ingested_at_utc":   str(deal.get("ingested_at_utc", "")).strip() or None,
-        "scored_at":         str(deal.get("scored_timestamp", "")).strip() or None,
+        "ingested_at_utc":   safe_timestamp(deal.get("ingested_at_utc", "")),
+        "scored_at":         safe_timestamp(deal.get("scored_timestamp", "")),
     }
 
 

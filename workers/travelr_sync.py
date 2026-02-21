@@ -14,11 +14,10 @@ Position in pipeline:
 
 Purpose:
   Read deals that have completed the full V5 pipeline
-  (status = POSTED_ALL) and write them to Travelr's
-  deals_cache table in Supabase.
+  and write them to Travelr's deals_cache table in Supabase.
 
 Reads:
-  RAW_DEALS (Google Sheets) — status = POSTED_ALL
+  RAW_DEALS (Google Sheets) — any status in TARGET_STATUSES
 
 Writes:
   Supabase deals_cache table (via REST API)
@@ -73,9 +72,16 @@ SUPABASE_HEADERS = {
     "Prefer":        "resolution=merge-duplicates",
 }
 
-# Status to read from RAW_DEALS
-# Change to POSTED_INSTAGRAM if you want to sync before Telegram publishing
-TARGET_STATUS = "POSTED_ALL"
+# All statuses that indicate a deal has been published and is ready to sync
+TARGET_STATUSES = {
+    "POSTED_ALL",
+    "POSTED_INSTAGRAM",
+    "VIP_DONE",
+    "READY_FREE",
+    "PUBLISHED",
+    "READY_FOR_FREE",
+    "READY_FOR_BOTH",
+}
 
 
 # ── Sheets connection ─────────────────────────────────────
@@ -91,13 +97,13 @@ def get_sheet():
 
 def read_ready_deals(sheet) -> list[dict]:
     """
-    Read all rows from RAW_DEALS where status = TARGET_STATUS.
+    Read all rows from RAW_DEALS where status is in TARGET_STATUSES.
     Returns list of dicts keyed by column header.
     """
     ws = sheet.worksheet("RAW_DEALS")
     rows = ws.get_all_records()
-    ready = [r for r in rows if r.get("status", "").strip() == TARGET_STATUS]
-    log.info(f"RAW_DEALS: {len(rows)} total rows, {len(ready)} with status={TARGET_STATUS}")
+    ready = [r for r in rows if r.get("status", "").strip() in TARGET_STATUSES]
+    log.info(f"RAW_DEALS: {len(rows)} total rows, {len(ready)} with publishable status")
     return ready
 
 
@@ -189,6 +195,7 @@ def upsert_deal(payload: dict) -> bool:
 # ── Main ──────────────────────────────────────────────────
 def main():
     log.info("── Travelr Sync starting ──────────────────────────")
+    log.info(f"Target statuses: {sorted(TARGET_STATUSES)}")
 
     # 1. Connect to Sheets
     try:
@@ -206,7 +213,7 @@ def main():
         raise SystemExit(1)
 
     if not deals:
-        log.info(f"No deals with status={TARGET_STATUS}. Nothing to sync. Exiting cleanly.")
+        log.info("No publishable deals found. Nothing to sync. Exiting cleanly.")
         return
 
     # 3. Sync each deal

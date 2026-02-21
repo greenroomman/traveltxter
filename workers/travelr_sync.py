@@ -3,41 +3,12 @@ travelr_sync.py
 ═══════════════════════════════════════════════════════════
 V5 Pipeline Step 7 — Travelr Sync Worker
 
-Position in pipeline:
-  1. Feeder
-  2. AI Scorer
-  3. Enrichment Router
-  4. Renderer
-  5. Link Router
-  6. Publishers (IG → TG VIP → TG FREE)
-  7. Travelr Sync  ← THIS FILE
-
-Purpose:
-  Read deals that have completed the full V5 pipeline
-  and write them to Travelr's deals_cache table in Supabase.
-
-Reads:
-  RAW_DEALS (Google Sheets) — any status in TARGET_STATUSES
-
-Writes:
-  Supabase deals_cache table (via REST API)
-
-Does NOT:
-  - Modify RAW_DEALS status
-  - Score deals
-  - Enrich deals
-  - Publish anywhere
-  - Remember state between runs (stateless)
-
-Idempotency:
-  Uses Supabase upsert (Prefer: resolution=merge-duplicates)
-  Safe to rerun — will not create duplicate rows.
-
-Required environment variables:
+Required environment variables (matches existing V5 workers):
   TRAVELR_SUPABASE_URL          https://yourref.supabase.co
   TRAVELR_SERVICE_ROLE_KEY      eyJ... (service_role key)
-  GOOGLE_SHEETS_SPREADSHEET_ID  your sheet ID
-  GOOGLE_CREDENTIALS_JSON       path to service account JSON
+  SPREADSHEET_ID or SHEET_ID    your sheet ID
+  GCP_SA_JSON_ONE_LINE          service account JSON as one line
+  GCP_SA_JSON                   service account JSON (fallback)
 ═══════════════════════════════════════════════════════════
 """
 
@@ -47,9 +18,7 @@ import logging
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timezone
 
-# ── Logging ──────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -57,11 +26,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("travelr_sync")
 
-# ── Config ───────────────────────────────────────────────
 SUPABASE_URL     = os.environ["TRAVELR_SUPABASE_URL"].rstrip("/")
 SERVICE_ROLE_KEY = os.environ["TRAVELR_SERVICE_ROLE_KEY"]
-SPREADSHEET_ID   = os.environ["GOOGLE_SHEETS_SPREADSHEET_ID"]
-CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_JSON", "credentials.json")
+SPREADSHEET_ID   = (
+    os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID")
+    or os.environ.get("SPREADSHEET_ID")
+    or os.environ.get("SHEET_ID")
+)
+if not SPREADSHEET_ID:
+    raise RuntimeError("Missing GOOGLE_SHEETS_SPREADSHEET_ID / SPREADSHEET_ID / SHEET_ID")
 
 DEALS_CACHE_ENDPOINT = f"{SUPABASE_URL}/rest/v1/deals_cache"
 
@@ -72,7 +45,6 @@ SUPABASE_HEADERS = {
     "Prefer":        "resolution=merge-duplicates",
 }
 
-# All statuses that indicate a deal has been published and is ready to sync
 TARGET_STATUSES = {
     "POSTED_ALL",
     "POSTED_INSTAGRAM",
@@ -83,23 +55,38 @@ TARGET_STATUSES = {
     "READY_FOR_BOTH",
 }
 
+GOOGLE_SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
-# ── Sheets connection ─────────────────────────────────────
+
+def _normalise_private_key(pk: str) -> str:
+    if "\\n" in pk and "\n" not in pk:
+        pk = pk.replace("\\n", "\n")
+    return pk.strip()
+
+
+def load_sa_info() -> dict:
+    raw = os.environ.get("GCP_SA_JSON_ONE_LINE") or os.environ.get("GCP_SA_JSON")
+    if not raw:
+        raise RuntimeError("Missing GCP_SA_JSON / GCP_SA_JSON_ONE_LINE")
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"GCP_SA_JSON is not valid JSON: {e}") from e
+    info["private_key"] = _normalise_private_key(info.get("private_key", ""))
+    return info
+
+
 def get_sheet():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    info = load_sa_info()
+    creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPE)
     client = gspread.authorize(creds)
     return client.open_by_key(SPREADSHEET_ID)
 
 
 def read_ready_deals(sheet) -> list[dict]:
-    """
-    Read all rows from RAW_DEALS where status is in TARGET_STATUSES.
-    Returns list of dicts keyed by column header.
-    """
     ws = sheet.worksheet("RAW_DEALS")
     rows = ws.get_all_records()
     ready = [r for r in rows if r.get("status", "").strip() in TARGET_STATUSES]
@@ -107,12 +94,7 @@ def read_ready_deals(sheet) -> list[dict]:
     return ready
 
 
-# ── Payload builder ───────────────────────────────────────
 def build_payload(deal: dict) -> dict | None:
-    """
-    Map RAW_DEALS columns to deals_cache schema.
-    Returns None if required fields are missing.
-    """
     deal_id = str(deal.get("deal_id", "")).strip()
     if not deal_id:
         log.warning("Skipping row with no deal_id")
@@ -131,7 +113,6 @@ def build_payload(deal: dict) -> dict | None:
     except (ValueError, TypeError):
         score = 0
 
-    # Dates display — use pre-formatted if available, else compose
     dates_display = (
         deal.get("dates_display")
         or deal.get("date_range")
@@ -169,13 +150,7 @@ def build_payload(deal: dict) -> dict | None:
     }
 
 
-# ── Supabase writer ───────────────────────────────────────
 def upsert_deal(payload: dict) -> bool:
-    """
-    Upsert a single deal into Supabase deals_cache.
-    Idempotent — safe to call multiple times for the same deal_id.
-    Returns True on success.
-    """
     try:
         r = requests.post(
             DEALS_CACHE_ENDPOINT,
@@ -192,12 +167,10 @@ def upsert_deal(payload: dict) -> bool:
         return False
 
 
-# ── Main ──────────────────────────────────────────────────
 def main():
     log.info("── Travelr Sync starting ──────────────────────────")
     log.info(f"Target statuses: {sorted(TARGET_STATUSES)}")
 
-    # 1. Connect to Sheets
     try:
         sheet = get_sheet()
         log.info(f"Connected to spreadsheet: {sheet.title}")
@@ -205,7 +178,6 @@ def main():
         log.error(f"Failed to connect to Google Sheets: {e}")
         raise SystemExit(1)
 
-    # 2. Read ready deals
     try:
         deals = read_ready_deals(sheet)
     except Exception as e:
@@ -216,33 +188,25 @@ def main():
         log.info("No publishable deals found. Nothing to sync. Exiting cleanly.")
         return
 
-    # 3. Sync each deal
-    synced  = 0
-    skipped = 0
-    failed  = 0
+    synced = skipped = failed = 0
 
     for deal in deals:
         payload = build_payload(deal)
-
         if payload is None:
             skipped += 1
             continue
-
-        success = upsert_deal(payload)
-
-        if success:
+        if upsert_deal(payload):
             log.info(f"  ✓ synced  {payload['id']:30s}  {payload['city']:18s}  £{payload['price_gbp']:.0f}  score={payload['score']}")
             synced += 1
         else:
             log.error(f"  ✗ failed  {payload['id']}")
             failed += 1
 
-    # 4. Summary
     log.info("──────────────────────────────────────────────────")
     log.info(f"Travelr Sync complete:  synced={synced}  skipped={skipped}  failed={failed}")
 
     if failed > 0:
-        log.warning(f"{failed} deal(s) failed to sync. Check Supabase credentials and network.")
+        log.warning(f"{failed} deal(s) failed to sync.")
         raise SystemExit(1)
 
     log.info("── Green ✓ ────────────────────────────────────────")

@@ -140,6 +140,28 @@ jobs:
           python workers/ai_scorer.py
 
       # =========================
+      # 2b) SIGNAL TRACKER
+      # Runs after Scorer, before Enrich.
+      # Reads SCORED rows from RAW_DEALS, writes deltas to Supabase signal_history.
+      # continue-on-error: true — never blocks the main pipeline.
+      # =========================
+      - name: Signal Tracker (signal_tracker.py)
+        continue-on-error: true
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
+          RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
+          SUPABASE_URL: ${{ secrets.TRAVELR_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.TRAVELR_SERVICE_ROLE_KEY }}
+          SIGNAL_DELTA_THRESHOLD: ${{ vars.SIGNAL_DELTA_THRESHOLD || '10' }}
+        run: |
+          set -e
+          python workers/signal_tracker.py
+
+
+      # =========================
       # 3) ENRICH
       # =========================
       - name: Enrich (enrich_router.py)

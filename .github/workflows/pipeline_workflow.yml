@@ -93,6 +93,7 @@ jobs:
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           FEEDER_CONFIG_TAB: CONFIG
+          FEEDER_ORIGINS_TAB: CONFIG_ORIGINS
           OPS_MASTER_TAB: OPS_MASTER
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           # feeder caps
@@ -159,7 +160,6 @@ jobs:
         run: |
           set -e
           python workers/signal_tracker.py
-
 
       # =========================
       # 3) ENRICH

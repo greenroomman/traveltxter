@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MODE: ${{ inputs.mode || 'full' }}
-      RUN_SLOT: ${{ inputs.run_slot || 'PM' }} # overwritten for scheduled runs by guard step
+      RUN_SLOT: ${{ inputs.run_slot || 'PM' }}
 
     steps:
       - name: Checkout
@@ -49,12 +49,14 @@ jobs:
 
       # =========================
       # SLOT GUARD (DST-SAFE)
+      # FIX: os.environ["GITHUB_ENV"] replaces broken shell variable interpolation
       # =========================
       - name: Determine UK-local slot (06:30/16:30 only)
         if: ${{ github.event_name == 'schedule' }}
         run: |
           set -e
           python - <<'PY'
+          import os
           from datetime import datetime
           from zoneinfo import ZoneInfo
 
@@ -66,13 +68,11 @@ jobs:
           elif hhmm == "16:30":
               run_slot = "PM"
           else:
-              # Not our intended local slot; exit cleanly.
               print(f"UK local time is {hhmm}; not 06:30 or 16:30 -> exiting.")
               raise SystemExit(0)
 
-          # Export RUN_SLOT for downstream steps
           print(f"RUN_SLOT={run_slot}")
-          with open("${GITHUB_ENV}", "a") as f:
+          with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"RUN_SLOT={run_slot}\n")
           PY
 
@@ -94,21 +94,21 @@ jobs:
           RAW_DEALS_TAB: ${{ secrets.RAW_DEALS_TAB }}
           FEEDER_CONFIG_TAB: CONFIG
           FEEDER_ORIGINS_TAB: CONFIG_ORIGINS
+          FEEDER_BUCKETS_TAB: CONFIG_BUCKETS
           OPS_MASTER_TAB: OPS_MASTER
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          # feeder caps
-          DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN || '12' }}
-          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS || '50' }}
-          DUFFEL_MAX_INSERTS_PER_ORIGIN: ${{ vars.DUFFEL_MAX_INSERTS_PER_ORIGIN || '15' }}
-          DUFFEL_MAX_INSERTS_PER_ROUTE: ${{ vars.DUFFEL_MAX_INSERTS_PER_ROUTE || '5' }}
-          DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN || '6' }}
+          DUFFEL_MAX_SEARCHES_PER_RUN: ${{ vars.DUFFEL_MAX_SEARCHES_PER_RUN || '4' }}
+          DUFFEL_MAX_INSERTS: ${{ vars.DUFFEL_MAX_INSERTS || '20' }}
+          DUFFEL_MAX_INSERTS_PER_ORIGIN: ${{ vars.DUFFEL_MAX_INSERTS_PER_ORIGIN || '5' }}
+          DUFFEL_MAX_INSERTS_PER_ROUTE: ${{ vars.DUFFEL_MAX_INSERTS_PER_ROUTE || '3' }}
+          DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN || '2' }}
+          DEDUPE_LOOKBACK_ROWS: ${{ vars.DEDUPE_LOOKBACK_ROWS || '2000' }}
           MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS || '90' }}
           VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS || '120' }}
         run: |
           set -e
           python workers/pipeline_worker.py
 
-      # If you dispatch feeder_only, we stop right here.
       - name: Stop after feeder (feeder_only)
         if: ${{ (inputs.mode || 'full') == 'feeder_only' }}
         run: |
@@ -116,7 +116,7 @@ jobs:
           exit 0
 
       # =========================
-      # PAUSE (IMPORTANT)
+      # PAUSE
       # =========================
       - name: Pause 30s for Sheets consistency
         run: |
@@ -142,9 +142,8 @@ jobs:
 
       # =========================
       # 2b) SIGNAL TRACKER
-      # Runs after Scorer, before Enrich.
-      # Reads SCORED rows from RAW_DEALS, writes deltas to Supabase signal_history.
-      # continue-on-error: true — never blocks the main pipeline.
+      # continue-on-error: true — never blocks pipeline
+      # SUPABASE env var names standardised to match signal_tracker.py
       # =========================
       - name: Signal Tracker (signal_tracker.py)
         continue-on-error: true
@@ -183,11 +182,12 @@ jobs:
 
       # =========================
       # 4) RENDER
+      # FIX: removed hardcoded MODE: full — inherits job-level MODE
+      # continue-on-error: true
       # =========================
       - name: Render (render_client.py)
         continue-on-error: true
         env:
-          MODE: full
           RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -203,12 +203,13 @@ jobs:
           python workers/render_client.py
 
       # =========================
-      # 5) INSTAGRAM (marketing; must not block TG)
+      # 5) INSTAGRAM
+      # FIX: removed hardcoded MODE: full
+      # continue-on-error: true — must not block Telegram or Travelr Sync
       # =========================
       - name: Instagram Publisher (instagram_publisher.py)
         continue-on-error: true
         env:
-          MODE: full
           RUN_SLOT: ${{ env.RUN_SLOT }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -228,6 +229,7 @@ jobs:
 
       # =========================
       # 6) LINK ROUTER
+      # continue-on-error: true
       # =========================
       - name: Link Router (link_router.py)
         continue-on-error: true
@@ -247,9 +249,11 @@ jobs:
           python workers/link_router.py
 
       # =========================
-      # 7) TELEGRAM (VIP first, then FREE)
+      # 7) TELEGRAM
+      # FIX: continue-on-error: true — Telegram failure must not block Travelr Sync
       # =========================
       - name: Telegram Publisher (telegram_publisher.py)
+        continue-on-error: true
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -273,9 +277,7 @@ jobs:
 
       # =========================
       # 8) TRAVELR SYNC
-      # Runs after full pipeline completion.
-      # Reads POSTED_ALL from RAW_DEALS, writes to Supabase deals_cache.
-      # continue-on-error: true — a Travelr failure must never block V5.
+      # continue-on-error: true — Travelr failure must never block V5
       # =========================
       - name: Travelr Sync (travelr_sync.py)
         continue-on-error: true

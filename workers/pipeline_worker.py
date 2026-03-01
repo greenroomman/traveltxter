@@ -368,7 +368,8 @@ BUCKET_MAX_TIER: Dict[int, int] = {
     3: 2,  # Near Long-Haul     — Tier 1 + 2 only
     4: 1,  # Long-Haul US/CA    — Tier 1 only
     5: 1,  # Long-Haul Asia/ME  — Tier 1 only
-    6: 2,  # Seasonal/Wildcard  — Tier 1 + 2 only
+    6: 1,  # Seasonal/Wildcard  — Tier 1 only
+             # UIO/HNL/SYD unreachable from Tier 2 airports at viable prices.
 }
 
 
@@ -384,12 +385,15 @@ def eligible_tiers_for_bucket(bucket_id: int) -> List[int]:
 # Each run gets 2 buckets: primary + secondary.
 # Pairs cycle across 6 days covering all 6 buckets.
 BUCKET_PAIRS = [
-    (1, 4),  # Day 1 AM
-    (2, 5),  # Day 1 PM
-    (3, 6),  # Day 2 AM
-    (4, 1),  # Day 2 PM
-    (5, 2),  # Day 3 AM
-    (6, 3),  # Day 3 PM
+    (1, 4),  # Run 0 — EU High Volume    + US/Canada
+    (2, 5),  # Run 1 — EU Secondary      + Asia/ME
+    (1, 3),  # Run 2 — EU High Volume    + Near Long-Haul
+    (2, 4),  # Run 3 — EU Secondary      + US/Canada
+    (1, 5),  # Run 4 — EU High Volume    + Asia/ME
+    (2, 6),  # Run 5 — EU Secondary      + Seasonal/Wildcard
+    # Rule: B1 or B2 always anchors every run.
+    # EU anchor guarantees viable offers. Thin buckets (B3-B6)
+    # ride alongside, never paired with each other.
 ]
 
 
@@ -408,26 +412,48 @@ def select_destinations(
     n: int,
 ) -> List[BucketDest]:
     """
-    Deterministic rotation within bucket.
-    dest = bucket_list[(dix + offset) % len(bucket_list)]
-    No randomness.
+    Deterministic rotation within bucket — tier-isolated.
+
+    Rotates within A-tier pool first, then B-tier pool.
+    C-tier destinations are NEVER selected by rotation.
+    They exist in CONFIG_BUCKETS for reference but are structural
+    no-offers on most UK origin × long-haul destination combinations.
+
+    This prevents the engine landing on Yellowknife or Whitehorse
+    simply because the dix value modulos into the C-tier index range.
     """
     if not bucket_dests:
         return []
-    # Prefer A-tier liquidity first, then B, then C
-    ordered = (
-        [d for d in bucket_dests if d.liquidity_tier == "A"]
-        + [d for d in bucket_dests if d.liquidity_tier == "B"]
-        + [d for d in bucket_dests if d.liquidity_tier == "C"]
-    )
+
+    a_pool = [d for d in bucket_dests if d.liquidity_tier == "A"]
+    b_pool = [d for d in bucket_dests if d.liquidity_tier == "B"]
+    # C-tier excluded from rotation entirely
+
     selected: List[BucketDest] = []
     seen: set = set()
-    for i in range(n):
-        idx = (dix + i) % len(ordered)
-        dest = ordered[idx]
-        if dest.destination_iata not in seen:
-            selected.append(dest)
-            seen.add(dest.destination_iata)
+
+    # Fill from A-tier first — rotate within A pool only
+    if a_pool:
+        for i in range(n):
+            idx = (dix + i) % len(a_pool)
+            dest = a_pool[idx]
+            if dest.destination_iata not in seen:
+                selected.append(dest)
+                seen.add(dest.destination_iata)
+            if len(selected) >= n:
+                break
+
+    # Fill remainder from B-tier — rotate within B pool only
+    if len(selected) < n and b_pool:
+        for i in range(n):
+            idx = (dix + i) % len(b_pool)
+            dest = b_pool[idx]
+            if dest.destination_iata not in seen:
+                selected.append(dest)
+                seen.add(dest.destination_iata)
+            if len(selected) >= n:
+                break
+
     return selected[:n]
 
 

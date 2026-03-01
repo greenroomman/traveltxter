@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 """
-TRAVELTXTTER V5 — AI_SCORER (Deterministic, Spreadsheet-led)
+TRAVELTXTTER V5 — AI_SCORER (Bucket-Aware, Origin-Adjusted)
 
 PURPOSE
 - Read RAW_DEALS rows with status=NEW.
 - Assign a numeric score (0–99).
 - Promote up to WINNERS_PER_RUN to status=READY_TO_POST.
 - Mark remaining NEW rows as SCORED.
-- Optionally HARD_REJECT invalid rows (non-GBP, missing price/dates, etc).
+- Optionally HARD_REJECT invalid rows.
 
-CONTRACT (V5 MINIMAL)
+SCORING ARCHITECTURE (v2 — bucket-aware)
+- Destinations are scored within their BUCKET COHORT, not theme cohort.
+- Theme is a label on the row; it does NOT gate promotable candidates.
+- Bucket is inferred from CONFIG_BUCKETS by destination_iata.
+- Origin tier adjustment: Tier 2/3 airports get a price allowance so
+  regional fares are not penalised vs London fares for same destination.
+- Winners selected per-bucket then ranked globally for coverage diversity.
+
+ORIGIN TIER PRICE ADJUSTMENT
+- Tier 1 (LHR/LGW/MAN/BHX): 1.00 — no adjustment
+- Tier 2 (BRS/EDI/GLA etc.): 1.15 — 15% allowance
+- Tier 3 (SOU/BOH/CWL/EXT): 1.25 — 25% allowance
+Adjusted price = actual_price / tier_multiplier
+Only used for scoring comparison — stored price_gbp never modified.
+
+CONTRACT (V5)
 - RAW_DEALS is the single writable truth.
-- RAW_DEALS_VIEW is read-only; scorer may read it (optional) but must never write to it.
+- RAW_DEALS_VIEW is read-only.
 - Downstream workers READ status.
 - Publishers change status after posting (not scorer).
-
-KEY FIX (2026-02-05)
-- Scorer no longer requires ingested_at_utc to be parseable to score a NEW row.
-- MIN_INGEST_AGE_SECONDS is best-effort: applied only when ingested_at_utc parses.
 """
 
 from __future__ import annotations
@@ -26,6 +37,7 @@ import base64
 import json
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,22 +46,24 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-# ----------------------------- Logging -----------------------------
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
 
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     print(f"{ts} | {msg}", flush=True)
 
 
-# -------------------------- GCP auth helpers -----------------------
+# ─────────────────────────────────────────────
+# GCP AUTH
+# ─────────────────────────────────────────────
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def _clean_json_string(raw: str) -> str:
-    raw = (raw or "").strip()
-    raw = _CONTROL_CHARS.sub("", raw)
-    return raw
+    return _CONTROL_CHARS.sub("", (raw or "").strip())
 
 
 def _try_json_loads(raw: str) -> Optional[dict]:
@@ -60,34 +74,16 @@ def _try_json_loads(raw: str) -> Optional[dict]:
 
 
 def load_service_account_info() -> dict:
-    """
-    Robustly parse service account json from:
-    - GCP_SA_JSON_ONE_LINE (preferred)
-    - GCP_SA_JSON
-
-    Handles:
-    - raw JSON
-    - JSON with escaped newlines
-    - base64-encoded JSON (common in CI)
-    - secrets wrapped with literal newlines
-    """
     raw = os.environ.get("GCP_SA_JSON_ONE_LINE") or os.environ.get("GCP_SA_JSON") or ""
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON env var")
-
     raw = _clean_json_string(raw)
-
-    # 1) direct json
     obj = _try_json_loads(raw)
     if obj:
         return obj
-
-    # 2) escaped newline variant
     obj = _try_json_loads(raw.replace("\\n", "\n"))
     if obj:
         return obj
-
-    # 3) base64
     try:
         decoded = base64.b64decode(raw).decode("utf-8", errors="replace")
         decoded = _clean_json_string(decoded)
@@ -96,14 +92,10 @@ def load_service_account_info() -> dict:
             return obj
     except Exception:
         pass
-
-    # 4) last resort: remove literal newlines and retry
-    compact = raw.replace("\n", "")
-    obj = _try_json_loads(compact)
+    obj = _try_json_loads(raw.replace("\n", ""))
     if obj:
         return obj
-
-    raise RuntimeError("Could not parse service account JSON (check secret formatting)")
+    raise RuntimeError("Could not parse service account JSON.")
 
 
 def gspread_client() -> gspread.Client:
@@ -111,12 +103,13 @@ def gspread_client() -> gspread.Client:
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    info = load_service_account_info()
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    creds = Credentials.from_service_account_info(load_service_account_info(), scopes=scopes)
     return gspread.authorize(creds)
 
 
-# ----------------------------- Sheet utils -------------------------
+# ─────────────────────────────────────────────
+# SHEET UTILS
+# ─────────────────────────────────────────────
 
 def open_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
     sheet_id = os.environ.get("SPREADSHEET_ID") or os.environ.get("SHEET_ID")
@@ -133,8 +126,7 @@ def open_ws(sh: gspread.Spreadsheet, name: str) -> gspread.Worksheet:
 
 
 def headers_map(ws: gspread.Worksheet) -> Dict[str, int]:
-    header_row = ws.row_values(1)
-    return {h.strip(): i for i, h in enumerate(header_row) if h.strip()}
+    return {h.strip(): i for i, h in enumerate(ws.row_values(1)) if h.strip()}
 
 
 def get_cell(ws: gspread.Worksheet, a1: str) -> str:
@@ -186,35 +178,150 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _max_stops_for_theme(theme: str) -> int:
-    key = f"MAX_STOPS_{theme.upper()}"
-    v = (os.environ.get(key) or "").strip()
-    if v:
+# ─────────────────────────────────────────────
+# CONFIG_BUCKETS — destination → bucket_id
+# ─────────────────────────────────────────────
+
+def load_dest_to_bucket(sh: gspread.Spreadsheet, buckets_tab: str) -> Dict[str, int]:
+    """
+    Returns: destination_iata → bucket_id
+    Gracefully falls back to empty dict if tab missing.
+    """
+    try:
+        ws = sh.worksheet(buckets_tab)
+    except Exception:
+        log(f"WARNING: CONFIG_BUCKETS tab '{buckets_tab}' not found. Single-pool scoring active.")
+        return {}
+
+    rows = ws.get_all_records()
+    mapping: Dict[str, int] = {}
+    for r in rows:
+        enabled = str(r.get("enabled", "")).strip().upper() in ("TRUE", "1", "YES", "Y")
+        if not enabled:
+            continue
+        iata = str(r.get("destination_iata", "")).strip().upper()
         try:
-            return int(v)
+            bid = int(r.get("bucket_id", 0) or 0)
         except Exception:
-            pass
-    return 1
+            bid = 0
+        if iata and bid > 0:
+            mapping[iata] = bid
+    log(f"CONFIG_BUCKETS: {len(mapping)} destinations mapped.")
+    return mapping
 
 
-# ------------------------------ RDV optional ------------------------
+# ─────────────────────────────────────────────
+# CONFIG_ORIGINS — origin → tier
+# ─────────────────────────────────────────────
 
-def _load_rdv_dynamic_theme_index(
-    sh: gspread.Spreadsheet,
-    rdv_tab: str,
-) -> Dict[str, str]:
+def load_origin_tiers(sh: gspread.Spreadsheet, origins_tab: str) -> Dict[str, int]:
     """
-    Optional. If RDV exists and has columns:
-      deal_id, dynamic_theme
-    build dict for scoring/theme match.
-
-    If not available, return {}.
+    Returns: airport_iata → tier (1/2/3)
+    Gracefully falls back to empty dict (all treated as Tier 1).
     """
+    try:
+        ws = sh.worksheet(origins_tab)
+    except Exception:
+        log(f"WARNING: CONFIG_ORIGINS tab '{origins_tab}' not found. All origins Tier 1.")
+        return {}
+
+    rows = ws.get_all_records()
+    mapping: Dict[str, int] = {}
+    for r in rows:
+        enabled = str(r.get("enabled", "")).strip().upper() in ("TRUE", "1", "YES", "Y")
+        if not enabled:
+            continue
+        iata = str(r.get("airport_iata", "")).strip().upper()
+        try:
+            tier = int(r.get("tier", 1) or 1)
+        except Exception:
+            tier = 1
+        if iata:
+            mapping[iata] = tier
+    log(f"CONFIG_ORIGINS: {len(mapping)} origins mapped to tiers.")
+    return mapping
+
+
+# ─────────────────────────────────────────────
+# ORIGIN TIER PRICE ADJUSTMENT
+# ─────────────────────────────────────────────
+
+ORIGIN_TIER_MULTIPLIER: Dict[int, float] = {
+    1: 1.00,
+    2: 1.15,
+    3: 1.25,
+}
+
+
+def adjusted_price(price_gbp: float, origin_iata: str, origin_tiers: Dict[str, int]) -> float:
+    """
+    Normalise price for scoring comparison only.
+    Stored price_gbp is never modified.
+    """
+    tier = origin_tiers.get(origin_iata, 1)
+    multiplier = ORIGIN_TIER_MULTIPLIER.get(tier, 1.00)
+    return price_gbp / multiplier
+
+
+# ─────────────────────────────────────────────
+# SCORING — quartile within bucket cohort
+# ─────────────────────────────────────────────
+
+def _compute_scores_by_adjusted_price(adj_prices: List[float]) -> Dict[float, float]:
+    """
+    Within-cohort quartile scoring.
+    Lowest adjusted price → highest score.
+    Single-item cohorts receive a neutral score (60.0).
+    """
+    if not adj_prices:
+        return {}
+    if len(adj_prices) == 1:
+        return {adj_prices[0]: 60.0}
+
+    sp = sorted(adj_prices)
+    n = len(sp)
+    q1 = sp[max(0, int(0.25 * (n - 1)))]
+    q3 = sp[max(0, int(0.75 * (n - 1)))]
+    span = max(1.0, q3 - q1)
+
+    out: Dict[float, float] = {}
+    for p in adj_prices:
+        z = (p - q1) / span
+        score = 85.0 - (z * 30.0)
+        score = max(1.0, min(99.0, score))
+        out[p] = max(out.get(p, 0.0), score)
+    return out
+
+
+# ─────────────────────────────────────────────
+# DEAL ROW
+# ─────────────────────────────────────────────
+
+@dataclass
+class DealRow:
+    row_idx: int
+    deal_id: str
+    theme: str
+    status: str
+    price_gbp: Optional[float]
+    currency: str
+    stops: Optional[int]
+    origin_iata: str
+    destination_iata: str
+    ingested_at_utc: str
+    bucket_id: int      # 0 = unmapped (fallback pool)
+    adj_price: float    # origin-adjusted price for scoring only
+
+
+# ─────────────────────────────────────────────
+# RDV optional theme signal (preserved)
+# ─────────────────────────────────────────────
+
+def _load_rdv_dynamic_theme_index(sh: gspread.Spreadsheet, rdv_tab: str) -> Dict[str, str]:
     try:
         ws = sh.worksheet(rdv_tab)
     except Exception:
         return {}
-
     try:
         vals = ws.get_all_values()
         if len(vals) < 2:
@@ -234,59 +341,29 @@ def _load_rdv_dynamic_theme_index(
         return {}
 
 
-# ------------------------------ Scoring ----------------------------
-
-@dataclass
-class DealRow:
-    row_idx: int
-    deal_id: str
-    theme: str
-    status: str
-    price_gbp: Optional[float]
-    currency: str
-    stops: Optional[int]
-    ingested_at_utc: str  # stored, but NOT required to be parseable
-
-
-def _compute_scores_by_price(prices: List[float]) -> Dict[float, float]:
-    """
-    Cheapness relative score: cheapest ~ high score.
-    Uses robust quartile span to avoid outliers.
-    """
-    if not prices:
-        return {}
-
-    sp = sorted(prices)
-    n = len(sp)
-    q1 = sp[max(0, int(0.25 * (n - 1)))]
-    q3 = sp[max(0, int(0.75 * (n - 1)))]
-    span = max(1.0, (q3 - q1))
-
-    out: Dict[float, float] = {}
-    for p in prices:
-        z = (p - q1) / span
-        score = 85.0 - (z * 30.0)
-        score = max(1.0, min(99.0, score))
-        out[p] = max(out.get(p, 0.0), score)
-    return out
-
-
-# ------------------------------ Main --------------------------------
+# ─────────────────────────────────────────────
+# ENV
+# ─────────────────────────────────────────────
 
 RAW_TAB = os.environ.get("RAW_DEALS_TAB", "RAW_DEALS")
 OPS_TAB = os.environ.get("OPS_MASTER_TAB", "OPS_MASTER")
 RDV_TAB = os.environ.get("RAW_DEALS_VIEW_TAB", "RAW_DEALS_VIEW")
+BUCKETS_TAB = os.environ.get("FEEDER_BUCKETS_TAB", "CONFIG_BUCKETS")
+ORIGINS_TAB = os.environ.get("FEEDER_ORIGINS_TAB", "CONFIG_ORIGINS")
+OPS_THEME_CELL = os.environ.get("OPS_THEME_CELL", "B2")
+OPS_SLOT_CELL = os.environ.get("OPS_SLOT_CELL", "A2")
 
-OPS_THEME_CELL = os.environ.get("OPS_THEME_CELL", "B2")  # V5: theme of day
-OPS_SLOT_CELL = os.environ.get("OPS_SLOT_CELL", "A2")    # V5: AM/PM label
 
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
 
 def main() -> int:
-    log("📥 TravelTxter V5 — AI_SCORER start")
+    log("AI_SCORER (bucket-aware) start")
 
-    # Best-effort freshness gate (applied only when ingest parses)
     min_age_seconds = _env_int("MIN_INGEST_AGE_SECONDS", 0)
     winners_per_run = _env_int("WINNERS_PER_RUN", 2)
+    winners_per_bucket = _env_int("WINNERS_PER_BUCKET", 1)
 
     gc = gspread_client()
     sh = open_spreadsheet(gc)
@@ -299,38 +376,24 @@ def main() -> int:
     if slot not in ("AM", "PM"):
         slot = "PM"
 
-    log(f"🎯 Theme of day: {theme_today}")
-    log(f"🕒 Slot: {slot} | MIN_INGEST_AGE_SECONDS={min_age_seconds} | WINNERS_PER_RUN={winners_per_run}")
+    log(f"Theme (label): {theme_today} | Slot: {slot} | winners_per_run={winners_per_run}")
+
+    dest_to_bucket = load_dest_to_bucket(sh, BUCKETS_TAB)
+    origin_tiers = load_origin_tiers(sh, ORIGINS_TAB)
 
     hmap = headers_map(ws_raw)
-
-    required = [
-        "deal_id",
-        "status",
-        "price_gbp",
-        "currency",
-        "stops",
-        "publish_window",
-        "score",
-    ]
-    missing = [h for h in required if h not in hmap]
-    if missing:
-        raise RuntimeError(f"{RAW_TAB} schema missing required columns: {missing}")
+    required = ["deal_id", "status", "price_gbp", "currency", "stops", "publish_window", "score"]
+    missing_cols = [h for h in required if h not in hmap]
+    if missing_cols:
+        raise RuntimeError(f"{RAW_TAB} missing required columns: {missing_cols}")
 
     has_theme_col = "theme" in hmap
     has_ingest_col = "ingested_at_utc" in hmap
+    has_origin_col = "origin_iata" in hmap
+    has_dest_col = "destination_iata" in hmap
     has_scored_ts = "scored_timestamp" in hmap
-    if not has_scored_ts:
-        log(f"ℹ️ {RAW_TAB} missing 'scored_timestamp' column. Timestamp write-back will be skipped.")
-    if not has_ingest_col:
-        log(f"ℹ️ {RAW_TAB} missing 'ingested_at_utc' column. Freshness gate disabled.")
 
-    # Optional RDV theme signal
     rdv_theme_by_id = _load_rdv_dynamic_theme_index(sh, RDV_TAB)
-    if rdv_theme_by_id:
-        log(f"✅ RDV loaded for scoring signals: {len(rdv_theme_by_id)} deal_ids indexed")
-    else:
-        log("ℹ️ RDV not used for scoring signals (missing tab or columns).")
 
     values = ws_raw.get_all_values()
     if len(values) < 2:
@@ -340,15 +403,14 @@ def main() -> int:
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    # Forensic counters
+    # ── Ingest NEW rows ──
     seen_rows = len(values) - 1
     seen_new = 0
-    skipped_status_not_new = 0
-    skipped_missing_deal_id = 0
+    skipped_status = 0
+    skipped_no_id = 0
+    skipped_too_fresh = 0
     ingest_blank = 0
     ingest_unparseable = 0
-    skipped_too_fresh = 0  # only when ingest parses
-
     new_rows: List[DealRow] = []
 
     for sheet_i, r in enumerate(values[1:], start=2):
@@ -357,127 +419,130 @@ def main() -> int:
             j = hmap.get(name)
             return (r[j] if (j is not None and j < len(r)) else "").strip()
 
-        status = col("status").upper()
-        if status != "NEW":
-            skipped_status_not_new += 1
+        if col("status").upper() != "NEW":
+            skipped_status += 1
             continue
 
         seen_new += 1
-
         deal_id = col("deal_id")
         if not deal_id:
-            skipped_missing_deal_id += 1
+            skipped_no_id += 1
             continue
 
         ing = col("ingested_at_utc") if has_ingest_col else ""
         if has_ingest_col and not ing:
             ingest_blank += 1
 
-        # Best-effort freshness gate: ONLY if we can parse ingest
         if min_age_seconds > 0 and ing:
             dt_ing = _parse_iso_utc(ing)
             if not dt_ing:
                 ingest_unparseable += 1
-            else:
-                age_s = (now - dt_ing).total_seconds()
-                if age_s < float(min_age_seconds):
-                    skipped_too_fresh += 1
-                    continue
-        elif has_ingest_col and ing:
-            # track parseability for forensics, but never block
-            if not _parse_iso_utc(ing):
-                ingest_unparseable += 1
+            elif (now - dt_ing).total_seconds() < float(min_age_seconds):
+                skipped_too_fresh += 1
+                continue
+        elif has_ingest_col and ing and not _parse_iso_utc(ing):
+            ingest_unparseable += 1
 
         theme_row = (col("theme") if has_theme_col else "").strip()
         theme_signal = (rdv_theme_by_id.get(deal_id) or "").strip()
         resolved_theme = (theme_row or theme_signal or theme_today).strip() or theme_today
 
-        new_rows.append(
-            DealRow(
-                row_idx=sheet_i,
-                deal_id=deal_id,
-                theme=resolved_theme,
-                status=status,
-                price_gbp=_safe_float(col("price_gbp")),
-                currency=col("currency").upper(),
-                stops=_safe_int(col("stops")),
-                ingested_at_utc=ing,
-            )
-        )
+        origin_iata = (col("origin_iata") if has_origin_col else "").strip().upper()
+        dest_iata = (col("destination_iata") if has_dest_col else "").strip().upper()
+        price = _safe_float(col("price_gbp"))
+        bucket_id = dest_to_bucket.get(dest_iata, 0)
+        adj = adjusted_price(price, origin_iata, origin_tiers) if price is not None else 0.0
+
+        new_rows.append(DealRow(
+            row_idx=sheet_i,
+            deal_id=deal_id,
+            theme=resolved_theme,
+            status="NEW",
+            price_gbp=price,
+            currency=col("currency").upper(),
+            stops=_safe_int(col("stops")),
+            origin_iata=origin_iata,
+            destination_iata=dest_iata,
+            ingested_at_utc=ing,
+            bucket_id=bucket_id,
+            adj_price=adj,
+        ))
 
     log(
-        "Forensics: "
-        f"rows={seen_rows} NEW={seen_new} "
-        f"eligible={len(new_rows)} "
-        f"skipped_status_not_new={skipped_status_not_new} "
-        f"skipped_missing_deal_id={skipped_missing_deal_id} "
-        f"ingest_blank={ingest_blank} ingest_unparseable={ingest_unparseable} "
-        f"skipped_too_fresh={skipped_too_fresh}"
+        f"rows={seen_rows} NEW={seen_new} eligible={len(new_rows)} "
+        f"skipped_status={skipped_status} skipped_no_id={skipped_no_id} "
+        f"too_fresh={skipped_too_fresh} ingest_blank={ingest_blank}"
     )
 
     if not new_rows:
-        log("✅ No status changes needed (idempotent).")
+        log("No status changes needed.")
         return 0
 
-    max_stops = _max_stops_for_theme(theme_today)
-
-    hard_reject: List[DealRow] = []
-    promotable: List[DealRow] = []
-
-    # Basic validation + promotable filtering
+    # ── Hard reject ──
+    hard_reject_ids: set = set()
+    candidates: List[DealRow] = []
     for d in new_rows:
-        if d.currency and d.currency != "GBP":
-            hard_reject.append(d)
-            continue
-        if d.price_gbp is None or d.price_gbp <= 0:
-            hard_reject.append(d)
-            continue
+        if (d.currency and d.currency != "GBP") or (d.price_gbp is None or d.price_gbp <= 0):
+            hard_reject_ids.add(d.deal_id)
+        else:
+            candidates.append(d)
 
-        # promotable = matches theme_today AND stops within tolerance
-        if (d.theme == theme_today) and (d.stops is None or d.stops <= max_stops):
-            promotable.append(d)
+    # ── Score within each bucket ──
+    by_bucket: Dict[int, List[DealRow]] = defaultdict(list)
+    for d in candidates:
+        by_bucket[d.bucket_id].append(d)
 
-    # Price-based scoring within promotable only (so “cheap within theme” wins)
-    price_scores = _compute_scores_by_price([d.price_gbp for d in promotable if d.price_gbp is not None])
+    log(f"Bucket distribution: { {k: len(v) for k, v in sorted(by_bucket.items())} }")
 
-    scored_items: List[Tuple[DealRow, float]] = []
-    for d in promotable:
-        base = float(price_scores.get(d.price_gbp or 0.0, 50.0))
-        if d.stops is not None:
-            base -= float(d.stops) * 5.0
-        base = max(1.0, min(99.0, base))
-        scored_items.append((d, base))
+    scored_map: Dict[str, float] = {}  # deal_id → score
 
-    scored_items.sort(key=lambda t: t[1], reverse=True)
-    winners = scored_items[: max(0, winners_per_run)]
+    for bucket_id, rows in by_bucket.items():
+        adj_prices = [d.adj_price for d in rows if d.adj_price > 0]
+        price_scores = _compute_scores_by_adjusted_price(adj_prices)
+
+        for d in rows:
+            base = float(price_scores.get(d.adj_price, 50.0))
+            if d.stops is not None:
+                base -= float(d.stops) * 5.0
+            scored_map[d.deal_id] = max(1.0, min(99.0, base))
+
+        bucket_label = f"B{bucket_id}" if bucket_id > 0 else "Unmapped"
+        best = max(rows, key=lambda x: scored_map[x.deal_id])
+        log(f"  {bucket_label} ({len(rows)} rows): "
+            f"best={best.destination_iata}({best.origin_iata}) "
+            f"adj=£{round(best.adj_price)} "
+            f"score={round(scored_map[best.deal_id], 1)}")
+
+    # ── Winner selection: best per bucket → rank globally ──
+    per_bucket_top: List[Tuple[DealRow, float]] = []
+    for bucket_id, rows in by_bucket.items():
+        valid = sorted(rows, key=lambda x: scored_map.get(x.deal_id, 0), reverse=True)
+        per_bucket_top.extend((d, scored_map[d.deal_id]) for d in valid[:winners_per_bucket])
+
+    per_bucket_top.sort(key=lambda t: t[1], reverse=True)
+    winners = per_bucket_top[:max(0, winners_per_run)]
     winner_ids = {w[0].deal_id for w in winners}
 
+    log(f"Winners: {[w[0].destination_iata+'('+w[0].origin_iata+') £'+str(w[0].price_gbp)+' s='+str(round(w[1],1)) for w in winners]}")
+
+    # ── Write ──
     updates: List[gspread.Cell] = []
 
     def set_cell(row_idx: int, header: str, value: Any) -> None:
-        col_idx = hmap[header] + 1
-        updates.append(gspread.Cell(row_idx, col_idx, value))
+        updates.append(gspread.Cell(row_idx, hmap[header] + 1, value))
 
-    publish_ct = 0
-    scored_ct = 0
-    hard_ct = 0
-    off_theme_ct = 0
-
-    # Pre-map winner scores for O(1) lookup
-    winner_score_map: Dict[str, float] = {d.deal_id: sc for d, sc in winners}
+    publish_ct = scored_ct = hard_ct = 0
 
     for d in new_rows:
-        if d in hard_reject:
+        if d.deal_id in hard_reject_ids:
             set_cell(d.row_idx, "status", "HARD_REJECT")
             set_cell(d.row_idx, "publish_window", "")
             set_cell(d.row_idx, "score", 0)
             if has_scored_ts:
                 set_cell(d.row_idx, "scored_timestamp", now_iso)
             hard_ct += 1
-            continue
-
-        if d.deal_id in winner_ids:
-            sc = float(winner_score_map.get(d.deal_id, 75.0))
+        elif d.deal_id in winner_ids:
+            sc = scored_map.get(d.deal_id, 75.0)
             set_cell(d.row_idx, "status", "READY_TO_POST")
             set_cell(d.row_idx, "publish_window", slot)
             set_cell(d.row_idx, "score", round(sc, 2))
@@ -485,19 +550,10 @@ def main() -> int:
                 set_cell(d.row_idx, "scored_timestamp", now_iso)
             publish_ct += 1
         else:
-            # non-winners become SCORED (even if off-theme); score is informative only
-            if d.theme != theme_today:
-                off_theme_ct += 1
-
-            score_val = 50.0
-            if d.price_gbp is not None:
-                score_val = max(1.0, min(99.0, 60.0 - (d.price_gbp / 50.0)))
-            if d.stops is not None:
-                score_val -= float(d.stops) * 3.0
-
+            sc = scored_map.get(d.deal_id, 50.0)
             set_cell(d.row_idx, "status", "SCORED")
             set_cell(d.row_idx, "publish_window", "")
-            set_cell(d.row_idx, "score", round(score_val, 2))
+            set_cell(d.row_idx, "score", round(sc, 2))
             if has_scored_ts:
                 set_cell(d.row_idx, "scored_timestamp", now_iso)
             scored_ct += 1
@@ -505,10 +561,7 @@ def main() -> int:
     if updates:
         ws_raw.update_cells(updates, value_input_option="USER_ENTERED")
 
-    log(
-        f"✅ Status writes: READY_TO_POST={publish_ct} SCORED={scored_ct} "
-        f"HARD_REJECT={hard_ct} off_theme_scored={off_theme_ct}"
-    )
+    log(f"READY_TO_POST={publish_ct} SCORED={scored_ct} HARD_REJECT={hard_ct}")
     return 0
 
 
@@ -516,5 +569,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as e:
-        log(f"❌ ERROR: {e}")
+        log(f"ERROR: {e}")
         raise

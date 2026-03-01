@@ -3,10 +3,12 @@
 workers/pipeline_worker.py
 TRAVELTXTTER V5 FEEDER
 
-Fixes in this version:
-- ISO timestamp format for ingested_at_utc (was epoch int, now ISO string)
-- Enhanced logging to see dedupe skips and destination progression
-- Preserved all other V5 contract requirements
+Changes in this version:
+- Origin selection now reads CONFIG_ORIGINS sheet (tier-weighted, theme-filtered)
+- Removed hardcoded LHR,LGW,MAN fallback
+- Env var ORIGINS_* still honoured as override if CONFIG_ORIGINS not available
+- All other V5 contract requirements preserved
+- Full file replacement per Canonical Oilpan protocol
 """
 
 from __future__ import annotations
@@ -71,14 +73,12 @@ def _sanitize_sa_json(raw: str) -> str:
     if not raw:
         raise RuntimeError("Missing GCP service account JSON (GCP_SA_JSON_ONE_LINE or GCP_SA_JSON).")
 
-    # Fast path: already valid JSON
     try:
         json.loads(raw)
         return raw
     except Exception:
         pass
 
-    # Common path: one-line JSON with \n escapes
     try:
         fixed = raw.replace("\\n", "\n")
         json.loads(fixed)
@@ -86,7 +86,6 @@ def _sanitize_sa_json(raw: str) -> str:
     except Exception:
         pass
 
-    # Repair literal newlines inside private_key value
     if '"private_key"' in raw and "BEGIN PRIVATE KEY" in raw:
         try:
             before, rest = raw.split('"private_key"', 1)
@@ -105,9 +104,8 @@ def _sanitize_sa_json(raw: str) -> str:
         except Exception:
             pass
 
-    # Last resort: remove CR and re-raise
     raw2 = raw.replace("\r", "")
-    json.loads(raw2)  # will raise with clearer message
+    json.loads(raw2)
     return raw2
 
 
@@ -133,10 +131,6 @@ def get_cell(ws: gspread.Worksheet, a1: str) -> str:
 # ----------------------------
 
 def _utc_iso() -> str:
-    """
-    CRITICAL FIX: Return ISO format timestamp string (not epoch int)
-    IG Publisher expects: "2026-02-08T07:34:52Z"
-    """
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
@@ -165,7 +159,6 @@ def _hash_trip(origin: str, dest: str, out_date: str, ret_date: str) -> str:
 
 
 def _pick_dates(days_ahead_min: int, days_ahead_max: int, trip_length_days: int) -> Tuple[str, str]:
-    # deterministic per hour bucket
     seed = int(time.time() // 3600)
     rnd = random.Random(seed + trip_length_days + days_ahead_min * 31 + days_ahead_max)
     depart_in = rnd.randint(days_ahead_min, max(days_ahead_min, days_ahead_max))
@@ -241,9 +234,6 @@ def extract_cabin_class(offer: Dict[str, Any], fallback: str = "economy") -> str
 
 
 def extract_bags_included(offer: Dict[str, Any]) -> str:
-    """
-    Fix for crash: offer.get("available_services") can be None
-    """
     try:
         services = offer.get("available_services") or []
         if isinstance(services, dict):
@@ -278,6 +268,14 @@ class DestRow:
     weight: float
 
 
+@dataclass
+class OriginRow:
+    airport_iata: str
+    tier: int
+    tier_weight: float
+    eligible_themes: List[str]  # ["all"] means unrestricted
+
+
 def load_config_dests(ws_cfg: gspread.Worksheet, theme_today: str) -> List[DestRow]:
     rows = ws_cfg.get_all_records()
     out: List[DestRow] = []
@@ -298,6 +296,113 @@ def load_config_dests(ws_cfg: gspread.Worksheet, theme_today: str) -> List[DestR
         out.append(DestRow(dest, w))
     out.sort(key=lambda x: x.weight, reverse=True)
     return out
+
+
+def load_config_origins(ws_origins: gspread.Worksheet) -> List[OriginRow]:
+    """
+    Reads CONFIG_ORIGINS sheet.
+    Columns: enabled, airport_iata, city, tier, tier_weight, eligible_themes
+    eligible_themes: pipe-separated list e.g. "northern_lights|snow|city_breaks"
+                     or "all" meaning no restriction.
+    """
+    rows = ws_origins.get_all_records()
+    out: List[OriginRow] = []
+    for r in rows:
+        enabled = str(r.get("enabled", "")).strip().upper() in ("TRUE", "1", "YES", "Y")
+        if not enabled:
+            continue
+        iata = str(r.get("airport_iata", "")).strip().upper()
+        if not iata:
+            continue
+        try:
+            tier = int(r.get("tier", 1) or 1)
+        except Exception:
+            tier = 1
+        try:
+            tw = float(r.get("tier_weight", 0.5) or 0.5)
+        except Exception:
+            tw = 0.5
+
+        raw_themes = str(r.get("eligible_themes", "all") or "all").strip().lower()
+        themes = [t.strip() for t in raw_themes.split("|") if t.strip()]
+        if not themes:
+            themes = ["all"]
+
+        out.append(OriginRow(
+            airport_iata=iata,
+            tier=tier,
+            tier_weight=tw,
+            eligible_themes=themes,
+        ))
+    return out
+
+
+def select_origins_weighted(
+    all_origins: List[OriginRow],
+    theme: str,
+    run_slot: str,
+    max_origins: int = 6,
+) -> List[str]:
+    """
+    Tier-weighted deterministic origin selection.
+
+    1. Filter by theme eligibility ("all" passes everything).
+    2. Group by tier.
+    3. Sample across tiers at 50/35/15 proportion.
+    4. Within each tier, rotate deterministically based on hour-bucket seed.
+    5. Return deduplicated ordered list of IATA codes.
+
+    Tier weights in CONFIG_ORIGINS are the share of the total pool:
+      Tier 1 = 0.50 → gets ~50% of selections
+      Tier 2 = 0.35 → gets ~35%
+      Tier 3 = 0.15 → gets ~15%
+    """
+    theme_lower = theme.lower()
+
+    # Filter to theme-eligible origins
+    eligible = [
+        o for o in all_origins
+        if "all" in o.eligible_themes or theme_lower in o.eligible_themes
+    ]
+
+    if not eligible:
+        return []
+
+    # Group by tier
+    tiers: Dict[int, List[OriginRow]] = {}
+    for o in eligible:
+        tiers.setdefault(o.tier, []).append(o)
+
+    # Tier proportions — read from first row of each tier
+    tier_weights: Dict[int, float] = {}
+    for tier_num, members in tiers.items():
+        tier_weights[tier_num] = members[0].tier_weight  # all rows in same tier share same weight
+
+    total_weight = sum(tier_weights.values())
+    if total_weight == 0:
+        return []
+
+    # Deterministic seed — rotates per hour so each run gets different airports
+    seed = int(time.time() // 3600)
+    rng = random.Random(seed + hash(theme_lower) + hash(run_slot.upper()))
+
+    selected: List[str] = []
+    seen: set = set()
+
+    # Allocate slots proportionally across tiers
+    # Then rotate within each tier
+    for tier_num in sorted(tiers.keys()):
+        weight = tier_weights[tier_num]
+        share = weight / total_weight
+        slots = max(1, round(max_origins * share))
+        pool = list(tiers[tier_num])
+        rng.shuffle(pool)
+        for o in pool[:slots]:
+            if o.airport_iata not in seen and len(selected) < max_origins:
+                selected.append(o.airport_iata)
+                seen.add(o.airport_iata)
+
+    return selected
 
 
 def header_map(ws: gspread.Worksheet) -> Dict[str, int]:
@@ -340,29 +445,65 @@ def append_rows_bulk(ws_raw: gspread.Worksheet, rows: List[List[Any]]) -> None:
 
 
 # ----------------------------
-# Origin selection
+# Origin selection (sheet-first, env fallback)
 # ----------------------------
 
-def origins_for(theme: str, run_slot: str) -> List[str]:
+def resolve_origins(
+    sh: gspread.Spreadsheet,
+    theme: str,
+    run_slot: str,
+    origins_tab: str,
+) -> List[str]:
+    """
+    Priority:
+    1. CONFIG_ORIGINS sheet (tier-weighted, theme-filtered)
+    2. Env override: AM_ORIGINS_<THEME> or PM_ORIGINS_<THEME>
+    3. Env override: ORIGINS_<THEME>
+    4. Env override: ORIGINS_DEFAULT
+    5. Hard error — never silently default to LHR,LGW,MAN
+
+    Sheet-first means origin architecture lives in CONFIG, not code.
+    """
+
+    # --- Attempt sheet read ---
+    try:
+        ws_origins = sh.worksheet(origins_tab)
+        all_origins = load_config_origins(ws_origins)
+        if all_origins:
+            selected = select_origins_weighted(all_origins, theme, run_slot)
+            if selected:
+                print(f"✅ Origins from CONFIG_ORIGINS ({len(selected)} airports, tier-weighted)")
+                return selected
+            else:
+                print(f"⚠️  CONFIG_ORIGINS loaded but no airports eligible for theme '{theme}' — checking env fallback")
+        else:
+            print(f"⚠️  CONFIG_ORIGINS sheet is empty — checking env fallback")
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"⚠️  CONFIG_ORIGINS tab not found ('{origins_tab}') — checking env fallback")
+    except Exception as e:
+        print(f"⚠️  CONFIG_ORIGINS read error: {e} — checking env fallback")
+
+    # --- Env fallback (explicit overrides only) ---
     tkey = theme.upper()
     slot = run_slot.upper() if run_slot else "PM"
 
-    # Priority: AM_/PM_ -> legacy ORIGINS_ -> ORIGINS_DEFAULT
     key1 = f"{slot}_ORIGINS_{tkey}"
     key2 = f"ORIGINS_{tkey}"
-    origins = parse_csv_list(env_str(key1))
-    if not origins:
-        origins = parse_csv_list(env_str(key2))
-    if not origins:
-        origins = parse_csv_list(env_str("ORIGINS_DEFAULT", "LHR,LGW,MAN"))
+    key3 = "ORIGINS_DEFAULT"
 
-    seen = set()
-    out: List[str] = []
-    for o in origins:
-        if o not in seen:
-            out.append(o)
-            seen.add(o)
-    return out
+    for key in [key1, key2, key3]:
+        val = env_str(key)
+        if val:
+            origins = parse_csv_list(val)
+            if origins:
+                print(f"✅ Origins from env var {key}: {origins}")
+                return origins
+
+    # --- No valid source found ---
+    raise RuntimeError(
+        f"No origins resolved for theme='{theme}' slot='{slot}'. "
+        "Add a CONFIG_ORIGINS sheet or set ORIGINS_DEFAULT env var."
+    )
 
 
 def max_stops_for(theme: str) -> int:
@@ -429,11 +570,12 @@ RAW_HEADERS_REQUIRED = [
 
 def main() -> int:
     print("======================================================================")
-    print("TRAVELTXTTER V5 — FEEDER START (FIXED: ISO TIMESTAMPS)")
+    print("TRAVELTXTTER V5 — FEEDER (CONFIG_ORIGINS TIER WEIGHTING)")
     print("======================================================================")
 
     run_slot = env_str("RUN_SLOT", "PM").upper()
     cfg_tab = env_str("FEEDER_CONFIG_TAB", "CONFIG")
+    origins_tab = env_str("FEEDER_ORIGINS_TAB", "CONFIG_ORIGINS")
     raw_tab = env_str("RAW_DEALS_TAB", "RAW_DEALS")
     ops_tab = env_str("OPS_MASTER_TAB", "OPS_MASTER")
 
@@ -460,17 +602,18 @@ def main() -> int:
         return 0
 
     chosen = dests[:max(1, routes_per_run)]
-    origins = origins_for(theme_today, run_slot)
+
+    # --- Origin resolution: sheet-first, env fallback ---
+    origins = resolve_origins(sh, theme_today, run_slot, origins_tab)
     if not origins:
-        raise RuntimeError("No origins resolved (check AM_/PM_/ORIGINS_* env vars).")
+        raise RuntimeError("No origins resolved.")
 
     max_conn = max_stops_for(theme_today)
     win_min, win_max = window_for(theme_today)
     trip_min, trip_max = trip_for(theme_today)
-
     cabin = env_str("CABIN_CLASS", "economy").lower()
 
-    print(f"📍 Origins: {origins}")
+    print(f"📍 Origins ({len(origins)}): {origins}")
     print(f"📍 Destinations (top {len(chosen)}): {[d.destination_iata for d in chosen]}")
     print(f"📍 Max searches: {max_searches} | Max inserts: {max_inserts}")
     print("=" * 60)
@@ -538,7 +681,7 @@ def main() -> int:
                 "posted_vip_at": "",
                 "posted_free_at": "",
                 "posted_instagram_at": "",
-                "ingested_at_utc": _utc_iso(),  # FIXED: ISO format
+                "ingested_at_utc": _utc_iso(),
                 "phrase_used": "",
                 "phrase_category": "",
                 "scored_timestamp": "",

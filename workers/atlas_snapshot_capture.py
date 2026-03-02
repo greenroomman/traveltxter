@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_capture.py
-ATLAS SNAPSHOT CAPTURE — v1 (Sheet-Driven, Bucket-Aware)
+ATLAS SNAPSHOT CAPTURE — v1.1 (Sheet-Driven, Bucket-Aware, Shuffled)
 
 Built against Atlas Snapshot Oilpan v1.0.
+
+WHAT CHANGED FROM v1.0:
+- compatible_routes shuffled before search loop (random.shuffle)
+  Prevents regional airports being systematically cut by search cap
+  due to deterministic sheet-order iteration (LHR→LGW→MAN→... always first)
+- BUCKET_MAX_TIER aligned with oilpan spec: Buckets 1+2 max tier = 2
+  (v1.0 incorrectly had max tier = 3 for Buckets 1+2; harmless in practice
+  since load_origins_from_sheet only loads Tier 1+2, but now matches spec)
 
 WHAT CHANGED FROM v0:
 - Origins loaded from CONFIG_ORIGINS sheet (Tier 1 + 2 only)
@@ -12,7 +20,7 @@ WHAT CHANGED FROM v0:
   Previously: hardcoded in atlas_snapshot_config.json
 - Bucket × origin compatibility enforced (Buckets 4+5 → Tier 1 only)
   Previously: all origins searched all destinations
-- ROUTE_CATEGORY replaced by bucket-derived category()
+- ROUTE_CATEGORY replaced by bucket-derived category_for_bucket()
   Previously: hardcoded dict covering LGW/MAN only
 
 WHAT IS UNCHANGED:
@@ -35,6 +43,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import random
 import datetime as dt
 import statistics
 from uuid import uuid4
@@ -267,7 +276,6 @@ def extract_stops(offer: Any) -> int:
 
 # ─────────────────────────────────────────────
 # SHEET-DRIVEN ORIGIN LOADING
-# Replaces: cfg.get("origins") from JSON
 # ─────────────────────────────────────────────
 
 @dataclass
@@ -279,7 +287,7 @@ class OriginRow:
 def load_origins_from_sheet(sh: gspread.Spreadsheet, tab: str) -> List[OriginRow]:
     """
     Reads CONFIG_ORIGINS. Returns Tier 1 + Tier 2 airports only.
-    Tier 3 excluded — structural no-offer rate too high for monitoring.
+    Tier 3 excluded — structural no-offer rate too high for daily monitoring.
     """
     try:
         ws = sh.worksheet(tab)
@@ -311,7 +319,6 @@ def load_origins_from_sheet(sh: gspread.Spreadsheet, tab: str) -> List[OriginRow
 
 # ─────────────────────────────────────────────
 # SHEET-DRIVEN DESTINATION LOADING
-# Replaces: cfg.get("destinations") from JSON
 # ─────────────────────────────────────────────
 
 @dataclass
@@ -326,6 +333,7 @@ def load_destinations_from_sheet(sh: gspread.Spreadsheet, tab: str) -> List[Dest
     """
     Reads CONFIG_BUCKETS. Returns Buckets 1–5 only.
     Bucket 6 (Seasonal/Wildcard) excluded — high no-offer rate from regional airports.
+    C-tier liquidity destinations excluded — structural no-offer for monitoring purposes.
     """
     try:
         ws = sh.worksheet(tab)
@@ -348,7 +356,6 @@ def load_destinations_from_sheet(sh: gspread.Spreadsheet, tab: str) -> List[Dest
         iata = str(r.get("destination_iata", "")).strip().upper()
         if not iata or iata in seen:
             continue
-        # Skip C-tier liquidity — structural no-offer for monitoring purposes
         liq = str(r.get("liquidity_tier", "B")).strip().upper()
         if liq == "C":
             continue
@@ -374,13 +381,14 @@ def load_destinations_from_sheet(sh: gspread.Spreadsheet, tab: str) -> List[Dest
 
 # ─────────────────────────────────────────────
 # BUCKET × ORIGIN COMPATIBILITY
-# Replaces: unrestricted all-origins-all-dests search
 # ─────────────────────────────────────────────
 
-# bucket_id → max origin tier allowed
+# bucket_id → max origin tier allowed to search that bucket
+# Aligned with oilpan spec. Tier 3 airports are excluded upstream
+# by load_origins_from_sheet, but the matrix is correct regardless.
 BUCKET_MAX_TIER: Dict[int, int] = {
-    1: 3,  # EU High Volume     — all tiers
-    2: 3,  # EU Secondary       — all tiers
+    1: 2,  # EU High Volume     — Tier 1 + 2
+    2: 2,  # EU Secondary       — Tier 1 + 2
     3: 2,  # Near Long-Haul     — Tier 1 + 2
     4: 1,  # Long-Haul US/CA    — Tier 1 only
     5: 1,  # Long-Haul Asia/ME  — Tier 1 only
@@ -541,7 +549,7 @@ def load_existing_keys(ws: gspread.Worksheet) -> Tuple[set, Dict[str, List[float
 
 def main() -> int:
     print("=" * 70)
-    print("ATLAS SNAPSHOT CAPTURE v1 — Sheet-Driven, Bucket-Aware")
+    print("ATLAS SNAPSHOT CAPTURE v1.1 — Sheet-Driven, Bucket-Aware, Shuffled")
     print("=" * 70)
 
     config_path = env_str("ATLAS_CONFIG_PATH", "config/atlas_snapshot_config.json")
@@ -580,33 +588,34 @@ def main() -> int:
         lookahead_min, lookahead_max, outbound_weekdays, trip_lengths, max_per_dest
     )
 
-    # Pre-compute search space respecting compatibility
+    # Build compatible routes then shuffle so all origins get fair coverage
+    # under the search cap. Without shuffle, deterministic sheet order means
+    # LHR→LGW→MAN always exhaust the cap before regional airports are reached.
     compatible_routes = [
         (o, d)
         for o in origins
         for d in destinations
         if origin_eligible_for_bucket(o, d.bucket_id)
     ]
+    random.shuffle(compatible_routes)
+
+    total_routes = len(origins) * len(destinations)
+    skipped_compat = total_routes - len(compatible_routes)
 
     print(f"📅 Snapshot date: {snapshot_date} | Capture time: {capture_time}")
     print(f"🗓  Date combos per route: {len(date_combos)}")
     print(f"🛫 Compatible origin × destination routes: {len(compatible_routes)}")
     print(f"🔢 Max potential searches: {len(compatible_routes) * len(date_combos)}")
     print(f"🔒 Search cap: {max_searches}")
-    print("-" * 70)
-
-    # Compatibility skip summary
-    total_routes = len(origins) * len(destinations)
-    skipped_compat = total_routes - len(compatible_routes)
     print(f"⏭️  Compatibility filter: {skipped_compat} routes skipped "
           f"(tier mismatch — e.g. GLA→JFK, BRS→BKK)")
+    print(f"🔀 Route order: shuffled (all origins get fair cap access)")
     print("-" * 70)
 
     searches = 0
     captured = 0
     skipped_dedupe = 0
     no_offer = 0
-    compat_skipped_log = 0
     pending: List[List[Any]] = []
 
     for origin, dest in compatible_routes:
@@ -732,7 +741,7 @@ def main() -> int:
     else:
         print("⚠️  No rows written.")
 
-    # Origins that actually appeared in searches
+    # Origins that actually appeared in this run's pending rows
     origin_iatas = list(dict.fromkeys(
         r[SNAPSHOT_HEADERS.index("origin_iata")]
         for r in pending
@@ -743,7 +752,7 @@ def main() -> int:
         f"\n📊 RUN SUMMARY\n"
         f"   searches={searches} | captured={captured} | "
         f"no_offer={no_offer} | dedupe_skipped={skipped_dedupe}\n"
-        f"   offer_rate={round(captured/max(1,searches)*100,1)}%\n"
+        f"   offer_rate={round(captured / max(1, searches) * 100, 1)}%\n"
         f"   origins_used={origin_iatas}\n"
         f"   compat_routes={len(compatible_routes)} | "
         f"compat_skipped={skipped_compat}"

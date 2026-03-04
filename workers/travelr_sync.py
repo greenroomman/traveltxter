@@ -188,6 +188,8 @@ def build_payload(deal: dict) -> dict | None:
     carriers_raw = str(
         deal.get("carriers") or deal.get("carrier") or ""
     ).strip()
+    # deals_cache.carriers is PostgreSQL text[] — must be a list
+    carriers_list = [c.strip() for c in carriers_raw.split(",") if c.strip()]
 
     return {
         "id":               deal_id,
@@ -201,8 +203,8 @@ def build_payload(deal: dict) -> dict | None:
         "currency":         "GBP",
         "stops":            int(deal.get("stops", 0) or 0),
         "cabin_class":      str(deal.get("cabin_class", "economy")).strip(),
-        "carrier":          carriers_raw,   # singular — primary carrier display
-        "carriers":         carriers_raw,   # plural  — matches deals_cache schema
+        "carrier":          carriers_raw,   # singular text — primary display
+        "carriers":         carriers_list,  # text[]  — PostgreSQL array
         "bags_included":    bool(deal.get("bags_incl", False)),
         "outbound_date":    str(deal.get("outbound_date", "")).strip() or None,
         "return_date":      str(deal.get("return_date", "")).strip() or None,

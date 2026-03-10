@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_capture.py
-ATLAS SNAPSHOT CAPTURE — v1.2 (Per-Origin Cap)
+ATLAS SNAPSHOT CAPTURE — v1.3 (Crisis Flag)
 
 Built against Atlas Snapshot Oilpan v1.0.
+
+WHAT CHANGED FROM v1.2:
+- Crisis flagging integrated (reads atlas_crisis_config.json)
+  Adds crisis_flag, crisis_id, crisis_severity, crisis_route_affected,
+  crisis_global_impact columns to every captured row.
+  Config-driven: define crisis events in JSON, no code changes needed.
+  Falls back gracefully if config file is missing (all flags = empty).
 
 WHAT CHANGED FROM v1.1:
 - Per-origin search cap added (max_searches_per_origin)
@@ -436,6 +443,141 @@ def shi_variance_flag(
 # DATE GENERATION (unchanged)
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# CRISIS DETECTOR (embedded — reads atlas_crisis_config.json)
+# ─────────────────────────────────────────────
+
+class CrisisDetector:
+    """
+    Reads crisis events from a JSON config file and evaluates
+    whether a given snapshot row falls within a crisis window.
+    Falls back to 'no crisis' if the config file is missing.
+    """
+
+    def __init__(self, config_path: str = "atlas_crisis_config.json"):
+        self.events = []
+        self.regions = {}
+        self.severity_levels = {}
+        try:
+            with open(config_path, "r") as f:
+                cfg = json.load(f)
+            self.events = cfg.get("crisis_events", [])
+            self.regions = cfg.get("region_definitions", {})
+            self.severity_levels = cfg.get("severity_levels", {})
+            active = sum(1 for e in self.events if not e.get("end_date"))
+            print(f"✅ Crisis config loaded: {len(self.events)} event(s), {active} active")
+        except FileNotFoundError:
+            print("⚠️  atlas_crisis_config.json not found — crisis flags disabled")
+        except Exception as e:
+            print(f"⚠️  Crisis config error: {e} — crisis flags disabled")
+
+    def _parse_date(self, date_str):
+        if not date_str:
+            return None
+        return dt.datetime.strptime(date_str, "%Y-%m-%d")
+
+    def _resolve_affected_iatas(self, event):
+        iatas = set(event.get("affected_destinations", []))
+        for region_key in event.get("affected_regions", []):
+            iatas.update(self.regions.get(region_key, []))
+        return iatas
+
+    def _is_date_in_window(self, check_date, start, end):
+        d = self._parse_date(check_date)
+        s = self._parse_date(start)
+        e = self._parse_date(end) if end else dt.datetime(2099, 12, 31)
+        return s <= d <= e
+
+    def get_flags(self, snapshot_date, origin, destination):
+        """Returns dict of crisis flag values for a single row."""
+        matching = []
+        for event in self.events:
+            if self._is_date_in_window(snapshot_date, event["start_date"], event.get("end_date")):
+                matching.append(event)
+
+        if not matching:
+            return {
+                "crisis_flag": "", "crisis_id": "",
+                "crisis_severity": "", "crisis_route_affected": "",
+                "crisis_global_impact": "",
+            }
+
+        route_affected = False
+        global_impact = False
+        severities = []
+        for event in matching:
+            affected = self._resolve_affected_iatas(event)
+            if origin in affected or destination in affected:
+                route_affected = True
+            if event.get("global_impact", False):
+                global_impact = True
+            severities.append(event.get("severity", "low"))
+
+        severity_order = ["extreme", "high", "moderate", "low"]
+        highest = "low"
+        for s in severity_order:
+            if s in severities:
+                highest = s
+                break
+
+        return {
+            "crisis_flag": "TRUE",
+            "crisis_id": ",".join(e["id"] for e in matching),
+            "crisis_severity": highest,
+            "crisis_route_affected": str(route_affected).upper(),
+            "crisis_global_impact": str(global_impact).upper(),
+        }
+
+    def get_contamination_pct(self, snapshot_date, lookahead_days=14):
+        snap_dt = self._parse_date(snapshot_date)
+        contaminated_days = 0
+        for day_offset in range(1, lookahead_days + 1):
+            check_dt = snap_dt + dt.timedelta(days=day_offset)
+            check_str = check_dt.strftime("%Y-%m-%d")
+            for event in self.events:
+                if self._is_date_in_window(check_str, event["start_date"], event.get("end_date")):
+                    contaminated_days += 1
+                    break
+        return contaminated_days / lookahead_days
+
+    def is_label_contaminated(self, snapshot_date, origin, destination, lookahead_days=14):
+        snap_dt = self._parse_date(snapshot_date)
+        for day_offset in range(1, lookahead_days + 1):
+            check_dt = snap_dt + dt.timedelta(days=day_offset)
+            check_str = check_dt.strftime("%Y-%m-%d")
+            for event in self.events:
+                if not self._is_date_in_window(check_str, event["start_date"], event.get("end_date")):
+                    continue
+                severity = event.get("severity", "low")
+                if severity in ("extreme", "high"):
+                    return True
+                contam_window = self.severity_levels.get(severity, {}).get("label_contamination_window_days", 14)
+                if day_offset <= contam_window:
+                    return True
+        return False
+
+    def get_training_recommendation(self, snapshot_date, origin, destination):
+        flags = self.get_flags(snapshot_date, origin, destination)
+        if flags["crisis_flag"] == "TRUE":
+            sev = flags["crisis_severity"]
+            action = self.severity_levels.get(sev, {}).get("training_action", "flag_only")
+            if action == "exclude_all":
+                return "exclude_crisis"
+            elif action == "exclude_affected" and flags["crisis_route_affected"] == "TRUE":
+                return "exclude_crisis"
+            else:
+                return "flag_review"
+        if self.is_label_contaminated(snapshot_date, origin, destination):
+            if not self.is_label_contaminated(snapshot_date, origin, destination, lookahead_days=7):
+                return "include_t7_only"
+            return "exclude_contaminated"
+        return "include"
+
+
+# ─────────────────────────────────────────────
+# DATE GENERATION (unchanged)
+# ─────────────────────────────────────────────
+
 def generate_target_dates(
     lookahead_min: int, lookahead_max: int,
     outbound_weekdays: List[int], trip_lengths: List[int],
@@ -462,7 +604,7 @@ def generate_target_dates(
 
 
 # ─────────────────────────────────────────────
-# SNAPSHOT_LOG SCHEMA (unchanged)
+# SNAPSHOT_LOG SCHEMA (v1.3 — crisis columns added)
 # ─────────────────────────────────────────────
 
 SNAPSHOT_HEADERS = [
@@ -479,6 +621,11 @@ SNAPSHOT_HEADERS = [
     "price_t7", "price_t14", "rose_10pct", "fell_10pct",
     "snapshot_key", "notes",
     "origin_type", "shi_variance_flag",
+    # ── Crisis flag columns (v1.3) ──
+    "crisis_flag", "crisis_id", "crisis_severity",
+    "crisis_route_affected", "crisis_global_impact",
+    "crisis_contamination_pct_t14", "crisis_contamination_pct_t7",
+    "crisis_label_contaminated", "training_action",
 ]
 
 
@@ -544,10 +691,11 @@ def load_existing_keys(ws: gspread.Worksheet) -> Tuple[set, Dict[str, List[float
 
 def main() -> int:
     print("=" * 70)
-    print("ATLAS SNAPSHOT CAPTURE v1.2 — Per-Origin Cap")
+    print("ATLAS SNAPSHOT CAPTURE v1.3 — Crisis Flag")
     print("=" * 70)
 
     config_path = env_str("ATLAS_CONFIG_PATH", "config/atlas_snapshot_config.json")
+    crisis_config_path = env_str("ATLAS_CRISIS_CONFIG_PATH", "atlas_crisis_config.json")
     snapshot_tab = env_str("SNAPSHOT_LOG_TAB", "SNAPSHOT_LOG")
     origins_tab = env_str("FEEDER_ORIGINS_TAB", "CONFIG_ORIGINS")
     buckets_tab = env_str("FEEDER_BUCKETS_TAB", "CONFIG_BUCKETS")
@@ -572,6 +720,9 @@ def main() -> int:
     # Sheet-driven origins and destinations
     origins = load_origins_from_sheet(sh, origins_tab)
     destinations = load_destinations_from_sheet(sh, buckets_tab)
+
+    # Crisis detector — reads atlas_crisis_config.json
+    crisis = CrisisDetector(crisis_config_path)
 
     ws = sh.worksheet(snapshot_tab)
     ensure_snapshot_headers(ws)
@@ -730,6 +881,22 @@ def main() -> int:
                 )
 
                 price_history.setdefault(route_key, []).append(price_gbp)
+
+            # ── Crisis flags (v1.3) ──
+            crisis_flags = crisis.get_flags(
+                snapshot_date, origin.airport_iata, dest.destination_iata
+            )
+            row["crisis_flag"] = crisis_flags["crisis_flag"]
+            row["crisis_id"] = crisis_flags["crisis_id"]
+            row["crisis_severity"] = crisis_flags["crisis_severity"]
+            row["crisis_route_affected"] = crisis_flags["crisis_route_affected"]
+            row["crisis_global_impact"] = crisis_flags["crisis_global_impact"]
+            # Contamination + training_action left blank at capture time.
+            # These are set by the backfill script when labels are generated.
+            row["crisis_contamination_pct_t14"] = ""
+            row["crisis_contamination_pct_t7"] = ""
+            row["crisis_label_contaminated"] = ""
+            row["training_action"] = ""
 
             pending.append([row[h] for h in SNAPSHOT_HEADERS])
             existing_keys.add(snap_key)

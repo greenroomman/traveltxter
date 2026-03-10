@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_capture.py
-ATLAS SNAPSHOT CAPTURE — v1.3 (Crisis Flag)
+ATLAS SNAPSHOT CAPTURE — v1.4 (Fuel Price Signal)
 
 Built against Atlas Snapshot Oilpan v1.0.
+
+WHAT CHANGED FROM v1.3:
+- Jet fuel spot price captured per snapshot run.
+  Uses EIA API (US Gulf Coast Kerosene-Type Jet Fuel, $/gal).
+  Requires EIA_API_KEY env var (free at eia.gov/opendata/).
+  Falls back gracefully if key missing — column left blank.
+  Single API call per run, applied to all rows.
 
 WHAT CHANGED FROM v1.2:
 - Crisis flagging integrated (reads atlas_crisis_config.json)
@@ -575,6 +582,49 @@ class CrisisDetector:
 
 
 # ─────────────────────────────────────────────
+# JET FUEL PRICE (EIA API — v1.4)
+# ─────────────────────────────────────────────
+
+def fetch_jet_fuel_price() -> Optional[float]:
+    """
+    Fetch latest US Gulf Coast Kerosene-Type Jet Fuel Spot Price ($/gallon)
+    from the EIA API v2. Requires EIA_API_KEY env var (free at eia.gov/opendata/).
+    Returns None if the key is missing or the fetch fails.
+    """
+    api_key = env_str("EIA_API_KEY")
+    if not api_key:
+        print("⚠️  EIA_API_KEY not set — jet fuel price will be blank")
+        return None
+    try:
+        url = (
+            "https://api.eia.gov/v2/petroleum/pri/spt/data/"
+            f"?api_key={api_key}"
+            "&frequency=weekly"
+            "&data[0]=value"
+            "&facets[series][]=EER_EPJK_PF4_RGC_DPG"
+            "&sort[0][column]=period"
+            "&sort[0][direction]=desc"
+            "&length=1"
+        )
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200:
+            print(f"⚠️  EIA API returned status {resp.status_code} — jet fuel price will be blank")
+            return None
+        data = resp.json()
+        rows = data.get("response", {}).get("data", [])
+        if not rows:
+            print("⚠️  EIA API returned no data — jet fuel price will be blank")
+            return None
+        value = float(rows[0].get("value", 0))
+        period = rows[0].get("period", "?")
+        print(f"✅ Jet fuel price: ${value:.3f}/gal (week of {period})")
+        return round(value, 4)
+    except Exception as e:
+        print(f"⚠️  Jet fuel fetch failed: {e} — column will be blank")
+        return None
+
+
+# ─────────────────────────────────────────────
 # DATE GENERATION (unchanged)
 # ─────────────────────────────────────────────
 
@@ -604,7 +654,7 @@ def generate_target_dates(
 
 
 # ─────────────────────────────────────────────
-# SNAPSHOT_LOG SCHEMA (v1.3 — crisis columns added)
+# SNAPSHOT_LOG SCHEMA (v1.4 — fuel price signal added)
 # ─────────────────────────────────────────────
 
 SNAPSHOT_HEADERS = [
@@ -626,6 +676,8 @@ SNAPSHOT_HEADERS = [
     "crisis_route_affected", "crisis_global_impact",
     "crisis_contamination_pct_t14", "crisis_contamination_pct_t7",
     "crisis_label_contaminated", "training_action",
+    # ── Fuel price signal (v1.4) ──
+    "jet_fuel_usd_gal",
 ]
 
 
@@ -691,7 +743,7 @@ def load_existing_keys(ws: gspread.Worksheet) -> Tuple[set, Dict[str, List[float
 
 def main() -> int:
     print("=" * 70)
-    print("ATLAS SNAPSHOT CAPTURE v1.3 — Crisis Flag")
+    print("ATLAS SNAPSHOT CAPTURE v1.4 — Fuel Price Signal")
     print("=" * 70)
 
     config_path = env_str("ATLAS_CONFIG_PATH", "config/atlas_snapshot_config.json")
@@ -723,6 +775,9 @@ def main() -> int:
 
     # Crisis detector — reads atlas_crisis_config.json
     crisis = CrisisDetector(crisis_config_path)
+
+    # Jet fuel price — fetched once per run, applied to all rows
+    jet_fuel_price = fetch_jet_fuel_price()
 
     ws = sh.worksheet(snapshot_tab)
     ensure_snapshot_headers(ws)
@@ -897,6 +952,9 @@ def main() -> int:
             row["crisis_contamination_pct_t7"] = ""
             row["crisis_label_contaminated"] = ""
             row["training_action"] = ""
+
+            # ── Fuel price signal (v1.4) ──
+            row["jet_fuel_usd_gal"] = jet_fuel_price if jet_fuel_price is not None else ""
 
             pending.append([row[h] for h in SNAPSHOT_HEADERS])
             existing_keys.add(snap_key)

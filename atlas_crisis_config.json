@@ -1,0 +1,55 @@
+{
+  "crisis_events": [
+    {
+      "id": "iran_conflict_2026",
+      "name": "Iran-Israel-US Conflict",
+      "type": "military_conflict",
+      "start_date": "2026-03-01",
+      "end_date": null,
+      "severity": "extreme",
+      "notes": "US-Israeli strikes on Iran from Feb 28. Airspace closures across Gulf states, Lebanon conflict, Strait of Hormuz disrupted. Major hub airports (DXB, AUH, DOH) closed. European routes affected by rerouting and capacity withdrawal.",
+      "affected_destinations": [
+        "DXB", "AUH", "DOH", "IST", "AYT", "DLM",
+        "PFO", "LCA", "TBS", "AMM", "KWI", "BAH",
+        "MCT", "RUH", "JED"
+      ],
+      "affected_regions": ["middle_east", "gulf", "east_med"],
+      "global_impact": true,
+      "impact_description": "All routes affected via oil price surge, capacity reallocation, hub disruption (Emirates/Etihad/QR grounded). Long-haul particularly affected by rerouting around closed airspace."
+    }
+  ],
+
+  "region_definitions": {
+    "middle_east": ["DXB", "AUH", "DOH", "AMM", "KWI", "BAH", "MCT", "RUH", "JED", "TLV", "BGW"],
+    "gulf": ["DXB", "AUH", "DOH", "KWI", "BAH", "MCT", "RUH", "JED", "DMM"],
+    "east_med": ["IST", "AYT", "DLM", "PFO", "LCA", "TBS", "ATH", "SKG"],
+    "north_africa": ["CAI", "ALG", "TUN", "CMN"],
+    "south_asia": ["BOM", "DEL", "CMB", "KTM", "KHI", "ISB"],
+    "southeast_asia": ["BKK", "SGN", "HAN", "KUL", "SIN", "DPS"],
+    "north_america": ["JFK", "LAX", "MIA", "BOS", "ORD", "SFO", "YYZ", "YVR", "YYC"],
+    "europe_short": ["BCN", "PRG", "LIS", "DUB", "AMS", "OSL", "CPH", "BUD", "WAW", "KRK", "CDG", "FCO", "NAP", "AGP", "FAO", "MAD", "GVA", "ZRH", "BRU", "FRA", "ARN", "HEL", "OPO", "MXP", "BER", "VIE", "MLA", "DBV", "OTP", "INN", "KEF"]
+  },
+
+  "severity_levels": {
+    "extreme": {
+      "description": "Major airspace closures, hub shutdowns, global repricing. All routes materially affected.",
+      "training_action": "exclude_all",
+      "label_contamination_window_days": 14
+    },
+    "high": {
+      "description": "Significant disruption to affected region, spillover to connected routes.",
+      "training_action": "exclude_affected",
+      "label_contamination_window_days": 14
+    },
+    "moderate": {
+      "description": "Localised disruption, limited spillover. e.g. volcanic ash cloud over Northern Europe.",
+      "training_action": "flag_only",
+      "label_contamination_window_days": 7
+    },
+    "low": {
+      "description": "Minor disruption, single carrier or airport. e.g. ATC strike at one airport.",
+      "training_action": "flag_only",
+      "label_contamination_window_days": 3
+    }
+  }
+}

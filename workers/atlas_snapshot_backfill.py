@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_backfill.py
-ATLAS SNAPSHOT BACKFILL — v0
+ATLAS SNAPSHOT BACKFILL — v1.0 (Crisis Flag)
 
 Fills price_t7 and price_t14 for mature snapshot rows.
 Computes rose_10pct and fell_10pct flags when price_t14 lands.
+Computes crisis contamination and training_action when labels are set.
 
 Run daily AFTER capture (07:20 UTC recommended).
 Never touches RAW_DEALS.
+
+WHAT CHANGED FROM v0:
+- Crisis contamination assessment added.
+  When a t7 or t14 label is set, the script also computes:
+    crisis_contamination_pct_t14, crisis_contamination_pct_t7,
+    crisis_label_contaminated, training_action.
+  Reads atlas_crisis_config.json. Falls back gracefully if missing.
 
 MISSING = vanished fare. Real data. Do not impute.
 """
@@ -161,15 +169,164 @@ REGRET_THRESHOLD = 0.10
 
 
 # ----------------------------
+# Crisis detector (embedded)
+# ----------------------------
+
+class CrisisDetector:
+    """
+    Reads crisis events from a JSON config file and evaluates
+    whether a given snapshot row falls within a crisis window.
+    Falls back to 'no crisis' if the config file is missing.
+    """
+
+    def __init__(self, config_path: str = "atlas_crisis_config.json"):
+        self.events = []
+        self.regions = {}
+        self.severity_levels = {}
+        try:
+            with open(config_path, "r") as f:
+                cfg = json.load(f)
+            self.events = cfg.get("crisis_events", [])
+            self.regions = cfg.get("region_definitions", {})
+            self.severity_levels = cfg.get("severity_levels", {})
+            active = sum(1 for e in self.events if not e.get("end_date"))
+            print(f"✅ Crisis config loaded: {len(self.events)} event(s), {active} active")
+        except FileNotFoundError:
+            print("⚠️  atlas_crisis_config.json not found — crisis flags disabled")
+        except Exception as e:
+            print(f"⚠️  Crisis config error: {e} — crisis flags disabled")
+
+    def _parse_date(self, date_str):
+        if not date_str:
+            return None
+        return dt.datetime.strptime(date_str, "%Y-%m-%d")
+
+    def _resolve_affected_iatas(self, event):
+        iatas = set(event.get("affected_destinations", []))
+        for region_key in event.get("affected_regions", []):
+            iatas.update(self.regions.get(region_key, []))
+        return iatas
+
+    def _is_date_in_window(self, check_date, start, end):
+        d = self._parse_date(check_date)
+        s = self._parse_date(start)
+        e = self._parse_date(end) if end else dt.datetime(2099, 12, 31)
+        return s <= d <= e
+
+    def get_contamination_pct(self, snapshot_date, lookahead_days=14):
+        snap_dt = self._parse_date(snapshot_date)
+        contaminated_days = 0
+        for day_offset in range(1, lookahead_days + 1):
+            check_dt = snap_dt + dt.timedelta(days=day_offset)
+            check_str = check_dt.strftime("%Y-%m-%d")
+            for event in self.events:
+                if self._is_date_in_window(check_str, event["start_date"], event.get("end_date")):
+                    contaminated_days += 1
+                    break
+        return contaminated_days / lookahead_days
+
+    def is_label_contaminated(self, snapshot_date, origin, destination, lookahead_days=14):
+        snap_dt = self._parse_date(snapshot_date)
+        for day_offset in range(1, lookahead_days + 1):
+            check_dt = snap_dt + dt.timedelta(days=day_offset)
+            check_str = check_dt.strftime("%Y-%m-%d")
+            for event in self.events:
+                if not self._is_date_in_window(check_str, event["start_date"], event.get("end_date")):
+                    continue
+                severity = event.get("severity", "low")
+                if severity in ("extreme", "high"):
+                    return True
+                contam_window = self.severity_levels.get(severity, {}).get("label_contamination_window_days", 14)
+                if day_offset <= contam_window:
+                    return True
+        return False
+
+    def get_flags(self, snapshot_date, origin, destination):
+        matching = []
+        for event in self.events:
+            if self._is_date_in_window(snapshot_date, event["start_date"], event.get("end_date")):
+                matching.append(event)
+        if not matching:
+            return {"crisis_flag": "", "crisis_id": "", "crisis_severity": "",
+                    "crisis_route_affected": "", "crisis_global_impact": ""}
+        route_affected = False
+        global_impact = False
+        severities = []
+        for event in matching:
+            affected = self._resolve_affected_iatas(event)
+            if origin in affected or destination in affected:
+                route_affected = True
+            if event.get("global_impact", False):
+                global_impact = True
+            severities.append(event.get("severity", "low"))
+        for s in ["extreme", "high", "moderate", "low"]:
+            if s in severities:
+                highest = s
+                break
+        else:
+            highest = "low"
+        return {
+            "crisis_flag": "TRUE",
+            "crisis_id": ",".join(e["id"] for e in matching),
+            "crisis_severity": highest,
+            "crisis_route_affected": str(route_affected).upper(),
+            "crisis_global_impact": str(global_impact).upper(),
+        }
+
+    def get_training_recommendation(self, snapshot_date, origin, destination):
+        flags = self.get_flags(snapshot_date, origin, destination)
+        if flags["crisis_flag"] == "TRUE":
+            sev = flags["crisis_severity"]
+            action = self.severity_levels.get(sev, {}).get("training_action", "flag_only")
+            if action == "exclude_all":
+                return "exclude_crisis"
+            elif action == "exclude_affected" and flags["crisis_route_affected"] == "TRUE":
+                return "exclude_crisis"
+            else:
+                return "flag_review"
+        if self.is_label_contaminated(snapshot_date, origin, destination):
+            if not self.is_label_contaminated(snapshot_date, origin, destination, lookahead_days=7):
+                return "include_t7_only"
+            return "exclude_contaminated"
+        return "include"
+
+
+# ----------------------------
+# Crisis contamination writer
+# ----------------------------
+
+def _write_crisis_contamination(updates, col, row_idx, crisis, snap_date, origin, dest):
+    """Write crisis contamination columns for a row during backfill."""
+    contam_t14_col = col.get("crisis_contamination_pct_t14")
+    contam_t7_col = col.get("crisis_contamination_pct_t7")
+    label_contam_col = col.get("crisis_label_contaminated")
+    training_col = col.get("training_action")
+
+    if contam_t14_col is not None:
+        pct14 = crisis.get_contamination_pct(snap_date, lookahead_days=14)
+        updates[(row_idx, contam_t14_col + 1)] = f"{pct14:.2f}"
+    if contam_t7_col is not None:
+        pct7 = crisis.get_contamination_pct(snap_date, lookahead_days=7)
+        updates[(row_idx, contam_t7_col + 1)] = f"{pct7:.2f}"
+    if label_contam_col is not None:
+        contam = crisis.is_label_contaminated(snap_date, origin, dest)
+        updates[(row_idx, label_contam_col + 1)] = str(contam).upper()
+    if training_col is not None:
+        action = crisis.get_training_recommendation(snap_date, origin, dest)
+        updates[(row_idx, training_col + 1)] = action
+
+
+# ----------------------------
 # Main
 # ----------------------------
 
 def main() -> int:
     print("=" * 70)
-    print("ATLAS SNAPSHOT BACKFILL v0")
+    print("ATLAS SNAPSHOT BACKFILL v1.0 — Crisis Flag")
     print("=" * 70)
 
     snapshot_tab = env_str("SNAPSHOT_LOG_TAB", "SNAPSHOT_LOG")
+    crisis_config_path = env_str("ATLAS_CRISIS_CONFIG_PATH", "atlas_crisis_config.json")
     sleep_s = float(env_str("FEEDER_SLEEP_SECONDS", "0.5"))
     max_fills = env_int("ATLAS_BACKFILL_MAX", 50)
     cabin = env_str("ATLAS_CABIN_CLASS", "economy")
@@ -188,6 +345,9 @@ def main() -> int:
     gc = gspread_client()
     sh = gc.open_by_key(env_str("SPREADSHEET_ID") or env_str("SHEET_ID"))
     ws = sh.worksheet(snapshot_tab)
+
+    # Crisis detector — reads atlas_crisis_config.json
+    crisis = CrisisDetector(crisis_config_path)
 
     all_values = ws.get_all_values()
     if len(all_values) < 2:
@@ -254,6 +414,9 @@ def main() -> int:
                     missing_count += 1
                     print(f"   ⚠️ t7: no offer — MISSING logged")
 
+            # ── Crisis contamination (v1.0) ──
+            _write_crisis_contamination(updates, col, row_idx, crisis, snap_date, origin, dest)
+
             time.sleep(sleep_s)
 
         # t14 fill + regret flags
@@ -296,6 +459,9 @@ def main() -> int:
                         updates[(row_idx, fell_col + 1)] = "UNKNOWN"
                     missing_count += 1
                     print(f"   ⚠️ t14: no offer — MISSING/UNKNOWN logged")
+
+            # ── Crisis contamination (v1.0) ──
+            _write_crisis_contamination(updates, col, row_idx, crisis, snap_date, origin, dest)
 
             time.sleep(sleep_s)
 

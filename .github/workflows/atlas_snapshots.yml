@@ -25,6 +25,7 @@ jobs:
           GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
           DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           SNAPSHOT_LOG_TAB: SNAPSHOT_LOG
           ATLAS_CONFIG_PATH: config/atlas_snapshot_config.json
           ATLAS_MAX_SEARCHES: 157 

@@ -210,6 +210,16 @@ AIRPORT_COORDS: Dict[str, Tuple[float, float]] = {
     'SIN': (1.3644, 103.9915),   # Singapore
     'SYD': (-33.9399, 151.1753), # Sydney
     'YYZ': (43.6777, -79.6248),  # Toronto
+  # Additional EU/Near destinations (added 2026-03-17)
+    'TIA': (41.4147, 19.7206),   # Tirana
+    'RVN': (66.5647, 25.8304),   # Rovaniemi
+    'LCA': (34.8751, 33.6249),   # Larnaca
+    'SKP': (41.9616, 21.6214),   # Skopje
+    'PFO': (34.7180, 32.4857),   # Paphos
+    'LPA': (27.9319, -15.3866),  # Las Palmas
+    'TOS': (69.6833, 18.9189),   # Tromsø
+    # Middle East long-haul (added 2026-03-17)
+    'AUH': (24.4330, 54.6511),   # Abu Dhabi
 }
 
 

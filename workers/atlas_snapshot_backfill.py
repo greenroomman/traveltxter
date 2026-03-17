@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_backfill.py
-ATLAS SNAPSHOT BACKFILL — v1.0 (Crisis Flag)
+ATLAS SNAPSHOT BACKFILL — v1.1 (Schema Expansion)
 
 Fills price_t7 and price_t14 for mature snapshot rows.
 Computes rose_10pct and fell_10pct flags when price_t14 lands.
@@ -9,6 +9,11 @@ Computes crisis contamination and training_action when labels are set.
 
 Run daily AFTER capture (07:20 UTC recommended).
 Never touches RAW_DEALS.
+
+WHAT CHANGED FROM v1.0:
+- Compatible with 43-column schema (v1.5):
+  carrier_primary_iata, route_distance_km, route_type, shi_score, model_version
+  These columns are populated at capture time, not during backfill.
 
 WHAT CHANGED FROM v0:
 - Crisis contamination assessment added.
@@ -242,13 +247,19 @@ class CrisisDetector:
         return False
 
     def get_flags(self, snapshot_date, origin, destination):
+        """Returns dict of crisis flag values for a single row."""
         matching = []
         for event in self.events:
             if self._is_date_in_window(snapshot_date, event["start_date"], event.get("end_date")):
                 matching.append(event)
+
         if not matching:
-            return {"crisis_flag": "", "crisis_id": "", "crisis_severity": "",
-                    "crisis_route_affected": "", "crisis_global_impact": ""}
+            return {
+                "crisis_flag": "", "crisis_id": "",
+                "crisis_severity": "", "crisis_route_affected": "",
+                "crisis_global_impact": "",
+            }
+
         route_affected = False
         global_impact = False
         severities = []
@@ -259,7 +270,10 @@ class CrisisDetector:
             if event.get("global_impact", False):
                 global_impact = True
             severities.append(event.get("severity", "low"))
-        for s in ["extreme", "high", "moderate", "low"]:
+
+        severity_order = ["extreme", "high", "moderate", "low"]
+        highest = "low"
+        for s in severity_order:
             if s in severities:
                 highest = s
                 break
@@ -322,7 +336,7 @@ def _write_crisis_contamination(updates, col, row_idx, crisis, snap_date, origin
 
 def main() -> int:
     print("=" * 70)
-    print("ATLAS SNAPSHOT BACKFILL v1.0 — Crisis Flag")
+    print("ATLAS SNAPSHOT BACKFILL v1.1 — Schema Expansion")
     print("=" * 70)
 
     snapshot_tab = env_str("SNAPSHOT_LOG_TAB", "SNAPSHOT_LOG")

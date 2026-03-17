@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_capture.py
-ATLAS SNAPSHOT CAPTURE — v1.4 (Fuel Price Signal)
+ATLAS SNAPSHOT CAPTURE — v1.5 (Schema Expansion)
 
 Built against Atlas Snapshot Oilpan v1.0.
+
+WHAT CHANGED FROM v1.4:
+- Schema expanded from 38 to 43 columns:
+  • carrier_primary_iata — IATA code of cheapest carrier
+  • route_distance_km — Great circle distance
+  • route_type — Route classification (domestic/european_short/european_long/intercontinental)
+  • shi_score — Numeric SHI value (z-score), replaces boolean-only flag
+  • model_version — RegretRisk model version tracking
+- Airport coordinates database added for distance calculation
+- shi_variance_flag now returns both flag AND numeric score
 
 WHAT CHANGED FROM v1.3:
 - Jet fuel spot price captured per snapshot run.
@@ -37,10 +47,8 @@ WHAT CHANGED FROM v0:
 - ROUTE_CATEGORY replaced by bucket-derived category_for_bucket()
 
 WHAT IS UNCHANGED:
-- SNAPSHOT_LOG schema — all columns preserved in exact order
-- shi_variance_flag() logic
-- School holiday / bank holiday logic
 - Duffel search implementation
+- School holiday / bank holiday logic
 - Batch write pattern
 - Dedupe via existing_keys
 - atlas_snapshot_config.json retained for non-route parameters
@@ -56,6 +64,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import math
 import random
 import datetime as dt
 import statistics
@@ -134,6 +143,100 @@ def gspread_client() -> gspread.Client:
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
+
+
+# ─────────────────────────────────────────────
+# AIRPORT COORDINATES DATABASE (v1.5)
+# ─────────────────────────────────────────────
+
+AIRPORT_COORDS: Dict[str, Tuple[float, float]] = {
+    # UK Origins (9 airports)
+    'MAN': (53.3537, -2.2750),   # Manchester
+    'LGW': (51.1537, -0.1821),   # London Gatwick
+    'LHR': (51.4700, -0.4543),   # London Heathrow
+    'EDI': (55.9500, -3.3725),   # Edinburgh
+    'BRS': (51.3827, -2.7190),   # Bristol
+    'LPL': (53.3336, -2.8497),   # Liverpool
+    'BHX': (52.4539, -1.7480),   # Birmingham
+    'NCL': (55.0375, -1.6917),   # Newcastle
+    'GLA': (55.8719, -4.4331),   # Glasgow
+    # Additional UK airports
+    'STN': (51.8850, 0.2350),    # London Stansted
+    'LTN': (51.8747, -0.3683),   # London Luton
+    'EMA': (52.8311, -1.3278),   # East Midlands
+    'LBA': (53.8659, -1.6605),   # Leeds Bradford
+    'BFS': (54.6575, -6.2158),   # Belfast
+    'ABZ': (57.2019, -2.1978),   # Aberdeen
+    'INV': (57.5425, -4.0475),   # Inverness
+    # Common European Destinations
+    'AGP': (36.6749, -4.4991),   # Malaga
+    'ALC': (38.2822, -0.5581),   # Alicante
+    'AMS': (52.3105, 4.7683),    # Amsterdam
+    'ATH': (37.9364, 23.9445),   # Athens
+    'BCN': (41.2974, 2.0833),    # Barcelona
+    'BER': (52.3667, 13.5033),   # Berlin
+    'BUD': (47.4367, 19.2556),   # Budapest
+    'CDG': (49.0097, 2.5479),    # Paris CDG
+    'CPH': (55.6181, 12.6561),   # Copenhagen
+    'DUB': (53.4213, -6.2701),   # Dublin
+    'DUS': (51.2895, 6.7668),    # Dusseldorf
+    'FAO': (37.0194, -7.9658),   # Faro
+    'FCO': (41.8003, 12.2389),   # Rome Fiumicino
+    'FRA': (50.0379, 8.5622),    # Frankfurt
+    'GVA': (46.2381, 6.1090),    # Geneva
+    'IBZ': (38.8729, 1.3731),    # Ibiza
+    'KRK': (50.0777, 19.7848),   # Krakow
+    'LIS': (38.7742, -9.1342),   # Lisbon
+    'MAD': (40.4983, -3.5676),   # Madrid
+    'MUC': (48.3537, 11.7750),   # Munich
+    'NAP': (40.8860, 14.2908),   # Naples
+    'NCE': (43.6584, 7.2159),    # Nice
+    'ORY': (48.7233, 2.3794),    # Paris Orly
+    'OPO': (41.2481, -8.6814),   # Porto
+    'OSL': (60.1939, 11.1004),   # Oslo
+    'PMI': (39.5517, 2.7388),    # Palma Mallorca
+    'PRG': (50.1008, 14.2600),   # Prague
+    'VCE': (45.5053, 12.3519),   # Venice
+    'VIE': (48.1103, 16.5697),   # Vienna
+    'ZRH': (47.4647, 8.5492),    # Zurich
+    # Long-haul destinations
+    'BKK': (13.6900, 100.7501),  # Bangkok
+    'DXB': (25.2532, 55.3657),   # Dubai
+    'HKG': (22.3080, 113.9185),  # Hong Kong
+    'JFK': (40.6413, -73.7781),  # New York JFK
+    'LAX': (33.9416, -118.4085), # Los Angeles
+    'MEL': (-37.6690, 144.8410), # Melbourne
+    'ORD': (41.9742, -87.9073),  # Chicago
+    'SIN': (1.3644, 103.9915),   # Singapore
+    'SYD': (-33.9399, 151.1753), # Sydney
+    'YYZ': (43.6777, -79.6248),  # Toronto
+}
+
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
+    """Calculate great circle distance in kilometers using Haversine formula."""
+    R = 6371  # Earth's radius in kilometers
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return int(R * c)
+
+
+def classify_route_type(distance_km: int, origin: str, dest: str) -> str:
+    """Classify route type based on distance and geography."""
+    UK_AIRPORTS = {'MAN', 'LGW', 'LHR', 'EDI', 'BRS', 'LPL', 'BHX', 'NCL', 'GLA',
+                   'STN', 'LTN', 'EMA', 'LBA', 'BFS', 'ABZ', 'INV'}
+    if origin in UK_AIRPORTS and dest in UK_AIRPORTS:
+        return 'domestic'
+    if distance_km < 1500:
+        return 'european_short'
+    elif distance_km < 4000:
+        return 'european_long'
+    else:
+        return 'intercontinental'
 
 
 # ─────────────────────────────────────────────
@@ -426,29 +529,59 @@ def category_for_bucket(bucket_id: int) -> str:
 
 
 # ─────────────────────────────────────────────
-# SHI VARIANCE FLAG (unchanged logic)
+# SHI VARIANCE CALCULATION (v1.5 — numeric score added)
 # ─────────────────────────────────────────────
 
-def shi_variance_flag(
+def shi_variance_calculation(
     route_key: str, today_price: float, history: Dict[str, List[float]]
-) -> str:
+) -> Tuple[str, Optional[float]]:
+    """
+    Returns (flag, numeric_score).
+    flag: "FLAG" | "OK" | "INSUFFICIENT_DATA"
+    numeric_score: z-score (float) or None if insufficient data
+    """
     baseline = history.get(route_key, [])
     if len(baseline) < 5:
-        return "INSUFFICIENT_DATA"
+        return ("INSUFFICIENT_DATA", None)
     try:
         mean = statistics.mean(baseline)
         stdev = statistics.stdev(baseline)
         if stdev == 0:
-            return "FLAG"
+            return ("FLAG", None)
         z = abs(today_price - mean) / stdev
-        return "FLAG" if z > 2.5 else "OK"
+        return ("FLAG" if z > 2.5 else "OK", round(z, 2))
     except Exception:
-        return "INSUFFICIENT_DATA"
+        return ("INSUFFICIENT_DATA", None)
 
 
 # ─────────────────────────────────────────────
 # DATE GENERATION (unchanged)
 # ─────────────────────────────────────────────
+
+def generate_target_dates(
+    lookahead_min: int, lookahead_max: int,
+    outbound_weekdays: List[int], trip_lengths: List[int],
+    max_per_dest: int = 1,
+) -> List[Tuple[str, str, int]]:
+    today = _utc_now().date()
+    results = []
+    weekday_hits = 0
+    for delta in range(lookahead_min, lookahead_max + 1):
+        candidate = today + dt.timedelta(days=delta)
+        if candidate.weekday() not in outbound_weekdays:
+            continue
+        weekday_hits += 1
+        if weekday_hits > max_per_dest:
+            break
+        for tl in trip_lengths:
+            ret = candidate + dt.timedelta(days=tl)
+            results.append((
+                candidate.strftime("%Y-%m-%d"),
+                ret.strftime("%Y-%m-%d"),
+                delta,
+            ))
+    return results
+
 
 # ─────────────────────────────────────────────
 # CRISIS DETECTOR (embedded — reads atlas_crisis_config.json)
@@ -625,36 +758,7 @@ def fetch_jet_fuel_price() -> Optional[float]:
 
 
 # ─────────────────────────────────────────────
-# DATE GENERATION (unchanged)
-# ─────────────────────────────────────────────
-
-def generate_target_dates(
-    lookahead_min: int, lookahead_max: int,
-    outbound_weekdays: List[int], trip_lengths: List[int],
-    max_per_dest: int = 1,
-) -> List[Tuple[str, str, int]]:
-    today = _utc_now().date()
-    results = []
-    weekday_hits = 0
-    for delta in range(lookahead_min, lookahead_max + 1):
-        candidate = today + dt.timedelta(days=delta)
-        if candidate.weekday() not in outbound_weekdays:
-            continue
-        weekday_hits += 1
-        if weekday_hits > max_per_dest:
-            break
-        for tl in trip_lengths:
-            ret = candidate + dt.timedelta(days=tl)
-            results.append((
-                candidate.strftime("%Y-%m-%d"),
-                ret.strftime("%Y-%m-%d"),
-                delta,
-            ))
-    return results
-
-
-# ─────────────────────────────────────────────
-# SNAPSHOT_LOG SCHEMA (v1.4 — fuel price signal added)
+# SNAPSHOT_LOG SCHEMA (v1.5 — 43 columns)
 # ─────────────────────────────────────────────
 
 SNAPSHOT_HEADERS = [
@@ -678,6 +782,12 @@ SNAPSHOT_HEADERS = [
     "crisis_label_contaminated", "training_action",
     # ── Fuel price signal (v1.4) ──
     "jet_fuel_usd_gal",
+    # ── Schema expansion (v1.5) ──
+    "carrier_primary_iata",
+    "route_distance_km",
+    "route_type",
+    "shi_score",
+    "model_version",
 ]
 
 
@@ -743,7 +853,7 @@ def load_existing_keys(ws: gspread.Worksheet) -> Tuple[set, Dict[str, List[float
 
 def main() -> int:
     print("=" * 70)
-    print("ATLAS SNAPSHOT CAPTURE v1.4 — Fuel Price Signal")
+    print("ATLAS SNAPSHOT CAPTURE v1.5 — Schema Expansion")
     print("=" * 70)
 
     config_path = env_str("ATLAS_CONFIG_PATH", "config/atlas_snapshot_config.json")
@@ -891,10 +1001,27 @@ def main() -> int:
                 "origin_type": category,
             })
 
+            # ── Calculate route distance and type (v1.5) ──
+            if origin.airport_iata in AIRPORT_COORDS and dest.destination_iata in AIRPORT_COORDS:
+                lat1, lon1 = AIRPORT_COORDS[origin.airport_iata]
+                lat2, lon2 = AIRPORT_COORDS[dest.destination_iata]
+                distance = haversine_distance(lat1, lon1, lat2, lon2)
+                route_type = classify_route_type(distance, origin.airport_iata, dest.destination_iata)
+                row["route_distance_km"] = distance
+                row["route_type"] = route_type
+            else:
+                row["route_distance_km"] = ""
+                row["route_type"] = ""
+
+            # ── Model version (v1.5) ──
+            row["model_version"] = "v1_0_0"
+
             if not offer:
                 no_offer += 1
                 row["notes"] = "no_offer"
                 row["shi_variance_flag"] = ""
+                row["shi_score"] = ""
+                row["carrier_primary_iata"] = ""
                 print(f"   ❌ No offer")
             else:
                 carriers = extract_carriers(offer)
@@ -911,9 +1038,13 @@ def main() -> int:
                 except Exception:
                     pass
 
-                shi_flag = shi_variance_flag(route_key, price_gbp, price_history)
+                # SHI calculation (v1.5 — now returns numeric score)
+                shi_flag, shi_numeric = shi_variance_calculation(route_key, price_gbp, price_history)
                 if shi_flag == "FLAG":
-                    print(f"   ⚠️  SHI variance FLAG")
+                    print(f"   ⚠️  SHI variance FLAG (z={shi_numeric})")
+
+                # Save primary carrier (v1.5)
+                carrier_primary = carriers[0] if carriers else ""
 
                 row.update({
                     "price_gbp": price_gbp,
@@ -926,11 +1057,13 @@ def main() -> int:
                     "seats_remaining": seats_remaining if seats_remaining is not None else "",
                     "notes": "",
                     "shi_variance_flag": shi_flag,
+                    "shi_score": shi_numeric if shi_numeric is not None else "",
+                    "carrier_primary_iata": carrier_primary,
                 })
                 captured += 1
                 print(
                     f"   ✅ £{price_gbp} | "
-                    f"{','.join(carriers)} | "
+                    f"{carrier_primary} ({','.join(carriers)}) | "
                     f"direct={stops == 0} | "
                     f"SHI={shi_flag}"
                 )

@@ -2,48 +2,50 @@ name: Atlas Snapshots
 
 on:
   schedule:
-    - cron: '0 9 * * *'  # 09:00 UTC daily
+    - cron: '10 7 * * *'
   workflow_dispatch:
 
 jobs:
+
   capture:
+    name: Capture Snapshots
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: pip install requests supabase
-      
+
       - name: Run capture
         env:
-          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_ANON_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           ATLAS_MAX_SEARCHES: 157
         run: python workers/atlas_snapshot_capture.py
 
   backfill:
+    name: Backfill Outcomes
     runs-on: ubuntu-latest
     needs: capture
+    if: always()
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: pip install requests supabase
-      
+
       - name: Run backfill
         env:
-          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_ANON_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: python workers/atlas_snapshot_backfill.py

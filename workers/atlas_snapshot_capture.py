@@ -253,7 +253,7 @@ def search_duffel(origin: str, dest: str, outbound: dt.date, return_date: dt.dat
     """Search Duffel API for cheapest offer."""
     url = "https://api.duffel.com/air/offer_requests"
     headers = {
-        "Duffel-Version": "v1",
+        "Duffel-Version": "v2",
         "Authorization": f"Bearer {duffel_token}",
         "Content-Type": "application/json"
     }

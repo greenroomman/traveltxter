@@ -18,18 +18,15 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests gspread google-auth
+        run: pip install requests supabase
 
       - name: Run capture
         env:
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
-          SNAPSHOT_LOG_TAB: SNAPSHOT_LOG
-          ATLAS_CONFIG_PATH: config/atlas_snapshot_config.json
-          ATLAS_MAX_SEARCHES: 157 
-          FEEDER_SLEEP_SECONDS: 0.5
+          ATLAS_MAX_SEARCHES: 157
         run: python workers/atlas_snapshot_capture.py
 
   backfill:
@@ -45,16 +42,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests gspread google-auth
+        run: pip install requests supabase
 
       - name: Run backfill
         env:
-          GCP_SA_JSON_ONE_LINE: ${{ secrets.GCP_SA_JSON_ONE_LINE }}
-          DUFFEL_API_KEY: ${{ secrets.DUFFEL_API_KEY }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          SNAPSHOT_LOG_TAB: SNAPSHOT_LOG
-          ATLAS_BACKFILL_MAX: 50
-          ATLAS_CABIN_CLASS: economy
-          ATLAS_MAX_CONNECTIONS: 1
-          FEEDER_SLEEP_SECONDS: 0.5
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python workers/atlas_snapshot_backfill.py

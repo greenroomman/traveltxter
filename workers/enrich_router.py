@@ -175,7 +175,7 @@ def _repair_json_private_key_newlines(raw: str) -> str:
 
 
 def load_sa_info() -> Dict[str, Any]:
-    raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
+    raw = env("GCP_SA_JSON") or env("GCP_SA_JSON_ONE_LINE")
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON / GCP_SA_JSON_ONE_LINE")
 

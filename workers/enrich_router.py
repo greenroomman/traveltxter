@@ -27,7 +27,6 @@
 
 from __future__ import annotations
 
-import base64
 import datetime as dt
 import hashlib
 import json
@@ -101,77 +100,7 @@ def truthy(v: str) -> bool:
     return (v or "").strip().lower() in ("true", "1", "yes", "y", "approved")
 
 
-# ----------------------------- service account parsing (robust) -----------------------------
-
-
-def _strip_control_chars(s: str) -> str:
-    # remove JSON-breaking control chars; keep \t\n\r
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
-
-
-def _looks_like_json(s: str) -> bool:
-    t = (s or "").lstrip()
-    return t.startswith("{") and ("private_key" in t or "client_email" in t)
-
-
-def _maybe_b64_decode(s: str) -> Optional[str]:
-    t = (s or "").strip()
-    if not t or _looks_like_json(t):
-        return None
-    # quick heuristic: base64-ish
-    if not re.fullmatch(r"[A-Za-z0-9+/=\s]+", t):
-        return None
-    try:
-        raw = base64.b64decode(t.encode("utf-8"), validate=False).decode("utf-8", "ignore").strip()
-    except Exception:
-        return None
-    return raw if _looks_like_json(raw) else None
-
-
-def _normalise_private_key(pk: str) -> str:
-    """
-    Ensure PEM has real newlines and correct BEGIN/END placement.
-    Handles literal '\\n' sequences and flattened keys.
-    """
-    s = (pk or "").strip()
-
-    # Convert literal backslash-n into actual newlines
-    if "\\n" in s:
-        s = s.replace("\\n", "\n")
-
-    # Normalise line endings
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Ensure BEGIN/END are on their own lines
-    s = s.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
-    s = s.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----")
-
-    # Collapse accidental double newlines
-    s = re.sub(r"\n{3,}", "\n\n", s).strip() + "\n"
-    return s
-
-
-def _repair_json_private_key_newlines(raw: str) -> str:
-    """
-    If someone pasted raw JSON but the private_key value contains *actual* newlines
-    (unescaped) then json.loads will throw "Invalid control character".
-    This function rewrites only the private_key value to use \\n escapes.
-    """
-    # Match "private_key" : " ... " including newlines inside the string
-    m = re.search(r'("private_key"\s*:\s*")(.+?)("\s*,\s*")', raw, flags=re.DOTALL)
-    if not m:
-        return raw
-
-    prefix = raw[: m.start(2)]
-    body = raw[m.start(2) : m.end(2)]
-    suffix = raw[m.end(2) :]
-
-    # Escape backslashes first, then convert real newlines to \n
-    body = body.replace("\\", "\\\\")
-    body = body.replace("\r\n", "\n").replace("\r", "\n")
-    body = body.replace("\n", "\\n")
-
-    return prefix + body + suffix
+# ----------------------------- service account parsing -----------------------------
 
 
 def load_sa_info() -> Dict[str, Any]:
@@ -179,33 +108,25 @@ def load_sa_info() -> Dict[str, Any]:
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON / GCP_SA_JSON_ONE_LINE")
 
-    raw = _strip_control_chars(raw.strip())
-
-    decoded = _maybe_b64_decode(raw)
-    if decoded:
-        raw = _strip_control_chars(decoded.strip())
-
-    # Try parse JSON; if it fails due to control chars/newlines in private_key, repair then retry
+    # First try: normal JSON secret
     try:
         info = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raw2 = _repair_json_private_key_newlines(raw)
+    except json.JSONDecodeError:
+        # Fallback: secret may contain literal \\n sequences in private_key
         try:
-            info = json.loads(raw2)
-        except Exception as e2:
-            raise RuntimeError(f"Service account JSON could not be parsed: {e2}") from e
+            info = json.loads(raw.replace("\\n", "\n"))
+        except Exception as e:
+            raise RuntimeError(f"Service account JSON could not be parsed: {e}") from e
 
     if not isinstance(info, dict):
         raise RuntimeError("Service account JSON parsed but is not an object")
 
-    pk_norm = _normalise_private_key(info.get("private_key", ""))
-    info["private_key"] = pk_norm
+    pk = info.get("private_key", "")
+    if not pk:
+        raise RuntimeError("Service account JSON missing private_key")
 
-    if "-----BEGIN PRIVATE KEY-----" not in pk_norm or "-----END PRIVATE KEY-----" not in pk_norm:
-        raise RuntimeError(
-            "Service account JSON loaded but private_key is missing BEGIN/END markers. "
-            "Fix the GitHub secret value for GCP_SA_JSON(_ONE_LINE)."
-        )
+    # Only normalisation we want here
+    info["private_key"] = pk.replace("\\n", "\n")
 
     return info
 
@@ -215,15 +136,7 @@ def gspread_client() -> gspread.Client:
     try:
         creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPE)
     except Exception as e:
-        pk = (info.get("private_key") or "")
-        has_begin = "BEGIN PRIVATE KEY" in pk
-        has_end = "END PRIVATE KEY" in pk
-        has_nl = "\n" in pk
-        raise RuntimeError(
-            "Google auth failed to build credentials. "
-            f"private_key markers: begin={has_begin} end={has_end} newline_present={has_nl}. "
-            f"Original error: {e}"
-        ) from e
+        raise RuntimeError(f"Google auth failed to build credentials: {e}") from e
     return gspread.authorize(creds)
 
 

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-"""
 workers/atlas_snapshot_backfill.py
 ATLAS SNAPSHOT BACKFILL v3.0 (Route-Level Matching)
 

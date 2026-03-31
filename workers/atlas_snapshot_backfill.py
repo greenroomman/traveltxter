@@ -1,29 +1,44 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_backfill.py
-ATLAS SNAPSHOT BACKFILL v3.1 (Route-Level Matching)
+ATLAS SNAPSHOT BACKFILL v3.2 (Route-Level Matching)
+
+FIXES FROM v3.1:
+- BUG: fetch_unlabeled_snapshots pulled permanently unresolvable rows
+  (routes dropped from pipeline with no t+7 snapshot ever written).
+  These rows blocked every batch — 3,346 rows marked training_action='exclude'
+  via direct SQL on 30 March 2026 after diagnosis.
+  FIX: added .neq("training_action", "exclude") filter at fetch time.
+- Changed batch order to DESC (newest-first) so fresh rows with t+7 data
+  immediately available are processed first. Older unresolvable rows
+  accumulate at the back and are filtered by the exclude check above.
 
 FIXES FROM v3.0:
 - BUG: build_route_price_index fetched without a row limit, causing silent
   truncation by the Supabase client default page size. Result: 524 index
   entries for 10 dates when 1500+ existed — 0 matches every run.
-  FIX: added .limit(10000) to price index fetch; added pagination loop
-  to handle dates with very high row counts.
+  FIX: added pagination loop with PAGE_SIZE=1000.
 - BUG: fetch_unlabeled_snapshots fetched crisis-contaminated rows, wasting
   batch capacity on rows that should never be labelled.
   FIX: filter crisis_label_contaminated IS NOT TRUE at fetch time.
 - BUG: .not_.is_("price_gbp", "null") has inconsistent behaviour across
   supabase-py versions.
   FIX: replaced with .gt("price_gbp", 0) — equivalent and reliable.
-- Added .order("snapshot_date", desc=False) to fetch_unlabeled_snapshots
-  so batches process oldest-first, not arbitrary order.
 
 WHAT IT DOES:
 - Runs daily after atlas_snapshot_capture.py
 - Backfills price_t7, rose_10pct, fell_10pct labels
 - Matches by route (origin+dest) and snapshot_date+7, using min price
 - Only updates rows where price_t7 is NULL (idempotent)
-- Processes in date-ordered batches of 500 rows
+- Processes newest-first in batches of 500 rows
+- Skips crisis-contaminated rows and permanently excluded rows
+
+NOTE ON training_action = 'exclude':
+- Set via direct SQL for routes where no t+7 snapshot ever existed
+  (pipeline route churn — route captured briefly then dropped)
+- These rows have rose_10pct IS NULL so they're already excluded from
+  training queries — the flag is backfill-only, not a training filter
+- Do NOT add training_action filters to model training queries
 """
 
 from __future__ import annotations
@@ -61,8 +76,11 @@ class Snapshot:
 def fetch_unlabeled_snapshots(supabase: Client, batch_size: int = 500) -> List[Snapshot]:
     """
     Fetch snapshots needing t+7 labels where the target date is in the past.
-    Excludes crisis-contaminated rows — these should never be labelled.
-    Ordered by snapshot_date ASC so batches process oldest-first.
+    Excludes:
+    - crisis-contaminated rows (crisis_label_contaminated IS TRUE)
+    - permanently unresolvable rows (training_action = 'exclude')
+    Ordered newest-first (DESC) so fresh rows with t+7 data available
+    are processed before older rows that may still be pending.
     """
     cutoff = str(dt.date.today() - dt.timedelta(days=7))
 
@@ -71,7 +89,8 @@ def fetch_unlabeled_snapshots(supabase: Client, batch_size: int = 500) -> List[S
         .select("snapshot_id, origin_iata, destination_iata, snapshot_date, price_gbp, crisis_label_contaminated")
         .is_("price_t7", "null")
         .lte("snapshot_date", cutoff)
-        .order("snapshot_date", desc=False)
+        .neq("training_action", "exclude")
+        .order("snapshot_date", desc=True)
         .limit(batch_size)
         .execute()
     )
@@ -80,7 +99,6 @@ def fetch_unlabeled_snapshots(supabase: Client, batch_size: int = 500) -> List[S
     skipped_crisis = 0
 
     for row in result.data:
-        # Filter crisis-contaminated rows — SQL IS NOT TRUE handles NULL as safe
         if row.get("crisis_label_contaminated") is True:
             skipped_crisis += 1
             continue
@@ -109,12 +127,8 @@ def build_route_price_index(
     For each target snapshot_date, fetch the MIN price per route.
     Returns a dict keyed by (origin_iata, destination_iata, snapshot_date_str) -> min_price.
 
-    FIX v3.1: added explicit .limit(10000) and pagination to prevent silent
-    truncation by Supabase client defaults. Without this, dates with 1000+
-    rows returned incomplete results, causing 0 matches.
-
-    Uses .gt("price_gbp", 0) instead of .not_.is_("price_gbp", "null") for
-    reliable cross-version behaviour.
+    Paginated to avoid silent truncation by Supabase client defaults.
+    Uses .gt("price_gbp", 0) for reliable cross-version behaviour.
     """
     index = {}
     PAGE_SIZE = 1000
@@ -170,7 +184,6 @@ def backfill_t7(supabase: Client):
     print("BACKFILL t+7 LABELS")
     print("=" * 70)
 
-    # Step 1: fetch unlabelled rows (up to 500 at a time, oldest first)
     snapshots = fetch_unlabeled_snapshots(supabase, batch_size=500)
     print(f"Found {len(snapshots)} snapshots ready for t+7 backfill")
 
@@ -178,7 +191,6 @@ def backfill_t7(supabase: Client):
         print("✅ Nothing to backfill")
         return
 
-    # Step 2: get all unique target dates (snapshot_date + 7)
     target_dates = sorted(set(
         snap.snapshot_date + dt.timedelta(days=7)
         for snap in snapshots
@@ -186,7 +198,6 @@ def backfill_t7(supabase: Client):
     print(f"Fetching prices for {len(target_dates)} target dates: "
           f"{target_dates[0]} → {target_dates[-1]}")
 
-    # Step 3: bulk fetch min prices per route per target date (with pagination)
     price_index = build_route_price_index(supabase, target_dates)
     print(f"Built price index: {len(price_index)} route/date combinations")
 
@@ -194,7 +205,6 @@ def backfill_t7(supabase: Client):
         print("❌ Price index is empty — no t+7 snapshots exist yet for these dates. Try again tomorrow.")
         return
 
-    # Step 4: match and compute labels
     updates = []
     no_match = 0
     no_price = 0
@@ -225,7 +235,6 @@ def backfill_t7(supabase: Client):
 
     if no_match > 0 and len(updates) == 0:
         print("❌ 0 matches — t+7 snapshots may not yet exist for these dates.")
-        # Diagnostic: show which dates have no coverage
         covered = set(k[2] for k in price_index.keys())
         needed = set(str(s.snapshot_date + dt.timedelta(days=7)) for s in snapshots)
         missing = needed - covered
@@ -233,7 +242,6 @@ def backfill_t7(supabase: Client):
             print(f"   Missing t+7 coverage for dates: {sorted(missing)}")
         return
 
-    # Step 5: write updates
     if not updates:
         print("✅ No updates to write")
         return
@@ -261,7 +269,7 @@ def backfill_t7(supabase: Client):
 
 def main():
     print("=" * 70)
-    print("ATLAS SNAPSHOT BACKFILL v3.1 (Route-Level Matching)")
+    print("ATLAS SNAPSHOT BACKFILL v3.2 (Route-Level Matching)")
     print("=" * 70)
 
     supabase = init_supabase()

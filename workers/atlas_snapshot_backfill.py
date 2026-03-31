@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_backfill.py
-ATLAS SNAPSHOT BACKFILL v3.2 (Route-Level Matching)
+ATLAS SNAPSHOT BACKFILL v3.3 (Route-Level Matching)
+
+FIXES FROM v3.2:
+- BUG: .neq("training_action", "exclude") silently drops rows where
+  training_action IS NULL in PostgREST — NULL != 'exclude' evaluates
+  to NULL, not TRUE, so all 374 genuinely pending rows were filtered out.
+  FIX: replaced with .or_("training_action.is.null,training_action.neq.exclude")
+  which correctly fetches rows where training_action is NULL or not 'exclude'.
 
 FIXES FROM v3.1:
 - BUG: fetch_unlabeled_snapshots pulled permanently unresolvable rows
   (routes dropped from pipeline with no t+7 snapshot ever written).
   These rows blocked every batch — 3,346 rows marked training_action='exclude'
   via direct SQL on 30 March 2026 after diagnosis.
-  FIX: added .neq("training_action", "exclude") filter at fetch time.
+  FIX: filter training_action != 'exclude' at fetch time (see above for
+  correct PostgREST syntax using .or_()).
 - Changed batch order to DESC (newest-first) so fresh rows with t+7 data
-  immediately available are processed first. Older unresolvable rows
-  accumulate at the back and are filtered by the exclude check above.
+  immediately available are processed first.
 
 FIXES FROM v3.0:
 - BUG: build_route_price_index fetched without a row limit, causing silent
@@ -36,9 +43,11 @@ WHAT IT DOES:
 NOTE ON training_action = 'exclude':
 - Set via direct SQL for routes where no t+7 snapshot ever existed
   (pipeline route churn — route captured briefly then dropped)
-- These rows have rose_10pct IS NULL so they're already excluded from
-  training queries — the flag is backfill-only, not a training filter
+- These rows have rose_10pct IS NULL so they are already excluded from
+  training queries — this flag is backfill-only, not a training filter
 - Do NOT add training_action filters to model training queries
+- Training filter remains: crisis_label_contaminated IS NOT TRUE
+  AND rose_10pct IS NOT NULL
 """
 
 from __future__ import annotations
@@ -81,6 +90,9 @@ def fetch_unlabeled_snapshots(supabase: Client, batch_size: int = 500) -> List[S
     - permanently unresolvable rows (training_action = 'exclude')
     Ordered newest-first (DESC) so fresh rows with t+7 data available
     are processed before older rows that may still be pending.
+
+    IMPORTANT: .neq("training_action", "exclude") silently drops NULL rows
+    in PostgREST. Must use .or_() to correctly express IS NULL OR != 'exclude'.
     """
     cutoff = str(dt.date.today() - dt.timedelta(days=7))
 
@@ -89,7 +101,7 @@ def fetch_unlabeled_snapshots(supabase: Client, batch_size: int = 500) -> List[S
         .select("snapshot_id, origin_iata, destination_iata, snapshot_date, price_gbp, crisis_label_contaminated")
         .is_("price_t7", "null")
         .lte("snapshot_date", cutoff)
-        .neq("training_action", "exclude")
+        .or_("training_action.is.null,training_action.neq.exclude")
         .order("snapshot_date", desc=True)
         .limit(batch_size)
         .execute()
@@ -269,7 +281,7 @@ def backfill_t7(supabase: Client):
 
 def main():
     print("=" * 70)
-    print("ATLAS SNAPSHOT BACKFILL v3.2 (Route-Level Matching)")
+    print("ATLAS SNAPSHOT BACKFILL v3.3 (Route-Level Matching)")
     print("=" * 70)
 
     supabase = init_supabase()

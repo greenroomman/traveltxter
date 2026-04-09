@@ -22,8 +22,8 @@ jobs:
 
       - name: Run capture
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
           DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           ATLAS_MAX_SEARCHES: 157
@@ -46,6 +46,6 @@ jobs:
 
       - name: Run backfill
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
         run: python workers/atlas_snapshot_backfill.py

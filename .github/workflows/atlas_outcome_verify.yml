@@ -1,0 +1,27 @@
+name: Atlas Outcome Verify
+
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+
+jobs:
+  outcome_verify:
+    name: Outcome Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests supabase
+
+      - name: Run outcome verification
+        env:
+          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
+        run: python workers/atlas_outcome_verify.py

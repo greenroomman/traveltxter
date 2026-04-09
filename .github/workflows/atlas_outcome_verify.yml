@@ -21,7 +21,7 @@ jobs:
 
       - name: Run outcome verification
         env:
-          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
           DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
         run: python workers/atlas_outcome_verify.py

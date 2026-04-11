@@ -21,7 +21,7 @@ from supabase import create_client, Client
 # ============================================================================
 
 SUPABASE_URL = os.environ['MIZAR_SUPABASE_URL']
-SUPABASE_KEY = os.environ['MIZAR_SUPABASE_ANON_KEY']
+SUPABASE_KEY = os.environ['MIZAR_SUPABASE_SERVICE_ROLE_KEY']
 DUFFEL_TOKEN = os.environ['DUFFEL_ACCESS_TOKEN']
 
 DUFFEL_API_BASE = 'https://api.duffel.com'
@@ -153,13 +153,13 @@ def classify_prediction(
     predicted_high_risk = regret_risk_score >= HIGH_RISK_THRESHOLD
     
     if predicted_high_risk and ground_truth_rose:
-        outcome = 'TP'  # True Positive
+        outcome = 'TP'
     elif predicted_high_risk and not ground_truth_rose:
-        outcome = 'FP'  # False Positive
+        outcome = 'FP'
     elif not predicted_high_risk and not ground_truth_rose:
-        outcome = 'TN'  # True Negative
-    else:  # not predicted_high_risk and ground_truth_rose
-        outcome = 'FN'  # False Negative
+        outcome = 'TN'
+    else:
+        outcome = 'FN'
     
     return ground_truth_rose, outcome
 
@@ -184,31 +184,27 @@ def verify_decision(decision: Dict) -> bool:
     
     print(f"Verifying decision {decision_id}: {origin}-{destination} on {outbound_date}")
     
-    # Query Duffel for actual price at t+7
     price_t7 = query_duffel_price(origin, destination, outbound_date, return_date)
     
     if price_t7 is None:
-        # Verification failed (route not available)
         supabase.table('outcome_verification').insert({
             'decision_id': decision_id,
             'verification_method': 'duffel_api',
-            'failure_reason': 'Route not available at t+7 (sold out or discontinued)'
+            'failure_reason': 'Price unavailable at t+7'
         }).execute()
         
         supabase.table('user_decisions').update({
             'verification_status': 'failed'
         }).eq('decision_id', decision_id).execute()
         
-        print(f"  ❌ Failed: Route not available")
+        print(f"  ❌ Failed: Price unavailable")
         return False
     
-    # Calculate price change and classify prediction
     price_change_pct = ((price_t7 - price_shown) / price_shown) * 100
     ground_truth_rose, prediction_outcome = classify_prediction(
         regret_risk_score, price_shown, price_t7
     )
     
-    # Insert verification result
     supabase.table('outcome_verification').insert({
         'decision_id': decision_id,
         'price_t7_gbp': price_t7,
@@ -218,7 +214,6 @@ def verify_decision(decision: Dict) -> bool:
         'verification_method': 'duffel_api'
     }).execute()
     
-    # Update decision verification status
     supabase.table('user_decisions').update({
         'verification_status': 'verified'
     }).eq('decision_id', decision_id).execute()
@@ -238,7 +233,6 @@ def main():
     print(f"Started: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 80)
     
-    # Fetch pending decisions
     pending = get_pending_decisions()
     print(f"\nFound {len(pending)} pending decisions ready for verification")
     
@@ -246,7 +240,6 @@ def main():
         print("✅ No decisions to verify. Exiting.")
         return 0
     
-    # Verify each decision
     success_count = 0
     failure_count = 0
     
@@ -260,7 +253,6 @@ def main():
             print(f"  ❌ Error verifying {decision['decision_id']}: {e}")
             failure_count += 1
     
-    # Summary
     print("\n" + "=" * 80)
     print(f"Verification Complete")
     print(f"  ✅ Verified: {success_count}")
@@ -268,7 +260,6 @@ def main():
     print(f"  Success rate: {success_count / len(pending) * 100:.1f}%")
     print("=" * 80)
     
-    # Exit with error code if success rate below 95%
     success_rate = success_count / len(pending)
     if success_rate < 0.95:
         print(f"⚠️ Warning: Success rate {success_rate * 100:.1f}% below 95% target")

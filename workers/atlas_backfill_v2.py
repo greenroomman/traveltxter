@@ -1,131 +1,158 @@
-import os
-import sys
 import pandas as pd
 import numpy as np
+from datetime import date
 
-sys.path.insert(0, os.path.dirname(__file__))
-from atlas_features_v2 import (
-    add_calendar_features,
-    compute_baseline,
-    compute_momentum,
-    compute_fuel_velocity,
-)
-from supabase import create_client
-
-SUPABASE_URL = os.environ["MIZAR_SUPABASE_URL"]
-SUPABASE_KEY = os.environ["MIZAR_SUPABASE_SERVICE_ROLE_KEY"]
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-FEATURE_COLS = [
-    "season_bucket",
-    "days_to_next_bank_holiday",
-    "trip_overlaps_holiday",
-    "holiday_intensity_score",
-    "price_z_score",
-    "price_percentile",
-    "price_ratio",
-    "baseline_mu",
-    "baseline_sigma",
-    "trend_3d",
-    "trend_7d",
-    "volatility_7d",
-    "direction_consistency_7d",
-    "jet_fuel_7d_change_pct",
+UK_BANK_HOLIDAYS = [
+    date(2025, 1, 1), date(2025, 4, 18), date(2025, 4, 21),
+    date(2025, 5, 5), date(2025, 5, 26), date(2025, 8, 25),
+    date(2025, 12, 25), date(2025, 12, 26),
+    date(2026, 1, 1), date(2026, 4, 3), date(2026, 4, 6),
+    date(2026, 5, 4), date(2026, 5, 25), date(2026, 8, 31),
+    date(2026, 12, 25), date(2026, 12, 28),
+    date(2027, 1, 1), date(2027, 3, 26), date(2027, 3, 29),
+    date(2027, 5, 3), date(2027, 5, 31), date(2027, 8, 30),
+    date(2027, 12, 27), date(2027, 12, 28),
 ]
 
-print("Fetching snapshots from Supabase...")
-rows = []
-page_size = 1000
-offset = 0
-while True:
-    batch = (
-        supabase.table("snapshots")
-        .select(
-            "snapshot_id,snapshot_date,origin_iata,destination_iata,"
-            "outbound_date,return_date,dtd,price_gbp,jet_fuel_usd_gal"
-        )
-        .range(offset, offset + page_size - 1)
-        .execute()
+
+def assign_season_bucket(d):
+    if isinstance(d, str):
+        d = date.fromisoformat(str(d)[:10])
+    elif hasattr(d, 'date'):
+        d = d.date()
+    m, day = d.month, d.day
+    if (m == 12 and day >= 20) or (m == 1 and day <= 5):
+        return "christmas"
+    if (m == 4 and 1 <= day <= 15) or (m == 3 and 24 <= day <= 31):
+        return "easter"
+    if (m == 7 and day >= 15) or m == 8 or (m == 9 and day <= 1):
+        return "summer_peak"
+    if (m == 1 and day >= 15) or m == 2 or (m == 3 and day <= 15):
+        return "ski"
+    if m == 2 and 14 <= day <= 21:
+        return "half_term"
+    if m == 10 and 19 <= day <= 30:
+        return "half_term"
+    if m in [4, 5, 6, 9, 10]:
+        return "shoulder"
+    return "off_peak"
+
+
+def days_to_next_bank_holiday(d):
+    if isinstance(d, str):
+        d = date.fromisoformat(str(d)[:10])
+    elif hasattr(d, 'date'):
+        d = d.date()
+    future = [h for h in UK_BANK_HOLIDAYS if h >= d]
+    return (min(future) - d).days if future else 365
+
+
+def trip_overlaps_holiday(outbound, return_date):
+    if isinstance(outbound, str):
+        outbound = date.fromisoformat(str(outbound)[:10])
+    elif hasattr(outbound, 'date'):
+        outbound = outbound.date()
+    if isinstance(return_date, str):
+        return_date = date.fromisoformat(str(return_date)[:10])
+    elif hasattr(return_date, 'date'):
+        return_date = return_date.date()
+    return any(outbound <= h <= return_date for h in UK_BANK_HOLIDAYS)
+
+
+def holiday_intensity_score(outbound):
+    if isinstance(outbound, str):
+        outbound = date.fromisoformat(str(outbound)[:10])
+    elif hasattr(outbound, 'date'):
+        outbound = outbound.date()
+    season = assign_season_bucket(outbound)
+    base = {
+        "christmas": 0.95, "easter": 0.85, "summer_peak": 0.90,
+        "half_term": 0.75, "ski": 0.70, "shoulder": 0.45, "off_peak": 0.20
+    }.get(season, 0.30)
+    if days_to_next_bank_holiday(outbound) <= 3:
+        base = min(1.0, base + 0.15)
+    return round(base, 3)
+
+
+def add_calendar_features(df):
+    df = df.copy()
+    df["season_bucket"] = df["outbound_date"].apply(assign_season_bucket)
+    df["days_to_next_bank_holiday"] = df["outbound_date"].apply(days_to_next_bank_holiday)
+    df["trip_overlaps_holiday"] = df.apply(
+        lambda r: trip_overlaps_holiday(r["outbound_date"], r["return_date"]), axis=1
     )
-    if not batch.data:
-        break
-    rows.extend(batch.data)
-    print(f"  Fetched {len(rows)} rows so far...")
-    if len(batch.data) < page_size:
-        break
-    offset += page_size
+    df["holiday_intensity_score"] = df["outbound_date"].apply(holiday_intensity_score)
+    return df
 
-print(f"Total rows loaded: {len(rows)}")
-if len(rows) == 0:
-    print("ERROR: No rows fetched. Check Supabase credentials.")
-    sys.exit(1)
 
-df = pd.DataFrame(rows)
-print(f"Columns available: {list(df.columns)}")
+def compute_baseline(df):
+    df = df.copy()
+    df["dtd_bucket"] = pd.cut(
+        df["dtd"].astype(float),
+        bins=[-1, 7, 21, 60, 120, 9999],
+        labels=["0-7", "8-21", "22-60", "61-120", "120+"]
+    )
+    df["route"] = df["origin_iata"] + "-" + df["destination_iata"]
+    baseline = df.groupby(["route", "dtd_bucket", "season_bucket"])["price_gbp"].agg(
+        baseline_mu="mean",
+        baseline_sigma="std"
+    ).reset_index()
+    baseline["baseline_sigma"] = baseline["baseline_sigma"].fillna(10.0).clip(lower=5.0)
+    df = df.merge(baseline, on=["route", "dtd_bucket", "season_bucket"], how="left")
+    df["price_z_score"] = ((df["price_gbp"] - df["baseline_mu"]) / df["baseline_sigma"]).round(3)
+    df["price_ratio"] = (df["price_gbp"] / df["baseline_mu"]).round(3)
 
-print("Computing calendar features...")
-df = add_calendar_features(df)
-print(f"  season_bucket sample: {df['season_bucket'].value_counts().to_dict()}")
+    def pct_rank(group):
+        group = group.copy()
+        group["price_percentile"] = group["price_gbp"].rank(pct=True).mul(100).round(1)
+        return group
 
-print("Computing price position features...")
-df = compute_baseline(df)
-print(f"  price_z_score non-null: {df['price_z_score'].notna().sum()}")
+    df = df.groupby(["route", "dtd_bucket", "season_bucket"], group_keys=False).apply(pct_rank)
+    return df
 
-print("Computing momentum features...")
-df = compute_momentum(df)
-print(f"  trend_7d non-null: {df['trend_7d'].notna().sum()}")
 
-print("Computing fuel velocity features...")
-df = compute_fuel_velocity(df)
-print(f"  jet_fuel_7d_change_pct non-null: {df['jet_fuel_7d_change_pct'].notna().sum()}")
+def compute_momentum(df):
+    df = df.copy().sort_values(
+        ["origin_iata", "destination_iata", "outbound_date", "snapshot_date"]
+    )
+    key = ["origin_iata", "destination_iata", "outbound_date"]
 
-print(f"\nStarting batch upsert — {len(df)} rows in batches of 500...")
+    for n, col in [(3, "trend_3d"), (7, "trend_7d")]:
+        df[col] = df.groupby(key)["price_gbp"].transform(
+            lambda x: x.pct_change(periods=min(n, max(1, len(x) - 1)))
+        ).round(4)
 
-def clean_val(val, col):
-    if col == "trip_overlaps_holiday":
-        if pd.isna(val) if not isinstance(val, bool) else False:
-            return None
-        return bool(val)
-    if col == "season_bucket":
-        return None if (pd.isna(val) if not isinstance(val, str) else False) else str(val)
-    if col == "days_to_next_bank_holiday":
-        return None if pd.isna(val) else int(val)
-    try:
-        f = float(val)
-        return None if np.isnan(f) else round(f, 6)
-    except (TypeError, ValueError):
-        return None
+    df["volatility_7d"] = df.groupby(key)["price_gbp"].transform(
+        lambda x: x.rolling(7, min_periods=2).std()
+    ).round(4)
 
-updated = 0
-errors = 0
-batch_size = 500
+    # Vectorised direction consistency — rolling mean of daily up-moves (1=up, 0=flat/down).
+    # Equivalent to the proportion of days with a price increase over the window.
+    # Fully vectorised: no rolling().apply() and no division-by-zero risk.
+    df["_price_up"] = df.groupby(key)["price_gbp"].transform(
+        lambda x: (x.diff() > 0).astype(float)
+    )
+    df["direction_consistency_7d"] = df.groupby(key)["_price_up"].transform(
+        lambda x: x.rolling(7, min_periods=2).mean()
+    ).round(3)
+    df.drop(columns=["_price_up"], inplace=True)
 
-for i in range(0, len(df), batch_size):
-    chunk = df.iloc[i : i + batch_size]
-    records = []
-    for _, row in chunk.iterrows():
-        record = {"snapshot_id": row["snapshot_id"]}
-        for col in FEATURE_COLS:
-            if col in df.columns:
-                record[col] = clean_val(row[col], col)
-        records.append(record)
-    try:
-        supabase.table("snapshots").upsert(
-            records, on_conflict="snapshot_id"
-        ).execute()
-        updated += len(records)
-        print(f"  Upserted {updated}/{len(df)} rows")
-    except Exception as e:
-        errors += 1
-        print(f"  ERROR on batch {i}-{i+batch_size}: {e}")
+    return df
 
-print(f"\nDone. Upserted: {updated} | Batch errors: {errors}")
 
-print("\nVerifying coverage in Supabase...")
-r1 = supabase.table("snapshots").select("snapshot_id", count="exact").not_.is_("price_z_score", "null").execute()
-r2 = supabase.table("snapshots").select("snapshot_id", count="exact").not_.is_("season_bucket", "null").execute()
-r3 = supabase.table("snapshots").select("snapshot_id", count="exact").not_.is_("trend_7d", "null").execute()
-print(f"  price_z_score populated: {r1.count}")
-print(f"  season_bucket populated: {r2.count}")
-print(f"  trend_7d populated:      {r3.count}")
-print(f"  Total rows:              {len(df)}")
+def compute_fuel_velocity(df):
+    df = df.copy().sort_values("snapshot_date")
+    fuel_by_date = (
+        df.groupby("snapshot_date")["jet_fuel_usd_gal"]
+        .first()
+        .reset_index()
+    )
+    fuel_by_date["jet_fuel_7d_change_pct"] = (
+        fuel_by_date["jet_fuel_usd_gal"].pct_change(periods=7).round(4)
+    )
+    df = df.merge(
+        fuel_by_date[["snapshot_date", "jet_fuel_7d_change_pct"]],
+        on="snapshot_date",
+        how="left"
+    )
+    return df

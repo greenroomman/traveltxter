@@ -102,6 +102,12 @@ def clean_val(val, col):
         if pd.isna(val):
             return None
         return int(val)
+    if col == "price_percentile":
+        try:
+            f = float(val)
+            return None if np.isnan(f) else round(min(f, 100.0), 2)
+        except (TypeError, ValueError):
+            return None
     try:
         f = float(val)
         return None if np.isnan(f) else round(f, 6)
@@ -137,6 +143,8 @@ if not rows:
     sys.exit(1)
 
 df = pd.DataFrame(rows)
+original_ids = set(df["snapshot_id"].dropna())
+print(f"Unique snapshot_ids: {len(original_ids)}")
 
 print("Calendar features...")
 df["season_bucket"] = df["outbound_date"].apply(assign_season_bucket)
@@ -151,15 +159,18 @@ df["route"] = df["origin_iata"] + "-" + df["destination_iata"]
 baseline = df.groupby(["route","dtd_bucket","season_bucket"])["price_gbp"].agg(baseline_mu="mean", baseline_sigma="std").reset_index()
 baseline["baseline_sigma"] = baseline["baseline_sigma"].fillna(10.0).clip(lower=5.0)
 df = df.merge(baseline, on=["route","dtd_bucket","season_bucket"], how="left")
-df["price_z_score"] = ((df["price_gbp"] - df["baseline_mu"]) / df["baseline_sigma"]).round(3)
-df["price_ratio"] = (df["price_gbp"] / df["baseline_mu"]).round(3)
+df["price_z_score"] = ((df["price_gbp"] - df["baseline_mu"]) / df["baseline_sigma"]).round(4)
+df["price_ratio"] = (df["price_gbp"] / df["baseline_mu"]).round(4)
 
 def pct_rank(group):
     group = group.copy()
-    group["price_percentile"] = group["price_gbp"].rank(pct=True).mul(100).round(1)
+    group["price_percentile"] = group["price_gbp"].rank(pct=True).mul(100).clip(upper=100.0).round(2)
     return group
 
 df = df.groupby(["route","dtd_bucket","season_bucket"], group_keys=False).apply(pct_rank)
+
+df = df[df["snapshot_id"].isin(original_ids)].copy()
+print(f"  Rows after ID safety filter: {len(df)} (expected {len(original_ids)})")
 print(f"  price_z_score non-null: {df['price_z_score'].notna().sum()}")
 
 print("Momentum features...")
@@ -180,7 +191,9 @@ df = df.sort_values("snapshot_date")
 fuel = df.groupby("snapshot_date")["jet_fuel_usd_gal"].first().reset_index()
 fuel["jet_fuel_7d_change_pct"] = fuel["jet_fuel_usd_gal"].pct_change(periods=7).round(4)
 df = df.merge(fuel[["snapshot_date","jet_fuel_7d_change_pct"]], on="snapshot_date", how="left")
+df = df[df["snapshot_id"].isin(original_ids)].copy()
 print(f"  jet_fuel_7d_change_pct non-null: {df['jet_fuel_7d_change_pct'].notna().sum()}")
+print(f"  Final row count: {len(df)}")
 
 print(f"\nUpserting {len(df)} rows in batches of 500...")
 updated = 0
@@ -189,11 +202,16 @@ for i in range(0, len(df), 500):
     chunk = df.iloc[i:i+500]
     records = []
     for _, row in chunk.iterrows():
-        record = {"snapshot_id": row["snapshot_id"]}
+        sid = row["snapshot_id"]
+        if pd.isna(sid) or sid not in original_ids:
+            continue
+        record = {"snapshot_id": str(sid)}
         for col in FEATURE_COLS:
             if col in df.columns:
                 record[col] = clean_val(row[col], col)
         records.append(record)
+    if not records:
+        continue
     try:
         supabase.table("snapshots").upsert(records, on_conflict="snapshot_id").execute()
         updated += len(records)
@@ -210,3 +228,4 @@ r3 = supabase.table("snapshots").select("snapshot_id", count="exact").not_.is_("
 print(f"price_z_score populated: {r1.count}")
 print(f"season_bucket populated: {r2.count}")
 print(f"trend_7d populated:      {r3.count}")
+print(f"Total rows:              {len(df)}")

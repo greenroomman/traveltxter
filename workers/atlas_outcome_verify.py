@@ -2,6 +2,7 @@
 """
 MIZAR Atlas Outcome Verification Worker
 Created: March 18, 2026
+Updated: April 12, 2026 — fixed Duffel 201 response and return_offers param
 """
 
 import os
@@ -70,13 +71,13 @@ def query_duffel_price(
 
     try:
         response = requests.post(
-            f'{DUFFEL_API_BASE}/air/offer_requests',
+            f'{DUFFEL_API_BASE}/air/offer_requests?return_offers=true',
             headers=DUFFEL_HEADERS,
             json=payload,
             timeout=30
         )
 
-        if response.status_code != 200:
+        if response.status_code not in (200, 201):
             print(f"Duffel API error {response.status_code}: {response.text}")
             return None
 
@@ -139,7 +140,7 @@ def verify_decision(decision: Dict) -> bool:
             'verification_status': 'failed'
         }).eq('decision_id', decision_id).execute()
 
-        print(f"  ❌ Failed: Price unavailable")
+        print(f"  Failed: Price unavailable")
         return False
 
     price_change_pct = ((price_t7 - price_shown) / price_shown) * 100
@@ -160,7 +161,7 @@ def verify_decision(decision: Dict) -> bool:
         'verification_status': 'verified'
     }).eq('decision_id', decision_id).execute()
 
-    print(f"  ✅ {price_shown:.2f} → {price_t7:.2f} ({price_change_pct:+.1f}%) | {prediction_outcome}")
+    print(f"  {price_shown:.2f} -> {price_t7:.2f} ({price_change_pct:+.1f}%) | {prediction_outcome}")
     return True
 
 
@@ -174,7 +175,7 @@ def main():
     print(f"\nFound {len(pending)} pending decisions ready for verification")
 
     if not pending:
-        print("✅ No decisions to verify. Exiting.")
+        print("No decisions to verify. Exiting.")
         return 0
 
     success_count = 0
@@ -187,19 +188,19 @@ def main():
             else:
                 failure_count += 1
         except Exception as e:
-            print(f"  ❌ Error verifying {decision['decision_id']}: {e}")
+            print(f"  Error verifying {decision['decision_id']}: {e}")
             failure_count += 1
 
     print("\n" + "=" * 80)
     print(f"Verification Complete")
-    print(f"  ✅ Verified: {success_count}")
-    print(f"  ❌ Failed: {failure_count}")
+    print(f"  Verified: {success_count}")
+    print(f"  Failed:   {failure_count}")
     print(f"  Success rate: {success_count / len(pending) * 100:.1f}%")
     print("=" * 80)
 
     success_rate = success_count / len(pending)
     if success_rate < 0.95:
-        print(f"⚠️ Warning: Success rate {success_rate * 100:.1f}% below 95% target")
+        print(f"Warning: Success rate {success_rate * 100:.1f}% below 95% target")
         return 1
 
     return 0

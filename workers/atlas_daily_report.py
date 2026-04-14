@@ -1,18 +1,17 @@
 
 import os, sys, httpx
 from datetime import datetime, timezone
+from supabase import create_client
 
 SUPABASE_URL = os.environ["MIZAR_SUPABASE_URL"]
 SUPABASE_KEY = os.environ["MIZAR_SUPABASE_SERVICE_ROLE_KEY"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_PAGE_ID = "341c2a683145815b9af0cb836bd90f4a"
 
-from supabase import create_client
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-print(f"Running daily report for {today}...")
+print("Running daily report for", today)
 
 decisions = sb.table("user_decisions").select("*").execute().data
 total_d = len(decisions)
@@ -50,88 +49,85 @@ usage = sb.table("api_usage").select("timestamp").execute().data
 today_calls = sum(1 for r in usage if (r.get("timestamp") or "")[:10] == today)
 
 fuel_data = sb.table("daily_market_signals").select("*").order("signal_date", desc=True).limit(1).execute().data
-fuel_price = float(fuel_data[0]["jet_fuel_usd_gal"]) if fuel_data else None
+fuel_price = float(fuel_data[0]["jet_fuel_usd_gal"]) if fuel_data else "N/A"
 fuel_date = fuel_data[0]["signal_date"] if fuel_data else "N/A"
-gbp_usd = float(fuel_data[0]["gbp_usd_rate"]) if fuel_data else None
+gbp_usd = float(fuel_data[0]["gbp_usd_rate"]) if fuel_data else "N/A"
 
 pipeline_status = "HEALTHY" if today_s >= 150 else "LOW" if today_s > 0 else "MISSING"
 
 flags = []
 if today_s < 150:
-    flags.append(f"[WARNING] Pipeline: only {today_s} snapshots today (expected 153)")
+    flags.append("[WARNING] Pipeline: only " + str(today_s) + " snapshots today (expected 153)")
 if failed_v > 30:
-    flags.append(f"[WARNING] Verification failures: {failed_v} total")
+    flags.append("[WARNING] Verification failures: " + str(failed_v) + " total")
 if precision < 20 and verified > 100:
-    flags.append(f"[WARNING] Precision low: {precision}% on {verified} verified decisions")
+    flags.append("[WARNING] Precision low: " + str(precision) + "% on " + str(verified) + " verified decisions")
 if not flags:
-    flags.append("[OK] No flags. All systems nominal.")
+    flags.append("[OK] All systems nominal.")
 
-report = f"""# MIZAR Daily Health -- {today}
+lines = [
+    "# MIZAR Daily Health -- " + today,
+    "",
+    "Generated: " + now_str,
+    "",
+    "---",
+    "",
+    "## Pipeline",
+    "",
+    "| Metric | Value | Status |",
+    "|---|---|---|",
+    "| Snapshots today | " + str(today_s) + " / 153 expected | " + pipeline_status + " |",
+    "| Total snapshots | " + str(total_s) + " | -- |",
+    "| Active origins | " + str(origins) + " / 9 | -- |",
+    "| Avg network price | GBP " + str(avg_price) + " | -- |",
+    "| Fuel price | USD " + str(fuel_price) + "/gal (" + str(fuel_date) + ") | -- |",
+    "| GBP/USD | " + str(gbp_usd) + " | -- |",
+    "",
+    "## Decisions and Verification",
+    "",
+    "| Metric | Value |",
+    "|---|---|",
+    "| Total decisions | " + str(total_d) + " |",
+    "| Decisions today | " + str(today_d) + " |",
+    "| Pending t+7 | " + str(pending) + " |",
+    "| Verified | " + str(verified) + " |",
+    "| Failed | " + str(failed_v) + " |",
+    "| v2_0_0 decisions | " + str(v2_d) + " |",
+    "| v1 decisions | " + str(v1_d) + " |",
+    "| Verified today | " + str(verified_today) + " |",
+    "| Live precision (all) | " + str(precision) + "% |",
+    "| TP / FP / TN / FN | " + str(tp) + " / " + str(fp) + " / " + str(tn) + " / " + str(fn_c) + " |",
+    "| Avg price change (verified) | " + str(avg_change) + "% |",
+    "",
+    "## API and Users",
+    "",
+    "| Metric | Value |",
+    "|---|---|",
+    "| Active API keys | " + str(len(keys)) + " |",
+    "| Total users | " + str(total_users) + " |",
+    "| Trialing | " + str(trialing) + " |",
+    "| Active subscriptions | " + str(active_subs) + " |",
+    "| API calls today | " + str(today_calls) + " |",
+    "",
+    "## Flags",
+    "",
+]
+for f in flags:
+    lines.append("- " + f)
 
-Generated: {now_str}
-
----
-
-## Pipeline
-
-| Metric | Value | Status |
-|---|---|---|
-| Snapshots today | {today_s} / 153 expected | {pipeline_status} |
-| Total snapshots | {total_s} | -- |
-| Active origins | {origins} / 9 | -- |
-| Avg network price | GBP {avg_price} | -- |
-| Fuel price | USD {fuel_price}/gal (EIA {fuel_date}) | -- |
-| GBP/USD | {gbp_usd} | -- |
-
-## Decisions and Verification
-
-| Metric | Value |
-|---|---|
-| Total decisions | {total_d} |
-| Decisions today | {today_d} |
-| Pending t+7 | {pending} |
-| Verified | {verified} |
-| Failed | {failed_v} |
-| v2_0_0 decisions | {v2_d} |
-| v1 decisions | {v1_d} |
-| Verified today | {verified_today} |
-| Live precision (all) | {precision}% |
-| TP / FP / TN / FN | {tp} / {fp} / {tn} / {fn_c} |
-| Avg price change (verified) | {avg_change}% |
-
-## API and Users
-
-| Metric | Value |
-|---|---|
-| Active API keys | {len(keys)} |
-| Total users | {total_users} |
-| Trialing | {trialing} |
-| Active subscriptions | {active_subs} |
-| API calls today | {today_calls} |
-
-## Flags
-
-""" + "
-".join(f"- {f}" for f in flags)
-
+report = "\n".join(lines)
 print(report)
 
 headers = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Authorization": "Bearer " + NOTION_TOKEN,
     "Content-Type": "application/json",
     "Notion-Version": "2022-06-28"
 }
 
 page_res = httpx.get(
-    f"https://api.notion.com/v1/blocks/{NOTION_PAGE_ID}/children",
+    "https://api.notion.com/v1/blocks/" + NOTION_PAGE_ID + "/children",
     headers=headers
 )
-blocks = page_res.json().get("results", [])
-for block in blocks:
-    if block.get("type") == "paragraph":
-        text = "".join(t.get("plain_text","") for t in block.get("paragraph",{}).get("rich_text",[]))
-        if "Awaiting first automated run" in text:
-            httpx.delete(f"https://api.notion.com/v1/blocks/{block["id"]}", headers=headers)
 
 new_block = {
     "children": [
@@ -139,7 +135,7 @@ new_block = {
             "object": "block",
             "type": "heading_2",
             "heading_2": {
-                "rich_text": [{"type": "text", "text": {"content": f"Report -- {today}"}}]
+                "rich_text": [{"type": "text", "text": {"content": "Report -- " + today}}]
             }
         },
         {
@@ -154,7 +150,7 @@ new_block = {
 }
 
 res = httpx.patch(
-    f"https://api.notion.com/v1/blocks/{NOTION_PAGE_ID}/children",
+    "https://api.notion.com/v1/blocks/" + NOTION_PAGE_ID + "/children",
     headers=headers,
     json=new_block
 )
@@ -162,5 +158,6 @@ res = httpx.patch(
 if res.status_code == 200:
     print("Notion updated successfully")
 else:
-    print(f"Notion update failed: {res.status_code} {res.text}")
+    print("Notion update failed: " + str(res.status_code))
+    print(res.text)
     sys.exit(1)

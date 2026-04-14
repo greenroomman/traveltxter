@@ -6,7 +6,7 @@ from supabase import create_client
 SUPABASE_URL = os.environ["MIZAR_SUPABASE_URL"]
 SUPABASE_KEY = os.environ["MIZAR_SUPABASE_SERVICE_ROLE_KEY"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_PAGE_ID = "341c2a683145815b9af0cb836bd90f4a"
+NOTION_PAGE_ID = "342c2a68314581e7aba4ec79934618d0"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -57,13 +57,13 @@ pipeline_status = "HEALTHY" if today_s >= 150 else "LOW" if today_s > 0 else "MI
 
 flags = []
 if today_s < 150:
-    flags.append("[WARNING] Pipeline: only " + str(today_s) + " snapshots today (expected 153)")
+    flags.append("WARNING: Pipeline: only " + str(today_s) + " snapshots today (expected 153)")
 if failed_v > 30:
-    flags.append("[WARNING] Verification failures: " + str(failed_v) + " total")
+    flags.append("WARNING: Verification failures: " + str(failed_v) + " total")
 if precision < 20 and verified > 100:
-    flags.append("[WARNING] Precision low: " + str(precision) + "% on " + str(verified) + " verified decisions")
+    flags.append("WARNING: Precision low: " + str(precision) + "% on " + str(verified) + " verified decisions")
 if not flags:
-    flags.append("[OK] All systems nominal.")
+    flags.append("OK: All systems nominal.")
 
 lines = [
     "# MIZAR Daily Health -- " + today,

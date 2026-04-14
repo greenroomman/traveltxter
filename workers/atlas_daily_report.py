@@ -6,7 +6,7 @@ from supabase import create_client
 SUPABASE_URL = os.environ["MIZAR_SUPABASE_URL"]
 SUPABASE_KEY = os.environ["MIZAR_SUPABASE_SERVICE_ROLE_KEY"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_PAGE_ID = "342c2a68314581e7aba4ec79934618d0"
+NOTION_PARENT_ID = "327c2a68314581a2a1aaf8a2d609b425"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -124,18 +124,20 @@ headers = {
     "Notion-Version": "2022-06-28"
 }
 
-page_res = httpx.get(
-    "https://api.notion.com/v1/blocks/" + NOTION_PAGE_ID + "/children",
-    headers=headers
-)
-
-new_block = {
+# Create a fresh dated page each run as a child of the Development Hub
+# Mizar integration owns the page it creates, so no access issues
+new_page = {
+    "parent": {"page_id": NOTION_PARENT_ID},
+    "icon": {"emoji": "📊"},
+    "properties": {
+        "title": [{"text": {"content": "Daily Health -- " + today}}]
+    },
     "children": [
         {
             "object": "block",
-            "type": "heading_2",
-            "heading_2": {
-                "rich_text": [{"type": "text", "text": {"content": "Report -- " + today}}]
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": "Auto-generated at " + now_str}}]
             }
         },
         {
@@ -149,15 +151,16 @@ new_block = {
     ]
 }
 
-res = httpx.patch(
-    "https://api.notion.com/v1/blocks/" + NOTION_PAGE_ID + "/children",
+res = httpx.post(
+    "https://api.notion.com/v1/pages",
     headers=headers,
-    json=new_block
+    json=new_page
 )
 
 if res.status_code == 200:
-    print("Notion updated successfully")
+    page_url = res.json().get("url", "")
+    print("Notion page created: " + page_url)
 else:
-    print("Notion update failed: " + str(res.status_code))
+    print("Notion create failed: " + str(res.status_code))
     print(res.text)
     sys.exit(1)

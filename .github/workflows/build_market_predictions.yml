@@ -28,6 +28,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
           MODEL_PATH: ${{ vars.MODEL_PATH }}
-          MODEL_VERSION: ${{ vars.MODEL_VERSION }}
+          MODEL_VERSION: regretrisk_v1_0_0
           MARKET_PREDICTIONS_MAX_SNAPSHOTS: 750
         run: python workers/build_market_predictions.py

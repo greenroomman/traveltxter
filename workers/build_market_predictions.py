@@ -198,31 +198,51 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_baseline(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
     df["dtd_bucket"] = pd.cut(
         df["dtd"].astype(float),
         bins=[-1, 7, 21, 60, 120, 9999],
         labels=["0-7", "8-21", "22-60", "61-120", "120+"]
     )
+
     df["route"] = df["origin_iata"].astype(str) + "-" + df["destination_iata"].astype(str)
 
-    baseline = df.groupby(["route", "dtd_bucket", "season_bucket"], observed=False)["price_gbp"].agg(
-        baseline_mu="mean",
-        baseline_sigma="std"
-    ).reset_index()
+    baseline = (
+        df.groupby(["route", "dtd_bucket", "season_bucket"], dropna=False, observed=False)["price_gbp"]
+        .agg(["mean", "std"])
+        .reset_index()
+        .rename(columns={"mean": "baseline_mu", "std": "baseline_sigma"})
+    )
 
-    baseline["baseline_sigma"] = baseline["baseline_sigma"].fillna(10.0).clip(lower=5.0)
+    df = df.merge(
+        baseline,
+        on=["route", "dtd_bucket", "season_bucket"],
+        how="left"
+    )
 
-    df = df.merge(baseline, on=["route", "dtd_bucket", "season_bucket"], how="left")
+    if "baseline_mu" not in df.columns:
+        df["baseline_mu"] = df["price_gbp"]
+
+    if "baseline_sigma" not in df.columns:
+        df["baseline_sigma"] = 10.0
+
+    df["baseline_mu"] = pd.to_numeric(df["baseline_mu"], errors="coerce")
+    df["baseline_sigma"] = pd.to_numeric(df["baseline_sigma"], errors="coerce")
+
+    # Fallbacks if a group has only one row or no stable std
+    df["baseline_mu"] = df["baseline_mu"].fillna(df["price_gbp"])
+    df["baseline_sigma"] = df["baseline_sigma"].fillna(10.0).clip(lower=5.0)
 
     df["price_z_score"] = ((df["price_gbp"] - df["baseline_mu"]) / df["baseline_sigma"]).round(3)
-    df["price_ratio"] = (df["price_gbp"] / df["baseline_mu"]).round(3)
+    df["price_ratio"] = (df["price_gbp"] / df["baseline_mu"]).replace([np.inf, -np.inf], np.nan).round(3)
 
     def pct_rank(group: pd.DataFrame) -> pd.DataFrame:
         group = group.copy()
         group["price_percentile"] = group["price_gbp"].rank(pct=True).mul(100).round(1)
         return group
 
-    df = df.groupby(["route", "dtd_bucket", "season_bucket"], group_keys=False, observed=False).apply(pct_rank)
+    df = df.groupby(["route", "dtd_bucket", "season_bucket"], group_keys=False, dropna=False, observed=False).apply(pct_rank)
+
     return df
 
 

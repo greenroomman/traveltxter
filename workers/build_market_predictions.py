@@ -229,7 +229,6 @@ def compute_baseline(df: pd.DataFrame) -> pd.DataFrame:
     df["baseline_mu"] = pd.to_numeric(df["baseline_mu"], errors="coerce")
     df["baseline_sigma"] = pd.to_numeric(df["baseline_sigma"], errors="coerce")
 
-    # Fallbacks if a group has only one row or no stable std
     df["baseline_mu"] = df["baseline_mu"].fillna(df["price_gbp"])
     df["baseline_sigma"] = df["baseline_sigma"].fillna(10.0).clip(lower=5.0)
 
@@ -241,7 +240,12 @@ def compute_baseline(df: pd.DataFrame) -> pd.DataFrame:
         group["price_percentile"] = group["price_gbp"].rank(pct=True).mul(100).round(1)
         return group
 
-    df = df.groupby(["route", "dtd_bucket", "season_bucket"], group_keys=False, dropna=False, observed=False).apply(pct_rank)
+    df = df.groupby(
+        ["route", "dtd_bucket", "season_bucket"],
+        group_keys=False,
+        dropna=False,
+        observed=False
+    ).apply(pct_rank)
 
     return df
 
@@ -272,6 +276,7 @@ def compute_momentum(df: pd.DataFrame) -> pd.DataFrame:
     df["direction_consistency_7d"] = df.groupby(key)["price_gbp"].transform(
         lambda x: x.rolling(7, min_periods=2).apply(dir_consistency, raw=False)
     )
+
     return df
 
 
@@ -408,6 +413,10 @@ def real_model_score(feature_row: Dict[str, Any], bundle: Dict[str, Any]) -> Tup
     feature_cols = bundle.get("feature_cols") or []
     version = bundle.get("version") or DEFAULT_MODEL_VERSION
 
+    outbound = parse_date(feature_row.get("outbound_date"))
+    if not outbound:
+        raise ValueError("Missing outbound_date")
+
     model_input = {
         "price_gbp": float(feature_row.get("price_gbp") or 0.0),
         "dtd": float(feature_row.get("dtd") or 0.0),
@@ -429,8 +438,8 @@ def real_model_score(feature_row: Dict[str, Any], bundle: Dict[str, Any]) -> Tup
         "jet_fuel_7d_change_pct": float(feature_row.get("jet_fuel_7d_change_pct") or 0.0),
         "gbp_usd_rate": float(feature_row.get("gbp_usd_rate") or 0.0),
         "gbp_eur_rate": float(feature_row.get("gbp_eur_rate") or 0.0),
-        "day_of_week_departure": float(parse_date(feature_row.get("outbound_date")).weekday()),
-        "is_weekend_departure": 1.0 if parse_date(feature_row.get("outbound_date")).weekday() in {4, 5, 6} else 0.0,
+        "day_of_week_departure": float(outbound.weekday()),
+        "is_weekend_departure": 1.0 if outbound.weekday() in {4, 5, 6} else 0.0,
     }
 
     origin = str(feature_row.get("origin_iata") or "").upper()
@@ -544,6 +553,23 @@ def row_to_prediction_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def dedupe_payloads(payloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped_map: Dict[tuple, Dict[str, Any]] = {}
+
+    for payload in payloads:
+        key = (
+            payload.get("snapshot_date"),
+            payload.get("origin_iata"),
+            payload.get("destination_iata"),
+            payload.get("outbound_date"),
+            payload.get("return_date"),
+            payload.get("price_gbp"),
+        )
+        deduped_map[key] = payload
+
+    return list(deduped_map.values())
+
+
 def main() -> int:
     print("=" * 60)
     print("MIZAR Market Predictions Builder")
@@ -583,12 +609,15 @@ def main() -> int:
         print("No payloads built. Exiting.")
         return 1
 
+    deduped_payloads = dedupe_payloads(payloads)
+
     result = supabase.table("market_predictions").upsert(
-        payloads,
+        deduped_payloads,
         on_conflict="snapshot_date,origin_iata,destination_iata,outbound_date,return_date,price_gbp"
     ).execute()
 
-    print(f"Upsert complete. Rows attempted: {len(payloads)}")
+    print(f"Rows built: {len(payloads)}")
+    print(f"Rows after dedupe: {len(deduped_payloads)}")
     print(f"Rows skipped: {skipped}")
     print(f"Supabase response rows: {len(result.data or [])}")
     print("=" * 60)

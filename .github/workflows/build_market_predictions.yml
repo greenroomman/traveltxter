@@ -1,0 +1,33 @@
+name: Build Market Predictions
+
+on:
+  schedule:
+    - cron: "15 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  build-market-predictions:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install supabase pandas numpy requests joblib scikit-learn
+
+      - name: Build market predictions
+        env:
+          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+          MODEL_PATH: ${{ vars.MODEL_PATH }}
+          MODEL_VERSION: ${{ vars.MODEL_VERSION }}
+          MARKET_PREDICTIONS_MAX_SNAPSHOTS: 750
+        run: python workers/build_market_predictions.py

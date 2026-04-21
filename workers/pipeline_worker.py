@@ -7,13 +7,18 @@ Architecture: Stratified bucket model with deterministic day-index rotation.
 Destination selection is geographic (bucket-driven), not theme-driven.
 Theme is read from OPS_MASTER and applied as a label to output rows only.
 
-This version keeps the original oilpan contract but reduces the Europe bias by:
+This version keeps the original oilpan contract but reduces Europe bias by:
 - Removing the "EU every run" anchor
 - Increasing non-EU bucket representation in the run schedule
 - Retrying within a bucket when an offer fails
 - Allowing 2 stops for long-haul / wildcard buckets only
 - Selecting more candidate destinations than strict search count so thin buckets
   have a chance to survive without increasing total API spend too aggressively
+
+This version also adds conflict filtering at feeder level:
+- Default blocked destination countries for current Middle East conflict exposure
+- Optional blocked destination IATA denylist
+- Optional env overrides for both
 
 Oilpan contracts preserved:
 - Only writes to RAW_DEALS
@@ -31,7 +36,7 @@ import math
 import hashlib
 import datetime as dt
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
 import gspread
@@ -166,6 +171,32 @@ DUFFEL_API = "https://api.duffel.com/air/offer_requests"
 LONDON_AIRPORTS = {"LHR", "LGW", "LCY"}
 LONG_HAUL_BUCKET_IDS = {4, 5, 6}
 
+# Default conflict filters for current Middle East risk footprint.
+# These can be extended or overridden through env vars.
+DEFAULT_BLOCKED_DESTINATION_IATAS = {
+    "AUH", "BAH", "BEY", "BGW", "BND", "BSR",
+    "DMM", "DOH", "DWC", "DXB", "EBL", "IKA",
+    "ISF", "JED", "KIH", "KWI", "MCT", "MED",
+    "MHD", "NJF", "RUH", "SHJ", "SLL", "SYZ",
+    "TBZ", "THR", "TLV", "AMM", "AQJ", "RKT",
+}
+
+DEFAULT_BLOCKED_COUNTRY_ALIASES = {
+    "BAHRAIN",
+    "IRAN",
+    "IRAQ",
+    "ISRAEL",
+    "JORDAN",
+    "KUWAIT",
+    "LEBANON",
+    "OMAN",
+    "QATAR",
+    "SAUDI ARABIA",
+    "KINGDOM OF SAUDI ARABIA",
+    "UAE",
+    "UNITED ARAB EMIRATES",
+}
+
 
 def duffel_headers() -> Dict[str, str]:
     key = env_str("DUFFEL_API_KEY")
@@ -289,6 +320,49 @@ def extract_bags_included(offer: Dict[str, Any]) -> str:
         return str(bag_qty) if bag_qty > 0 else ""
     except Exception:
         return ""
+
+
+# ─────────────────────────────────────────────
+# CONFLICT FILTER HELPERS
+# ─────────────────────────────────────────────
+
+def normalize_token(value: str) -> str:
+    s = str(value or "").strip().upper()
+    s = s.replace("&", " AND ")
+    for ch in [".", ",", ";", ":", "'", '"', "(", ")", "/", "\\", "-", "_"]:
+        s = s.replace(ch, " ")
+    s = " ".join(s.split())
+    return s
+
+
+def load_csv_env_set(name: str) -> Set[str]:
+    raw = env_str(name, "")
+    if not raw:
+        return set()
+    return {normalize_token(x) for x in raw.split(",") if x.strip()}
+
+
+def load_blocked_destination_iatas() -> Set[str]:
+    env_iatas = load_csv_env_set("BLOCKED_DESTINATION_IATAS")
+    base = {normalize_token(x) for x in DEFAULT_BLOCKED_DESTINATION_IATAS}
+    return base.union(env_iatas)
+
+
+def load_blocked_country_aliases() -> Set[str]:
+    env_countries = load_csv_env_set("BLOCKED_DESTINATION_COUNTRIES")
+    base = {normalize_token(x) for x in DEFAULT_BLOCKED_COUNTRY_ALIASES}
+    return base.union(env_countries)
+
+
+def is_blocked_destination(
+    destination_iata: str,
+    destination_country: str,
+    blocked_iatas: Set[str],
+    blocked_countries: Set[str],
+) -> bool:
+    iata_key = normalize_token(destination_iata)
+    country_key = normalize_token(destination_country)
+    return (iata_key in blocked_iatas) or (country_key in blocked_countries)
 
 
 # ─────────────────────────────────────────────
@@ -439,7 +513,7 @@ def select_destinations(
     c_pool = [d for d in bucket_dests if d.liquidity_tier == "C"] if allow_c_tier else []
 
     selected: List[BucketDest] = []
-    seen: set[str] = set()
+    seen: Set[str] = set()
 
     def fill_from_pool(pool: List[BucketDest], target_n: int, seed_offset: int = 0) -> None:
         if not pool:
@@ -697,6 +771,27 @@ def build_search_candidates(
     ]
 
 
+def filter_blocked_candidates(
+    candidates: List[SearchCandidate],
+    blocked_iatas: Set[str],
+    blocked_countries: Set[str],
+    label: str,
+) -> List[SearchCandidate]:
+    kept: List[SearchCandidate] = []
+    blocked: List[str] = []
+
+    for c in candidates:
+        if is_blocked_destination(c.destination_iata, c.country, blocked_iatas, blocked_countries):
+            blocked.append(f"{c.destination_iata}({c.city}/{c.country})")
+        else:
+            kept.append(c)
+
+    if blocked:
+        print(f"🚫 Blocked {len(blocked)} candidate(s) from {label}: {blocked}")
+
+    return kept
+
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -719,13 +814,17 @@ def main() -> int:
     sleep_s = env_float("FEEDER_SLEEP_SECONDS", 0.1)
     cabin = env_str("CABIN_CLASS", "economy").lower()
 
-    # We want more candidate destinations than searches so thin buckets can retry
-    # without changing your spend too aggressively.
+    # More candidate destinations than searches so thin buckets can retry.
     candidate_multiplier = env_int("DUFFEL_CANDIDATE_MULTIPLIER", 2)
     candidates_per_bucket = max(dests_per_bucket, dests_per_bucket * candidate_multiplier)
 
+    blocked_iatas = load_blocked_destination_iatas()
+    blocked_countries = load_blocked_country_aliases()
+
     dix = day_index(run_slot)
     print(f"📅 Day index: {dix} | Slot: {run_slot}")
+    print(f"🚫 Blocked IATAs loaded: {len(blocked_iatas)}")
+    print(f"🚫 Blocked countries loaded: {sorted(blocked_countries)}")
 
     gc = gspread_client()
     sh = gc.open_by_key(env_str("SPREADSHEET_ID") or env_str("SHEET_ID"))
@@ -733,7 +832,9 @@ def main() -> int:
     ws_ops = sh.worksheet(ops_tab)
     theme_today = (get_cell(ws_ops, "B2") or "DEFAULT").strip()
     travel_p = params_for_theme(theme_today)
-    print(f"🎯 Theme (label): {theme_today}")
+    print(
+        f"🎯 Theme (label): {theme_today}"
+    )
     print(
         f"   Window: {travel_p.win_min}–{travel_p.win_max}d | "
         f"Trip: {travel_p.trip_min}–{travel_p.trip_max}d | "
@@ -763,7 +864,6 @@ def main() -> int:
     bucket_a_name = all_buckets.get(bucket_a, [BucketDest(bucket_a, "", "", "", "", "B")])[0].bucket_name
     bucket_b_name = all_buckets.get(bucket_b, [BucketDest(bucket_b, "", "", "", "", "B")])[0].bucket_name
 
-    # Allow a tiny bit of C-tier only when wildcard bucket is involved.
     allow_c_a = bucket_a == 6
     allow_c_b = bucket_b == 6
 
@@ -785,14 +885,26 @@ def main() -> int:
         allow_c_tier=allow_c_b,
     )
 
+    candidates_a = filter_blocked_candidates(
+        candidates=candidates_a,
+        blocked_iatas=blocked_iatas,
+        blocked_countries=blocked_countries,
+        label=f"bucket {bucket_a}",
+    )
+    candidates_b = filter_blocked_candidates(
+        candidates=candidates_b,
+        blocked_iatas=blocked_iatas,
+        blocked_countries=blocked_countries,
+        label=f"bucket {bucket_b}",
+    )
+
     if not candidates_a and not candidates_b:
-        print("⚠️  No destinations resolved. Exiting cleanly.")
+        print("⚠️  No destinations resolved after filters. Exiting cleanly.")
         return 0
 
     print(f"📍 Candidate destinations A ({len(candidates_a)}): {[f'{d.destination_iata}({d.city})' for d in candidates_a]}")
     print(f"📍 Candidate destinations B ({len(candidates_b)}): {[f'{d.destination_iata}({d.city})' for d in candidates_b]}")
 
-    # Midpoint of theme range
     trip_len = (travel_p.trip_min + travel_p.trip_max) // 2
 
     searches = 0
@@ -801,11 +913,11 @@ def main() -> int:
     london_used = 0
     pending_rows: List[List[Any]] = []
 
-    # Alternate between buckets so one strong bucket doesn't fully dominate the run.
     queue_a = list(candidates_a)
     queue_b = list(candidates_b)
     combined_queue: List[SearchCandidate] = []
     toggle = 0
+
     while queue_a or queue_b:
         if toggle % 2 == 0:
             if queue_a:

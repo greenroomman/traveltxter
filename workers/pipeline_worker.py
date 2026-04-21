@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
 workers/pipeline_worker.py
-TRAVELTXTTER V5 FEEDER — CONSTRAINED COVERAGE ENGINE
+TRAVELTXTTER V5 FEEDER — BALANCED COVERAGE ENGINE
 
 Architecture: Stratified bucket model with deterministic day-index rotation.
 Destination selection is geographic (bucket-driven), not theme-driven.
 Theme is read from OPS_MASTER and applied as a label to output rows only.
 
-Key changes from v1:
-- Bucket model replaces theme-gated CONFIG destination selection
-- Day-index deterministic rotation (no randomness)
-- London dominance control via modulo constraint (≤40% share)
-- Dedupe reads last N rows only (not full sheet)
-- Single batch write at end of run
-- Run summary logging to console (structured for future metrics tab)
+This version keeps the original oilpan contract but reduces the Europe bias by:
+- Removing the "EU every run" anchor
+- Increasing non-EU bucket representation in the run schedule
+- Retrying within a bucket when an offer fails
+- Allowing 2 stops for long-haul / wildcard buckets only
+- Selecting more candidate destinations than strict search count so thin buckets
+  have a chance to survive without increasing total API spend too aggressively
 
 Oilpan contracts preserved:
 - Only writes to RAW_DEALS
@@ -30,7 +30,7 @@ import time
 import math
 import hashlib
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -91,8 +91,15 @@ def _sanitize_sa_json(raw: str) -> str:
                 pk_prefix = '": "'
             key_body, after = krest.split("-----END PRIVATE KEY-----", 1)
             key_body = key_body.replace("\r", "").replace("\n", "\\n")
-            repaired = (before + '"private_key"' + k1 + pk_prefix
-                        + key_body + "-----END PRIVATE KEY-----" + after)
+            repaired = (
+                before
+                + '"private_key"'
+                + k1
+                + pk_prefix
+                + key_body
+                + "-----END PRIVATE KEY-----"
+                + after
+            )
             json.loads(repaired)
             return repaired
         except Exception:
@@ -125,10 +132,12 @@ def get_cell(ws: gspread.Worksheet, a1: str) -> str:
 # ─────────────────────────────────────────────
 
 def _utc_iso() -> str:
-    return (dt.datetime.now(dt.timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z"))
+    return (
+        dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 # ─────────────────────────────────────────────
@@ -155,6 +164,7 @@ def day_index(run_slot: str) -> int:
 DUFFEL_API = "https://api.duffel.com/air/offer_requests"
 
 LONDON_AIRPORTS = {"LHR", "LGW", "LCY"}
+LONG_HAUL_BUCKET_IDS = {4, 5, 6}
 
 
 def duffel_headers() -> Dict[str, str]:
@@ -189,8 +199,12 @@ def _pick_dates(dix: int, win_min: int, win_max: int, trip_days: int) -> Tuple[s
 
 
 def duffel_search(
-    origin: str, dest: str, out_date: str, ret_date: str,
-    cabin: str, max_connections: int
+    origin: str,
+    dest: str,
+    out_date: str,
+    ret_date: str,
+    cabin: str,
+    max_connections: int,
 ) -> Optional[Dict[str, Any]]:
     payload = {
         "data": {
@@ -363,13 +377,12 @@ def load_origins(ws_origins: gspread.Worksheet) -> Dict[int, List[OriginAirport]
 
 # bucket_id → max_origin_tier allowed
 BUCKET_MAX_TIER: Dict[int, int] = {
-    1: 3,  # EU High Volume     — all tiers
-    2: 3,  # EU Secondary       — all tiers
-    3: 2,  # Near Long-Haul     — Tier 1 + 2 only
-    4: 1,  # Long-Haul US/CA    — Tier 1 only
-    5: 1,  # Long-Haul Asia/ME  — Tier 1 only
-    6: 1,  # Seasonal/Wildcard  — Tier 1 only
-             # UIO/HNL/SYD unreachable from Tier 2 airports at viable prices.
+    1: 3,  # EU High Volume
+    2: 3,  # EU Secondary
+    3: 2,  # Near Long-Haul
+    4: 1,  # Long-Haul US/CA
+    5: 1,  # Long-Haul Asia/ME
+    6: 1,  # Seasonal/Wildcard
 }
 
 
@@ -379,21 +392,20 @@ def eligible_tiers_for_bucket(bucket_id: int) -> List[int]:
 
 
 # ─────────────────────────────────────────────
-# BUCKET ROTATION (STRATIFIED)
+# BUCKET ROTATION (BALANCED)
 # ─────────────────────────────────────────────
 
-# Each run gets 2 buckets: primary + secondary.
-# Pairs cycle across 6 days covering all 6 buckets.
+# Old logic anchored every run in Europe.
+# New logic still keeps Europe in the mix, but not as a compulsory anchor.
 BUCKET_PAIRS = [
-    (1, 4),  # Run 0 — EU High Volume    + US/Canada
-    (2, 5),  # Run 1 — EU Secondary      + Asia/ME
-    (1, 3),  # Run 2 — EU High Volume    + Near Long-Haul
-    (2, 4),  # Run 3 — EU Secondary      + US/Canada
-    (1, 5),  # Run 4 — EU High Volume    + Asia/ME
-    (2, 6),  # Run 5 — EU Secondary      + Seasonal/Wildcard
-    # Rule: B1 or B2 always anchors every run.
-    # EU anchor guarantees viable offers. Thin buckets (B3-B6)
-    # ride alongside, never paired with each other.
+    (1, 4),  # EU High Volume + US/Canada
+    (2, 5),  # EU Secondary   + Asia/ME
+    (3, 4),  # Near Long-Haul + US/Canada
+    (4, 5),  # US/Canada      + Asia/ME
+    (5, 6),  # Asia/ME        + Seasonal/Wildcard
+    (3, 5),  # Near Long-Haul + Asia/ME
+    (1, 6),  # EU High Volume + Seasonal/Wildcard
+    (2, 4),  # EU Secondary   + US/Canada
 ]
 
 
@@ -410,49 +422,42 @@ def select_destinations(
     bucket_dests: List[BucketDest],
     dix: int,
     n: int,
+    allow_c_tier: bool = False,
 ) -> List[BucketDest]:
     """
-    Deterministic rotation within bucket — tier-isolated.
+    Deterministic rotation within bucket.
 
-    Rotates within A-tier pool first, then B-tier pool.
-    C-tier destinations are NEVER selected by rotation.
-    They exist in CONFIG_BUCKETS for reference but are structural
-    no-offers on most UK origin × long-haul destination combinations.
-
-    This prevents the engine landing on Yellowknife or Whitehorse
-    simply because the dix value modulos into the C-tier index range.
+    A-tier rotates first, B-tier second.
+    C-tier is normally excluded, but can optionally be allowed in tiny doses for
+    wildcard discovery without making the engine collapse into no-offer territory.
     """
     if not bucket_dests:
         return []
 
     a_pool = [d for d in bucket_dests if d.liquidity_tier == "A"]
     b_pool = [d for d in bucket_dests if d.liquidity_tier == "B"]
-    # C-tier excluded from rotation entirely
+    c_pool = [d for d in bucket_dests if d.liquidity_tier == "C"] if allow_c_tier else []
 
     selected: List[BucketDest] = []
-    seen: set = set()
+    seen: set[str] = set()
 
-    # Fill from A-tier first — rotate within A pool only
-    if a_pool:
-        for i in range(n):
-            idx = (dix + i) % len(a_pool)
-            dest = a_pool[idx]
+    def fill_from_pool(pool: List[BucketDest], target_n: int, seed_offset: int = 0) -> None:
+        if not pool:
+            return
+        for i in range(max(target_n * 2, len(pool))):
+            idx = (dix + seed_offset + i) % len(pool)
+            dest = pool[idx]
             if dest.destination_iata not in seen:
                 selected.append(dest)
                 seen.add(dest.destination_iata)
-            if len(selected) >= n:
-                break
+            if len(selected) >= target_n:
+                return
 
-    # Fill remainder from B-tier — rotate within B pool only
-    if len(selected) < n and b_pool:
-        for i in range(n):
-            idx = (dix + i) % len(b_pool)
-            dest = b_pool[idx]
-            if dest.destination_iata not in seen:
-                selected.append(dest)
-                seen.add(dest.destination_iata)
-            if len(selected) >= n:
-                break
+    fill_from_pool(a_pool, n, 0)
+    if len(selected) < n:
+        fill_from_pool(b_pool, n, 100)
+    if len(selected) < n and c_pool:
+        fill_from_pool(c_pool, n, 200)
 
     return selected[:n]
 
@@ -466,8 +471,6 @@ def select_origin(
     bucket_id: int,
     dix: int,
     slot_offset: int,
-    london_count: int,
-    total_count: int,
 ) -> Optional[str]:
     """
     Selects one origin for a search:
@@ -481,18 +484,15 @@ def select_origin(
     """
     eligible = eligible_tiers_for_bucket(bucket_id)
 
-    # Tier probability weights
     tier_weights = {1: 0.50, 2: 0.35, 3: 0.15}
-
-    # Normalise to eligible tiers only
     total_w = sum(tier_weights.get(t, 0) for t in eligible if t in tier_airports)
     if total_w == 0:
         return None
 
-    # Deterministic tier pick: use dix + slot_offset to cycle
     tier_seed = (dix + slot_offset) % 100
     cumulative = 0.0
     chosen_tier = eligible[0]
+
     for t in sorted(eligible):
         if t not in tier_airports:
             continue
@@ -505,20 +505,15 @@ def select_origin(
     if not pool:
         return None
 
-    # Deterministic rotation within tier
     airport = pool[(dix + slot_offset) % len(pool)]
     iata = airport.airport_iata
 
-    # London modulo constraint: only allow LHR/LGW every 3rd rotation
-    # This keeps London share ≤ 33% deterministically
     if iata in LONDON_AIRPORTS:
         if dix % 3 != 0:
-            # Try next airport in tier that isn't London
             for i in range(1, len(pool)):
                 alt = pool[(dix + slot_offset + i) % len(pool)]
                 if alt.airport_iata not in LONDON_AIRPORTS:
                     return alt.airport_iata
-            # All airports in tier are London — allow it
             return iata
 
     return iata
@@ -544,7 +539,6 @@ def load_dedupe_set(ws_raw: gspread.Worksheet, lookback_rows: int) -> set:
         i = hm.get(name)
         return (row[i] if (i is not None and i < len(row)) else "").strip()
 
-    # Take only last N data rows
     data_rows = all_values[1:]
     if len(data_rows) > lookback_rows:
         data_rows = data_rows[-lookback_rows:]
@@ -574,12 +568,33 @@ def append_rows_bulk(ws_raw: gspread.Worksheet, rows: List[List[Any]]) -> None:
 # ─────────────────────────────────────────────
 
 RAW_HEADERS_REQUIRED = [
-    "deal_id", "origin_iata", "destination_iata", "origin_city",
-    "destination_city", "destination_country", "outbound_date", "return_date",
-    "price_gbp", "currency", "stops", "cabin_class", "carriers", "theme",
-    "status", "publish_window", "score", "bags_incl", "graphic_url",
-    "booking_link_vip", "posted_vip_at", "posted_free_at", "posted_instagram_at",
-    "ingested_at_utc", "phrase_used", "phrase_category", "scored_timestamp",
+    "deal_id",
+    "origin_iata",
+    "destination_iata",
+    "origin_city",
+    "destination_city",
+    "destination_country",
+    "outbound_date",
+    "return_date",
+    "price_gbp",
+    "currency",
+    "stops",
+    "cabin_class",
+    "carriers",
+    "theme",
+    "status",
+    "publish_window",
+    "score",
+    "bags_incl",
+    "graphic_url",
+    "booking_link_vip",
+    "posted_vip_at",
+    "posted_free_at",
+    "posted_instagram_at",
+    "ingested_at_utc",
+    "phrase_used",
+    "phrase_category",
+    "scored_timestamp",
 ]
 
 
@@ -609,17 +624,17 @@ class TravelParams:
 
 THEME_PARAMS: Dict[str, TravelParams] = {
     "northern_lights": TravelParams(win_min=14, win_max=60, trip_min=4, trip_max=8, max_stops=1),
-    "snow":            TravelParams(win_min=21, win_max=90, trip_min=5, trip_max=10, max_stops=1),
-    "city_breaks":     TravelParams(win_min=14, win_max=60, trip_min=3, trip_max=5, max_stops=0),
-    "beach_break":     TravelParams(win_min=21, win_max=90, trip_min=5, trip_max=10, max_stops=1),
-    "summer_sun":      TravelParams(win_min=30, win_max=120, trip_min=7, trip_max=14, max_stops=1),
-    "winter_sun":      TravelParams(win_min=14, win_max=90, trip_min=5, trip_max=10, max_stops=1),
-    "surf":            TravelParams(win_min=21, win_max=90, trip_min=7, trip_max=14, max_stops=1),
-    "adventure":       TravelParams(win_min=30, win_max=120, trip_min=7, trip_max=14, max_stops=2),
-    "luxury_value":    TravelParams(win_min=30, win_max=120, trip_min=7, trip_max=14, max_stops=1),
-    "long_haul":       TravelParams(win_min=30, win_max=120, trip_min=7, trip_max=14, max_stops=1),
-    "unexpected_value":TravelParams(win_min=14, win_max=60, trip_min=3, trip_max=7, max_stops=1),
-    "hub":             TravelParams(win_min=21, win_max=90, trip_min=5, trip_max=10, max_stops=0),
+    "snow": TravelParams(win_min=21, win_max=90, trip_min=5, trip_max=10, max_stops=1),
+    "city_breaks": TravelParams(win_min=14, win_max=60, trip_min=3, trip_max=5, max_stops=0),
+    "beach_break": TravelParams(win_min=21, win_max=90, trip_min=5, trip_max=10, max_stops=1),
+    "summer_sun": TravelParams(win_min=30, win_max=120, trip_min=7, trip_max=14, max_stops=1),
+    "winter_sun": TravelParams(win_min=14, win_max=90, trip_min=5, trip_max=10, max_stops=1),
+    "surf": TravelParams(win_min=21, win_max=90, trip_min=7, trip_max=14, max_stops=1),
+    "adventure": TravelParams(win_min=30, win_max=120, trip_min=7, trip_max=14, max_stops=2),
+    "luxury_value": TravelParams(win_min=30, win_max=120, trip_min=7, trip_max=14, max_stops=1),
+    "long_haul": TravelParams(win_min=30, win_max=120, trip_min=7, trip_max=14, max_stops=1),
+    "unexpected_value": TravelParams(win_min=14, win_max=60, trip_min=3, trip_max=7, max_stops=1),
+    "hub": TravelParams(win_min=21, win_max=90, trip_min=5, trip_max=10, max_stops=0),
 }
 
 DEFAULT_PARAMS = TravelParams()
@@ -629,13 +644,66 @@ def params_for_theme(theme: str) -> TravelParams:
     return THEME_PARAMS.get(theme.lower(), DEFAULT_PARAMS)
 
 
+def max_connections_for_bucket(bucket_id: int, travel_p: TravelParams) -> int:
+    """
+    Long-haul / wildcard buckets need more flexibility.
+    Keep Europe tight; loosen long-haul just enough to produce survivable offers.
+    """
+    if bucket_id in LONG_HAUL_BUCKET_IDS:
+        return max(2, travel_p.max_stops)
+    return travel_p.max_stops
+
+
+# ─────────────────────────────────────────────
+# SEARCH PLAN
+# ─────────────────────────────────────────────
+
+@dataclass
+class SearchCandidate:
+    bucket_id: int
+    bucket_name: str
+    destination_iata: str
+    city: str
+    country: str
+    liquidity_tier: str
+    candidate_index: int
+
+
+def build_search_candidates(
+    bucket_id: int,
+    bucket_name: str,
+    bucket_dests: List[BucketDest],
+    dix: int,
+    desired_count: int,
+    allow_c_tier: bool,
+) -> List[SearchCandidate]:
+    selected = select_destinations(
+        bucket_dests=bucket_dests,
+        dix=dix,
+        n=desired_count,
+        allow_c_tier=allow_c_tier,
+    )
+    return [
+        SearchCandidate(
+            bucket_id=bucket_id,
+            bucket_name=bucket_name,
+            destination_iata=d.destination_iata,
+            city=d.city,
+            country=d.country,
+            liquidity_tier=d.liquidity_tier,
+            candidate_index=i,
+        )
+        for i, d in enumerate(selected)
+    ]
+
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
 def main() -> int:
     print("=" * 70)
-    print("TRAVELTXTTER V5 — FEEDER — CONSTRAINED COVERAGE ENGINE")
+    print("TRAVELTXTTER V5 — FEEDER — BALANCED COVERAGE ENGINE")
     print("=" * 70)
 
     run_slot = env_str("RUN_SLOT", "PM").upper()
@@ -651,23 +719,27 @@ def main() -> int:
     sleep_s = env_float("FEEDER_SLEEP_SECONDS", 0.1)
     cabin = env_str("CABIN_CLASS", "economy").lower()
 
+    # We want more candidate destinations than searches so thin buckets can retry
+    # without changing your spend too aggressively.
+    candidate_multiplier = env_int("DUFFEL_CANDIDATE_MULTIPLIER", 2)
+    candidates_per_bucket = max(dests_per_bucket, dests_per_bucket * candidate_multiplier)
+
     dix = day_index(run_slot)
     print(f"📅 Day index: {dix} | Slot: {run_slot}")
 
-    # ── Connect ──
     gc = gspread_client()
     sh = gc.open_by_key(env_str("SPREADSHEET_ID") or env_str("SHEET_ID"))
 
-    # ── Theme (label only — does not gate destinations) ──
     ws_ops = sh.worksheet(ops_tab)
     theme_today = (get_cell(ws_ops, "B2") or "DEFAULT").strip()
     travel_p = params_for_theme(theme_today)
     print(f"🎯 Theme (label): {theme_today}")
-    print(f"   Window: {travel_p.win_min}–{travel_p.win_max}d | "
-          f"Trip: {travel_p.trip_min}–{travel_p.trip_max}d | "
-          f"Max stops: {travel_p.max_stops}")
+    print(
+        f"   Window: {travel_p.win_min}–{travel_p.win_max}d | "
+        f"Trip: {travel_p.trip_min}–{travel_p.trip_max}d | "
+        f"Base max stops: {travel_p.max_stops}"
+    )
 
-    # ── Load sheets ──
     ws_raw = sh.worksheet(raw_tab)
     ensure_headers(ws_raw)
     dedupe = load_dedupe_set(ws_raw, lookback_rows)
@@ -685,48 +757,91 @@ def main() -> int:
         print("❌ CONFIG_ORIGINS is empty or missing. Exiting.")
         return 1
 
-    # ── Select buckets for this run ──
     bucket_a, bucket_b = select_buckets(dix)
     print(f"🪣 Buckets this run: {bucket_a} + {bucket_b}")
 
-    # ── Select destinations ──
-    dests_a = select_destinations(all_buckets.get(bucket_a, []), dix, dests_per_bucket)
-    dests_b = select_destinations(all_buckets.get(bucket_b, []), dix + 100, dests_per_bucket)
-    all_dests = dests_a + dests_b
+    bucket_a_name = all_buckets.get(bucket_a, [BucketDest(bucket_a, "", "", "", "", "B")])[0].bucket_name
+    bucket_b_name = all_buckets.get(bucket_b, [BucketDest(bucket_b, "", "", "", "", "B")])[0].bucket_name
 
-    if not all_dests:
+    # Allow a tiny bit of C-tier only when wildcard bucket is involved.
+    allow_c_a = bucket_a == 6
+    allow_c_b = bucket_b == 6
+
+    candidates_a = build_search_candidates(
+        bucket_id=bucket_a,
+        bucket_name=bucket_a_name,
+        bucket_dests=all_buckets.get(bucket_a, []),
+        dix=dix,
+        desired_count=candidates_per_bucket,
+        allow_c_tier=allow_c_a,
+    )
+
+    candidates_b = build_search_candidates(
+        bucket_id=bucket_b,
+        bucket_name=bucket_b_name,
+        bucket_dests=all_buckets.get(bucket_b, []),
+        dix=dix + 100,
+        desired_count=candidates_per_bucket,
+        allow_c_tier=allow_c_b,
+    )
+
+    if not candidates_a and not candidates_b:
         print("⚠️  No destinations resolved. Exiting cleanly.")
         return 0
 
-    dest_names = [f"{d.destination_iata}({d.city})" for d in all_dests]
-    print(f"📍 Destinations ({len(all_dests)}): {dest_names}")
+    print(f"📍 Candidate destinations A ({len(candidates_a)}): {[f'{d.destination_iata}({d.city})' for d in candidates_a]}")
+    print(f"📍 Candidate destinations B ({len(candidates_b)}): {[f'{d.destination_iata}({d.city})' for d in candidates_b]}")
 
-    # ── Trip length (midpoint of theme range) ──
+    # Midpoint of theme range
     trip_len = (travel_p.trip_min + travel_p.trip_max) // 2
 
-    # ── Search loop ──
     searches = 0
     no_offer = 0
     dedupe_skips = 0
     london_used = 0
     pending_rows: List[List[Any]] = []
 
+    # Alternate between buckets so one strong bucket doesn't fully dominate the run.
+    queue_a = list(candidates_a)
+    queue_b = list(candidates_b)
+    combined_queue: List[SearchCandidate] = []
+    toggle = 0
+    while queue_a or queue_b:
+        if toggle % 2 == 0:
+            if queue_a:
+                combined_queue.append(queue_a.pop(0))
+            elif queue_b:
+                combined_queue.append(queue_b.pop(0))
+        else:
+            if queue_b:
+                combined_queue.append(queue_b.pop(0))
+            elif queue_a:
+                combined_queue.append(queue_a.pop(0))
+        toggle += 1
+
     print("=" * 70)
 
-    for slot_offset, dest in enumerate(all_dests):
+    for slot_offset, dest in enumerate(combined_queue):
         if searches >= max_searches or len(pending_rows) >= max_inserts:
             break
 
         origin = select_origin(
-            tier_airports, dest.bucket_id, dix,
-            slot_offset, london_used, searches
+            tier_airports=tier_airports,
+            bucket_id=dest.bucket_id,
+            dix=dix,
+            slot_offset=slot_offset,
         )
 
         if not origin:
             print(f"⚠️  No eligible origin for bucket {dest.bucket_id}. Skipping {dest.destination_iata}.")
             continue
 
-        out_date, ret_date = _pick_dates(dix + slot_offset, travel_p.win_min, travel_p.win_max, trip_len)
+        out_date, ret_date = _pick_dates(
+            dix + slot_offset,
+            travel_p.win_min,
+            travel_p.win_max,
+            trip_len,
+        )
         trip_key = (origin, dest.destination_iata, out_date, ret_date)
 
         if trip_key in dedupe:
@@ -739,17 +854,26 @@ def main() -> int:
 
         searches += 1
         bucket_label = f"[B{dest.bucket_id}:{dest.bucket_name}]"
-        print(f"🔎 Search {searches}/{max_searches} {origin}→{dest.destination_iata} "
-              f"{out_date}/{ret_date} {bucket_label}")
+        max_conn = max_connections_for_bucket(dest.bucket_id, travel_p)
+
+        print(
+            f"🔎 Search {searches}/{max_searches} "
+            f"{origin}→{dest.destination_iata} {out_date}/{ret_date} "
+            f"{bucket_label} | liquidity={dest.liquidity_tier} | max_conn={max_conn}"
+        )
 
         offer = duffel_search(
-            origin, dest.destination_iata, out_date, ret_date,
-            cabin=cabin, max_connections=travel_p.max_stops
+            origin=origin,
+            dest=dest.destination_iata,
+            out_date=out_date,
+            ret_date=ret_date,
+            cabin=cabin,
+            max_connections=max_conn,
         )
 
         if not offer:
             no_offer += 1
-            print(f"   ❌ No offer")
+            print("   ❌ No offer")
             time.sleep(sleep_s)
             continue
 
@@ -758,41 +882,42 @@ def main() -> int:
         print(f"   ✅ £{price_gbp} ({dest.city}, {dest.country})")
 
         row_map: Dict[str, Any] = {h: "" for h in RAW_HEADERS_REQUIRED}
-        row_map.update({
-            "deal_id": offer.get("id") or _hash_trip(origin, dest.destination_iata, out_date, ret_date),
-            "origin_iata": origin,
-            "destination_iata": dest.destination_iata,
-            "origin_city": "",
-            "destination_city": dest.city,
-            "destination_country": dest.country,
-            "outbound_date": out_date,
-            "return_date": ret_date,
-            "price_gbp": price_gbp,
-            "currency": currency,
-            "stops": extract_stops(offer),
-            "cabin_class": extract_cabin_class(offer, fallback=cabin),
-            "carriers": extract_carriers(offer),
-            "theme": theme_today,
-            "status": "NEW",
-            "publish_window": "",
-            "score": "",
-            "bags_incl": extract_bags_included(offer),
-            "graphic_url": "",
-            "booking_link_vip": "",
-            "posted_vip_at": "",
-            "posted_free_at": "",
-            "posted_instagram_at": "",
-            "ingested_at_utc": _utc_iso(),
-            "phrase_used": "",
-            "phrase_category": "",
-            "scored_timestamp": "",
-        })
+        row_map.update(
+            {
+                "deal_id": offer.get("id") or _hash_trip(origin, dest.destination_iata, out_date, ret_date),
+                "origin_iata": origin,
+                "destination_iata": dest.destination_iata,
+                "origin_city": "",
+                "destination_city": dest.city,
+                "destination_country": dest.country,
+                "outbound_date": out_date,
+                "return_date": ret_date,
+                "price_gbp": price_gbp,
+                "currency": currency,
+                "stops": extract_stops(offer),
+                "cabin_class": extract_cabin_class(offer, fallback=cabin),
+                "carriers": extract_carriers(offer),
+                "theme": theme_today,
+                "status": "NEW",
+                "publish_window": "",
+                "score": "",
+                "bags_incl": extract_bags_included(offer),
+                "graphic_url": "",
+                "booking_link_vip": "",
+                "posted_vip_at": "",
+                "posted_free_at": "",
+                "posted_instagram_at": "",
+                "ingested_at_utc": _utc_iso(),
+                "phrase_used": "",
+                "phrase_category": "",
+                "scored_timestamp": "",
+            }
+        )
 
         pending_rows.append([row_map[h] for h in RAW_HEADERS_REQUIRED])
         dedupe.add(trip_key)
         time.sleep(sleep_s)
 
-    # ── Single batch write ──
     print("=" * 70)
     if pending_rows:
         append_rows_bulk(ws_raw, pending_rows)
@@ -800,13 +925,12 @@ def main() -> int:
     else:
         print("⚠️  No rows inserted this run.")
 
-    # ── Run summary (structured for future metrics tab) ──
     london_pct = round(london_used / max(1, searches) * 100, 1)
     offer_rate = round((searches - no_offer) / max(1, searches) * 100, 1)
-    unique_dests = len({r[RAW_HEADERS_REQUIRED.index("destination_iata")] for r in pending_rows})
-    unique_origins = len({r[RAW_HEADERS_REQUIRED.index("origin_iata")] for r in pending_rows})
+    unique_dests = len({r[RAW_HEADERS_REQUIRED.index('destination_iata')] for r in pending_rows})
+    unique_origins = len({r[RAW_HEADERS_REQUIRED.index('origin_iata')] for r in pending_rows})
 
-    print(f"\n📊 RUN SUMMARY")
+    print("\n📊 RUN SUMMARY")
     print(f"   slot={run_slot} | day_index={dix}")
     print(f"   buckets={bucket_a}+{bucket_b}")
     print(f"   searches={searches} | inserted={len(pending_rows)}")

@@ -7,18 +7,11 @@ Architecture: Stratified bucket model with deterministic day-index rotation.
 Destination selection is geographic (bucket-driven), not theme-driven.
 Theme is read from OPS_MASTER and applied as a label to output rows only.
 
-This version keeps the original oilpan contract but reduces Europe bias by:
-- Removing the "EU every run" anchor
-- Increasing non-EU bucket representation in the run schedule
-- Retrying within a bucket when an offer fails
-- Allowing 2 stops for long-haul / wildcard buckets only
-- Selecting more candidate destinations than strict search count so thin buckets
-  have a chance to survive without increasing total API spend too aggressively
-
-This version also adds conflict filtering at feeder level:
-- Default blocked destination countries for current Middle East conflict exposure
-- Optional blocked destination IATA denylist
-- Optional env overrides for both
+This version fixes:
+- Europe bias from permanent EU anchoring
+- no-retry failure on transient Google Sheets outages
+- conflict-affected Middle East destinations polluting RAW_DEALS
+- thin-bucket fragility by over-selecting candidates and alternating queues
 
 Oilpan contracts preserved:
 - Only writes to RAW_DEALS
@@ -36,11 +29,14 @@ import math
 import hashlib
 import datetime as dt
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set, Callable, TypeVar
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+
+
+T = TypeVar("T")
 
 
 # ─────────────────────────────────────────────
@@ -64,6 +60,58 @@ def env_float(name: str, default: float) -> float:
 def env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else str(v).strip()
+
+
+# ─────────────────────────────────────────────
+# RETRY HELPERS
+# ─────────────────────────────────────────────
+
+RETRYABLE_MARKERS = [
+    "503",
+    "429",
+    "500",
+    "502",
+    "504",
+    "service is currently unavailable",
+    "rate limit",
+    "quota exceeded",
+    "backend error",
+    "temporarily unavailable",
+]
+
+
+def is_retryable_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in RETRYABLE_MARKERS)
+
+
+def retry_call(
+    fn: Callable[[], T],
+    label: str,
+    attempts: int = 5,
+    base_sleep: float = 2.0,
+) -> T:
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_err = exc
+            retryable = is_retryable_error(exc)
+
+            if (not retryable) or attempt == attempts:
+                print(f"❌ {label} failed on attempt {attempt}/{attempts}: {exc}")
+                raise
+
+            sleep_for = base_sleep * attempt
+            print(f"⚠️  {label} failed on attempt {attempt}/{attempts}: {exc}")
+            print(f"   Retrying in {sleep_for:.1f}s...")
+            time.sleep(sleep_for)
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"{label} failed unexpectedly with no captured exception.")
 
 
 # ─────────────────────────────────────────────
@@ -97,13 +145,8 @@ def _sanitize_sa_json(raw: str) -> str:
             key_body, after = krest.split("-----END PRIVATE KEY-----", 1)
             key_body = key_body.replace("\r", "").replace("\n", "\\n")
             repaired = (
-                before
-                + '"private_key"'
-                + k1
-                + pk_prefix
-                + key_body
-                + "-----END PRIVATE KEY-----"
-                + after
+                before + '"private_key"' + k1 + pk_prefix
+                + key_body + "-----END PRIVATE KEY-----" + after
             )
             json.loads(repaired)
             return repaired
@@ -119,7 +162,8 @@ def gspread_client() -> gspread.Client:
     raw = _sanitize_sa_json(raw)
     info = json.loads(raw)
     creds = Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return gspread.authorize(creds)
 
@@ -171,7 +215,6 @@ DUFFEL_API = "https://api.duffel.com/air/offer_requests"
 LONDON_AIRPORTS = {"LHR", "LGW", "LCY"}
 LONG_HAUL_BUCKET_IDS = {4, 5, 6}
 
-# Default conflict filters for current Middle East risk footprint.
 DEFAULT_BLOCKED_DESTINATION_IATAS = {
     "AUH", "BAH", "BEY", "BGW", "BND", "BSR",
     "DMM", "DOH", "DWC", "DXB", "EBL", "IKA",
@@ -215,10 +258,6 @@ def _hash_trip(origin: str, dest: str, out_date: str, ret_date: str) -> str:
 
 
 def _pick_dates(dix: int, win_min: int, win_max: int, trip_days: int) -> Tuple[str, str]:
-    """
-    Deterministic date selection based on day_index.
-    No random — same dix always returns same dates.
-    """
     span = max(1, win_max - win_min)
     depart_offset = win_min + (dix % span)
     out_epoch = int(time.time()) + depart_offset * 86400
@@ -249,7 +288,12 @@ def duffel_search(
         }
     }
     try:
-        resp = requests.post(DUFFEL_API, headers=duffel_headers(), json=payload, timeout=45)
+        resp = requests.post(
+            DUFFEL_API,
+            headers=duffel_headers(),
+            json=payload,
+            timeout=45,
+        )
         if resp.status_code >= 400:
             return None
         data = resp.json().get("data", {})
@@ -379,7 +423,10 @@ class BucketDest:
 
 
 def load_buckets(ws_buckets: gspread.Worksheet) -> Dict[int, List[BucketDest]]:
-    rows = ws_buckets.get_all_records()
+    rows = retry_call(
+        lambda: ws_buckets.get_all_records(),
+        label=f"read records from worksheet {ws_buckets.title}",
+    )
     buckets: Dict[int, List[BucketDest]] = {}
     for r in rows:
         enabled = str(r.get("enabled", "")).strip().upper() in ("TRUE", "1", "YES", "Y")
@@ -418,7 +465,10 @@ class OriginAirport:
 
 
 def load_origins(ws_origins: gspread.Worksheet) -> Dict[int, List[OriginAirport]]:
-    rows = ws_origins.get_all_records()
+    rows = retry_call(
+        lambda: ws_origins.get_all_records(),
+        label=f"read records from worksheet {ws_origins.title}",
+    )
     tiers: Dict[int, List[OriginAirport]] = {}
     for r in rows:
         enabled = str(r.get("enabled", "")).strip().upper() in ("TRUE", "1", "YES", "Y")
@@ -569,7 +619,11 @@ def select_origin(
 # ─────────────────────────────────────────────
 
 def load_dedupe_set(ws_raw: gspread.Worksheet, lookback_rows: int) -> set:
-    all_values = ws_raw.get_all_values()
+    all_values = retry_call(
+        lambda: ws_raw.get_all_values(),
+        label=f"read values from worksheet {ws_raw.title}",
+    )
+
     if len(all_values) < 2:
         return set()
 
@@ -601,7 +655,10 @@ def load_dedupe_set(ws_raw: gspread.Worksheet, lookback_rows: int) -> set:
 
 def append_rows_bulk(ws_raw: gspread.Worksheet, rows: List[List[Any]]) -> None:
     if rows:
-        ws_raw.append_rows(rows, value_input_option="USER_ENTERED")
+        retry_call(
+            lambda: ws_raw.append_rows(rows, value_input_option="USER_ENTERED"),
+            label=f"append rows to worksheet {ws_raw.title}",
+        )
 
 
 # ─────────────────────────────────────────────
@@ -640,7 +697,11 @@ RAW_HEADERS_REQUIRED = [
 
 
 def ensure_headers(ws: gspread.Worksheet) -> Dict[str, int]:
-    hm = {str(h).strip(): i for i, h in enumerate(ws.row_values(1))}
+    header_row = retry_call(
+        lambda: ws.row_values(1),
+        label=f"read header row from worksheet {ws.title}",
+    )
+    hm = {str(h).strip(): i for i, h in enumerate(header_row)}
     missing = [h for h in RAW_HEADERS_REQUIRED if h not in hm]
     if missing:
         raise RuntimeError(f"{ws.title} missing required headers: {missing}")
@@ -786,10 +847,26 @@ def main() -> int:
     print(f"🚫 Blocked IATAs loaded: {len(blocked_iatas)}")
     print(f"🚫 Blocked countries loaded: {sorted(blocked_countries)}")
 
-    gc = gspread_client()
-    sh = gc.open_by_key(env_str("SPREADSHEET_ID") or env_str("SHEET_ID"))
+    # ── Connect ──
+    gc = retry_call(
+        gspread_client,
+        label="authorise gspread client",
+    )
 
-    ws_ops = sh.worksheet(ops_tab)
+    spreadsheet_key = env_str("SPREADSHEET_ID") or env_str("SHEET_ID")
+    if not spreadsheet_key:
+        raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID.")
+
+    sh = retry_call(
+        lambda: gc.open_by_key(spreadsheet_key),
+        label=f"open spreadsheet {spreadsheet_key}",
+    )
+
+    # ── Theme ──
+    ws_ops = retry_call(
+        lambda: sh.worksheet(ops_tab),
+        label=f"open worksheet {ops_tab}",
+    )
     theme_today = (get_cell(ws_ops, "B2") or "DEFAULT").strip()
     travel_p = params_for_theme(theme_today)
     print(f"🎯 Theme (label): {theme_today}")
@@ -799,23 +876,34 @@ def main() -> int:
         f"Base max stops: {travel_p.max_stops}"
     )
 
-    ws_raw = sh.worksheet(raw_tab)
+    # ── Load sheets ──
+    ws_raw = retry_call(
+        lambda: sh.worksheet(raw_tab),
+        label=f"open worksheet {raw_tab}",
+    )
     ensure_headers(ws_raw)
     dedupe = load_dedupe_set(ws_raw, lookback_rows)
     print(f"🔍 Dedupe set loaded: {len(dedupe)} recent trips")
 
-    ws_buckets = sh.worksheet(buckets_tab)
+    ws_buckets = retry_call(
+        lambda: sh.worksheet(buckets_tab),
+        label=f"open worksheet {buckets_tab}",
+    )
     all_buckets = load_buckets(ws_buckets)
     if not all_buckets:
         print("❌ CONFIG_BUCKETS is empty or missing. Exiting.")
         return 1
 
-    ws_origins = sh.worksheet(origins_tab)
+    ws_origins = retry_call(
+        lambda: sh.worksheet(origins_tab),
+        label=f"open worksheet {origins_tab}",
+    )
     tier_airports = load_origins(ws_origins)
     if not tier_airports:
         print("❌ CONFIG_ORIGINS is empty or missing. Exiting.")
         return 1
 
+    # ── Select buckets for this run ──
     bucket_a, bucket_b = select_buckets(dix)
     print(f"🪣 Buckets this run: {bucket_a} + {bucket_b}")
 
@@ -865,6 +953,7 @@ def main() -> int:
 
     trip_len = (travel_p.trip_min + travel_p.trip_max) // 2
 
+    # ── Search loop ──
     searches = 0
     no_offer = 0
     dedupe_skips = 0
@@ -988,6 +1077,7 @@ def main() -> int:
         dedupe.add(trip_key)
         time.sleep(sleep_s)
 
+    # ── Single batch write ──
     print("=" * 70)
     if pending_rows:
         append_rows_bulk(ws_raw, pending_rows)
@@ -995,6 +1085,7 @@ def main() -> int:
     else:
         print("⚠️  No rows inserted this run.")
 
+    # ── Run summary ──
     london_pct = round(london_used / max(1, searches) * 100, 1)
     offer_rate = round((searches - no_offer) / max(1, searches) * 100, 1)
     unique_dests = len({r[RAW_HEADERS_REQUIRED.index('destination_iata')] for r in pending_rows})

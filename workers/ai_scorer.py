@@ -39,7 +39,7 @@ import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
@@ -308,9 +308,11 @@ class DealRow:
     stops: Optional[int]
     origin_iata: str
     destination_iata: str
+    destination_city: str
+    destination_country: str
     ingested_at_utc: str
-    bucket_id: int      # 0 = unmapped (fallback pool)
-    adj_price: float    # origin-adjusted price for scoring only
+    bucket_id: int
+    adj_price: float
 
 
 # ─────────────────────────────────────────────
@@ -342,6 +344,98 @@ def _load_rdv_dynamic_theme_index(sh: gspread.Spreadsheet, rdv_tab: str) -> Dict
 
 
 # ─────────────────────────────────────────────
+# RECENT REPETITION MEMORY
+# ─────────────────────────────────────────────
+
+RECENT_SURFACED_STATUSES = {
+    "READY_TO_POST",
+    "READY_FREE",
+    "PUBLISHED",
+    "POSTED_ALL",
+    "POSTED_INSTAGRAM",
+    "VIP_DONE",
+    "READY_FOR_BOTH",
+    "READY_FOR_FREE",
+}
+
+def _recent_event_timestamp(r: List[str], hmap: Dict[str, int]) -> Optional[datetime]:
+    for header in ("posted_free_at", "posted_vip_at", "posted_instagram_at", "scored_timestamp", "ingested_at_utc"):
+        idx = hmap.get(header)
+        if idx is None or idx >= len(r):
+            continue
+        dt_val = _parse_iso_utc(r[idx])
+        if dt_val:
+            return dt_val
+    return None
+
+
+def build_recent_surface_memory(
+    values: List[List[str]],
+    hmap: Dict[str, int],
+    now: datetime,
+    lookback_hours: int,
+) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
+    recent_iata: Dict[str, int] = defaultdict(int)
+    recent_city: Dict[str, int] = defaultdict(int)
+    recent_country: Dict[str, int] = defaultdict(int)
+
+    cutoff = now - timedelta(hours=max(1, lookback_hours))
+
+    status_idx = hmap.get("status")
+    iata_idx = hmap.get("destination_iata")
+    city_idx = hmap.get("destination_city")
+    country_idx = hmap.get("destination_country")
+
+    if status_idx is None:
+        return recent_iata, recent_city, recent_country
+
+    for r in values[1:]:
+        status = (r[status_idx] if status_idx < len(r) else "").strip().upper()
+        if status not in RECENT_SURFACED_STATUSES:
+            continue
+
+        ts = _recent_event_timestamp(r, hmap)
+        if not ts or ts < cutoff:
+            continue
+
+        if iata_idx is not None and iata_idx < len(r):
+            iata = (r[iata_idx] or "").strip().upper()
+            if iata:
+                recent_iata[iata] += 1
+
+        if city_idx is not None and city_idx < len(r):
+            city = (r[city_idx] or "").strip().upper()
+            if city:
+                recent_city[city] += 1
+
+        if country_idx is not None and country_idx < len(r):
+            country = (r[country_idx] or "").strip().upper()
+            if country:
+                recent_country[country] += 1
+
+    return recent_iata, recent_city, recent_country
+
+
+def repetition_penalty(
+    d: DealRow,
+    recent_iata: Dict[str, int],
+    recent_city: Dict[str, int],
+    recent_country: Dict[str, int],
+) -> float:
+    penalty = 0.0
+
+    iata_ct = recent_iata.get(d.destination_iata.upper(), 0) if d.destination_iata else 0
+    city_ct = recent_city.get(d.destination_city.upper(), 0) if d.destination_city else 0
+    country_ct = recent_country.get(d.destination_country.upper(), 0) if d.destination_country else 0
+
+    penalty += min(30.0, iata_ct * 18.0)
+    penalty += min(18.0, city_ct * 10.0)
+    penalty += min(12.0, country_ct * 4.0)
+
+    return penalty
+
+
+# ─────────────────────────────────────────────
 # ENV
 # ─────────────────────────────────────────────
 
@@ -364,6 +458,7 @@ def main() -> int:
     min_age_seconds = _env_int("MIN_INGEST_AGE_SECONDS", 0)
     winners_per_run = _env_int("WINNERS_PER_RUN", 2)
     winners_per_bucket = _env_int("WINNERS_PER_BUCKET", 1)
+    variety_lookback_hours = _env_int("VARIETY_LOOKBACK_HOURS", 120)
 
     gc = gspread_client()
     sh = open_spreadsheet(gc)
@@ -376,7 +471,11 @@ def main() -> int:
     if slot not in ("AM", "PM"):
         slot = "PM"
 
-    log(f"Theme (label): {theme_today} | Slot: {slot} | winners_per_run={winners_per_run}")
+    log(
+        f"Theme (label): {theme_today} | Slot: {slot} | "
+        f"winners_per_run={winners_per_run} | winners_per_bucket={winners_per_bucket} | "
+        f"variety_lookback_hours={variety_lookback_hours}"
+    )
 
     dest_to_bucket = load_dest_to_bucket(sh, BUCKETS_TAB)
     origin_tiers = load_origin_tiers(sh, ORIGINS_TAB)
@@ -391,6 +490,8 @@ def main() -> int:
     has_ingest_col = "ingested_at_utc" in hmap
     has_origin_col = "origin_iata" in hmap
     has_dest_col = "destination_iata" in hmap
+    has_dest_city_col = "destination_city" in hmap
+    has_dest_country_col = "destination_country" in hmap
     has_scored_ts = "scored_timestamp" in hmap
 
     rdv_theme_by_id = _load_rdv_dynamic_theme_index(sh, RDV_TAB)
@@ -402,6 +503,17 @@ def main() -> int:
 
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    recent_iata, recent_city, recent_country = build_recent_surface_memory(
+        values=values,
+        hmap=hmap,
+        now=now,
+        lookback_hours=variety_lookback_hours,
+    )
+    log(
+        f"Recent surfaced memory: iata={len(recent_iata)} city={len(recent_city)} "
+        f"country={len(recent_country)}"
+    )
 
     # ── Ingest NEW rows ──
     seen_rows = len(values) - 1
@@ -449,6 +561,8 @@ def main() -> int:
 
         origin_iata = (col("origin_iata") if has_origin_col else "").strip().upper()
         dest_iata = (col("destination_iata") if has_dest_col else "").strip().upper()
+        dest_city = (col("destination_city") if has_dest_city_col else "").strip()
+        dest_country = (col("destination_country") if has_dest_country_col else "").strip()
         price = _safe_float(col("price_gbp"))
         bucket_id = dest_to_bucket.get(dest_iata, 0)
         adj = adjusted_price(price, origin_iata, origin_tiers) if price is not None else 0.0
@@ -463,6 +577,8 @@ def main() -> int:
             stops=_safe_int(col("stops")),
             origin_iata=origin_iata,
             destination_iata=dest_iata,
+            destination_city=dest_city,
+            destination_country=dest_country,
             ingested_at_utc=ing,
             bucket_id=bucket_id,
             adj_price=adj,
@@ -494,7 +610,7 @@ def main() -> int:
 
     log(f"Bucket distribution: { {k: len(v) for k, v in sorted(by_bucket.items())} }")
 
-    scored_map: Dict[str, float] = {}  # deal_id → score
+    scored_map: Dict[str, float] = {}
 
     for bucket_id, rows in by_bucket.items():
         adj_prices = [d.adj_price for d in rows if d.adj_price > 0]
@@ -504,14 +620,27 @@ def main() -> int:
             base = float(price_scores.get(d.adj_price, 50.0))
             if d.stops is not None:
                 base -= float(d.stops) * 5.0
+
+            penalty = repetition_penalty(
+                d=d,
+                recent_iata=recent_iata,
+                recent_city=recent_city,
+                recent_country=recent_country,
+            )
+            base -= penalty
+
             scored_map[d.deal_id] = max(1.0, min(99.0, base))
 
         bucket_label = f"B{bucket_id}" if bucket_id > 0 else "Unmapped"
         best = max(rows, key=lambda x: scored_map[x.deal_id])
-        log(f"  {bucket_label} ({len(rows)} rows): "
+        best_penalty = repetition_penalty(best, recent_iata, recent_city, recent_country)
+        log(
+            f"  {bucket_label} ({len(rows)} rows): "
             f"best={best.destination_iata}({best.origin_iata}) "
             f"adj=£{round(best.adj_price)} "
-            f"score={round(scored_map[best.deal_id], 1)}")
+            f"penalty={round(best_penalty,1)} "
+            f"score={round(scored_map[best.deal_id], 1)}"
+        )
 
     # ── Winner selection: best per bucket → rank globally ──
     per_bucket_top: List[Tuple[DealRow, float]] = []
@@ -523,7 +652,10 @@ def main() -> int:
     winners = per_bucket_top[:max(0, winners_per_run)]
     winner_ids = {w[0].deal_id for w in winners}
 
-    log(f"Winners: {[w[0].destination_iata+'('+w[0].origin_iata+') £'+str(w[0].price_gbp)+' s='+str(round(w[1],1)) for w in winners]}")
+    log(
+        f"Winners: "
+        f"{[w[0].destination_iata+'('+w[0].origin_iata+') £'+str(w[0].price_gbp)+' s='+str(round(w[1],1)) for w in winners]}"
+    )
 
     # ── Write ──
     updates: List[gspread.Cell] = []

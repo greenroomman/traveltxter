@@ -49,7 +49,6 @@ jobs:
 
       # =========================
       # SLOT GUARD (DST-SAFE)
-      # FIX: os.environ["GITHUB_ENV"] replaces broken shell variable interpolation
       # =========================
       - name: Determine UK-local slot (06:30/16:30 only)
         if: ${{ github.event_name == 'schedule' }}
@@ -102,6 +101,9 @@ jobs:
           DUFFEL_MAX_INSERTS_PER_ORIGIN: ${{ vars.DUFFEL_MAX_INSERTS_PER_ORIGIN || '5' }}
           DUFFEL_MAX_INSERTS_PER_ROUTE: ${{ vars.DUFFEL_MAX_INSERTS_PER_ROUTE || '3' }}
           DUFFEL_ROUTES_PER_RUN: ${{ vars.DUFFEL_ROUTES_PER_RUN || '2' }}
+          DUFFEL_CANDIDATE_MULTIPLIER: ${{ vars.DUFFEL_CANDIDATE_MULTIPLIER || '2' }}
+          BLOCKED_DESTINATION_COUNTRIES: ${{ vars.BLOCKED_DESTINATION_COUNTRIES || '' }}
+          BLOCKED_DESTINATION_IATAS: ${{ vars.BLOCKED_DESTINATION_IATAS || '' }}
           DEDUPE_LOOKBACK_ROWS: ${{ vars.DEDUPE_LOOKBACK_ROWS || '2000' }}
           MIN_INGEST_AGE_SECONDS: ${{ vars.MIN_INGEST_AGE_SECONDS || '90' }}
           VARIETY_LOOKBACK_HOURS: ${{ vars.VARIETY_LOOKBACK_HOURS || '120' }}
@@ -142,8 +144,6 @@ jobs:
 
       # =========================
       # 2b) SIGNAL TRACKER
-      # continue-on-error: true — never blocks pipeline
-      # SUPABASE env var names standardised to match signal_tracker.py
       # =========================
       - name: Signal Tracker (signal_tracker.py)
         continue-on-error: true
@@ -182,8 +182,6 @@ jobs:
 
       # =========================
       # 4) RENDER
-      # FIX: removed hardcoded MODE: full — inherits job-level MODE
-      # continue-on-error: true
       # =========================
       - name: Render (render_client.py)
         continue-on-error: true
@@ -204,8 +202,6 @@ jobs:
 
       # =========================
       # 5) INSTAGRAM
-      # FIX: removed hardcoded MODE: full
-      # continue-on-error: true — must not block Telegram or Travelr Sync
       # =========================
       - name: Instagram Publisher (instagram_publisher.py)
         continue-on-error: true
@@ -229,7 +225,6 @@ jobs:
 
       # =========================
       # 6) LINK ROUTER
-      # continue-on-error: true
       # =========================
       - name: Link Router (link_router.py)
         continue-on-error: true
@@ -250,7 +245,6 @@ jobs:
 
       # =========================
       # 7) TELEGRAM
-      # FIX: continue-on-error: true — Telegram failure must not block Travelr Sync
       # =========================
       - name: Telegram Publisher (telegram_publisher.py)
         continue-on-error: true
@@ -277,7 +271,6 @@ jobs:
 
       # =========================
       # 8) TRAVELR SYNC
-      # continue-on-error: true — Travelr failure must never block V5
       # =========================
       - name: Travelr Sync (travelr_sync.py)
         continue-on-error: true

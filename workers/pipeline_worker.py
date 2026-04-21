@@ -172,7 +172,6 @@ LONDON_AIRPORTS = {"LHR", "LGW", "LCY"}
 LONG_HAUL_BUCKET_IDS = {4, 5, 6}
 
 # Default conflict filters for current Middle East risk footprint.
-# These can be extended or overridden through env vars.
 DEFAULT_BLOCKED_DESTINATION_IATAS = {
     "AUH", "BAH", "BEY", "BGW", "BND", "BSR",
     "DMM", "DOH", "DWC", "DXB", "EBL", "IKA",
@@ -380,10 +379,6 @@ class BucketDest:
 
 
 def load_buckets(ws_buckets: gspread.Worksheet) -> Dict[int, List[BucketDest]]:
-    """
-    Returns dict: bucket_id → [BucketDest, ...]
-    Only enabled rows included.
-    """
     rows = ws_buckets.get_all_records()
     buckets: Dict[int, List[BucketDest]] = {}
     for r in rows:
@@ -423,10 +418,6 @@ class OriginAirport:
 
 
 def load_origins(ws_origins: gspread.Worksheet) -> Dict[int, List[OriginAirport]]:
-    """
-    Returns dict: tier → [OriginAirport, ...]
-    Only enabled rows.
-    """
     rows = ws_origins.get_all_records()
     tiers: Dict[int, List[OriginAirport]] = {}
     for r in rows:
@@ -449,14 +440,13 @@ def load_origins(ws_origins: gspread.Worksheet) -> Dict[int, List[OriginAirport]
 # BUCKET × ORIGIN COMPATIBILITY
 # ─────────────────────────────────────────────
 
-# bucket_id → max_origin_tier allowed
 BUCKET_MAX_TIER: Dict[int, int] = {
-    1: 3,  # EU High Volume
-    2: 3,  # EU Secondary
-    3: 2,  # Near Long-Haul
-    4: 1,  # Long-Haul US/CA
-    5: 1,  # Long-Haul Asia/ME
-    6: 1,  # Seasonal/Wildcard
+    1: 3,
+    2: 3,
+    3: 2,
+    4: 1,
+    5: 1,
+    6: 1,
 }
 
 
@@ -469,17 +459,15 @@ def eligible_tiers_for_bucket(bucket_id: int) -> List[int]:
 # BUCKET ROTATION (BALANCED)
 # ─────────────────────────────────────────────
 
-# Old logic anchored every run in Europe.
-# New logic still keeps Europe in the mix, but not as a compulsory anchor.
 BUCKET_PAIRS = [
-    (1, 4),  # EU High Volume + US/Canada
-    (2, 5),  # EU Secondary   + Asia/ME
-    (3, 4),  # Near Long-Haul + US/Canada
-    (4, 5),  # US/Canada      + Asia/ME
-    (5, 6),  # Asia/ME        + Seasonal/Wildcard
-    (3, 5),  # Near Long-Haul + Asia/ME
-    (1, 6),  # EU High Volume + Seasonal/Wildcard
-    (2, 4),  # EU Secondary   + US/Canada
+    (1, 4),
+    (2, 5),
+    (3, 4),
+    (4, 5),
+    (5, 6),
+    (3, 5),
+    (1, 6),
+    (2, 4),
 ]
 
 
@@ -498,13 +486,6 @@ def select_destinations(
     n: int,
     allow_c_tier: bool = False,
 ) -> List[BucketDest]:
-    """
-    Deterministic rotation within bucket.
-
-    A-tier rotates first, B-tier second.
-    C-tier is normally excluded, but can optionally be allowed in tiny doses for
-    wildcard discovery without making the engine collapse into no-offer territory.
-    """
     if not bucket_dests:
         return []
 
@@ -546,16 +527,6 @@ def select_origin(
     dix: int,
     slot_offset: int,
 ) -> Optional[str]:
-    """
-    Selects one origin for a search:
-    1. Determine eligible tiers for this bucket
-    2. Pick tier based on weighted distribution (50/35/15)
-    3. Rotate deterministically within tier
-    4. Apply London modulo constraint: LHR/LGW only when (dix % 3 == 0)
-       This enforces ≤40% London share without needing state
-
-    Returns IATA string or None if no eligible airport found.
-    """
     eligible = eligible_tiers_for_bucket(bucket_id)
 
     tier_weights = {1: 0.50, 2: 0.35, 3: 0.15}
@@ -598,10 +569,6 @@ def select_origin(
 # ─────────────────────────────────────────────
 
 def load_dedupe_set(ws_raw: gspread.Worksheet, lookback_rows: int) -> set:
-    """
-    Read only last N rows to build dedupe set.
-    Avoids full-sheet load as RAW_DEALS grows.
-    """
     all_values = ws_raw.get_all_values()
     if len(all_values) < 2:
         return set()
@@ -682,8 +649,6 @@ def ensure_headers(ws: gspread.Worksheet) -> Dict[str, int]:
 
 # ─────────────────────────────────────────────
 # THEME → TRAVEL PARAMS
-# Theme determines travel window, trip length, max stops.
-# Theme does NOT determine destination.
 # ─────────────────────────────────────────────
 
 @dataclass
@@ -719,10 +684,6 @@ def params_for_theme(theme: str) -> TravelParams:
 
 
 def max_connections_for_bucket(bucket_id: int, travel_p: TravelParams) -> int:
-    """
-    Long-haul / wildcard buckets need more flexibility.
-    Keep Europe tight; loosen long-haul just enough to produce survivable offers.
-    """
     if bucket_id in LONG_HAUL_BUCKET_IDS:
         return max(2, travel_p.max_stops)
     return travel_p.max_stops
@@ -814,7 +775,6 @@ def main() -> int:
     sleep_s = env_float("FEEDER_SLEEP_SECONDS", 0.1)
     cabin = env_str("CABIN_CLASS", "economy").lower()
 
-    # More candidate destinations than searches so thin buckets can retry.
     candidate_multiplier = env_int("DUFFEL_CANDIDATE_MULTIPLIER", 2)
     candidates_per_bucket = max(dests_per_bucket, dests_per_bucket * candidate_multiplier)
 
@@ -832,9 +792,7 @@ def main() -> int:
     ws_ops = sh.worksheet(ops_tab)
     theme_today = (get_cell(ws_ops, "B2") or "DEFAULT").strip()
     travel_p = params_for_theme(theme_today)
-    print(
-        f"🎯 Theme (label): {theme_today}"
-    )
+    print(f"🎯 Theme (label): {theme_today}")
     print(
         f"   Window: {travel_p.win_min}–{travel_p.win_max}d | "
         f"Trip: {travel_p.trip_min}–{travel_p.trip_max}d | "

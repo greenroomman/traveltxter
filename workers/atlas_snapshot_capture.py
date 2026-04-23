@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_capture.py
-ATLAS SNAPSHOT CAPTURE - v2.1 (Supabase Migration)
+ATLAS SNAPSHOT CAPTURE - v2.2 (Supabase Migration)
 
 Migrated from Google Sheets to PostgreSQL/Supabase.
 Same 43-column schema, same logic, different storage layer.
+
+Improvements in v2.2:
+- Multi-DTD capture
+- Balanced origin caps
+- SUPABASE_SERVICE_KEY fallback
+- Duffel-safe retry/backoff handling
+- Slower pacing to reduce 429s
+- Better end-of-run diagnostics
 """
 
 from __future__ import annotations
@@ -31,6 +39,13 @@ from supabase import create_client, Client
 def env_int(name: str, default: int) -> int:
     try:
         return int(str(os.getenv(name, default)).strip())
+    except Exception:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, default)).strip())
     except Exception:
         return default
 
@@ -312,6 +327,14 @@ def fetch_jet_fuel_price() -> Optional[float]:
 # DUFFEL API
 # -------------------------------------------------
 
+def _is_rate_limited(response: Optional[requests.Response], exc: Exception) -> bool:
+    if response is not None and response.status_code == 429:
+        return True
+    if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 429:
+        return True
+    return False
+
+
 def search_duffel(
     origin: str,
     dest: str,
@@ -319,8 +342,15 @@ def search_duffel(
     return_date: dt.date,
     cabin_class: str,
     duffel_token: str,
-) -> Optional[Dict[str, Any]]:
-    """Search Duffel API for cheapest offer."""
+    max_attempts: int = 3,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Search Duffel API for cheapest offer.
+
+    Returns:
+        (result, status)
+        status in {"success", "no_offers", "rate_limited", "failed"}
+    """
     url = "https://api.duffel.com/air/offer_requests"
     headers = {
         "Duffel-Version": "v2",
@@ -339,42 +369,63 @@ def search_duffel(
         }
     }
 
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+    backoffs = [2.0, 5.0, 10.0]
 
-        offers = data.get("data", {}).get("offers", [])
-        if not offers:
-            return None
+    for attempt in range(1, max_attempts + 1):
+        response = None
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
 
-        cheapest = min(offers, key=lambda o: float(o["total_amount"]))
+            offers = data.get("data", {}).get("offers", [])
+            if not offers:
+                return None, "no_offers"
 
-        return {
-            "price_gbp": float(cheapest["total_amount"]),
-            "currency": cheapest["total_currency"],
-            "carrier_count": len(
-                set(
-                    seg["marketing_carrier"]["iata_code"]
+            cheapest = min(offers, key=lambda o: float(o["total_amount"]))
+
+            return {
+                "price_gbp": float(cheapest["total_amount"]),
+                "currency": cheapest["total_currency"],
+                "carrier_count": len(
+                    set(
+                        seg["marketing_carrier"]["iata_code"]
+                        for slice_ in cheapest["slices"]
+                        for seg in slice_["segments"]
+                    )
+                ),
+                "lcc_present": any(
+                    seg["marketing_carrier"].get("name", "").lower()
+                    in ["ryanair", "easyjet", "wizz air", "norwegian"]
                     for slice_ in cheapest["slices"]
                     for seg in slice_["segments"]
-                )
-            ),
-            "lcc_present": any(
-                seg["marketing_carrier"].get("name", "").lower()
-                in ["ryanair", "easyjet", "wizz air", "norwegian"]
-                for slice_ in cheapest["slices"]
-                for seg in slice_["segments"]
-            ),
-            "direct": all(len(slice_["segments"]) == 1 for slice_ in cheapest["slices"]),
-            "stops": max(len(slice_["segments"]) - 1 for slice_ in cheapest["slices"]),
-            "cabin_class": cabin_class,
-            "carrier_primary_iata": cheapest["slices"][0]["segments"][0]["marketing_carrier"]["iata_code"],
-        }
+                ),
+                "direct": all(len(slice_["segments"]) == 1 for slice_ in cheapest["slices"]),
+                "stops": max(len(slice_["segments"]) - 1 for slice_ in cheapest["slices"]),
+                "cabin_class": cabin_class,
+                "carrier_primary_iata": cheapest["slices"][0]["segments"][0]["marketing_carrier"]["iata_code"],
+            }, "success"
 
-    except Exception as ex:
-        print(f"Warning: Duffel search failed ({origin}->{dest} {outbound}): {ex}")
-        return None
+        except Exception as ex:
+            is_429 = _is_rate_limited(response, ex)
+
+            if is_429 and attempt < max_attempts:
+                sleep_for = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                print(
+                    f"Warning: Duffel 429 for {origin}->{dest} {outbound} "
+                    f"(attempt {attempt}/{max_attempts}). Backing off {sleep_for:.1f}s"
+                )
+                time.sleep(sleep_for)
+                continue
+
+            if is_429:
+                print(f"Warning: Duffel search rate-limited ({origin}->{dest} {outbound}): {ex}")
+                return None, "rate_limited"
+
+            print(f"Warning: Duffel search failed ({origin}->{dest} {outbound}): {ex}")
+            return None, "failed"
+
+    return None, "failed"
 
 
 # -------------------------------------------------
@@ -383,7 +434,7 @@ def search_duffel(
 
 def main():
     print("=" * 70)
-    print("ATLAS SNAPSHOT CAPTURE v2.1 (Supabase)")
+    print("ATLAS SNAPSHOT CAPTURE v2.2 (Supabase)")
     print("=" * 70)
 
     supabase = init_supabase()
@@ -395,8 +446,9 @@ def main():
     snapshot_date = dt.date.today()
     capture_time = dt.datetime.utcnow().strftime("%H:%M")
     duffel_token = env_str("DUFFEL_ACCESS_TOKEN")
-    max_searches = env_int("ATLAS_MAX_SEARCHES", 600)
+    max_searches = env_int("ATLAS_MAX_SEARCHES", 157)
     dtd_targets = env_int_list("ATLAS_DTD_TARGETS", [14, 21, 30, 45, 60, 84])
+    inter_request_sleep = env_float("ATLAS_REQUEST_SLEEP_SECONDS", 1.2)
 
     if not duffel_token:
         raise ValueError("Missing DUFFEL_ACCESS_TOKEN")
@@ -410,8 +462,8 @@ def main():
     print(f"Snapshot date: {snapshot_date}")
     print(f"Max searches: {max_searches}")
     print(f"DTD targets: {dtd_targets}")
+    print(f"Inter-request sleep: {inter_request_sleep}s")
 
-    # Build routes across multiple DTD targets
     routes = []
     for origin in origins:
         for dest in destinations:
@@ -422,10 +474,16 @@ def main():
 
     random.shuffle(routes)
 
-    # Execute searches with balanced origin coverage
     snapshots = []
     searches_per_origin = {o: 0 for o in origins}
     max_per_origin = max_searches // len(origins)
+
+    status_counts = {
+        "success": 0,
+        "no_offers": 0,
+        "rate_limited": 0,
+        "failed": 0,
+    }
 
     for origin, dest, outbound, return_date, cabin in routes:
         if len(snapshots) >= max_searches:
@@ -434,9 +492,9 @@ def main():
         if searches_per_origin[origin] >= max_per_origin:
             continue
 
+        result, status = search_duffel(origin, dest, outbound, return_date, cabin, duffel_token)
+        status_counts[status] += 1
         searches_per_origin[origin] += 1
-
-        result = search_duffel(origin, dest, outbound, return_date, cabin, duffel_token)
 
         distance_km = None
         route_type = None
@@ -498,7 +556,7 @@ def main():
         }
 
         snapshots.append(row)
-        time.sleep(0.5)
+        time.sleep(inter_request_sleep)
 
     if snapshots:
         print(f"\nWriting {len(snapshots)} snapshots...")
@@ -509,9 +567,23 @@ def main():
             print(f"Insert failed: {ex}")
             raise
 
+    priced_rows = sum(1 for row in snapshots if row.get("price_gbp") is not None)
+    null_rows = len(snapshots) - priced_rows
+    fill_pct = round((priced_rows * 100.0 / len(snapshots)), 1) if snapshots else 0.0
+
     print("\nSearches per origin:")
     for origin in origins:
         print(f"  {origin}: {searches_per_origin[origin]}")
+
+    print("\nDuffel status summary:")
+    for key in ["success", "no_offers", "rate_limited", "failed"]:
+        print(f"  {key}: {status_counts[key]}")
+
+    print("\nSnapshot fill summary:")
+    print(f"  total rows : {len(snapshots)}")
+    print(f"  priced     : {priced_rows}")
+    print(f"  null price : {null_rows}")
+    print(f"  fill pct   : {fill_pct}%")
 
     print(f"\n{'=' * 70}")
     print(f"Capture complete: {len(snapshots)} snapshots")

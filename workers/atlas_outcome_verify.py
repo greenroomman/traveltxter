@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
 
 SUPABASE_URL = os.environ["MIZAR_SUPABASE_URL"]
 SUPABASE_KEY = os.environ["MIZAR_SUPABASE_SERVICE_ROLE_KEY"]
-DUFFEL_TOKEN = os.environ["DUFFEL_API_KEY"]
+DUFFEL_TOKEN = os.environ.get("DUFFEL_API_KEY") or os.environ["DUFFEL_ACCESS_TOKEN"]
 
 DUFFEL_BASE = "https://api.duffel.com"
 DUFFEL_HEADERS = {

@@ -35,3 +35,19 @@ jobs:
           MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         run: python workers/atlas_daily_report.py
+
+      - name: Run alert checks
+        id: alerts
+        env:
+          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+        run: python workers/atlas_alerts.py
+
+      - name: Send Slack alert
+        if: always() && steps.alerts.outputs.has_alerts == 'true'
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook-type: incoming-webhook
+          payload-file-path: /tmp/slack_payload.json
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

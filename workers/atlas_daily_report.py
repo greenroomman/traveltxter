@@ -203,7 +203,7 @@ try:
             "tn": tn_all,
             "fn": fn_all,
             "precision_high_risk": precision_h,
-            "recall_high_risk": recall_all,
+            "recall_global": recall_all,
             "avg_price_change": avg_change,
         },
         on_conflict="report_date",

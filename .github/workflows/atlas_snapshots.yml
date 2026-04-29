@@ -71,3 +71,35 @@ jobs:
           SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
         run: python workers/atlas_market_signals.py
+
+
+  alerts:
+    name: MIZAR Alerts
+    runs-on: ubuntu-latest
+    needs: [capture, backfill, market_signals]
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install supabase
+
+      - name: Run alert checks
+        id: alerts
+        env:
+          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+        run: python workers/atlas_alerts.py
+
+      - name: Send Slack alert
+        if: always() && steps.alerts.outputs.has_alerts == 'true'
+        uses: slackapi/slack-github-action@v2
+        with:
+          payload-file-path: /tmp/slack_payload.json
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

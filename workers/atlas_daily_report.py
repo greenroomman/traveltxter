@@ -149,31 +149,48 @@ sb.table("system_health_daily").upsert(
         "flags": flags,
     },
     on_conflict="report_date",
-).execute()
+).
 
 
 # ============================================================
-# MODEL PERFORMANCE TABLE (v2 high-risk)
+# MODEL PERFORMANCE TABLE (v2 high-risk precision + all-v2 outcomes)
 # ============================================================
 
 try:
     v2 = {
         r["decision_id"]: r
         for r in decisions
-        if r.get("model_version") == "v2_0_0"
+        if r.get("model_version") == "v2_0_0" and r.get("decision_id")
     }
 
-    v2_ov = [r for r in ov if r.get("decision_id") in v2]
+    v2_ov = [
+        r for r in ov
+        if r.get("decision_id") in v2
+        and r.get("prediction_outcome") is not None
+    ]
 
     high = [
         r for r in v2_ov
         if float(v2[r["decision_id"]].get("regret_risk_score") or 0) >= 0.70
     ]
 
+    tp_all = sum(1 for r in v2_ov if r.get("prediction_outcome") == "TP")
+    fp_all = sum(1 for r in v2_ov if r.get("prediction_outcome") == "FP")
+    tn_all = sum(1 for r in v2_ov if r.get("prediction_outcome") == "TN")
+    fn_all = sum(1 for r in v2_ov if r.get("prediction_outcome") == "FN")
+
     tp_h = sum(1 for r in high if r.get("prediction_outcome") == "TP")
     fp_h = sum(1 for r in high if r.get("prediction_outcome") == "FP")
 
     precision_h = round(tp_h / (tp_h + fp_h) * 100, 2) if (tp_h + fp_h) else None
+    recall_all = round(tp_all / (tp_all + fn_all) * 100, 2) if (tp_all + fn_all) else None
+
+    v2_changes = [
+        float(r["price_change_pct"])
+        for r in v2_ov
+        if r.get("price_change_pct") is not None
+    ]
+    avg_change = round(sum(v2_changes) / len(v2_changes), 2) if v2_changes else None
 
     sb.table("model_performance_daily").upsert(
         {
@@ -181,9 +198,13 @@ try:
             "model_version": "v2_0_0",
             "total_verified": len(v2_ov),
             "high_risk_verified": len(high),
-            "tp": tp_h,
-            "fp": fp_h,
+            "tp": tp_all,
+            "fp": fp_all,
+            "tn": tn_all,
+            "fn": fn_all,
             "precision_high_risk": precision_h,
+            "recall_high_risk": recall_all,
+            "avg_price_change": avg_change,
         },
         on_conflict="report_date",
     ).execute()

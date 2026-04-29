@@ -8,8 +8,18 @@ on:
 jobs:
   daily-report:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v3
+
+      - name: Verify health report script exists
+        run: |
+          if [ ! -f workers/atlas_daily_report.py ]; then
+            echo "ERROR: workers/atlas_daily_report.py not found"
+            echo "Available worker files:"
+            ls -la workers/
+            exit 1
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v4

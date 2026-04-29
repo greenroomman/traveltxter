@@ -94,16 +94,32 @@ if not flags:
 report = f"""
 MIZAR Daily Health - {today}
 
+Generated: {now_str}
+
 Snapshots today: {today_s}/{EXPECTED_SNAPSHOTS} ({pipeline_status})
-Decisions: {total_d}
-Verified: {verified}
-Precision: {precision}%
+Total snapshots: {total_s}
+
+Decisions today: {today_d}
+Total decisions: {total_d}
+Pending verifications: {pending}
+Verified decisions: {verified}
+Failed verifications: {failed_v}
+
+Outcome counts:
+TP: {tp}
+FP: {fp}
+TN: {tn}
+FN: {fn_c}
+
+Live precision all: {precision}%
+
+API calls today: {today_calls}
 
 Fuel: {fuel_price} ({fuel_date})
 
 Flags:
 {chr(10).join(flags)}
-"""
+""".strip()
 
 headers = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -111,25 +127,40 @@ headers = {
     "Notion-Version": "2022-06-28",
 }
 
-httpx.post(
-    "https://api.notion.com/v1/pages",
-    headers=headers,
-    json={
-        "parent": {"page_id": NOTION_PARENT_ID},
-        "properties": {
-            "title": [{"text": {"content": f"Daily Health - {today}"}}]
+try:
+    notion_response = httpx.post(
+        "https://api.notion.com/v1/pages",
+        headers=headers,
+        json={
+            "parent": {"page_id": NOTION_PARENT_ID},
+            "properties": {
+                "title": [{"text": {"content": f"Daily Health - {today}"}}]
+            },
+            "children": [
+                {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": report[:1900]},
+                            }
+                        ]
+                    },
+                }
+            ],
         },
-        "children": [
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{"type": "text", "text": {"content": report[:1900]}}]
-                },
-            }
-        ],
-    },
-)
+        timeout=30,
+    )
+
+    if notion_response.status_code >= 400:
+        print("Notion report write failed:", notion_response.status_code, notion_response.text)
+    else:
+        print("Notion report written")
+
+except Exception as e:
+    print("Notion report write failed:", e)
 
 
 # ============================================================
@@ -149,11 +180,18 @@ sb.table("system_health_daily").upsert(
         "flags": flags,
     },
     on_conflict="report_date",
-).
+).execute()
+
+print(
+    f"system_health_daily updated: "
+    f"report_date={today}, "
+    f"snapshots_today={today_s}, "
+    f"pipeline_status={pipeline_status}"
+)
 
 
 # ============================================================
-# MODEL PERFORMANCE TABLE (v2 high-risk precision + all-v2 outcomes)
+# MODEL PERFORMANCE TABLE
 # ============================================================
 
 try:
@@ -209,6 +247,13 @@ try:
         on_conflict="report_date",
     ).execute()
 
+    print(
+        f"model_performance_daily updated: "
+        f"total_verified={len(v2_ov)}, "
+        f"high_risk_verified={len(high)}, "
+        f"precision_high_risk={precision_h}"
+    )
+
 except Exception as e:
     print("model performance failed:", e)
 
@@ -218,7 +263,7 @@ except Exception as e:
 # ============================================================
 
 if today_s < MIN_HEALTHY_SNAPSHOTS:
-    print("Pipeline unhealthy - failing job")
+    print(f"Pipeline unhealthy - snapshot coverage {today_s}/{EXPECTED_SNAPSHOTS}")
     sys.exit(1)
 
 print("All checks passed")

@@ -98,6 +98,37 @@ def load_model_bundle() -> Optional[Dict[str, Any]]:
     return bundle
 
 
+def check_system_health(supabase: Client) -> bool:
+    today = utc_today().isoformat()
+
+    result = (
+        supabase.table("system_health_daily")
+        .select("report_date,pipeline_status,flags")
+        .eq("report_date", today)
+        .limit(1)
+        .execute()
+    )
+
+    rows = result.data or []
+
+    if not rows:
+        print("System health row missing - skipping market_predictions build")
+        return False
+
+    row = rows[0]
+    status = row.get("pipeline_status")
+    flags = row.get("flags")
+
+    if status != "HEALTHY":
+        print("System unhealthy - skipping market_predictions build")
+        print("pipeline_status:", status)
+        print("flags:", flags)
+        return False
+
+    print("System health check passed")
+    return True
+
+
 # ============================================================
 # Calendar features
 # ============================================================
@@ -186,7 +217,8 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     df["season_bucket"] = df["outbound_date"].apply(assign_season_bucket)
     df["days_to_next_bank_holiday"] = df["outbound_date"].apply(days_to_next_bank_holiday)
     df["trip_overlaps_holiday"] = df.apply(
-        lambda r: trip_overlaps_holiday(r["outbound_date"], r["return_date"]), axis=1
+        lambda r: trip_overlaps_holiday(r["outbound_date"], r["return_date"]),
+        axis=1,
     )
     df["holiday_intensity_score"] = df["outbound_date"].apply(holiday_intensity_score)
     return df
@@ -202,13 +234,21 @@ def compute_baseline(df: pd.DataFrame) -> pd.DataFrame:
     df["dtd_bucket"] = pd.cut(
         df["dtd"].astype(float),
         bins=[-1, 7, 21, 60, 120, 9999],
-        labels=["0-7", "8-21", "22-60", "61-120", "120+"]
+        labels=["0-7", "8-21", "22-60", "61-120", "120+"],
     )
 
-    df["route"] = df["origin_iata"].astype(str) + "-" + df["destination_iata"].astype(str)
+    df["route"] = (
+        df["origin_iata"].astype(str)
+        + "-"
+        + df["destination_iata"].astype(str)
+    )
 
     baseline = (
-        df.groupby(["route", "dtd_bucket", "season_bucket"], dropna=False, observed=False)["price_gbp"]
+        df.groupby(
+            ["route", "dtd_bucket", "season_bucket"],
+            dropna=False,
+            observed=False,
+        )["price_gbp"]
         .agg(["mean", "std"])
         .reset_index()
         .rename(columns={"mean": "baseline_mu", "std": "baseline_sigma"})
@@ -217,7 +257,7 @@ def compute_baseline(df: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(
         baseline,
         on=["route", "dtd_bucket", "season_bucket"],
-        how="left"
+        how="left",
     )
 
     if "baseline_mu" not in df.columns:
@@ -232,19 +272,26 @@ def compute_baseline(df: pd.DataFrame) -> pd.DataFrame:
     df["baseline_mu"] = df["baseline_mu"].fillna(df["price_gbp"])
     df["baseline_sigma"] = df["baseline_sigma"].fillna(10.0).clip(lower=5.0)
 
-    df["price_z_score"] = ((df["price_gbp"] - df["baseline_mu"]) / df["baseline_sigma"]).round(3)
-    df["price_ratio"] = (df["price_gbp"] / df["baseline_mu"]).replace([np.inf, -np.inf], np.nan).round(3)
+    df["price_z_score"] = (
+        (df["price_gbp"] - df["baseline_mu"]) / df["baseline_sigma"]
+    ).round(3)
+
+    df["price_ratio"] = (
+        df["price_gbp"] / df["baseline_mu"]
+    ).replace([np.inf, -np.inf], np.nan).round(3)
 
     def pct_rank(group: pd.DataFrame) -> pd.DataFrame:
         group = group.copy()
-        group["price_percentile"] = group["price_gbp"].rank(pct=True).mul(100).round(1)
+        group["price_percentile"] = (
+            group["price_gbp"].rank(pct=True).mul(100).round(1)
+        )
         return group
 
     df = df.groupby(
         ["route", "dtd_bucket", "season_bucket"],
         group_keys=False,
         dropna=False,
-        observed=False
+        observed=False,
     ).apply(pct_rank)
 
     return df
@@ -293,7 +340,7 @@ def compute_fuel_velocity(df: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(
         fuel_by_date[["snapshot_date", "jet_fuel_7d_change_pct"]],
         on="snapshot_date",
-        how="left"
+        how="left",
     )
     return df
 
@@ -314,7 +361,10 @@ def get_latest_macro_signals(supabase: Client) -> Dict[str, Any]:
     return rows[0] if rows else {}
 
 
-def get_candidate_snapshots(supabase: Client, limit: int = MAX_SNAPSHOTS) -> List[Dict[str, Any]]:
+def get_candidate_snapshots(
+    supabase: Client,
+    limit: int = MAX_SNAPSHOTS,
+) -> List[Dict[str, Any]]:
     result = (
         supabase.table("snapshots")
         .select("*")
@@ -407,7 +457,10 @@ def heuristic_score(feature_row: Dict[str, Any]) -> Tuple[float, str]:
     return round(score, 3), DEFAULT_MODEL_VERSION
 
 
-def real_model_score(feature_row: Dict[str, Any], bundle: Dict[str, Any]) -> Tuple[float, str]:
+def real_model_score(
+    feature_row: Dict[str, Any],
+    bundle: Dict[str, Any],
+) -> Tuple[float, str]:
     model = bundle.get("model")
     scaler = bundle.get("scaler")
     feature_cols = bundle.get("feature_cols") or []
@@ -446,7 +499,10 @@ def real_model_score(feature_row: Dict[str, Any], bundle: Dict[str, Any]) -> Tup
     for code in ["MAN", "LGW", "LHR", "EDI", "BRS", "LPL", "BHX", "NCL", "GLA"]:
         model_input[f"origin_{code}"] = 1.0 if origin == code else 0.0
 
-    X = np.array([[float(model_input.get(col, 0.0)) for col in feature_cols]], dtype=float)
+    X = np.array(
+        [[float(model_input.get(col, 0.0)) for col in feature_cols]],
+        dtype=float,
+    )
 
     if scaler is not None:
         X = scaler.transform(X)
@@ -470,7 +526,10 @@ def score_feature_row(feature_row: Dict[str, Any]) -> Tuple[float, str]:
 # Build + upsert
 # ============================================================
 
-def build_feature_frame(snapshots: List[Dict[str, Any]], macro: Dict[str, Any]) -> pd.DataFrame:
+def build_feature_frame(
+    snapshots: List[Dict[str, Any]],
+    macro: Dict[str, Any],
+) -> pd.DataFrame:
     if not snapshots:
         return pd.DataFrame()
 
@@ -481,11 +540,17 @@ def build_feature_frame(snapshots: List[Dict[str, Any]], macro: Dict[str, Any]) 
             df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
 
     df["price_gbp"] = pd.to_numeric(df["price_gbp"], errors="coerce")
-    df["carrier_count"] = pd.to_numeric(df.get("carrier_count"), errors="coerce").fillna(0).astype(int)
+    df["carrier_count"] = (
+        pd.to_numeric(df.get("carrier_count"), errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
     df["direct"] = df.get("direct", False).fillna(False).astype(bool)
     df["lcc_present"] = df.get("lcc_present", False).fillna(False).astype(bool)
 
-    df["dtd"] = (pd.to_datetime(df["outbound_date"]) - pd.Timestamp(utc_today())).dt.days
+    df["dtd"] = (
+        pd.to_datetime(df["outbound_date"]) - pd.Timestamp(utc_today())
+    ).dt.days
 
     df["jet_fuel_usd_gal"] = float(macro.get("jet_fuel_usd_gal") or 0.0)
     df["gbp_usd_rate"] = float(macro.get("gbp_usd_rate") or 0.0)
@@ -578,6 +643,9 @@ def main() -> int:
 
     supabase = get_supabase()
 
+    if not check_system_health(supabase):
+        return 0
+
     macro = get_latest_macro_signals(supabase)
     print(f"Latest macro signal date: {macro.get('signal_date')}")
 
@@ -613,7 +681,10 @@ def main() -> int:
 
     result = supabase.table("market_predictions").upsert(
         deduped_payloads,
-        on_conflict="snapshot_date,origin_iata,destination_iata,outbound_date,return_date,price_gbp"
+        on_conflict=(
+            "snapshot_date,origin_iata,destination_iata,"
+            "outbound_date,return_date,price_gbp"
+        ),
     ).execute()
 
     print(f"Rows built: {len(payloads)}")

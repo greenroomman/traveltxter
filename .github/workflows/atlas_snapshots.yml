@@ -72,7 +72,6 @@ jobs:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
         run: python workers/atlas_market_signals.py
 
-
   alerts:
     name: MIZAR Alerts
     runs-on: ubuntu-latest
@@ -96,7 +95,7 @@ jobs:
           MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
         run: python workers/atlas_alerts.py
 
-            - name: Send Slack alert
+      - name: Send Slack alert
         if: always() && steps.alerts.outputs.has_alerts == 'true'
         uses: slackapi/slack-github-action@v2
         with:

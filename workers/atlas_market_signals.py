@@ -1,7 +1,8 @@
+#!/usr/bin/env python3
 import os
 import sys
 import requests
-from datetime import date
+from datetime import date, timedelta
 from supabase import create_client
 
 def env_str(key):
@@ -49,6 +50,32 @@ def fetch_gbp_fx_rates():
         print(f"WARNING: Failed to fetch FX rates: {ex}")
         return None, None
 
+def compute_7d_change(supabase, today, current_fuel):
+    if current_fuel is None:
+        print("Skipping 7d change: no fuel price today")
+        return None
+    prior_date = (date.fromisoformat(today) - timedelta(days=7)).isoformat()
+    try:
+        result = (
+            supabase.table("daily_market_signals")
+            .select("jet_fuel_usd_gal")
+            .eq("signal_date", prior_date)
+            .not_.is_("jet_fuel_usd_gal", "null")
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            print(f"No fuel price found for {prior_date}, skipping 7d change")
+            return None
+        prior_fuel = float(rows[0]["jet_fuel_usd_gal"])
+        change_pct = round((current_fuel - prior_fuel) / prior_fuel * 100, 4)
+        print(f"Jet fuel 7d change: {prior_fuel} -> {current_fuel} = {change_pct}%")
+        return change_pct
+    except Exception as ex:
+        print(f"WARNING: Failed to compute 7d fuel change: {ex}")
+        return None
+
 def main():
     supabase_url = env_str("SUPABASE_URL")
     supabase_key = env_str("SUPABASE_KEY")
@@ -68,17 +95,24 @@ def main():
         print("ERROR: Both data sources failed, nothing to record")
         sys.exit(1)
 
+    jet_fuel_7d_change = compute_7d_change(supabase, today, jet_fuel)
+
     record = {
         "signal_date": today,
         "jet_fuel_usd_gal": jet_fuel,
         "gbp_usd_rate": gbp_usd,
         "gbp_eur_rate": gbp_eur,
+        "jet_fuel_7d_change_pct": jet_fuel_7d_change,
         "notes": "auto"
     }
 
     result = supabase.table("daily_market_signals").insert(record).execute()
     if result.data:
         print(f"Market signal recorded for {today}")
+        if jet_fuel_7d_change is not None:
+            print(f"  jet_fuel_7d_change_pct: {jet_fuel_7d_change}%")
+        else:
+            print("  jet_fuel_7d_change_pct: NULL (no prior week data)")
     else:
         print(f"ERROR: Insert failed: {result}")
         sys.exit(1)

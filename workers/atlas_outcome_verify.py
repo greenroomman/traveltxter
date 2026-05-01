@@ -299,9 +299,14 @@ def write_verification(
             "failure_reason": failure_reason or "invalid_original_price",
         }
 
-        supabase.table("outcome_verification").insert(row).execute()
-        mark_decision_status(decision_id, "failed")
-        return
+        try:
+    supabase.table("outcome_verification") \
+        .upsert(row, on_conflict="decision_id") \
+        .execute()
+
+        except Exception as exc:
+            logger.error(f"Failed to write verification for {decision_id}: {exc}")
+            mark_decision_status(decision_id, "failed")
 
     if price_t7 is None:
         row = {

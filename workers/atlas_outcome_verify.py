@@ -6,17 +6,6 @@ atlas_outcome_verify.py
 MIZAR Atlas — Outcome Verification Worker
 
 Runs daily at 10:00 UTC via atlas_outcome_verify.yml.
-
-Selects all user_decisions where:
-- verification_status = 'pending'
-- decision_timestamp is at least 7 days old
-
-For each eligible decision:
-- queries Duffel for the same route and travel dates
-- compares current price against original shown price
-- classifies TP / FP / TN / FN
-- writes outcome_verification
-- updates user_decisions.verification_status
 """
 
 import json
@@ -90,7 +79,12 @@ def _duffel_post(path: str, payload: dict[str, Any], retries: int = 3) -> dict[s
 
             if exc.code == 429:
                 wait = delays[min(attempt, len(delays) - 1)]
-                log.warning("Duffel 429. Waiting %ss. Attempt %d/%d.", wait, attempt + 1, retries)
+                log.warning(
+                    "Duffel 429. Waiting %ss. Attempt %d/%d.",
+                    wait,
+                    attempt + 1,
+                    retries,
+                )
                 time.sleep(wait)
                 continue
 
@@ -249,7 +243,7 @@ def fetch_pending_decisions() -> list[dict[str, Any]]:
 
 
 def already_verified(decision_id: str) -> bool:
-    """Guard against duplicate inserts on outcome_verification.decision_id."""
+    """Guard against duplicate processing on outcome_verification.decision_id."""
 
     response = (
         supabase.table("outcome_verification")
@@ -286,6 +280,7 @@ def write_verification(
     failure_reason: str | None,
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
+    status = "failed"
 
     if price_shown is None or price_shown <= 0:
         row = {
@@ -299,16 +294,7 @@ def write_verification(
             "failure_reason": failure_reason or "invalid_original_price",
         }
 
-        try:
-    supabase.table("outcome_verification") \
-        .upsert(row, on_conflict="decision_id") \
-        .execute()
-
-        except Exception as exc:
-            logger.error(f"Failed to write verification for {decision_id}: {exc}")
-            mark_decision_status(decision_id, "failed")
-
-    if price_t7 is None:
+    elif price_t7 is None:
         row = {
             "decision_id": decision_id,
             "verification_timestamp": now_iso,
@@ -320,27 +306,36 @@ def write_verification(
             "failure_reason": failure_reason or "no_price_returned",
         }
 
-        supabase.table("outcome_verification").insert(row).execute()
+    else:
+        change_pct = ((float(price_t7) - float(price_shown)) / float(price_shown)) * 100
+        ground_truth_rose = change_pct >= RISE_THRESHOLD_PCT
+        outcome = classify_outcome(float(regret_risk_score or 0.0), ground_truth_rose)
+
+        row = {
+            "decision_id": decision_id,
+            "verification_timestamp": now_iso,
+            "price_t7_gbp": round(float(price_t7), 2),
+            "price_change_pct": round(change_pct, 2),
+            "ground_truth_rose": ground_truth_rose,
+            "prediction_outcome": outcome,
+            "verification_method": "duffel_api",
+            "failure_reason": None,
+        }
+
+        status = "verified"
+
+    try:
+        (
+            supabase.table("outcome_verification")
+            .upsert(row, on_conflict="decision_id")
+            .execute()
+        )
+
+        mark_decision_status(decision_id, status)
+
+    except Exception as exc:
+        log.error("Failed to write verification for %s: %s", decision_id, exc)
         mark_decision_status(decision_id, "failed")
-        return
-
-    change_pct = ((float(price_t7) - float(price_shown)) / float(price_shown)) * 100
-    ground_truth_rose = change_pct >= RISE_THRESHOLD_PCT
-    outcome = classify_outcome(float(regret_risk_score or 0.0), ground_truth_rose)
-
-    row = {
-        "decision_id": decision_id,
-        "verification_timestamp": now_iso,
-        "price_t7_gbp": round(float(price_t7), 2),
-        "price_change_pct": round(change_pct, 2),
-        "ground_truth_rose": ground_truth_rose,
-        "prediction_outcome": outcome,
-        "verification_method": "duffel_api",
-        "failure_reason": None,
-    }
-
-    supabase.table("outcome_verification").insert(row).execute()
-    mark_decision_status(decision_id, "verified")
 
 
 # ------------------------------------------------------------
@@ -385,7 +380,12 @@ def run() -> None:
             score = 0.0
 
         if not origin or not destination:
-            log.warning("Invalid route for %s: origin=%s destination=%s", decision_id, origin, destination)
+            log.warning(
+                "Invalid route for %s: origin=%s destination=%s",
+                decision_id,
+                origin,
+                destination,
+            )
             write_verification(decision_id, None, price_shown, score, "invalid_route")
             failed += 1
             continue

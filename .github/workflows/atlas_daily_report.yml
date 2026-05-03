@@ -1,4 +1,4 @@
-name: Atlas Snapshot Capture
+name: Atlas Snapshot Report
 
 on:
   schedule:
@@ -34,7 +34,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
-          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_ACCESS_TOKEN }}
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           ATLAS_MAX_SEARCHES: 157
         run: python workers/atlas_snapshot_capture.py

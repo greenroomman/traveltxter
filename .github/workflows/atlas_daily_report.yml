@@ -1,4 +1,4 @@
-name: MIZAR Daily Health Report
+name: Atlas Snapshot Capture
 
 on:
   schedule:
@@ -6,16 +6,16 @@ on:
   workflow_dispatch:
 
 jobs:
-  daily-report:
+  snapshot-capture:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify health report script exists
+      - name: Verify snapshot capture script exists
         run: |
-          if [ ! -f workers/atlas_daily_report.py ]; then
-            echo "ERROR: workers/atlas_daily_report.py not found"
+          if [ ! -f workers/atlas_snapshot_capture.py ]; then
+            echo "ERROR: workers/atlas_snapshot_capture.py not found"
             echo "Available worker files:"
             ls -la workers/
             exit 1
@@ -27,27 +27,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install supabase httpx
+        run: |
+          pip install supabase requests httpx
 
-      - name: Run daily report
+      - name: Run snapshot capture
         env:
-          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
-          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-        run: python workers/atlas_daily_report.py
-
-      - name: Run alert checks
-        id: alerts
-        env:
-          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
-          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
-        run: python workers/atlas_alerts.py
-
-      - name: Send Slack alert
-        if: always() && steps.alerts.outputs.has_alerts == 'true'
-        uses: slackapi/slack-github-action@v2
-        with:
-          webhook-type: incoming-webhook
-          payload-file-path: /tmp/slack_payload.json
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_ACCESS_TOKEN }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          ATLAS_MAX_SEARCHES: 157
+        run: python workers/atlas_snapshot_capture.py

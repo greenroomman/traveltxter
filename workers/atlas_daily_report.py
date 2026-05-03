@@ -25,8 +25,16 @@ print("Running daily report for", today)
 
 decisions = sb.table("user_decisions").select("*").execute().data or []
 ov = sb.table("outcome_verification").select("*").execute().data or []
-snaps = sb.table("snapshots").select("snapshot_date,price_gbp,origin_iata").execute().data or []
 usage = sb.table("api_usage").select("timestamp").execute().data or []
+
+snap_count_res = (
+    sb.table("snapshots")
+    .select("snapshot_date", count="exact")
+    .eq("snapshot_date", today)
+    .execute()
+)
+
+today_s = snap_count_res.count or 0
 
 fuel_data = (
     sb.table("daily_market_signals")
@@ -53,9 +61,6 @@ tn = sum(1 for r in ov if r.get("prediction_outcome") == "TN")
 fn_c = sum(1 for r in ov if r.get("prediction_outcome") == "FN")
 
 precision = round(tp / (tp + fp) * 100, 1) if (tp + fp) > 0 else 0.0
-
-total_s = len(snaps)
-today_s = sum(1 for r in snaps if r.get("snapshot_date") == today)
 
 today_calls = sum(1 for r in usage if (r.get("timestamp") or "")[:10] == today)
 
@@ -91,7 +96,6 @@ MIZAR Daily Health - {today}
 Generated: {now_str}
 
 Snapshots today: {today_s}/{EXPECTED_SNAPSHOTS} ({pipeline_status})
-Total snapshots: {total_s}
 
 Decisions today: {today_d}
 Total decisions: {total_d}

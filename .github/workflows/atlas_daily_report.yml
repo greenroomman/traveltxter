@@ -1,21 +1,21 @@
-name: Atlas Snapshot Report
+name: MIZAR Daily Health Report
 
 on:
   schedule:
-    - cron: "30 8 * * *"
+    - cron: "50 9 * * *"
   workflow_dispatch:
 
 jobs:
-  snapshot-capture:
+  daily-report:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify snapshot capture script exists
+      - name: Verify health report script exists
         run: |
-          if [ ! -f workers/atlas_snapshot_capture.py ]; then
-            echo "ERROR: workers/atlas_snapshot_capture.py not found"
+          if [ ! -f workers/atlas_daily_report.py ]; then
+            echo "ERROR: workers/atlas_daily_report.py not found"
             echo "Available worker files:"
             ls -la workers/
             exit 1
@@ -27,14 +27,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install supabase requests httpx
+        run: pip install supabase httpx requests
 
-      - name: Run snapshot capture
+      - name: Run daily report
         env:
-          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
-          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
-          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
-          ATLAS_MAX_SEARCHES: 157
-        run: python workers/atlas_snapshot_capture.py
+          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: python workers/atlas_daily_report.py

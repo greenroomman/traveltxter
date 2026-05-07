@@ -2,7 +2,7 @@ name: Build Market Predictions
 
 on:
   schedule:
-    - cron: "15 9 * * *"
+    - cron: "58 6 * * *"
   workflow_dispatch:
 
 jobs:

@@ -6,7 +6,7 @@ on:
     # Runs after PM slot completes
     - cron: "50 16 * * *"   # 16:50 UTC
     # Optional AM refresh
-    - cron: "50 06 * * *"   # 06:50 UTC
+    - cron: "30 07 * * *"   # 06:50 UTC
 
 jobs:
   export:

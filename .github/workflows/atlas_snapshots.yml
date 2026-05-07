@@ -2,7 +2,7 @@ name: Atlas Snapshots
 
 on:
   schedule:
-    - cron: '10 7 * * *'
+    - cron: "50 6 * * *"
   workflow_dispatch:
 
 jobs:

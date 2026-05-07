@@ -1,0 +1,40 @@
+name: MIZAR Report PAYG Usage
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  report-usage:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify usage reporter exists
+        run: |
+          if [ ! -f workers/atlas_report_usage.py ]; then
+            echo "ERROR: workers/atlas_report_usage.py not found"
+            echo "Available worker files:"
+            ls -la workers/
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install supabase requests
+
+      - name: Report PAYG metered usage to Stripe
+        env:
+          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+        run: |
+          python workers/atlas_report_usage.py

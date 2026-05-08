@@ -55,10 +55,31 @@ pending = sum(1 for r in decisions if r.get("verification_status") == "pending")
 verified = sum(1 for r in decisions if r.get("verification_status") == "verified")
 failed_v = sum(1 for r in decisions if r.get("verification_status") == "failed")
 
-tp = sum(1 for r in ov if r.get("prediction_outcome") == "TP")
-fp = sum(1 for r in ov if r.get("prediction_outcome") == "FP")
-tn = sum(1 for r in ov if r.get("prediction_outcome") == "TN")
-fn_c = sum(1 for r in ov if r.get("prediction_outcome") == "FN")
+# Clean validation population only.
+# Excludes suppress-zone rows, crisis rows, console/demo rows, old models, and rows explicitly marked ineligible.
+CURRENT_MODEL_VERSION = "v3_0_0"
+CURRENT_HIGH_RISK_THRESHOLD = 0.45
+
+clean_decisions = {
+    r["decision_id"]: r
+    for r in decisions
+    if r.get("decision_id")
+    and r.get("model_version") == CURRENT_MODEL_VERSION
+    and r.get("client_platform") == "api"
+    and r.get("validation_eligible") is True
+    and r.get("route_class") != "suppress"
+}
+
+clean_ov = [
+    r for r in ov
+    if r.get("decision_id") in clean_decisions
+    and r.get("prediction_outcome") is not None
+]
+
+tp = sum(1 for r in clean_ov if r.get("prediction_outcome") == "TP")
+fp = sum(1 for r in clean_ov if r.get("prediction_outcome") == "FP")
+tn = sum(1 for r in clean_ov if r.get("prediction_outcome") == "TN")
+fn_c = sum(1 for r in clean_ov if r.get("prediction_outcome") == "FN")
 
 precision = round(tp / (tp + fp) * 100, 1) if (tp + fp) > 0 else 0.0
 
@@ -109,7 +130,7 @@ FP: {fp}
 TN: {tn}
 FN: {fn_c}
 
-Live precision all: {precision}%
+Clean v3 precision all: {precision}%
 
 API calls today: {today_calls}
 
@@ -191,27 +212,15 @@ print(
 # ============================================================
 
 try:
-    v2 = {
-        r["decision_id"]: r
-        for r in decisions
-        if r.get("model_version") == "v2_0_0" and r.get("decision_id")
-    }
-
-    v2_ov = [
-        r for r in ov
-        if r.get("decision_id") in v2
-        and r.get("prediction_outcome") is not None
-    ]
-
     high = [
-        r for r in v2_ov
-        if float(v2[r["decision_id"]].get("regret_risk_score") or 0) >= 0.70
+        r for r in clean_ov
+        if float(clean_decisions[r["decision_id"]].get("regret_risk_score") or 0) >= CURRENT_HIGH_RISK_THRESHOLD
     ]
 
-    tp_all = sum(1 for r in v2_ov if r.get("prediction_outcome") == "TP")
-    fp_all = sum(1 for r in v2_ov if r.get("prediction_outcome") == "FP")
-    tn_all = sum(1 for r in v2_ov if r.get("prediction_outcome") == "TN")
-    fn_all = sum(1 for r in v2_ov if r.get("prediction_outcome") == "FN")
+    tp_all = sum(1 for r in clean_ov if r.get("prediction_outcome") == "TP")
+    fp_all = sum(1 for r in clean_ov if r.get("prediction_outcome") == "FP")
+    tn_all = sum(1 for r in clean_ov if r.get("prediction_outcome") == "TN")
+    fn_all = sum(1 for r in clean_ov if r.get("prediction_outcome") == "FN")
 
     tp_h = sum(1 for r in high if r.get("prediction_outcome") == "TP")
     fp_h = sum(1 for r in high if r.get("prediction_outcome") == "FP")
@@ -219,18 +228,18 @@ try:
     precision_h = round(tp_h / (tp_h + fp_h) * 100, 2) if (tp_h + fp_h) else None
     recall_all = round(tp_all / (tp_all + fn_all) * 100, 2) if (tp_all + fn_all) else None
 
-    v2_changes = [
+    clean_changes = [
         float(r["price_change_pct"])
-        for r in v2_ov
+        for r in clean_ov
         if r.get("price_change_pct") is not None
     ]
-    avg_change = round(sum(v2_changes) / len(v2_changes), 2) if v2_changes else None
+    avg_change = round(sum(clean_changes) / len(clean_changes), 2) if clean_changes else None
 
     sb.table("model_performance_daily").upsert(
         {
             "report_date": today,
-            "model_version": "v2_0_0",
-            "total_verified": len(v2_ov),
+            "model_version": CURRENT_MODEL_VERSION,
+            "total_verified": len(clean_ov),
             "high_risk_verified": len(high),
             "tp": tp_all,
             "fp": fp_all,
@@ -245,7 +254,8 @@ try:
 
     print(
         f"model_performance_daily updated: "
-        f"total_verified={len(v2_ov)}, "
+        f"model_version={CURRENT_MODEL_VERSION}, "
+        f"total_verified={len(clean_ov)}, "
         f"high_risk_verified={len(high)}, "
         f"precision_high_risk={precision_h}"
     )

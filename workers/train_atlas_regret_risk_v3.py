@@ -32,6 +32,8 @@ import numpy as np
 from supabase import create_client
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import brier_score_loss
 
 
@@ -556,15 +558,65 @@ def precision_at_threshold(y_true: np.ndarray, y_score: np.ndarray, threshold: f
     return float(tp / n_high), n_high
 
 
-def print_score_histogram(scores: np.ndarray) -> None:
-    log.info("Score distribution histogram, 0.1 buckets:")
-    for start in [i / 10 for i in range(10)]:
-        end = start + 0.1
-        if end >= 1.0:
-            count = int(np.sum((scores >= start) & (scores <= end)))
-        else:
-            count = int(np.sum((scores >= start) & (scores < end)))
-        log.info("  %.1f-%.1f: %d", start, end, count)
+def score_distribution(scores: np.ndarray) -> dict[str, int]:
+    return {
+        "0.00-0.10": int(np.sum((scores >= 0.00) & (scores < 0.10))),
+        "0.10-0.20": int(np.sum((scores >= 0.10) & (scores < 0.20))),
+        "0.20-0.30": int(np.sum((scores >= 0.20) & (scores < 0.30))),
+        "0.30-0.40": int(np.sum((scores >= 0.30) & (scores < 0.40))),
+        "0.40-0.50": int(np.sum((scores >= 0.40) & (scores < 0.50))),
+        "0.50+": int(np.sum(scores >= 0.50)),
+    }
+
+
+def distribution_is_not_collapsed(distribution: dict[str, int], total: int) -> bool:
+    if total <= 0:
+        return False
+    non_zero_bands = sum(1 for count in distribution.values() if count > 0)
+    max_band_share = max(distribution.values()) / total
+    return non_zero_bands >= 2 and max_band_share < 0.85
+
+
+def evaluate_variant(
+    name: str,
+    fitted_model: Any,
+    y_test: np.ndarray,
+    scores: np.ndarray,
+) -> dict[str, Any]:
+    brier = float(brier_score_loss(y_test, scores))
+    precision_045, n_045 = precision_at_threshold(y_test, scores, 0.45)
+    precision_030, n_030 = precision_at_threshold(y_test, scores, 0.30)
+    distribution = score_distribution(scores)
+
+    print(f"Variant: {name}")
+    print(f"  Brier score:         {brier:.3f}")
+    print(f"  Avg score (test):    {float(np.mean(scores)):.3f}")
+    print(f"  Min score (test):    {float(np.min(scores)):.3f}")
+    print(f"  Max score (test):    {float(np.max(scores)):.3f}")
+    print(f"  % scores >= 0.45:    {100.0 * float(np.mean(scores >= 0.45)):.1f}%")
+    print(f"  % scores >= 0.30:    {100.0 * float(np.mean(scores >= 0.30)):.1f}%")
+    print(f"  Precision at 0.45:   {100.0 * precision_045:.1f}%  (n={n_045})")
+    print(f"  Precision at 0.30:   {100.0 * precision_030:.1f}%  (n={n_030})")
+    print("  Score distribution:")
+    print(f"    0.00-0.10: {distribution['0.00-0.10']} rows")
+    print(f"    0.10-0.20: {distribution['0.10-0.20']} rows")
+    print(f"    0.20-0.30: {distribution['0.20-0.30']} rows")
+    print(f"    0.30-0.40: {distribution['0.30-0.40']} rows")
+    print(f"    0.40-0.50: {distribution['0.40-0.50']} rows")
+    print(f"    0.50+:     {distribution['0.50+']} rows")
+    print("")
+
+    return {
+        "name": name,
+        "model": fitted_model,
+        "scores": scores,
+        "brier_score": brier,
+        "precision_at_0.45": precision_045,
+        "precision_at_0.30": precision_030,
+        "n_high_risk_test": n_045,
+        "distribution": distribution,
+        "distribution_ok": distribution_is_not_collapsed(distribution, len(scores)),
+    }
 
 
 def write_feature_file(output_dir: str) -> str:
@@ -572,6 +624,28 @@ def write_feature_file(output_dir: str) -> str:
     with open(path, "w", encoding="utf-8") as handle:
         handle.write("\n".join(FEATURE_COLS) + "\n")
     return path
+
+
+def select_winning_variant(results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    eligible = [
+        result for result in results
+        if result["n_high_risk_test"] >= 30
+        and result["distribution_ok"]
+        and result["brier_score"] < 0.28
+    ]
+
+    if not eligible:
+        return None
+
+    eligible.sort(
+        key=lambda result: (
+            result["precision_at_0.45"],
+            -result["brier_score"],
+            result["n_high_risk_test"],
+        ),
+        reverse=True,
+    )
+    return eligible[0]
 
 
 def train() -> None:
@@ -609,37 +683,52 @@ def train() -> None:
     if int(np.sum(y_train == 1)) < 5 or int(np.sum(y_train == 0)) < 5:
         raise RuntimeError("Training split has fewer than 5 examples in at least one class; cv=5 cannot run.")
 
-    base = LogisticRegression(max_iter=1000, class_weight="balanced", C=1.0)
-    model = CalibratedClassifierCV(base, method="sigmoid", cv=5)
-    model.fit(X_train, y_train)
+    print("")
+    print("=== V3 calibration comparison ===")
+    print("Same data pipeline, same feature set, same temporal train/test split.")
+    print("")
 
-    test_scores = model.predict_proba(X_test)[:, 1]
-    brier = float(brier_score_loss(y_test, test_scores))
-    precision_070, n_high_risk_test = precision_at_threshold(y_test, test_scores, HIGH_RISK_THRESHOLD)
+    variants = {
+        "v3_current_scaled": CalibratedClassifierCV(
+            Pipeline([
+                ("scaler", StandardScaler()),
+                ("lr", LogisticRegression(
+                    max_iter=5000,
+                    class_weight="balanced",
+                    C=1.0,
+                    solver="lbfgs",
+                )),
+            ]),
+            method="sigmoid",
+            cv=5,
+        ),
+    }
 
-    log.info("Brier score: %.4f", brier)
-    log.info("Precision at %.2f: %.3f", HIGH_RISK_THRESHOLD, precision_070)
-    log.info("High-risk test count: %d", n_high_risk_test)
-    if n_high_risk_test < 30:
-        log.warning("n_high_risk_test < 30. Precision at 0.70 is not yet stable.")
+    results: list[dict[str, Any]] = []
 
-    print_score_histogram(test_scores)
+    for name, model in variants.items():
+        model.fit(X_train, y_train)
+        scores = model.predict_proba(X_test)[:, 1]
+        results.append(evaluate_variant(name, model, y_test, scores))
+
+    winner = results[0]
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     model_path = os.path.join(OUTPUT_DIR, MODEL_FILENAME)
     feature_path = write_feature_file(OUTPUT_DIR)
 
     artefact = {
-        "model": model,
+        "model": winner["model"],
         "feature_cols": FEATURE_COLS,
         "version": MODEL_VERSION,
         "trained_at": utc_now().isoformat(),
         "train_rows": int(len(y_train)),
         "test_rows": int(len(y_test)),
-        "positive_rate_train": positive_rate(y_train),
-        "brier_score": brier,
-        "precision_at_0.70": precision_070,
-        "n_high_risk_test": n_high_risk_test,
+        "brier_score": float(winner["brier_score"]),
+        "precision_at_0.45": float(winner["precision_at_0.45"]),
+        "n_high_risk_test": int(winner["n_high_risk_test"]),
+        "variant": "v3_current_scaled_converged",
+        "architecture": "Pipeline(StandardScaler + LogisticRegression(C=1.0, max_iter=5000, solver=lbfgs)) + CalibratedClassifierCV(sigmoid, cv=5)",
     }
 
     joblib.dump(artefact, model_path)

@@ -382,11 +382,27 @@ def search_duffel(
             if not offers:
                 return None, "no_offers"
 
+            offer_prices = []
+            for offer in offers:
+                total = offer.get("total_amount")
+                currency = offer.get("total_currency", "GBP")
+                if total and currency == "GBP":
+                    try:
+                        offer_prices.append(float(total))
+                    except Exception:
+                        pass
+
             cheapest = min(offers, key=lambda o: float(o["total_amount"]))
+
+            cheapest_offer_gbp = min(offer_prices) if offer_prices else None
+            most_expensive_offer_gbp = max(offer_prices) if offer_prices else None
 
             return {
                 "price_gbp": float(cheapest["total_amount"]),
                 "currency": cheapest["total_currency"],
+                "offer_count": len(offers),
+                "cheapest_offer_gbp": cheapest_offer_gbp,
+                "most_expensive_offer_gbp": most_expensive_offer_gbp,
                 "carrier_count": len(
                     set(
                         seg["marketing_carrier"]["iata_code"]
@@ -532,6 +548,9 @@ def main():
             "is_bank_holiday_adjacent": False,
             "price_gbp": result["price_gbp"] if result else None,
             "currency": result["currency"] if result else "GBP",
+            "offer_count": result["offer_count"] if result else None,
+            "cheapest_offer_gbp": result["cheapest_offer_gbp"] if result else None,
+            "most_expensive_offer_gbp": result["most_expensive_offer_gbp"] if result else None,
             "carrier_count": result["carrier_count"] if result else None,
             "lcc_present": result["lcc_present"] if result else None,
             "direct": result["direct"] if result else None,

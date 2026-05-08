@@ -91,6 +91,10 @@ FEATURE_COLS = [
     "trend_7d",
     "volatility_7d",
     "direction_consistency_7d",
+    "offer_count_latest",
+    "offer_count_7d_avg",
+    "offer_count_trend",
+    "price_range_ratio",
     "carrier_count",
     "lcc_present",
     "direct",
@@ -195,7 +199,7 @@ def fetch_snapshots() -> list[dict[str, Any]]:
     cols = (
         "snapshot_id,snapshot_date,origin_iata,destination_iata,"
         "outbound_date,return_date,price_gbp,cabin_class,direct,stops,"
-        "carrier_count,lcc_present"
+        "carrier_count,lcc_present,offer_count,cheapest_offer_gbp,most_expensive_offer_gbp"
     )
     raw_rows = fetch_all_rows("snapshots", cols, "snapshot_date")
     cleaned: list[dict[str, Any]] = []
@@ -427,6 +431,69 @@ def route_momentum_features(
     }
 
 
+def compute_offer_features(
+    route_snapshots: list[dict[str, Any]],
+    current_offer_count: Any,
+    current_cheapest: Any,
+    current_most_expensive: Any,
+) -> dict[str, float]:
+    """
+    Compute offer-count based capacity proxy features.
+    Falls back to neutral values if offer_count data is unavailable.
+    """
+    neutral = {
+        "offer_count_latest": 5.0,
+        "offer_count_7d_avg": 5.0,
+        "offer_count_trend": 0.0,
+        "price_range_ratio": 0.5,
+    }
+
+    if current_offer_count is None:
+        return neutral
+
+    try:
+        offer_count_latest = float(current_offer_count)
+    except Exception:
+        return neutral
+
+    recent_counts = []
+    for snapshot in route_snapshots[-7:]:
+        if snapshot.get("offer_count") is not None:
+            try:
+                recent_counts.append(float(snapshot["offer_count"]))
+            except Exception:
+                pass
+
+    offer_count_7d_avg = (
+        sum(recent_counts) / len(recent_counts) if recent_counts else offer_count_latest
+    )
+
+    offer_count_trend = (
+        offer_count_latest - offer_count_7d_avg
+    ) / max(offer_count_7d_avg, 1.0)
+
+    try:
+        cheapest = float(current_cheapest) if current_cheapest is not None else None
+        most_expensive = (
+            float(current_most_expensive) if current_most_expensive is not None else None
+        )
+    except Exception:
+        cheapest = None
+        most_expensive = None
+
+    if cheapest and most_expensive and cheapest > 0:
+        price_range_ratio = (most_expensive - cheapest) / cheapest
+    else:
+        price_range_ratio = neutral["price_range_ratio"]
+
+    return {
+        "offer_count_latest": round(offer_count_latest, 1),
+        "offer_count_7d_avg": round(offer_count_7d_avg, 2),
+        "offer_count_trend": round(offer_count_trend, 4),
+        "price_range_ratio": round(price_range_ratio, 4),
+    }
+
+
 def truthy_float(value: Any, default: float) -> float:
     if value is None:
         return default
@@ -455,6 +522,18 @@ def build_feature_row(
     days_to_bh = days_to_next_bank_holiday(outbound_date)
     rel = route_relative_features(row, indexes)
     momentum = route_momentum_features(row, indexes)
+    route_key = (row["origin_iata"], row["destination_iata"])
+    route_snapshots = [
+        {"snapshot_date": d, "price_gbp": p, "offer_count": None}
+        for d, p in indexes["by_route"].get(route_key, [])
+        if d <= snapshot_date
+    ]
+    offer_features = compute_offer_features(
+        route_snapshots,
+        row.get("offer_count"),
+        row.get("cheapest_offer_gbp"),
+        row.get("most_expensive_offer_gbp"),
+    )
     market = market_signal_for_date(signals_by_date, snapshot_date)
 
     trip_overlaps_holiday = 0.0
@@ -473,6 +552,10 @@ def build_feature_row(
         "trend_7d": momentum["trend_7d"],
         "volatility_7d": momentum["volatility_7d"],
         "direction_consistency_7d": momentum["direction_consistency_7d"],
+        "offer_count_latest": offer_features["offer_count_latest"],
+        "offer_count_7d_avg": offer_features["offer_count_7d_avg"],
+        "offer_count_trend": offer_features["offer_count_trend"],
+        "price_range_ratio": offer_features["price_range_ratio"],
         "carrier_count": truthy_float(row.get("carrier_count"), 3.0),
         "lcc_present": truthy_float(row.get("lcc_present"), 1.0),
         "direct": truthy_float(row.get("direct"), 1.0),

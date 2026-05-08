@@ -1,0 +1,30 @@
+name: MIZAR Decision Harness
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-harness:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install supabase requests python-dotenv
+
+      - name: Run decision harness
+        run: python workers/decision_harness.py
+        env:
+          SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+          MIZAR_API_KEY: ${{ secrets.MIZAR_API_KEY }}
+          MIZAR_API_BASE: https://mizar-api.vercel.app

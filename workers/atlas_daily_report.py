@@ -1,7 +1,7 @@
 import os
 import sys
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from supabase import create_client
 
 SUPABASE_URL = os.environ["MIZAR_SUPABASE_URL"]
@@ -12,20 +12,97 @@ NOTION_PARENT_ID = "327c2a68314581a2a1aaf8a2d609b425"
 EXPECTED_SNAPSHOTS = 153
 MIN_HEALTHY_SNAPSHOTS = 150
 
+CURRENT_MODEL_VERSION = "v3_0_0"
+CURRENT_HIGH_RISK_THRESHOLD = 0.45
+BATCH_SIZE = 1000
+
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+now_utc = datetime.now(timezone.utc)
+today = now_utc.strftime("%Y-%m-%d")
+tomorrow = (now_utc + timedelta(days=1)).strftime("%Y-%m-%d")
+now_str = now_utc.strftime("%Y-%m-%d %H:%M UTC")
 
 print("Running daily report for", today)
+
+
+# ============================================================
+# PAGINATION HELPERS
+# ============================================================
+
+def fetch_all_user_decisions():
+    rows = []
+    start = 0
+
+    while True:
+        end = start + BATCH_SIZE - 1
+
+        response = (
+            sb.table("user_decisions")
+            .select(
+                "decision_id, decision_timestamp, model_version, client_platform, "
+                "validation_eligible, route_class, verification_status, regret_risk_score"
+            )
+            .order("decision_timestamp", desc=False)
+            .range(start, end)
+            .execute()
+        )
+
+        batch = response.data or []
+        rows.extend(batch)
+
+        if len(batch) < BATCH_SIZE:
+            break
+
+        start += BATCH_SIZE
+
+    return rows
+
+
+def fetch_all_outcome_verification():
+    rows = []
+    start = 0
+
+    while True:
+        end = start + BATCH_SIZE - 1
+
+        response = (
+            sb.table("outcome_verification")
+            .select(
+                "decision_id, prediction_outcome, price_change_pct, verification_timestamp"
+            )
+            .order("verification_timestamp", desc=False)
+            .range(start, end)
+            .execute()
+        )
+
+        batch = response.data or []
+        rows.extend(batch)
+
+        if len(batch) < BATCH_SIZE:
+            break
+
+        start += BATCH_SIZE
+
+    return rows
+
 
 # ============================================================
 # DATA LOAD
 # ============================================================
 
-decisions = sb.table("user_decisions").select("*").execute().data or []
-ov = sb.table("outcome_verification").select("*").execute().data or []
-usage = sb.table("api_usage").select("timestamp").execute().data or []
+decisions = fetch_all_user_decisions()
+ov = fetch_all_outcome_verification()
+
+usage_count_res = (
+    sb.table("api_usage")
+    .select("timestamp", count="exact")
+    .gte("timestamp", today)
+    .lt("timestamp", tomorrow)
+    .execute()
+)
+
+today_calls = usage_count_res.count or 0
 
 snap_count_res = (
     sb.table("snapshots")
@@ -45,6 +122,10 @@ fuel_data = (
     .data or []
 )
 
+print(f"Loaded user_decisions rows: {len(decisions)}")
+print(f"Loaded outcome_verification rows: {len(ov)}")
+
+
 # ============================================================
 # METRICS
 # ============================================================
@@ -57,9 +138,6 @@ failed_v = sum(1 for r in decisions if r.get("verification_status") == "failed")
 
 # Clean validation population only.
 # Excludes suppress-zone rows, crisis rows, console/demo rows, old models, and rows explicitly marked ineligible.
-CURRENT_MODEL_VERSION = "v3_0_0"
-CURRENT_HIGH_RISK_THRESHOLD = 0.45
-
 clean_decisions = {
     r["decision_id"]: r
     for r in decisions
@@ -81,12 +159,12 @@ fp = sum(1 for r in clean_ov if r.get("prediction_outcome") == "FP")
 tn = sum(1 for r in clean_ov if r.get("prediction_outcome") == "TN")
 fn_c = sum(1 for r in clean_ov if r.get("prediction_outcome") == "FN")
 
-precision = round(tp / (tp + fp) * 100, 1) if (tp + fp) > 0 else 0.0
-
-today_calls = sum(1 for r in usage if (r.get("timestamp") or "")[:10] == today)
+precision = round(tp / (tp + fp) * 100, 1) if (tp + fp) > 0 else None
+precision_display = f"{precision}%" if precision is not None else "n/a"
 
 fuel_price = float(fuel_data[0]["jet_fuel_usd_gal"]) if fuel_data else "N/A"
 fuel_date = fuel_data[0]["signal_date"] if fuel_data else "N/A"
+
 
 # ============================================================
 # HEALTH STATUS
@@ -104,8 +182,12 @@ flags = []
 if today_s < MIN_HEALTHY_SNAPSHOTS:
     flags.append(f"CRITICAL: Snapshot coverage {today_s}/{EXPECTED_SNAPSHOTS}")
 
+if precision is None:
+    flags.append("INFO: v3 precision pending t+7 verification window")
+
 if not flags:
     flags.append("OK")
+
 
 # ============================================================
 # NOTION REPORT
@@ -130,7 +212,7 @@ FP: {fp}
 TN: {tn}
 FN: {fn_c}
 
-Clean v3 precision all: {precision}%
+Clean v3 precision all: {precision_display}
 
 API calls today: {today_calls}
 
@@ -181,6 +263,7 @@ try:
 except Exception as e:
     print("Notion report write failed:", e)
 
+
 # ============================================================
 # SYSTEM HEALTH TABLE
 # ============================================================
@@ -191,6 +274,7 @@ sb.table("system_health_daily").upsert(
         "snapshots_today": today_s,
         "pipeline_status": pipeline_status,
         "total_decisions": total_d,
+        "pending_decisions": pending,
         "verified_decisions": verified,
         "failed_verifications": failed_v,
         "live_precision_all": precision,
@@ -204,8 +288,12 @@ print(
     f"system_health_daily updated: "
     f"report_date={today}, "
     f"snapshots_today={today_s}, "
-    f"pipeline_status={pipeline_status}"
+    f"pipeline_status={pipeline_status}, "
+    f"total_decisions={total_d}, "
+    f"pending_decisions={pending}, "
+    f"live_precision_all={precision_display}"
 )
+
 
 # ============================================================
 # MODEL PERFORMANCE TABLE
@@ -262,6 +350,7 @@ try:
 
 except Exception as e:
     print("model performance failed:", e)
+
 
 # ============================================================
 # ENFORCEMENT

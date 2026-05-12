@@ -205,20 +205,40 @@ def parse_datetime_utc(value: str) -> datetime:
 
 
 def fetch_pending_decisions() -> list[dict[str, Any]]:
-    """Return decisions eligible for t+7 verification."""
+    """Return validation-eligible pending decisions ready for t+7 verification.
 
-    response = (
-        supabase.table("user_decisions")
-        .select(
-            "decision_id, decision_timestamp, origin_iata, destination_iata, "
-            "outbound_date, return_date, price_shown_gbp, regret_risk_score, "
-            "trip_type, cabin_class"
+    Supabase Python client returns 1,000 rows by default. This worker must
+    paginate explicitly so older pending rows cannot hide newer v3 decisions.
+    """
+
+    batch_size = 1000
+    start = 0
+    rows: list[dict[str, Any]] = []
+
+    while True:
+        end = start + batch_size - 1
+
+        response = (
+            supabase.table("user_decisions")
+            .select(
+                "decision_id, decision_timestamp, origin_iata, destination_iata, "
+                "outbound_date, return_date, price_shown_gbp, regret_risk_score, "
+                "trip_type, cabin_class"
+            )
+            .eq("verification_status", "pending")
+            .eq("validation_eligible", True)
+            .order("decision_timestamp", desc=False)
+            .range(start, end)
+            .execute()
         )
-        .eq("verification_status", "pending")
-        .execute()
-    )
 
-    rows = response.data or []
+        batch = response.data or []
+        rows.extend(batch)
+
+        if len(batch) < batch_size:
+            break
+
+        start += batch_size
 
     eligible: list[dict[str, Any]] = []
     now_dt = datetime.now(timezone.utc)
@@ -238,7 +258,11 @@ def fetch_pending_decisions() -> list[dict[str, Any]]:
         if (now_dt - decision_dt).days >= 7:
             eligible.append(row)
 
-    log.info("Found %d pending decisions, %d eligible for t+7.", len(rows), len(eligible))
+    log.info(
+        "Found %d validation-eligible pending decisions, %d eligible for t+7.",
+        len(rows),
+        len(eligible),
+    )
     return eligible
 
 

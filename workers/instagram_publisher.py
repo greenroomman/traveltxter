@@ -1,19 +1,28 @@
 # workers/instagram_publisher.py
-# V5 — Instagram Publisher (90/10 Rotation Buffer)
+# V6 Safe — Instagram Publisher (single-image compatible)
+#
+# Purpose:
+# - Publish rendered TravelTxter images to Instagram
 #
 # Reads:
-# - OPS_MASTER!B2 (theme of the day)
-# - RAW_DEALS (source of truth; writable)
+# - OPS_MASTER!B2 for theme of the day
+# - RAW_DEALS as source of truth
 #
-# Writes (RAW_DEALS only):
-# - posted_instagram_at (timestamp)
-# - status: Only transitions PUBLISH_* statuses to READY_TO_POST
-# - publish_error / publish_error_at (if columns exist)
+# Publishes:
+# - Single image posts using RAW_DEALS.graphic_url
 #
-# 90/10 Rotation Strategy:
-# - 90%: Prefer deals from current slot (AM during AM run, PM during PM run)
-# - 10%: Fallback to opposite slot if current slot is empty (rotation buffer)
-# - Caption always uses CURRENT slot language, regardless of graphic slot
+# Writes to RAW_DEALS only:
+# - posted_instagram_at
+# - instagram_media_id if column exists
+# - status -> POSTED_INSTAGRAM when publish succeeds
+# - publish_error / publish_error_at if columns exist
+#
+# Contract:
+# - Only publishes rows with status = READY_TO_PUBLISH
+# - Requires graphic_url to be populated and publicly reachable
+# - Does not post broken image URLs
+# - Keeps the current single-image Graph API flow
+# - Carousel support should be added later as a separate contract change
 
 from __future__ import annotations
 
@@ -75,11 +84,6 @@ def hours_since(ts: Optional[dt.datetime], ref: dt.datetime) -> Optional[float]:
 # ------------------ robust SA JSON parsing ------------------
 
 def _repair_private_key_newlines(raw: str) -> str:
-    """
-    Repairs a common bad-secret format where the JSON is mostly valid
-    but private_key contains literal newlines (invalid in JSON strings).
-    Converts those literal newlines inside the private_key field to \\n.
-    """
     pat = re.compile(r'("private_key"\s*:\s*")(.+?)(")', re.DOTALL)
     m = pat.search(raw)
     if not m:
@@ -92,36 +96,26 @@ def _repair_private_key_newlines(raw: str) -> str:
     return raw[: m.start()] + prefix + pk_fixed + suffix + raw[m.end():]
 
 def load_sa_info() -> Dict[str, Any]:
-    """
-    Load SA JSON from:
-      1) GCP_SA_JSON_ONE_LINE (preferred)
-      2) GCP_SA_JSON (fallback)
-    And repair if secret contains invalid control chars.
-    """
     raw = env("GCP_SA_JSON_ONE_LINE") or env("GCP_SA_JSON")
     if not raw:
         raise RuntimeError("Missing GCP_SA_JSON_ONE_LINE / GCP_SA_JSON")
 
-    # Attempt 1: direct JSON
     try:
         return json.loads(raw)
     except Exception:
         pass
 
-    # Attempt 2: common one-line secret contains literal "\\n"
     try:
         return json.loads(raw.replace("\\n", "\n"))
     except Exception:
         pass
 
-    # Attempt 3: repair literal newlines inside private_key value
     repaired = _repair_private_key_newlines(raw)
     try:
         return json.loads(repaired)
     except Exception:
         pass
 
-    # Attempt 4: repair + then unescape \\n
     repaired2 = _repair_private_key_newlines(raw).replace("\\n", "\n")
     return json.loads(repaired2)
 
@@ -151,26 +145,36 @@ def get_cell(row: Dict[str, str], key: str) -> str:
 def truthy(v: str) -> bool:
     return str(v or "").strip().lower() in ("true", "1", "yes", "y")
 
-def safe_float(v: str, default: float = 0.0) -> float:
-    try:
-        s = str(v or "").strip()
-        if not s:
-            return default
-        s = s.replace("£", "").replace(",", "")
-        return float(s)
-    except Exception:
-        return default
-
 def normalize_theme(t: str) -> str:
     t = (t or "").strip().lower()
     t = t.replace(" ", "_")
     return t
+
+def update_cell_if_present(ws, row_i: int, h: Dict[str, int], col: str, value: str) -> None:
+    if col in h:
+        ws.update_cell(row_i, h[col] + 1, value)
 
 
 # ------------------ IG API helpers ------------------
 
 def graph_url(version: str, path: str) -> str:
     return f"https://graph.facebook.com/{version}/{path.lstrip('/')}"
+
+def preflight_image_url(image_url: str) -> None:
+    if not image_url:
+        raise RuntimeError("Missing graphic_url")
+
+    try:
+        r = requests.get(image_url, timeout=20, allow_redirects=True)
+    except Exception as e:
+        raise RuntimeError(f"Graphic URL preflight failed: {e}") from e
+
+    if r.status_code != 200:
+        raise RuntimeError(f"Graphic URL preflight returned HTTP {r.status_code}: {image_url}")
+
+    ctype = (r.headers.get("content-type") or "").lower()
+    if ctype and not ctype.startswith("image/"):
+        raise RuntimeError(f"Graphic URL is not an image. content-type={ctype}")
 
 def ig_create_container(version: str, ig_user_id: str, access_token: str, image_url: str, caption: str) -> str:
     r = requests.post(
@@ -182,9 +186,15 @@ def ig_create_container(version: str, ig_user_id: str, access_token: str, image_
         },
         timeout=45,
     )
-    j = r.json()
+
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"IG media create failed: HTTP {r.status_code} {r.text[:300]}")
+
     if "id" not in j:
         raise RuntimeError(f"IG media create failed: {j}")
+
     return j["id"]
 
 def ig_publish_container(version: str, ig_user_id: str, access_token: str, creation_id: str) -> str:
@@ -196,145 +206,178 @@ def ig_publish_container(version: str, ig_user_id: str, access_token: str, creat
         },
         timeout=45,
     )
-    j = r.json()
+
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"IG publish failed: HTTP {r.status_code} {r.text[:300]}")
+
     if "id" not in j:
         raise RuntimeError(f"IG publish failed: {j}")
+
     return j["id"]
 
 
-# ------------------ selection logic (90/10 rotation buffer) ------------------
+# ------------------ selection logic ------------------
 
 def run_slot() -> str:
     s = env("RUN_SLOT", "").upper()
     return s if s in ("AM", "PM") else ""
 
-def is_fresh_24h(row: Dict[str, str], ref: dt.datetime) -> bool:
-    # Prefer explicit column if present
+def is_fresh_enough(row: Dict[str, str], ref: dt.datetime, max_age_hours: float) -> bool:
+    if max_age_hours <= 0:
+        return True
+
     if "is_fresh_24h" in row:
         v = get_cell(row, "is_fresh_24h")
         if v:
             return truthy(v)
 
-    # Else compute from ingested_at_utc if available
     ts = parse_iso_utc(get_cell(row, "ingested_at_utc"))
     h = hours_since(ts, ref)
-    return (h is not None and h <= 24.0)
+    return h is not None and h <= max_age_hours
 
-def pick_candidate(rows: List[Tuple[int, Dict[str, str]]],
-                   theme_today: str,
-                   slot: str,
-                   ref: dt.datetime) -> Optional[Tuple[int, Dict[str, str], str]]:
+def pick_candidate(
+    rows: List[Tuple[int, Dict[str, str]]],
+    theme_today: str,
+    slot: str,
+    ref: dt.datetime,
+    max_age_hours: float,
+) -> Optional[Tuple[int, Dict[str, str], str]]:
     """
-    90/10 Rotation Buffer Strategy:
-    - 90%: Prefer deals from current slot (AM during AM run, PM during PM run)
-    - 10%: Fallback to opposite slot if current slot is empty
-    - Always respect freshness (<24h) and theme match
-    
-    Returns (row_index_1based, row, reason) or None
+    Select one Instagram candidate.
+
+    Required:
+    - status = READY_TO_PUBLISH
+    - graphic_url populated
+    - posted_instagram_at blank
+    - fresh enough unless INSTAGRAM_MAX_AGE_HOURS <= 0
+
+    Preference:
+    - current slot
+    - theme match
+    - newest ingested row
     """
-    
-    # Define current and fallback slots
-    current_slot = slot  # "AM" or "PM"
+
+    current_slot = slot
     opposite_slot = "PM" if slot == "AM" else "AM"
-    
-    # Filter: must have graphic_url, not already posted, fresh <24h
+
     eligible = []
+
     for i, r in rows:
+        if get_cell(r, "status") != "READY_TO_PUBLISH":
+            continue
         if not get_cell(r, "graphic_url"):
             continue
         if get_cell(r, "posted_instagram_at"):
             continue
-        if not is_fresh_24h(r, ref):
+        if not is_fresh_enough(r, ref, max_age_hours):
             continue
-        
-        # Theme match (prefer column theme, then deal_theme)
+
         rt = normalize_theme(get_cell(r, "theme") or get_cell(r, "deal_theme"))
-        match = (rt == theme_today) if rt else True  # if blank, don't block
-        eligible.append((i, r, match))
-    
+        theme_match = (rt == theme_today) if rt else True
+
+        eligible.append((i, r, theme_match))
+
     if not eligible:
         return None
-    
+
     def sort_key(item):
-        i, r, match = item
+        i, r, theme_match = item
         ing = parse_iso_utc(get_cell(r, "ingested_at_utc")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-        # Prefer theme match, newest ingest
-        return (1 if match else 0, ing)
-    
-    # 90% PATH: Current slot deals (primary)
-    current_slot_deals = []
-    for i, r, match in eligible:
+        score_raw = get_cell(r, "score") or get_cell(r, "worthiness_score") or "0"
+        try:
+            score = float(str(score_raw).replace("%", "").strip() or 0)
+        except Exception:
+            score = 0.0
+
+        return (
+            1 if theme_match else 0,
+            score,
+            ing,
+        )
+
+    def publish_window_matches(r: Dict[str, str], wanted: str) -> bool:
         pw = get_cell(r, "publish_window").upper()
-        if pw == current_slot or pw == "BOTH":
-            current_slot_deals.append((i, r, match))
-    
-    if current_slot_deals:
-        current_slot_deals.sort(key=sort_key, reverse=True)
-        i, r, match = current_slot_deals[0]
-        return i, r, f"primary_slot={current_slot} theme_match={match}"
-    
-    # 10% PATH: Opposite slot deals (rotation buffer fallback)
-    opposite_slot_deals = []
-    for i, r, match in eligible:
-        pw = get_cell(r, "publish_window").upper()
-        if pw == opposite_slot:
-            opposite_slot_deals.append((i, r, match))
-    
-    if opposite_slot_deals:
-        opposite_slot_deals.sort(key=sort_key, reverse=True)
-        i, r, match = opposite_slot_deals[0]
-        return i, r, f"rotation_fallback={opposite_slot} theme_match={match}"
-    
-    # LAST RESORT: Any theme-matched fresh deal
+        return pw == wanted or pw == "BOTH" or not pw
+
+    if current_slot:
+        primary = [(i, r, m) for (i, r, m) in eligible if publish_window_matches(r, current_slot)]
+        if primary:
+            primary.sort(key=sort_key, reverse=True)
+            i, r, m = primary[0]
+            return i, r, f"primary_slot={current_slot} theme_match={m}"
+
+        fallback = [(i, r, m) for (i, r, m) in eligible if publish_window_matches(r, opposite_slot)]
+        if fallback:
+            fallback.sort(key=sort_key, reverse=True)
+            i, r, m = fallback[0]
+            return i, r, f"rotation_fallback={opposite_slot} theme_match={m}"
+
     theme_hits = [(i, r, m) for (i, r, m) in eligible if m]
     if theme_hits:
         theme_hits.sort(key=sort_key, reverse=True)
-        i, r, match = theme_hits[0]
-        return i, r, f"fallback_theme_any theme_match={match}"
-    
-    # ABSOLUTE LAST: Any fresh deal (still advertising)
+        i, r, m = theme_hits[0]
+        return i, r, f"fallback_theme_any theme_match={m}"
+
     eligible.sort(key=sort_key, reverse=True)
-    i, r, match = eligible[0]
-    return i, r, f"fallback_any theme_match={match}"
+    i, r, m = eligible[0]
+    return i, r, f"fallback_any theme_match={m}"
 
 
-# ------------------ caption (always uses current slot) ------------------
+# ------------------ caption ------------------
+
+def clean_price(row: Dict[str, str]) -> str:
+    raw = get_cell(row, "price_gbp") or get_cell(row, "price") or ""
+    raw = raw.replace("Â£", "").replace("£", "").replace(",", "").strip()
+    if not raw:
+        return ""
+    try:
+        return f"£{int(float(raw))}"
+    except Exception:
+        return f"£{raw}"
 
 def build_caption(row: Dict[str, str], theme_today: str, current_slot: str) -> str:
-    """
-    IG caption uses CURRENT slot language, regardless of graphic's original slot.
-    This ensures PM language softens AM graphics when rotation fallback occurs.
-    """
     to_city = get_cell(row, "destination_city") or get_cell(row, "destination_iata")
     from_city = get_cell(row, "origin_city") or get_cell(row, "origin_iata")
     out_d = get_cell(row, "outbound_date")
     in_d = get_cell(row, "return_date")
-
+    country = get_cell(row, "destination_country")
     phrase = get_cell(row, "phrase_used") or get_cell(row, "phrase_bank")
-    if phrase:
-        phrase = phrase.strip()
+    price = clean_price(row)
 
-    # Build caption
-    lines = [
-        f"Theme today: {theme_today.replace('_',' ')}",
-        f"TO: {to_city}",
-        f"FROM: {from_city}",
-        f"OUT: {out_d}",
-        f"IN:  {in_d}",
-    ]
+    if not phrase or phrase.lower() in ("empty", "none", "null", "nan"):
+        phrase = "One worth checking before the fare moves."
 
-    if phrase:
-        lines.append(phrase)
+    headline = country.strip() if country else to_city
 
-    # Slot language ALWAYS uses current_slot (not graphic's slot)
+    lines = []
+    if headline:
+        lines.append(headline)
+
+    if to_city:
+        lines.append(f"To: {to_city}")
+    if from_city:
+        lines.append(f"From: {from_city}")
+    if price:
+        lines.append(f"Price: {price}")
+    if out_d:
+        lines.append(f"Out: {out_d}")
+    if in_d:
+        lines.append(f"Return: {in_d}")
+
+    lines.append("")
+    lines.append(phrase.strip())
+    lines.append("")
+
     if current_slot == "AM":
-        lines.append("AM radar: what's looking interesting right now. Link in bio for the full feed.")
+        lines.append("AM radar. Link in bio for the live feed.")
     elif current_slot == "PM":
-        lines.append("PM shortlist: one worth a look if you're in the mood for it. Link in bio for the full feed.")
+        lines.append("PM shortlist. Link in bio for the live feed.")
     else:
-        lines.append("Link in bio for the full feed.")
+        lines.append("Link in bio for the live feed.")
 
-    return "\n".join([x for x in lines if x.strip()])
+    return "\n".join([x for x in lines if x is not None])
 
 
 # ------------------ main ------------------
@@ -349,6 +392,7 @@ def main() -> int:
     ig_token = env("IG_ACCESS_TOKEN")
     ig_user_id = env("IG_USER_ID")
     version = env("GRAPH_API_VERSION", "v20.0")
+    max_age_hours = float(env("INSTAGRAM_MAX_AGE_HOURS", "24") or "24")
 
     if not ig_token or not ig_user_id:
         raise RuntimeError("Missing IG_ACCESS_TOKEN / IG_USER_ID")
@@ -356,13 +400,21 @@ def main() -> int:
     gc = gspread_client()
     sh = gc.open_by_key(env("SPREADSHEET_ID") or env("SHEET_ID"))
 
-    ws_ops = sh.worksheet(OPS_TAB)
-    theme_today = normalize_theme(ws_ops.acell("B2").value or "")
+    try:
+        ws_ops = sh.worksheet(OPS_TAB)
+        theme_today = normalize_theme(ws_ops.acell("B2").value or "")
+    except Exception:
+        theme_today = ""
+
     if not theme_today:
-        theme_today = "adventure"
+        theme_today = normalize_theme(env("THEME_OF_DAY", "")) or "adventure"
 
     ws = sh.worksheet(RAW_TAB)
     values = ws.get_all_values()
+
+    if not values:
+        raise RuntimeError(f"{RAW_TAB} is empty")
+
     headers = values[0]
     h = idx_map(headers)
 
@@ -371,54 +423,50 @@ def main() -> int:
         if k not in h:
             raise RuntimeError(f"RAW_DEALS missing required header: {k}")
 
-    # Optional write columns
-    has_posted = ("posted_instagram_at" in h)
-    has_pub_err = ("publish_error" in h)
-    has_pub_err_at = ("publish_error_at" in h)
-
-    # Pull rows (index starts at 2 for first data row)
     rows: List[Tuple[int, Dict[str, str]]] = []
     for i, r in enumerate(values[1:], start=2):
-        rd = row_dict(headers, r)
-        rows.append((i, rd))
+        rows.append((i, row_dict(headers, r)))
 
-    pick = pick_candidate(rows, theme_today, slot, ref)
+    pick = pick_candidate(rows, theme_today, slot, ref, max_age_hours)
+
     if not pick:
-        print("⚠️ No IG candidate found (no fresh rendered deals). Exiting 0.")
+        print("⚠️ No Instagram candidate found: no READY_TO_PUBLISH row with a usable graphic_url.")
         return 0
 
     row_i, row, reason = pick
-    print("======================================================================")
-    print("📣 Instagram Publisher — V5 (90/10 Rotation Buffer)")
-    print(f"TODAY_THEME: '{theme_today}' | CURRENT_SLOT: '{slot or '(auto)'}'")
-    print(f"SELECTED row={row_i} | deal_id={get_cell(row,'deal_id')}")
-    print(f"SELECTION: {reason}")
-    print(f"GRAPHIC_SLOT: {get_cell(row, 'publish_window')} | CAPTION_SLOT: {slot}")
-    print("======================================================================")
-
-    caption = build_caption(row, theme_today, slot)
+    deal_id = get_cell(row, "deal_id")
     image_url = get_cell(row, "graphic_url")
+    caption = build_caption(row, theme_today, slot)
+
+    print("======================================================================")
+    print("📣 Instagram Publisher — V6 Safe Single Image")
+    print(f"TODAY_THEME: '{theme_today}' | CURRENT_SLOT: '{slot or '(none)'}'")
+    print(f"SELECTED row={row_i} | deal_id={deal_id}")
+    print(f"SELECTION: {reason}")
+    print(f"IMAGE: {image_url}")
+    print("======================================================================")
 
     try:
+        preflight_image_url(image_url)
+
+        dry_run = env_bool("INSTAGRAM_DRY_RUN", False)
+        if dry_run:
+            print("🧪 INSTAGRAM_DRY_RUN=true. Not publishing.")
+            print("Caption:")
+            print(caption)
+            return 0
+
         creation_id = ig_create_container(version, ig_user_id, ig_token, image_url, caption)
-        time.sleep(2)  # small wait improves publish reliability
+        time.sleep(2)
         media_id = ig_publish_container(version, ig_user_id, ig_token, creation_id)
+
         print(f"✅ IG published media_id={media_id}")
 
-        # Write posted_instagram_at
-        if has_posted:
-            ws.update_cell(row_i, h["posted_instagram_at"] + 1, iso_z(ref))
-
-        # Status transition ONLY when currently PUBLISH_*
-        status = get_cell(row, "status")
-        if status in ("PUBLISH_AM", "PUBLISH_PM", "PUBLISH_BOTH"):
-            ws.update_cell(row_i, h["status"] + 1, "READY_TO_POST")
-
-        # Clear publish_error on success
-        if has_pub_err:
-            ws.update_cell(row_i, h["publish_error"] + 1, "")
-        if has_pub_err_at:
-            ws.update_cell(row_i, h["publish_error_at"] + 1, "")
+        update_cell_if_present(ws, row_i, h, "posted_instagram_at", iso_z(ref))
+        update_cell_if_present(ws, row_i, h, "instagram_media_id", media_id)
+        update_cell_if_present(ws, row_i, h, "status", "POSTED_INSTAGRAM")
+        update_cell_if_present(ws, row_i, h, "publish_error", "")
+        update_cell_if_present(ws, row_i, h, "publish_error_at", "")
 
         return 0
 
@@ -426,10 +474,8 @@ def main() -> int:
         msg = str(e)[:450]
         print(f"⛔ IG publish failed: {msg}")
 
-        if has_pub_err:
-            ws.update_cell(row_i, h["publish_error"] + 1, msg)
-        if has_pub_err_at:
-            ws.update_cell(row_i, h["publish_error_at"] + 1, iso_z(ref))
+        update_cell_if_present(ws, row_i, h, "publish_error", msg)
+        update_cell_if_present(ws, row_i, h, "publish_error_at", iso_z(ref))
 
         raise
 

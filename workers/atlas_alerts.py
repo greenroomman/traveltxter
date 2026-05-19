@@ -9,6 +9,9 @@ Env vars required:
 MIZAR_SUPABASE_URL
 MIZAR_SUPABASE_SERVICE_ROLE_KEY
 SLACK_WEBHOOK_URL
+
+Env vars optional:
+MIZAR_MODEL_VERSION — canonical expected model version for drift checks
 """
 
 import os
@@ -20,6 +23,7 @@ from supabase import create_client
 SUPABASE_URL = os.environ["MIZAR_SUPABASE_URL"]
 SUPABASE_KEY = os.environ["MIZAR_SUPABASE_SERVICE_ROLE_KEY"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
+MIZAR_MODEL_VERSION = os.environ.get("MIZAR_MODEL_VERSION", "").strip()
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -59,6 +63,88 @@ def log_alert(alert_type: str) -> None:
     ).execute()
 
 
+def _utc_day_bounds(day: datetime.date) -> tuple[str, str]:
+    start = datetime.datetime.combine(
+        day,
+        datetime.time.min,
+        tzinfo=datetime.timezone.utc,
+    )
+    end = start + datetime.timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
+def _count_decisions_for_day(day: datetime.date) -> int:
+    start, end = _utc_day_bounds(day)
+
+    result = (
+        supabase.table("user_decisions")
+        .select("decision_id")
+        .gte("created_at", start)
+        .lt("created_at", end)
+        .execute()
+    )
+
+    return len(result.data or [])
+
+
+def _count_eligible_high_risk_for_day(day: datetime.date) -> int:
+    start, end = _utc_day_bounds(day)
+
+    result = (
+        supabase.table("user_decisions")
+        .select("decision_id")
+        .eq("validation_eligible", True)
+        .gte("regret_risk_score", 0.70)
+        .gte("created_at", start)
+        .lt("created_at", end)
+        .execute()
+    )
+
+    return len(result.data or [])
+
+
+def _recent_model_versions(hours: int = 24) -> set[str]:
+    cutoff = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+    ).isoformat()
+
+    result = (
+        supabase.table("user_decisions")
+        .select("model_version")
+        .gte("created_at", cutoff)
+        .execute()
+    )
+
+    versions = {
+        str(row.get("model_version"))
+        for row in (result.data or [])
+        if row.get("model_version")
+    }
+
+    return versions
+
+
+def _yesterday_model_versions() -> set[str]:
+    yesterday = datetime.date.today() - datetime.timedelta(days=1)
+    start, end = _utc_day_bounds(yesterday)
+
+    result = (
+        supabase.table("user_decisions")
+        .select("model_version")
+        .gte("created_at", start)
+        .lt("created_at", end)
+        .execute()
+    )
+
+    versions = {
+        str(row.get("model_version"))
+        for row in (result.data or [])
+        if row.get("model_version")
+    }
+
+    return versions
+
+
 def run_health_check() -> None:
     print("Running daily health check...")
 
@@ -95,6 +181,75 @@ def run_health_check() -> None:
                 f"(expected 153)"
             )
             log_alert("snapshots_low")
+
+    # Outcome-quality alert: detect silent score compression before t+7 verification.
+    yesterday = datetime.date.today() - datetime.timedelta(days=1)
+    day_before = datetime.date.today() - datetime.timedelta(days=2)
+
+    yesterday_total = _count_decisions_for_day(yesterday)
+    day_before_total = _count_decisions_for_day(day_before)
+    yesterday_high_risk = _count_eligible_high_risk_for_day(yesterday)
+    day_before_high_risk = _count_eligible_high_risk_for_day(day_before)
+
+    print(
+        "Eligible high-risk counts: "
+        f"{day_before.isoformat()}={day_before_high_risk}/{day_before_total}, "
+        f"{yesterday.isoformat()}={yesterday_high_risk}/{yesterday_total}"
+    )
+
+    if (
+        yesterday_total > 0
+        and day_before_total > 0
+        and yesterday_high_risk == 0
+        and day_before_high_risk == 0
+    ):
+        if not already_alerted("eligible_high_risk_zero"):
+            alerts_fired.append(
+                ":rotating_light: *Eligible high-risk count is zero for two "
+                "complete days* — possible score compression or validation "
+                "eligibility regression."
+            )
+            log_alert("eligible_high_risk_zero")
+
+    # Outcome-quality alert: detect unexpected model-version discontinuity.
+    recent_versions = _recent_model_versions(hours=24)
+    yesterday_versions = _yesterday_model_versions()
+
+    print(
+        "Model versions: "
+        f"recent_24h={sorted(recent_versions)}, "
+        f"yesterday={sorted(yesterday_versions)}, "
+        f"canonical={MIZAR_MODEL_VERSION or 'not_set'}"
+    )
+
+    model_version_drift = False
+    drift_reason = ""
+
+    if MIZAR_MODEL_VERSION and recent_versions:
+        unexpected = recent_versions - {MIZAR_MODEL_VERSION}
+        if unexpected:
+            model_version_drift = True
+            drift_reason = (
+                f"recent versions {sorted(recent_versions)} do not match "
+                f"canonical `{MIZAR_MODEL_VERSION}`"
+            )
+    elif len(recent_versions) > 1:
+        model_version_drift = True
+        drift_reason = f"multiple versions in last 24h: {sorted(recent_versions)}"
+    elif recent_versions and yesterday_versions and recent_versions != yesterday_versions:
+        model_version_drift = True
+        drift_reason = (
+            f"recent versions {sorted(recent_versions)} differ from "
+            f"yesterday {sorted(yesterday_versions)}"
+        )
+
+    if model_version_drift:
+        if not already_alerted("model_version_drift"):
+            alerts_fired.append(
+                f":warning: *Model version drift detected* — {drift_reason}. "
+                "Confirm deploy state before trusting precision reads."
+            )
+            log_alert("model_version_drift")
 
     if alerts_fired:
         post_slack("*MIZAR Pipeline Alert*\n" + "\n".join(alerts_fired))

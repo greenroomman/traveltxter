@@ -2,7 +2,7 @@ name: MIZAR Daily Health Report
 
 on:
   schedule:
-    - cron: "14 7 * * *"
+    - cron: "50 7 * * *"
   workflow_dispatch:
 
 jobs:

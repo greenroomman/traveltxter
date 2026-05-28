@@ -2,11 +2,42 @@ name: MIZAR Decision Harness
 
 on:
   schedule:
-    - cron: "30 7 * * *"
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 jobs:
+  daily-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify health report script exists
+        run: |
+          if [ ! -f workers/atlas_daily_report.py ]; then
+            echo "ERROR: workers/atlas_daily_report.py not found"
+            echo "Available worker files:"
+            ls -la workers/
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install daily report dependencies
+        run: pip install supabase httpx requests
+
+      - name: Run daily report
+        env:
+          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: python workers/atlas_daily_report.py
+
   run-harness:
+    needs: daily-report
     runs-on: ubuntu-latest
 
     steps:
@@ -18,7 +49,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install harness dependencies
         run: pip install supabase requests python-dotenv
 
       - name: Run decision harness

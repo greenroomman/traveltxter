@@ -23,6 +23,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from collections import Counter
 
+import httpx
 import requests
 from dotenv import load_dotenv
 from supabase import create_client
@@ -106,7 +107,7 @@ def fetch_snapshot_rows(snapshot_date):
 
     since = latest - timedelta(days=HARNESS_LOOKBACK_DAYS)
 
-    result = (
+    query = (
         SUPABASE.table("snapshots")
         .select(
             "snapshot_id,"
@@ -128,8 +129,23 @@ def fetch_snapshot_rows(snapshot_date):
         .not_.is_("outbound_date", "null")
         .order("snapshot_date", desc=True)
         .limit(max(MAX_ROWS * 4, 1000))
-        .execute()
     )
+
+    _max_attempts = 3
+    _delays = [2, 4]
+    result = None
+    for _attempt in range(1, _max_attempts + 1):
+        try:
+            result = query.execute()
+            break
+        except (httpx.RemoteProtocolError, httpx.ConnectError) as e:
+            if _attempt < _max_attempts:
+                _delay = _delays[_attempt - 1]
+                print(f"[WARN] fetch_snapshot_rows attempt {_attempt} failed: {e}. Retrying in {_delay}s...")
+                time.sleep(_delay)
+            else:
+                print(f"[ERROR] fetch_snapshot_rows failed after {_max_attempts} attempts: {e}")
+                raise
 
     rows = result.data or []
 

@@ -161,7 +161,7 @@ def check_ci_4() -> dict[str, Any]:
 def check_ci_5() -> dict[str, Any]:
     response = (
         supabase.table("model_registry")
-        .select("model_hash")
+        .select("joblib_hash")
         .eq("model_version", MODEL_VERSION)
         .order("deployed_at", desc=True)
         .limit(1)
@@ -169,7 +169,7 @@ def check_ci_5() -> dict[str, Any]:
     )
 
     data = response.data or []
-    value = data[0].get("model_hash") if data else None
+    value = data[0].get("joblib_hash") if data else None
     passed = value == EXPECTED_MODEL_HASH
 
     return {

@@ -89,11 +89,11 @@ def _duffel_post(path: str, payload: dict[str, Any], retries: int = 3) -> dict[s
                 continue
 
             log.warning("Duffel HTTP %d: %s", exc.code, body[:500])
-            return None
+            return None, duffel_search_id
 
         except Exception as exc:
             log.warning("Duffel request error: %s", exc)
-            return None
+            return None, duffel_search_id
 
     log.error("Duffel exhausted retries for %s", path)
     return None
@@ -106,7 +106,7 @@ def cheapest_gbp_price(
     cabin_class: str = "economy",
     trip_type: str = "return",
     return_date: date | None = None,
-) -> float | None:
+) -> tuple[float | None, str | None]:
     """Search Duffel for the cheapest GBP offer on the given route/date."""
 
     cabin_map = {
@@ -145,13 +145,18 @@ def cheapest_gbp_price(
 
     response = _duffel_post("/air/offer_requests?return_offers=true", payload)
 
+    duffel_search_id = None
+
+    if response:
+        duffel_search_id = response.get("data", {}).get("id")
+
     if response is None:
-        return None
+        return None, duffel_search_id
 
     offers = response.get("data", {}).get("offers", [])
 
     if not offers:
-        return None
+        return None, duffel_search_id
 
     gbp_prices: list[float] = []
 
@@ -165,9 +170,9 @@ def cheapest_gbp_price(
             continue
 
     if not gbp_prices:
-        return None
+        return None, duffel_search_id
 
-    return min(gbp_prices)
+    return min(gbp_prices), duffel_search_id
 
 
 # ------------------------------------------------------------
@@ -302,6 +307,7 @@ def write_verification(
     price_shown: float | None,
     regret_risk_score: float | None,
     failure_reason: str | None,
+    duffel_search_id: str | None = None,
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     status = "failed"
@@ -316,6 +322,7 @@ def write_verification(
             "prediction_outcome": None,
             "verification_method": "duffel_api",
             "failure_reason": failure_reason or "invalid_original_price",
+            "duffel_search_id": duffel_search_id,
         }
 
     elif price_t7 is None:
@@ -328,6 +335,7 @@ def write_verification(
             "prediction_outcome": None,
             "verification_method": "duffel_api",
             "failure_reason": failure_reason or "no_price_returned",
+            "duffel_search_id": duffel_search_id,
         }
 
     else:
@@ -344,6 +352,7 @@ def write_verification(
             "prediction_outcome": outcome,
             "verification_method": "duffel_api",
             "failure_reason": None,
+            "duffel_search_id": duffel_search_id,
         }
 
         status = "verified"
@@ -456,7 +465,7 @@ def run() -> None:
             f"£{price_shown:.2f}" if price_shown is not None else "NULL",
         )
 
-        price_t7 = cheapest_gbp_price(
+        price_t7, duffel_search_id = cheapest_gbp_price(
             origin=origin,
             destination=destination,
             outbound_date=outbound_dt,
@@ -478,12 +487,12 @@ def run() -> None:
             )
 
             success += 1
-            write_verification(decision_id, price_t7, price_shown, score, None)
+            write_verification(decision_id, price_t7, price_shown, score, None, duffel_search_id)
 
         else:
             log.warning("No valid GBP price returned for %s.", decision_id)
             failed += 1
-            write_verification(decision_id, None, price_shown, score, "duffel_no_gbp_offer")
+            write_verification(decision_id, None, price_shown, score, "duffel_no_gbp_offer", duffel_search_id)
 
         time.sleep(REQUEST_DELAY_S)
 

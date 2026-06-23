@@ -126,7 +126,7 @@ def main() -> int:
     result = (
         supabase.table("user_decisions")
         .select(
-            "id,created_at,origin_iata,destination_iata,regret_risk_score,"
+            "created_at,origin_iata,destination_iata,regret_risk_score,"
             "gated_recommendation,raw_recommendation,model_version"
         )
         .gte("created_at", start_iso)

@@ -1,0 +1,29 @@
+name: MIZAR Daily Slack Signal
+
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+jobs:
+  daily_slack_signal:
+    name: Daily Slack Route Signal
+    runs-on: ubuntu-latest
+
+    env:
+      MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+      MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests supabase
+
+      - name: Post daily MIZAR route signal to Slack
+        run: python workers/atlas_daily_slack_signal.py

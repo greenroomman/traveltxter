@@ -326,6 +326,9 @@ def write_verification(
         }
 
     elif price_t7 is None:
+        if failure_reason == "duffel_no_gbp_offer":
+            status = "unavailable"
+
         row = {
             "decision_id": decision_id,
             "verification_timestamp": now_iso,
@@ -384,6 +387,7 @@ def run() -> None:
 
     success = 0
     failed = 0
+    unavailable = 0
     skipped = 0
 
     for decision in decisions:
@@ -491,15 +495,16 @@ def run() -> None:
 
         else:
             log.warning("No valid GBP price returned for %s.", decision_id)
-            failed += 1
+            unavailable += 1
             write_verification(decision_id, None, price_shown, score, "duffel_no_gbp_offer", duffel_search_id)
 
         time.sleep(REQUEST_DELAY_S)
 
     log.info(
-        "Done. Success=%d Failed=%d Skipped=%d Total=%d",
+        "Done. Success=%d Failed=%d Unavailable=%d Skipped=%d Total=%d",
         success,
         failed,
+        unavailable,
         skipped,
         len(decisions),
     )

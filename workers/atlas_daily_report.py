@@ -27,6 +27,20 @@ print("Running daily report for", today)
 
 
 # ============================================================
+# HELPERS
+# ============================================================
+
+def safe_float(value):
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# ============================================================
 # PAGINATION HELPERS
 # ============================================================
 
@@ -135,6 +149,7 @@ today_d = sum(1 for r in decisions if (r.get("decision_timestamp") or "")[:10] =
 pending = sum(1 for r in decisions if r.get("verification_status") == "pending")
 verified = sum(1 for r in decisions if r.get("verification_status") == "verified")
 failed_v = sum(1 for r in decisions if r.get("verification_status") == "failed")
+unavailable_v = sum(1 for r in decisions if r.get("verification_status") == "unavailable")
 
 # Clean validation population only.
 # Excludes suppress-zone rows, crisis rows, console/demo rows, old models, and rows explicitly marked ineligible.
@@ -162,8 +177,10 @@ fn_c = sum(1 for r in clean_ov if r.get("prediction_outcome") == "FN")
 precision = round(tp / (tp + fp) * 100, 1) if (tp + fp) > 0 else None
 precision_display = f"{precision}%" if precision is not None else "n/a"
 
-fuel_price = float(fuel_data[0]["jet_fuel_usd_gal"]) if fuel_data else "N/A"
-fuel_date = fuel_data[0]["signal_date"] if fuel_data else "N/A"
+fuel_price_raw = fuel_data[0].get("jet_fuel_usd_gal") if fuel_data else None
+fuel_price_value = safe_float(fuel_price_raw)
+fuel_price = fuel_price_value if fuel_price_value is not None else "N/A"
+fuel_date = fuel_data[0].get("signal_date") if fuel_data else "N/A"
 
 
 # ============================================================
@@ -185,6 +202,9 @@ if today_s < MIN_HEALTHY_SNAPSHOTS:
 if precision is None:
     flags.append("INFO: v3 precision pending t+7 verification window")
 
+if fuel_price_value is None:
+    flags.append("INFO: latest jet fuel signal unavailable")
+
 if not flags:
     flags.append("OK")
 
@@ -204,6 +224,7 @@ Decisions today: {today_d}
 Total decisions: {total_d}
 Pending verifications: {pending}
 Verified decisions: {verified}
+Unavailable verifications: {unavailable_v}
 Failed verifications: {failed_v}
 
 Outcome counts:

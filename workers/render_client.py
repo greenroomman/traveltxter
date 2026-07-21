@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """
-Render Client worker for TravelTxter V6-safe single-image pipeline
+Render Client worker for TravelTxter V6-safe single-image pipeline + MIZAR.
 
-Purpose:
-- Generate Instagram graphics for deals ready to post.
-- Preserve the existing PythonAnywhere /api/render contract.
-- Promote successfully rendered deals to READY_TO_PUBLISH so instagram_publisher.py can pick them up.
+Preserves the existing pipeline contract:
+- Reads RAW_DEALS rows with status READY_TO_POST or READY_TO_PUBLISH and blank graphic_url.
+- Calls the existing PythonAnywhere /api/render endpoint.
+- Writes graphic_url and promotes successful renders to READY_TO_PUBLISH.
+- Never blocks rendering if MIZAR is unavailable.
 
-Reads:
-- RAW_DEALS rows with status READY_TO_POST or READY_TO_PUBLISH and blank graphic_url.
-
-Writes RAW_DEALS only:
-- graphic_url
-- status -> READY_TO_PUBLISH after a successful render
-
-Contract:
-- Idempotent: skips rows where graphic_url already exists.
-- Does not alter score, timestamps, phrase fields, enrichment fields, or deal content.
-- Compatible with either:
-    RENDER_URL=https://greenroomman.pythonanywhere.com/api/render
-  or:
-    RENDER_BASE_URL=https://greenroomman.pythonanywhere.com
+MIZAR integration:
+- Uses the real route, outbound/return dates and real price_gbp from RAW_DEALS.
+- Calls /v1/signal with a 5 second timeout.
+- mizar_signal becomes true only when regret_risk_score >= 0.65 and, when the API
+  returns gated_recommendation, that recommendation is book_now.
+- Passes mizar_score and mizar_signal through to the renderer.
+- Writes mizar_score / mizar_signal only when those columns exist.
 """
 
 from __future__ import annotations
@@ -36,14 +30,19 @@ import gspread
 import requests
 from google.oauth2.service_account import Credentials
 
+MIZAR_THRESHOLD = 0.65
 
-# ------------------ env helpers ------------------
 
 def env(k: str, d: str = "") -> str:
     return (os.getenv(k, d) or "").strip()
 
 
-# ------------------ robust SA JSON parsing ------------------
+def env_int(k: str, d: int) -> int:
+    try:
+        return int(env(k, str(d)))
+    except Exception:
+        return d
+
 
 def _repair_private_key_newlines(raw: str) -> str:
     pat = re.compile(r'("private_key"\s*:\s*")(.+?)(")', re.DOTALL)
@@ -71,9 +70,8 @@ def load_sa_info() -> Dict[str, Any]:
     for candidate in attempts:
         try:
             return json.loads(candidate)
-        except Exception as e:
-            last_error = e
-
+        except Exception as exc:
+            last_error = exc
     raise RuntimeError(f"Could not parse service account JSON: {last_error}")
 
 
@@ -88,8 +86,6 @@ def gspread_client():
     )
     return gspread.authorize(creds)
 
-
-# ------------------ sheet helpers ------------------
 
 def idx_map(headers: List[str]) -> Dict[str, int]:
     return {h: i for i, h in enumerate(headers)}
@@ -111,64 +107,114 @@ def first_present(row: Dict[str, str], keys: List[str], default: str = "") -> st
     return default
 
 
-# ------------------ date + price helpers ------------------
-
 def parse_date(s: str) -> Optional[dt.date]:
-    """Parse YYYY-MM-DD or ISO-ish date string."""
     s = (s or "").strip()
     if not s:
         return None
-
-    # Most RAW_DEALS dates should be YYYY-MM-DD.
     try:
         return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).date()
     except Exception:
         pass
-
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
         try:
             return dt.datetime.strptime(s, fmt).date()
         except Exception:
             continue
-
     return None
 
 
 def format_ddmmyy(d: dt.date) -> str:
-    """Format as ddmmyy, e.g. 120326."""
     return d.strftime("%d%m%y")
 
 
-def clean_price(raw: str) -> str:
-    """Return a clean Â£xxx string and avoid double-Â£ / ÃÂ£ failures."""
-    s = (raw or "").strip()
-    s = s.replace("ÃÂ£", "").replace("Â£", "").replace(",", "").strip()
-    if not s:
-        raise ValueError("missing price")
-    try:
-        value = int(round(float(s)))
-    except Exception as e:
-        raise ValueError(f"invalid price: {raw!r}") from e
+def price_float(raw: str) -> float:
+    s = (raw or "").strip().replace("£", "").replace("Â£", "").replace("ÃÂ£", "").replace(",", "")
+    value = float(s)
     if value <= 0:
         raise ValueError(f"invalid non-positive price: {raw!r}")
-    return f"Â£{value}"
+    return value
 
 
-# ------------------ render API ------------------
+def clean_price(raw: str) -> str:
+    return f"£{int(round(price_float(raw)))}"
+
 
 def resolve_render_endpoint() -> str:
-    """
-    Supports both the locked guide variable RENDER_URL and the older RENDER_BASE_URL.
-    """
     render_url = env("RENDER_URL")
     if render_url:
         render_url = render_url.rstrip("/")
         if render_url.endswith("/api/render"):
             return render_url
         return f"{render_url}/api/render"
-
     base = env("RENDER_BASE_URL", "https://greenroomman.pythonanywhere.com").rstrip("/")
     return f"{base}/api/render"
+
+
+def call_mizar(rd: Dict[str, str]) -> Tuple[Optional[float], bool]:
+    """Return (score, signal). Failure never blocks rendering."""
+    api_key = env("MIZAR_API_KEY")
+    if not api_key:
+        print("  ⚠️ MIZAR_API_KEY missing; continuing without MIZAR")
+        return None, False
+
+    origin = first_present(rd, ["origin_iata", "origin"]).upper()
+    destination = first_present(rd, ["destination_iata", "destination"]).upper()
+    outbound = first_present(rd, ["outbound_date", "out_date"])
+    return_date = first_present(rd, ["return_date", "in_date"])
+    raw_price = first_present(rd, ["price_gbp", "price", "PRICE"])
+
+    if not origin or not destination or not outbound or not raw_price:
+        print("  ⚠️ MIZAR skipped: missing route/date/price")
+        return None, False
+
+    try:
+        payload: Dict[str, Any] = {
+            "origin": origin,
+            "destination": destination,
+            "outbound_date": outbound[:10],
+            "price_gbp": price_float(raw_price),
+            "session_id": "traveltxter_render",
+            "client_platform": "social",
+            "decision_source_type": "traveltxter_social",
+            "cabin_class": first_present(rd, ["cabin_class"], "economy"),
+        }
+        if return_date:
+            payload["return_date"] = return_date[:10]
+            payload["trip_type"] = "return"
+        else:
+            payload["return_date"] = None
+            payload["trip_type"] = "oneway"
+
+        base = env("MIZAR_API_BASE", "https://mizar-api.vercel.app").rstrip("/")
+        response = requests.post(
+            f"{base}/v1/signal",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=5,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("regret_risk_score") is None:
+            raise RuntimeError(f"MIZAR response missing regret_risk_score: {data}")
+
+        score = float(data["regret_risk_score"])
+        gated = str(data.get("gated_recommendation") or "").strip().lower()
+        signal = score >= MIZAR_THRESHOLD and (not gated or gated == "book_now")
+
+        gate_note = gated or "not_returned"
+        print(f"  ✓ MIZAR {origin}→{destination}: score={score:.2f} gate={gate_note} signal={signal}")
+        return score, signal
+
+    except requests.exceptions.Timeout:
+        print("  ⚠️ MIZAR timeout after 5s; continuing without MIZAR")
+        return None, False
+    except Exception as exc:
+        print(f"  ⚠️ MIZAR unavailable: {str(exc)[:180]}; continuing without MIZAR")
+        return None, False
 
 
 def call_render_api(
@@ -186,10 +232,10 @@ def call_render_api(
     benefit: str = "",
     phrase_bank: str = "",
     booking_link: str = "",
+    mizar_score: Optional[float] = None,
+    mizar_signal: bool = False,
 ) -> str:
-    """Call PythonAnywhere render API and return graphic_url."""
     payload = {
-        # Locked render_api.py contract.
         "TO": to_city,
         "FROM": from_city,
         "OUT": out_date,
@@ -198,20 +244,20 @@ def call_render_api(
         "LAYOUT": layout,
         "THEME": theme,
         "deal_id": deal_id,
-        # Forward-compatible fields. Current render_api.py may ignore these until upgraded.
         "signal": signal,
         "benefit": benefit,
         "phrase_bank": phrase_bank,
         "booking_link": booking_link,
+        "mizar_score": mizar_score if mizar_score is not None else 0.0,
+        "mizar_signal": bool(mizar_signal),
     }
 
     response = requests.post(endpoint, json=payload, timeout=45)
     response.raise_for_status()
-
     try:
         result = response.json()
-    except Exception as e:
-        raise RuntimeError(f"Render API returned non-JSON response: {response.text[:300]!r}") from e
+    except Exception as exc:
+        raise RuntimeError(f"Render API returned non-JSON response: {response.text[:300]!r}") from exc
 
     if not result.get("ok"):
         raise RuntimeError(f"Render failed: {result}")
@@ -223,15 +269,12 @@ def call_render_api(
     parsed = urlparse(graphic_url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise RuntimeError(f"graphic_url is not a public URL: {graphic_url!r}")
-
     return graphic_url
 
 
-# ------------------ row extraction ------------------
-
 def require_headers(headers: List[str], required: List[str]) -> None:
     present = set(headers)
-    missing = [k for k in required if k not in present]
+    missing = [key for key in required if key not in present]
     if missing:
         raise RuntimeError(f"RAW_DEALS missing required header(s): {', '.join(missing)}")
 
@@ -249,17 +292,13 @@ def determine_signal(rd: Dict[str, str]) -> str:
     explicit = first_present(rd, ["signal", "signal_state", "worthiness_verdict", "score_label"])
     if explicit:
         return explicit.upper()
-
     score_raw = first_present(rd, ["score", "worthiness_score", "price_value_score"])
     try:
         score = float(score_raw)
     except Exception:
         return ""
-
-    # Works whether scores are 0-1 or 0-100.
     if 0 <= score <= 1:
         score *= 100
-
     if score >= 92:
         return "ELITE"
     if score >= 85:
@@ -269,9 +308,8 @@ def determine_signal(rd: Dict[str, str]) -> str:
     return "STANDARD"
 
 
-def build_render_input(rd: Dict[str, str], row_i: int) -> Dict[str, str]:
+def build_render_input(rd: Dict[str, str], row_i: int) -> Dict[str, Any]:
     deal_id = get_cell(rd, "deal_id") or f"row_{row_i}"
-
     to_city = first_present(rd, ["destination_city", "to_city", "destination"])
     from_city = first_present(rd, ["origin_city", "from_city", "origin"])
     if not to_city or not from_city:
@@ -285,6 +323,7 @@ def build_render_input(rd: Dict[str, str], row_i: int) -> Dict[str, str]:
     theme = first_present(rd, ["theme", "dynamic_theme"], "adventure")
     phrase = first_present(rd, ["phrase_used", "phrase_bank", "benefit", "promo_hint"], "")
     booking_link = first_present(rd, ["booking_link_vip", "affiliate_url", "booking_link"], "")
+    mizar_score, mizar_signal = call_mizar(rd)
 
     return {
         "deal_id": deal_id,
@@ -299,10 +338,10 @@ def build_render_input(rd: Dict[str, str], row_i: int) -> Dict[str, str]:
         "benefit": phrase,
         "phrase_bank": phrase,
         "booking_link": booking_link,
+        "mizar_score": mizar_score,
+        "mizar_signal": mizar_signal,
     }
 
-
-# ------------------ main ------------------
 
 def main() -> int:
     raw_tab = env("RAW_DEALS_TAB", "RAW_DEALS")
@@ -311,87 +350,81 @@ def main() -> int:
         raise RuntimeError("Missing SPREADSHEET_ID / SHEET_ID")
 
     endpoint = resolve_render_endpoint()
+    render_max = env_int("RENDER_MAX_ROWS", 2)
 
     gc = gspread_client()
     sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(raw_tab)
-
     values = ws.get_all_values()
     if not values:
         raise RuntimeError(f"{raw_tab} is empty")
 
     headers = values[0]
     h = idx_map(headers)
-
-    required = [
-        "status",
-        "deal_id",
-        "origin_city",
-        "destination_city",
-        "outbound_date",
-        "return_date",
-        "price_gbp",
-        "graphic_url",
-    ]
-    require_headers(headers, required)
+    require_headers(
+        headers,
+        [
+            "status",
+            "deal_id",
+            "origin_city",
+            "destination_city",
+            "outbound_date",
+            "return_date",
+            "price_gbp",
+            "graphic_url",
+        ],
+    )
 
     to_render: List[Tuple[int, Dict[str, str]]] = []
     for row_i, row in enumerate(values[1:], start=2):
         rd = row_dict(headers, row)
-        status = get_cell(rd, "status")
-        graphic_url = get_cell(rd, "graphic_url")
-
-        if status not in ("READY_TO_POST", "READY_TO_PUBLISH"):
+        if get_cell(rd, "status") not in ("READY_TO_POST", "READY_TO_PUBLISH"):
             continue
-        if graphic_url:
+        if get_cell(rd, "graphic_url"):
             continue
-
         to_render.append((row_i, rd))
 
     if not to_render:
-        print("â No deals need rendering. All READY_TO_POST/READY_TO_PUBLISH deals already have graphics.")
+        print("✓ No deals need rendering. All READY_TO_POST/READY_TO_PUBLISH deals already have graphics.")
         return 0
 
-    print(f"ð¸ Render Client V6-safe â Found {len(to_render)} deal(s) needing graphics")
-    print(f"ð Render endpoint: {endpoint}")
+    print(f"📸 Render Client V6-safe + MIZAR — Found {len(to_render)} deal(s) needing graphics")
+    print(f"🔗 Render endpoint: {endpoint}")
     print("=" * 72)
 
     rendered_count = 0
     error_count = 0
 
-    for row_i, rd in to_render:
+    for row_i, rd in to_render[:render_max]:
         deal_id = get_cell(rd, "deal_id") or f"row_{row_i}"
-
         try:
             render_input = build_render_input(rd, row_i)
-
             graphic_url = call_render_api(endpoint, **render_input)
 
-            # Write back. gspread uses 1-based columns.
             ws.update_cell(row_i, h["graphic_url"] + 1, graphic_url)
             ws.update_cell(row_i, h["status"] + 1, "READY_TO_PUBLISH")
 
+            if "mizar_score" in h and render_input["mizar_score"] is not None:
+                ws.update_cell(row_i, h["mizar_score"] + 1, f"{render_input['mizar_score']:.4f}")
+            if "mizar_signal" in h:
+                ws.update_cell(row_i, h["mizar_signal"] + 1, "TRUE" if render_input["mizar_signal"] else "FALSE")
+
             print(
-                "â "
-                f"row={row_i} deal_id={deal_id} "
-                f"{render_input['from_city']}â{render_input['to_city']} "
+                f"✓ row={row_i} deal_id={deal_id} "
+                f"{render_input['from_city']}→{render_input['to_city']} "
                 f"layout={render_input['layout']} theme={render_input['theme']} "
-                f"signal={render_input['signal'] or 'n/a'} "
-                f"â {graphic_url[:100]}..."
+                f"mizar={render_input['mizar_score'] if render_input['mizar_score'] is not None else 'n/a'} "
+                f"signal={render_input['mizar_signal']} → {graphic_url[:100]}..."
             )
             rendered_count += 1
-
-        except Exception as e:
-            print(f"â row={row_i} deal_id={deal_id} â Render failed: {e}")
+        except Exception as exc:
+            print(f"❌ row={row_i} deal_id={deal_id} — Render failed: {exc}")
             error_count += 1
-            continue
 
     print("=" * 72)
-    print(f"ð Rendered: {rendered_count} | Errors: {error_count}")
-
+    print(f"📊 Rendered: {rendered_count} | Errors: {error_count}")
     if error_count > 0 and rendered_count == 0:
         return 1
-
     return 0
 
 

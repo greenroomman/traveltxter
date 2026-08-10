@@ -182,25 +182,21 @@ df["price_z_score"] = (
     (df["price_gbp"] - df["baseline_mu"]) / df["baseline_sigma"]
 ).round(4)
 df["price_ratio"] = (df["price_gbp"] / df["baseline_mu"]).round(4)
-
-
-def pct_rank(group):
-    group = group.copy()
-    group["price_percentile"] = (
-        group["price_gbp"].rank(pct=True).mul(100).clip(upper=100.0).round(2)
-    )
-    return group
-
-
-df = df.groupby(
-    ["route", "dtd_bucket", "season_bucket"],
-    group_keys=False,
-    observed=False,
-).apply(pct_rank, include_groups=False)
+df["price_percentile"] = (
+    df.groupby(
+        ["route", "dtd_bucket", "season_bucket"],
+        observed=False,
+    )["price_gbp"]
+    .rank(pct=True)
+    .mul(100)
+    .clip(upper=100.0)
+    .round(2)
+)
 
 df = df[df["snapshot_id"].isin(original_ids)].copy()
 print(f"  Rows after ID safety filter: {len(df)} (expected {len(original_ids)})")
 print(f"  price_z_score non-null: {df['price_z_score'].notna().sum()}")
+print(f"  season_bucket non-null: {df['season_bucket'].notna().sum()}")
 
 print("Momentum features...")
 df = df.sort_values(

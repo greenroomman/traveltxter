@@ -29,6 +29,66 @@ jobs:
           ATLAS_MAX_SEARCHES: 157
         run: python workers/atlas_snapshot_capture.py
 
+  enrich_features:
+    name: Enrich Snapshot Features
+    runs-on: ubuntu-latest
+    needs: capture
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install supabase pandas numpy
+
+      - name: Run feature enrichment
+        env:
+          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+        run: python workers/atlas_backfill_v2.py
+
+      - name: Verify today's feature population
+        env:
+          MIZAR_SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
+          MIZAR_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python - << 'PY'
+          import os
+          from datetime import date
+          from supabase import create_client
+
+          sb = create_client(
+              os.environ["MIZAR_SUPABASE_URL"],
+              os.environ["MIZAR_SUPABASE_SERVICE_ROLE_KEY"],
+          )
+          today = date.today().isoformat()
+          rows = (
+              sb.table("snapshots")
+              .select("snapshot_id,season_bucket,price_z_score,price_ratio")
+              .eq("snapshot_date", today)
+              .execute()
+          ).data or []
+
+          if not rows:
+              raise SystemExit(f"No snapshots found for {today}")
+
+          total = len(rows)
+          season = sum(r.get("season_bucket") is not None for r in rows)
+          priced = [r for r in rows if r.get("price_z_score") is not None and r.get("price_ratio") is not None]
+
+          print(f"snapshot_date={today}")
+          print(f"total_rows={total}")
+          print(f"season_bucket_populated={season}")
+          print(f"price_position_populated={len(priced)}")
+
+          if season != total:
+              raise SystemExit(
+                  f"Feature enrichment incomplete: season_bucket {season}/{total}"
+              )
+          PY
+
   backfill:
     name: Backfill Outcomes
     runs-on: ubuntu-latest

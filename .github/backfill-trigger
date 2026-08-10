@@ -1,2 +1,3 @@
-triggered_at=2026-08-10T20:28:00+01:00
-reason=restore_snapshot_feature_enrichment
+triggered_at=2026-08-10T20:35:00+01:00
+reason=run_corrected_snapshot_feature_enrichment
+worker_commit=c6de357bc48247033033ce34af5e913cb25e3321

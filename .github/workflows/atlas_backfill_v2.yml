@@ -2,6 +2,9 @@ name: Atlas v2 Feature Backfill
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - .github/backfill-trigger
 
 jobs:
   backfill:

@@ -33,7 +33,7 @@ FEATURE_COLS = [
 def assign_season_bucket(d):
     if isinstance(d, str):
         d = date.fromisoformat(str(d)[:10])
-    elif hasattr(d, 'date'):
+    elif hasattr(d, "date"):
         d = d.date()
     m, day = d.month, d.day
     if (m == 12 and day >= 20) or (m == 1 and day <= 5):
@@ -42,7 +42,7 @@ def assign_season_bucket(d):
         return "easter"
     if (m == 7 and day >= 15) or m == 8 or (m == 9 and day <= 1):
         return "summer_peak"
-    if (m == 1 and day >= 15) or m == 2 or (m == 3 and day <= 15):
+    if m == 1 and day >= 15 or m == 2 or (m == 3 and day <= 15):
         return "ski"
     if m == 2 and 14 <= day <= 21:
         return "half_term"
@@ -56,7 +56,7 @@ def assign_season_bucket(d):
 def days_to_next_bh(d):
     if isinstance(d, str):
         d = date.fromisoformat(str(d)[:10])
-    elif hasattr(d, 'date'):
+    elif hasattr(d, "date"):
         d = d.date()
     future = [h for h in UK_BANK_HOLIDAYS if h >= d]
     return (min(future) - d).days if future else 365
@@ -65,11 +65,11 @@ def days_to_next_bh(d):
 def trip_overlaps(outbound, ret):
     if isinstance(outbound, str):
         outbound = date.fromisoformat(str(outbound)[:10])
-    elif hasattr(outbound, 'date'):
+    elif hasattr(outbound, "date"):
         outbound = outbound.date()
     if isinstance(ret, str):
         ret = date.fromisoformat(str(ret)[:10])
-    elif hasattr(ret, 'date'):
+    elif hasattr(ret, "date"):
         ret = ret.date()
     return any(outbound <= h <= ret for h in UK_BANK_HOLIDAYS)
 
@@ -77,12 +77,17 @@ def trip_overlaps(outbound, ret):
 def intensity(outbound):
     if isinstance(outbound, str):
         outbound = date.fromisoformat(str(outbound)[:10])
-    elif hasattr(outbound, 'date'):
+    elif hasattr(outbound, "date"):
         outbound = outbound.date()
     season = assign_season_bucket(outbound)
     base = {
-        "christmas": 0.95, "easter": 0.85, "summer_peak": 0.90,
-        "half_term": 0.75, "ski": 0.70, "shoulder": 0.45, "off_peak": 0.20
+        "christmas": 0.95,
+        "easter": 0.85,
+        "summer_peak": 0.90,
+        "half_term": 0.75,
+        "ski": 0.70,
+        "shoulder": 0.45,
+        "off_peak": 0.20,
     }.get(season, 0.30)
     if days_to_next_bh(outbound) <= 3:
         base = min(1.0, base + 0.15)
@@ -149,40 +154,76 @@ print(f"Unique snapshot_ids: {len(original_ids)}")
 print("Calendar features...")
 df["season_bucket"] = df["outbound_date"].apply(assign_season_bucket)
 df["days_to_next_bank_holiday"] = df["outbound_date"].apply(days_to_next_bh)
-df["trip_overlaps_holiday"] = df.apply(lambda r: trip_overlaps(r["outbound_date"], r["return_date"]), axis=1)
+df["trip_overlaps_holiday"] = df.apply(
+    lambda r: trip_overlaps(r["outbound_date"], r["return_date"]), axis=1
+)
 df["holiday_intensity_score"] = df["outbound_date"].apply(intensity)
 print(f"  seasons: {df['season_bucket'].value_counts().to_dict()}")
 
 print("Price position features...")
-df["dtd_bucket"] = pd.cut(df["dtd"].astype(float), bins=[-1,7,21,60,120,9999], labels=["0-7","8-21","22-60","61-120","120+"])
+df["dtd_bucket"] = pd.cut(
+    df["dtd"].astype(float),
+    bins=[-1, 7, 21, 60, 120, 9999],
+    labels=["0-7", "8-21", "22-60", "61-120", "120+"],
+)
 df["route"] = df["origin_iata"] + "-" + df["destination_iata"]
-baseline = df.groupby(["route","dtd_bucket","season_bucket"])["price_gbp"].agg(baseline_mu="mean", baseline_sigma="std").reset_index()
+baseline = (
+    df.groupby(["route", "dtd_bucket", "season_bucket"], observed=False)["price_gbp"]
+    .agg(baseline_mu="mean", baseline_sigma="std")
+    .reset_index()
+)
 baseline["baseline_sigma"] = baseline["baseline_sigma"].fillna(10.0).clip(lower=5.0)
-df = df.merge(baseline, on=["route","dtd_bucket","season_bucket"], how="left")
-df["price_z_score"] = ((df["price_gbp"] - df["baseline_mu"]) / df["baseline_sigma"]).round(4)
+df = df.merge(
+    baseline,
+    on=["route", "dtd_bucket", "season_bucket"],
+    how="left",
+)
+df["price_z_score"] = (
+    (df["price_gbp"] - df["baseline_mu"]) / df["baseline_sigma"]
+).round(4)
 df["price_ratio"] = (df["price_gbp"] / df["baseline_mu"]).round(4)
+
 
 def pct_rank(group):
     group = group.copy()
-    group["price_percentile"] = group["price_gbp"].rank(pct=True).mul(100).clip(upper=100.0).round(2)
+    group["price_percentile"] = (
+        group["price_gbp"].rank(pct=True).mul(100).clip(upper=100.0).round(2)
+    )
     return group
 
-df = df.groupby(["route","dtd_bucket","season_bucket"], group_keys=False).apply(pct_rank)
+
+df = df.groupby(
+    ["route", "dtd_bucket", "season_bucket"],
+    group_keys=False,
+    observed=False,
+).apply(pct_rank, include_groups=False)
 
 df = df[df["snapshot_id"].isin(original_ids)].copy()
 print(f"  Rows after ID safety filter: {len(df)} (expected {len(original_ids)})")
 print(f"  price_z_score non-null: {df['price_z_score'].notna().sum()}")
 
 print("Momentum features...")
-df = df.sort_values(["origin_iata","destination_iata","outbound_date","snapshot_date"])
-key = ["origin_iata","destination_iata","outbound_date"]
+df = df.sort_values(
+    ["origin_iata", "destination_iata", "outbound_date", "snapshot_date"]
+)
+key = ["origin_iata", "destination_iata", "outbound_date"]
 
-df["trend_3d"] = df.groupby(key)["price_gbp"].transform(lambda x: x.pct_change(periods=min(3, max(1, len(x)-1)))).round(4)
-df["trend_7d"] = df.groupby(key)["price_gbp"].transform(lambda x: x.pct_change(periods=min(7, max(1, len(x)-1)))).round(4)
-df["volatility_7d"] = df.groupby(key)["price_gbp"].transform(lambda x: x.rolling(7, min_periods=2).std()).round(4)
+df["trend_3d"] = df.groupby(key)["price_gbp"].transform(
+    lambda x: x.pct_change(periods=min(3, max(1, len(x) - 1)))
+).round(4)
+df["trend_7d"] = df.groupby(key)["price_gbp"].transform(
+    lambda x: x.pct_change(periods=min(7, max(1, len(x) - 1)))
+).round(4)
+df["volatility_7d"] = df.groupby(key)["price_gbp"].transform(
+    lambda x: x.rolling(7, min_periods=2).std()
+).round(4)
 
-df["_up"] = df.groupby(key)["price_gbp"].transform(lambda x: (x.diff() > 0).astype(float))
-df["direction_consistency_7d"] = df.groupby(key)["_up"].transform(lambda x: x.rolling(7, min_periods=2).mean()).round(3)
+df["_up"] = df.groupby(key)["price_gbp"].transform(
+    lambda x: (x.diff() > 0).astype(float)
+)
+df["direction_consistency_7d"] = df.groupby(key)["_up"].transform(
+    lambda x: x.rolling(7, min_periods=2).mean()
+).round(3)
 df.drop(columns=["_up"], inplace=True)
 print(f"  trend_7d non-null: {df['trend_7d'].notna().sum()}")
 
@@ -190,42 +231,84 @@ print("Fuel velocity...")
 df = df.sort_values("snapshot_date")
 fuel = df.groupby("snapshot_date")["jet_fuel_usd_gal"].first().reset_index()
 fuel["jet_fuel_7d_change_pct"] = fuel["jet_fuel_usd_gal"].pct_change(periods=7).round(4)
-df = df.merge(fuel[["snapshot_date","jet_fuel_7d_change_pct"]], on="snapshot_date", how="left")
+df = df.merge(
+    fuel[["snapshot_date", "jet_fuel_7d_change_pct"]],
+    on="snapshot_date",
+    how="left",
+)
 df = df[df["snapshot_id"].isin(original_ids)].copy()
-print(f"  jet_fuel_7d_change_pct non-null: {df['jet_fuel_7d_change_pct'].notna().sum()}")
+print(
+    "  jet_fuel_7d_change_pct non-null: "
+    f"{df['jet_fuel_7d_change_pct'].notna().sum()}"
+)
 print(f"  Final row count: {len(df)}")
 
-print(f"\nUpserting {len(df)} rows in batches of 500...")
+print(f"\nUpdating {len(df)} existing snapshot rows...")
 updated = 0
 errors = 0
-for i in range(0, len(df), 500):
-    chunk = df.iloc[i:i+500]
-    records = []
-    for _, row in chunk.iterrows():
-        sid = row["snapshot_id"]
-        if pd.isna(sid) or sid not in original_ids:
-            continue
-        record = {"snapshot_id": str(sid)}
-        for col in FEATURE_COLS:
-            if col in df.columns:
-                record[col] = clean_val(row[col], col)
-        records.append(record)
-    if not records:
+
+for _, row in df.iterrows():
+    sid = row["snapshot_id"]
+    if pd.isna(sid) or sid not in original_ids:
         continue
+
+    enrichment_columns = {}
+    for col in FEATURE_COLS:
+        if col in df.columns:
+            enrichment_columns[col] = clean_val(row[col], col)
+
     try:
-        supabase.table("snapshots").upsert(records, on_conflict="snapshot_id").execute()
-        updated += len(records)
-        print(f"  {updated}/{len(df)}")
-    except Exception as e:
+        result = (
+            supabase.table("snapshots")
+            .update(enrichment_columns)
+            .eq("snapshot_id", str(sid))
+            .execute()
+        )
+        if not result.data:
+            errors += 1
+            print(f"  ERROR snapshot_id {sid}: update matched no row")
+        else:
+            updated += 1
+            if updated % 500 == 0 or updated == len(df):
+                print(f"  {updated}/{len(df)}")
+    except Exception as exc:
         errors += 1
-        print(f"  ERROR batch {i}: {e}")
+        print(f"  ERROR snapshot_id {sid}: {exc}")
 
-print(f"\nDone. Upserted: {updated} | Errors: {errors}")
+print(f"\nDone. Updated: {updated} | Errors: {errors}")
 
-r1 = supabase.table("snapshots").select("snapshot_id", count="exact").not_.is_("price_z_score","null").execute()
-r2 = supabase.table("snapshots").select("snapshot_id", count="exact").not_.is_("season_bucket","null").execute()
-r3 = supabase.table("snapshots").select("snapshot_id", count="exact").not_.is_("trend_7d","null").execute()
+r1 = (
+    supabase.table("snapshots")
+    .select("snapshot_id", count="exact")
+    .not_.is_("price_z_score", "null")
+    .execute()
+)
+r2 = (
+    supabase.table("snapshots")
+    .select("snapshot_id", count="exact")
+    .not_.is_("season_bucket", "null")
+    .execute()
+)
+r3 = (
+    supabase.table("snapshots")
+    .select("snapshot_id", count="exact")
+    .not_.is_("trend_7d", "null")
+    .execute()
+)
 print(f"price_z_score populated: {r1.count}")
 print(f"season_bucket populated: {r2.count}")
 print(f"trend_7d populated:      {r3.count}")
 print(f"Total rows:              {len(df)}")
+
+if errors > 0:
+    print(f"ENRICHMENT FAILED: {errors} row updates failed. Exiting 1.")
+    sys.exit(1)
+
+if updated != len(df):
+    print(
+        "ENRICHMENT FAILED: updated row count does not match calculated row count. "
+        "Exiting 1."
+    )
+    sys.exit(1)
+
+print("ENRICHMENT SUCCESS: all calculated rows persisted.")

@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
 workers/atlas_snapshot_capture.py
-ATLAS SNAPSHOT CAPTURE - v2.2 (Supabase Migration)
+ATLAS SNAPSHOT CAPTURE - v2.3 (Offer Quality Guard)
 
 Migrated from Google Sheets to PostgreSQL/Supabase.
-Same 43-column schema, same logic, different storage layer.
+Same snapshot schema, with independent Duffel offer-quality protection.
 
-Improvements in v2.2:
+Improvements in v2.3:
 - Multi-DTD capture
 - Balanced origin caps
 - SUPABASE_SERVICE_KEY fallback
 - Duffel-safe retry/backoff handling
 - Slower pacing to reduce 429s
 - Better end-of-run diagnostics
+- Short-haul direct-flight quality filtering
+- Per-slice short-haul duration ceiling
+- European-route absolute price ceiling
+- Flagged NULL snapshot when no valid offer remains
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import math
 import random
 import datetime as dt
 import statistics
+import re
 from uuid import uuid4
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -135,6 +140,14 @@ def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) ->
     a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return round(R * c)
+
+
+def route_distance_km(origin: str, dest: str) -> Optional[int]:
+    if origin not in AIRPORT_COORDS or dest not in AIRPORT_COORDS:
+        return None
+    lat1, lon1 = AIRPORT_COORDS[origin]
+    lat2, lon2 = AIRPORT_COORDS[dest]
+    return haversine_distance_km(lat1, lon1, lat2, lon2)
 
 
 def classify_route_type(distance_km: int) -> str:
@@ -335,6 +348,49 @@ def _is_rate_limited(response: Optional[requests.Response], exc: Exception) -> b
     return False
 
 
+def parse_iso8601_duration_minutes(value: Any) -> Optional[int]:
+    """Convert Duffel ISO-8601 duration strings such as PT2H35M into minutes."""
+    if not value or not isinstance(value, str):
+        return None
+
+    match = re.fullmatch(r"P(?:(?P<days>\d+)D)?T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?", value)
+    if not match:
+        return None
+
+    days = int(match.group("days") or 0)
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes") or 0)
+    return days * 1440 + hours * 60 + minutes
+
+
+def offer_passes_quality_filters(offer: Dict[str, Any], distance_km: Optional[int]) -> bool:
+    """Apply independent offer-quality controls before price selection."""
+    try:
+        if offer.get("total_currency", "GBP") != "GBP":
+            return False
+
+        price_gbp = float(offer["total_amount"])
+        slices = offer.get("slices") or []
+        if len(slices) != 2:
+            return False
+
+        if distance_km is not None and distance_km < 2500:
+            if not all(len(slice_.get("segments") or []) == 1 for slice_ in slices):
+                return False
+
+            for slice_ in slices:
+                duration_minutes = parse_iso8601_duration_minutes(slice_.get("duration"))
+                if duration_minutes is None or duration_minutes > 240:
+                    return False
+
+        if distance_km is not None and distance_km < 3000 and price_gbp > 800:
+            return False
+
+        return True
+    except Exception:
+        return False
+
+
 def search_duffel(
     origin: str,
     dest: str,
@@ -345,11 +401,11 @@ def search_duffel(
     max_attempts: int = 3,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     """
-    Search Duffel API for cheapest offer.
+    Search Duffel API and return the cheapest offer that passes quality filters.
 
     Returns:
         (result, status)
-        status in {"success", "no_offers", "rate_limited", "failed"}
+        status in {"success", "quality_filtered", "no_offers", "rate_limited", "failed"}
     """
     url = "https://api.duffel.com/air/offer_requests"
     headers = {
@@ -370,6 +426,7 @@ def search_duffel(
     }
 
     backoffs = [2.0, 5.0, 10.0]
+    distance_km = route_distance_km(origin, dest)
 
     for attempt in range(1, max_attempts + 1):
         response = None
@@ -383,19 +440,47 @@ def search_duffel(
                 return None, "no_offers"
 
             offer_prices = []
+            gbp_offers = []
             for offer in offers:
                 total = offer.get("total_amount")
                 currency = offer.get("total_currency", "GBP")
                 if total and currency == "GBP":
                     try:
-                        offer_prices.append(float(total))
+                        price = float(total)
+                        offer_prices.append(price)
+                        gbp_offers.append(offer)
                     except Exception:
                         pass
 
-            cheapest = min(offers, key=lambda o: float(o["total_amount"]))
-
             cheapest_offer_gbp = min(offer_prices) if offer_prices else None
             most_expensive_offer_gbp = max(offer_prices) if offer_prices else None
+
+            valid_offers = [
+                offer for offer in gbp_offers
+                if offer_passes_quality_filters(offer, distance_km)
+            ]
+
+            if not valid_offers:
+                print(
+                    f"Warning: no valid offer after quality filters for {origin}->{dest} "
+                    f"{outbound}; raw_offers={len(offers)} distance_km={distance_km}"
+                )
+                return {
+                    "price_gbp": None,
+                    "currency": "GBP",
+                    "offer_count": len(offers),
+                    "cheapest_offer_gbp": cheapest_offer_gbp,
+                    "most_expensive_offer_gbp": most_expensive_offer_gbp,
+                    "carrier_count": None,
+                    "lcc_present": None,
+                    "direct": None,
+                    "stops": None,
+                    "cabin_class": cabin_class,
+                    "carrier_primary_iata": None,
+                    "quality_filter_failed": True,
+                }, "quality_filtered"
+
+            cheapest = min(valid_offers, key=lambda o: float(o["total_amount"]))
 
             return {
                 "price_gbp": float(cheapest["total_amount"]),
@@ -420,6 +505,7 @@ def search_duffel(
                 "stops": max(len(slice_["segments"]) - 1 for slice_ in cheapest["slices"]),
                 "cabin_class": cabin_class,
                 "carrier_primary_iata": cheapest["slices"][0]["segments"][0]["marketing_carrier"]["iata_code"],
+                "quality_filter_failed": False,
             }, "success"
 
         except Exception as ex:
@@ -450,7 +536,7 @@ def search_duffel(
 
 def main():
     print("=" * 70)
-    print("ATLAS SNAPSHOT CAPTURE v2.2 (Supabase)")
+    print("ATLAS SNAPSHOT CAPTURE v2.3 (Offer Quality Guard)")
     print("=" * 70)
 
     supabase = init_supabase()
@@ -496,6 +582,7 @@ def main():
 
     status_counts = {
         "success": 0,
+        "quality_filtered": 0,
         "no_offers": 0,
         "rate_limited": 0,
         "failed": 0,
@@ -512,13 +599,8 @@ def main():
         status_counts[status] += 1
         searches_per_origin[origin] += 1
 
-        distance_km = None
-        route_type = None
-        if origin in AIRPORT_COORDS and dest in AIRPORT_COORDS:
-            lat1, lon1 = AIRPORT_COORDS[origin]
-            lat2, lon2 = AIRPORT_COORDS[dest]
-            distance_km = haversine_distance_km(lat1, lon1, lat2, lon2)
-            route_type = classify_route_type(distance_km)
+        distance_km = route_distance_km(origin, dest)
+        route_type = classify_route_type(distance_km) if distance_km is not None else None
 
         snapshot_id = str(uuid4())
         snapshot_key = (
@@ -526,9 +608,13 @@ def main():
         )
         crisis_flags = check_crisis_flags(snapshot_date, dest, crisis_events)
 
+        quality_filter_failed = bool(result and result.get("quality_filter_failed"))
+
         shi_flag = "INSUFFICIENT_DATA"
         shi_score = None
-        if result and result.get("price_gbp"):
+        if quality_filter_failed:
+            shi_flag = "FLAG"
+        elif result and result.get("price_gbp"):
             shi_flag, shi_score = shi_variance_calculation(
                 supabase, origin, dest, outbound, return_date, result["price_gbp"]
             )
@@ -562,7 +648,7 @@ def main():
             "rose_10pct": None,
             "fell_10pct": None,
             "snapshot_key": snapshot_key,
-            "notes": None,
+            "notes": "no_valid_offer_after_quality_filters" if quality_filter_failed else None,
             "origin_type": "Tier1",
             "shi_variance_flag": shi_flag,
             **crisis_flags,
@@ -573,6 +659,9 @@ def main():
             "shi_score": shi_score,
             "model_version": "v1_0_0",
         }
+
+        if quality_filter_failed:
+            row["training_action"] = "exclude"
 
         snapshots.append(row)
         time.sleep(inter_request_sleep)
@@ -595,7 +684,7 @@ def main():
         print(f"  {origin}: {searches_per_origin[origin]}")
 
     print("\nDuffel status summary:")
-    for key in ["success", "no_offers", "rate_limited", "failed"]:
+    for key in ["success", "quality_filtered", "no_offers", "rate_limited", "failed"]:
         print(f"  {key}: {status_counts[key]}")
 
     print("\nSnapshot fill summary:")

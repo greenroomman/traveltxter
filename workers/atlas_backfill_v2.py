@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import pandas as pd
 import numpy as np
 from datetime import date
@@ -28,6 +29,9 @@ FEATURE_COLS = [
     "trend_3d", "trend_7d", "volatility_7d", "direction_consistency_7d",
     "jet_fuel_7d_change_pct",
 ]
+
+UPDATE_MAX_ATTEMPTS = 3
+UPDATE_BACKOFF_SECONDS = [1.0, 3.0]
 
 
 def assign_season_bucket(d):
@@ -118,6 +122,37 @@ def clean_val(val, col):
         return None if np.isnan(f) else round(f, 6)
     except (TypeError, ValueError):
         return None
+
+
+def update_snapshot_with_retry(snapshot_id, enrichment_columns):
+    global supabase
+    last_error = None
+
+    for attempt in range(1, UPDATE_MAX_ATTEMPTS + 1):
+        try:
+            result = (
+                supabase.table("snapshots")
+                .update(enrichment_columns)
+                .eq("snapshot_id", str(snapshot_id))
+                .execute()
+            )
+            if not result.data:
+                return False, "update matched no row"
+            return True, None
+        except Exception as exc:
+            last_error = exc
+            if attempt >= UPDATE_MAX_ATTEMPTS:
+                break
+
+            sleep_for = UPDATE_BACKOFF_SECONDS[min(attempt - 1, len(UPDATE_BACKOFF_SECONDS) - 1)]
+            print(
+                f"  RETRY snapshot_id {snapshot_id}: attempt {attempt}/{UPDATE_MAX_ATTEMPTS} "
+                f"failed: {exc}; sleeping {sleep_for:.1f}s"
+            )
+            time.sleep(sleep_for)
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    return False, str(last_error)
 
 
 print("Fetching snapshots...")
@@ -253,23 +288,14 @@ for _, row in df.iterrows():
         if col in df.columns:
             enrichment_columns[col] = clean_val(row[col], col)
 
-    try:
-        result = (
-            supabase.table("snapshots")
-            .update(enrichment_columns)
-            .eq("snapshot_id", str(sid))
-            .execute()
-        )
-        if not result.data:
-            errors += 1
-            print(f"  ERROR snapshot_id {sid}: update matched no row")
-        else:
-            updated += 1
-            if updated % 500 == 0 or updated == len(df):
-                print(f"  {updated}/{len(df)}")
-    except Exception as exc:
+    ok, error_message = update_snapshot_with_retry(sid, enrichment_columns)
+    if ok:
+        updated += 1
+        if updated % 500 == 0 or updated == len(df):
+            print(f"  {updated}/{len(df)}")
+    else:
         errors += 1
-        print(f"  ERROR snapshot_id {sid}: {exc}")
+        print(f"  ERROR snapshot_id {sid}: {error_message}")
 
 print(f"\nDone. Updated: {updated} | Errors: {errors}")
 

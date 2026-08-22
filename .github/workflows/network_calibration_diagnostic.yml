@@ -1,0 +1,291 @@
+name: MIZAR Network Calibration Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    name: Read-only network calibration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify diagnostic isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${DUFFEL_ACCESS_TOKEN:-}"
+          if env | grep -Eq '^SUPABASE_(URL|KEY|SERVICE_KEY|SERVICE_ROLE_KEY)='; then
+            echo 'ERROR: Supabase credential unexpectedly present.'
+            exit 1
+          fi
+          echo 'Duffel credential present.'
+          echo 'No Supabase credentials present. Database writes are not possible.'
+
+      - name: Run read-only network calibration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          import datetime as dt
+          import json
+          import math
+          import os
+          import re
+          import statistics
+          import time
+          from collections import defaultdict
+
+          import urllib.request
+          import urllib.error
+
+          TOKEN = os.environ['DUFFEL_ACCESS_TOKEN']
+          TODAY = dt.date.today()
+          OUTBOUND = TODAY + dt.timedelta(days=45)
+          RETURN = OUTBOUND + dt.timedelta(days=7)
+
+          # Exact active network from workers/atlas_snapshot_capture.py:
+          ORIGINS = ['MAN','LGW','LHR','EDI','BRS','LPL','BHX','NCL','GLA']
+          DESTINATIONS = ['AMS','CDG','BCN','DUB','FCO','MAD','ATH','LIS','AGP','PMI','FAO','NCE','VCE','MXP','PRG','CPH','ARN','OSL','VIE','ZRH']
+
+          AIRPORT_COORDS = {
+              'MAN':(53.3537,-2.2750),'LGW':(51.1537,-0.1821),'LHR':(51.4700,-0.4543),
+              'EDI':(55.9500,-3.3725),'BRS':(51.3827,-2.7190),'LPL':(53.3337,-2.8497),
+              'BHX':(52.4539,-1.7480),'NCL':(55.0375,-1.6917),'GLA':(55.8719,-4.4333),
+              'AMS':(52.3105,4.7683),'CDG':(49.0097,2.5479),'FCO':(41.8003,12.2389),
+              'MAD':(40.4983,-3.5676),'BCN':(41.2974,2.0833),'DUB':(53.4213,-6.2701),
+              'BRU':(50.9010,4.4856),'CPH':(55.6180,12.6508),'ARN':(59.6519,17.9186),
+              'OSL':(60.1939,11.1004),'VIE':(48.1103,16.5697),'ZRH':(47.4647,8.5492),
+              'PRG':(50.1008,14.2632),'ATH':(37.9364,23.9445),'LIS':(38.7742,-9.1342),
+              'AGP':(36.6749,-4.4991),'PMI':(39.5517,2.7388),'FAO':(37.0144,-7.9659),
+              'NCE':(43.6584,7.2159),'VCE':(45.5053,12.3519),'MXP':(45.6306,8.7281),
+          }
+
+          def distance_km(a,b):
+              lat1,lon1=AIRPORT_COORDS[a]; lat2,lon2=AIRPORT_COORDS[b]
+              r=6371.0
+              p1,p2=math.radians(lat1),math.radians(lat2)
+              dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
+              x=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+              return round(r*2*math.atan2(math.sqrt(x),math.sqrt(1-x)))
+
+          def band(d):
+              if d < 1000: return 'A_<1000'
+              if d < 2000: return 'B_1000_1999'
+              if d < 3000: return 'C_2000_2999'
+              return 'D_3000_plus'
+
+          def pct(vals,p):
+              if not vals: return None
+              xs=sorted(vals)
+              if len(xs)==1: return float(xs[0])
+              k=(len(xs)-1)*(p/100.0); f=math.floor(k); c=math.ceil(k)
+              if f==c: return float(xs[int(k)])
+              return xs[f]*(c-k)+xs[c]*(k-f)
+
+          def parse_duration(v):
+              if not isinstance(v,str): return None
+              m=re.fullmatch(r'P(?:(?P<days>\d+)D)?T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?',v)
+              if not m: return None
+              return int(m.group('days') or 0)*1440+int(m.group('hours') or 0)*60+int(m.group('minutes') or 0)
+
+          # Deterministic stratified sample from the real 180-route network.
+          # Eight routes per calibration band, spread across the band's distance range.
+          all_routes=[]
+          for o in ORIGINS:
+              for d in DESTINATIONS:
+                  km=distance_km(o,d); b=band(km)
+                  if b in {'A_<1000','B_1000_1999','C_2000_2999'}:
+                      all_routes.append((o,d,km,b))
+
+          required={('GLA','VCE'),('LPL','MAD'),('NCL','LIS')}
+          sample=[]
+          for b in ['A_<1000','B_1000_1999','C_2000_2999']:
+              rs=sorted([r for r in all_routes if r[3]==b], key=lambda r:(r[2],r[0],r[1]))
+              picks=[]
+              if rs:
+                  indexes=sorted(set(round(i*(len(rs)-1)/7) for i in range(8)))
+                  picks=[rs[i] for i in indexes]
+              for r in rs:
+                  if (r[0],r[1]) in required and r not in picks:
+                      if len(picks)>=8:
+                          # Replace nearest-distance non-required route so band size stays bounded.
+                          candidates=[x for x in picks if (x[0],x[1]) not in required]
+                          victim=min(candidates,key=lambda x:abs(x[2]-r[2])) if candidates else picks[-1]
+                          picks[picks.index(victim)]=r
+                      else:
+                          picks.append(r)
+              sample.extend(sorted(set(picks), key=lambda r:(r[2],r[0],r[1])))
+
+          print('READ-ONLY NETWORK CALIBRATION')
+          print(f'Live search dates: {OUTBOUND} to {RETURN}')
+          print(f'Active network: {len(ORIGINS)} origins x {len(DESTINATIONS)} destinations = {len(ORIGINS)*len(DESTINATIONS)} routes')
+          print(f'Sampled routes: {len(sample)}')
+          for r in sample: print('SAMPLE',*r)
+
+          headers={
+              'Duffel-Version':'v2','Authorization':f'Bearer {TOKEN}','Content-Type':'application/json'
+          }
+          offer_rows=[]; route_rows=[]
+
+          for idx,(origin,dest,km,b) in enumerate(sample,1):
+              payload={'data':{'cabin_class':'economy','passengers':[{'type':'adult'}],
+                  'slices':[{'origin':origin,'destination':dest,'departure_date':str(OUTBOUND)},
+                            {'origin':dest,'destination':origin,'departure_date':str(RETURN)}]}}
+              req=urllib.request.Request('https://api.duffel.com/air/offer_requests',
+                  data=json.dumps(payload).encode(),headers=headers,method='POST')
+              offers=[]; status='unknown'
+              try:
+                  with urllib.request.urlopen(req,timeout=40) as resp:
+                      status=str(resp.status)
+                      body=json.loads(resp.read().decode())
+                      offers=body.get('data',{}).get('offers',[]) or []
+              except Exception as e:
+                  status=f'ERROR:{type(e).__name__}:{e}'
+
+              gbp=0; direct=0; plausible=[]; raw_slices=[]; plausible_slices=[]
+              cheapest_direct=None; cheapest_connect=None
+              for off in offers:
+                  if off.get('total_currency')!='GBP': continue
+                  try: price=float(off['total_amount'])
+                  except Exception: continue
+                  gbp+=1
+                  slices=off.get('slices') or []
+                  seg_counts=[len((s or {}).get('segments') or []) for s in slices]
+                  is_direct=len(slices)==2 and all(n==1 for n in seg_counts)
+                  if is_direct:
+                      direct+=1; cheapest_direct=price if cheapest_direct is None else min(cheapest_direct,price)
+                  else:
+                      cheapest_connect=price if cheapest_connect is None else min(cheapest_connect,price)
+                  durations=[parse_duration((s or {}).get('duration')) for s in slices]
+                  for dur in durations:
+                      if dur is not None: raw_slices.append(dur)
+                  parse_ok=len(slices)==2 and len(durations)==2 and all(x is not None for x in durations)
+                  price_ok=(price<=800) if km<3000 else True
+                  is_plausible=len(slices)==2 and parse_ok and price_ok
+                  if is_plausible:
+                      plausible.append((price,durations,is_direct,off.get('id','')))
+                      plausible_slices.extend(durations)
+                  offer_rows.append({
+                      'route':f'{origin}->{dest}','band':b,'distance_km':km,'offer_id':off.get('id',''),
+                      'price_gbp':price,'slice_count':len(slices),'segment_counts':'/'.join(map(str,seg_counts)),
+                      'outbound_minutes':durations[0] if len(durations)>0 else '',
+                      'return_minutes':durations[1] if len(durations)>1 else '',
+                      'direct':is_direct,'duration_parse_ok':parse_ok,'price_le_800':price<=800,
+                      'plausible':is_plausible,
+                  })
+
+              pr_prices=[x[0] for x in plausible]
+              route_rows.append({
+                  'route':f'{origin}->{dest}','band':b,'distance_km':km,'http_status':status,
+                  'raw_offers':len(offers),'gbp_offers':gbp,'direct_offers':direct,'plausible_offers':len(plausible),
+                  'shortest_plausible_slice':min(plausible_slices) if plausible_slices else '',
+                  'median_plausible_slice':pct(plausible_slices,50) if plausible_slices else '',
+                  'p90_plausible_slice':pct(plausible_slices,90) if plausible_slices else '',
+                  'p95_plausible_slice':pct(plausible_slices,95) if plausible_slices else '',
+                  'max_plausible_slice':max(plausible_slices) if plausible_slices else '',
+                  'cheapest_plausible_fare':min(pr_prices) if pr_prices else '',
+                  'cheapest_direct_fare':cheapest_direct if cheapest_direct is not None else '',
+                  'cheapest_connecting_fare':cheapest_connect if cheapest_connect is not None else '',
+              })
+              print(f'ROUTE {origin}->{dest} band={b} km={km} status={status} raw={len(offers)} GBP={gbp} direct={direct} plausible={len(plausible)}')
+              time.sleep(1.2)
+
+          with open('network_calibration_offers.csv','w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=offer_rows[0].keys() if offer_rows else ['route'])
+              w.writeheader(); w.writerows(offer_rows)
+          with open('network_calibration_routes.csv','w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=route_rows[0].keys())
+              w.writeheader(); w.writerows(route_rows)
+
+          thresholds={
+              'A_<1000':[150,180,210,240],
+              'B_1000_1999':[240,270,300,330,360],
+              'C_2000_2999':[300,360,420,480,540],
+          }
+          report=[]
+          print('\n=== BAND SUMMARIES ===')
+          for b in thresholds:
+              ors=[x for x in offer_rows if x.get('band')==b and x.get('duration_parse_ok')]
+              prs=[x for x in ors if x.get('plausible')]
+              rawdur=[]; pdur=[]
+              for x in ors:
+                  for k in ['outbound_minutes','return_minutes']:
+                      if isinstance(x.get(k),int): rawdur.append(x[k])
+              for x in prs:
+                  for k in ['outbound_minutes','return_minutes']:
+                      if isinstance(x.get(k),int): pdur.append(x[k])
+              rr=[x for x in route_rows if x['band']==b]
+              summary={
+                  'band':b,'routes':len(rr),'gbp_offers':sum(x['gbp_offers'] for x in rr),
+                  'plausible_offers':sum(x['plausible_offers'] for x in rr),
+                  'raw_p50':pct(rawdur,50),'raw_p75':pct(rawdur,75),'raw_p90':pct(rawdur,90),'raw_p95':pct(rawdur,95),'raw_p99':pct(rawdur,99),'raw_max':max(rawdur) if rawdur else None,
+                  'plausible_p50':pct(pdur,50),'plausible_p75':pct(pdur,75),'plausible_p90':pct(pdur,90),'plausible_p95':pct(pdur,95),'plausible_p99':pct(pdur,99),'plausible_max':max(pdur) if pdur else None,
+              }
+              print('BAND',json.dumps(summary,sort_keys=True))
+              report.append(summary)
+
+              print('THRESHOLDS',b)
+              total_plausible=len(prs)
+              total_slices=len(pdur)
+              for t in thresholds[b]:
+                  kept=[x for x in prs if x['outbound_minutes']<=t and x['return_minutes']<=t]
+                  kept_slices=sum((1 if x['outbound_minutes']<=t else 0)+(1 if x['return_minutes']<=t else 0) for x in prs)
+                  route_names={x['route'] for x in rr if x['plausible_offers']>0}
+                  surviving={x['route'] for x in kept}
+                  zero=sorted(route_names-surviving)
+                  print(f'  threshold={t} offers_retained={len(kept)}/{total_plausible} ({(100*len(kept)/total_plausible if total_plausible else 0):.1f}%) slices_retained={kept_slices}/{total_slices} ({(100*kept_slices/total_slices if total_slices else 0):.1f}%) routes_retained={len(surviving)}/{len(route_names)} zero_valid={len(zero)} zero_routes={zero}')
+
+          print('\n=== ROUTE LEVEL ===')
+          for x in route_rows: print('ROUTE_SUMMARY',json.dumps(x,sort_keys=True))
+
+          print('\n=== CONNECTING-ONLY ROUTES ===')
+          for r in route_rows:
+              if r['gbp_offers']>0 and r['direct_offers']==0:
+                  rows=[x for x in offer_rows if x['route']==r['route'] and x['plausible']]
+                  if rows:
+                      mins=min(max(x['outbound_minutes'],x['return_minutes']) for x in rows)
+                  else: mins=None
+                  print(f"CONNECTING_ONLY route={r['route']} band={r['band']} km={r['distance_km']} plausible={r['plausible_offers']} minimum_threshold_to_retain_one={mins} cheapest_plausible={r['cheapest_plausible_fare']}")
+
+          print('\n=== DIRECT MARKET CONTROLS ===')
+          for r in route_rows:
+              if r['direct_offers']>0:
+                  print(f"DIRECT_CONTROL route={r['route']} direct={r['direct_offers']} gbp={r['gbp_offers']} cheapest_direct={r['cheapest_direct_fare']} cheapest_connecting={r['cheapest_connecting_fare']}")
+
+          print('\n=== PRICE / DURATION INTERACTION ===')
+          for b in thresholds:
+              rows=[x for x in offer_rows if x['band']==b and x['duration_parse_ok']]
+              current_t=240
+              price_only=sum(1 for x in rows if x['price_gbp']>800 and x['outbound_minutes']<=current_t and x['return_minutes']<=current_t)
+              duration_only=sum(1 for x in rows if x['price_gbp']<=800 and (x['outbound_minutes']>current_t or x['return_minutes']>current_t))
+              both=sum(1 for x in rows if x['price_gbp']>800 and (x['outbound_minutes']>current_t or x['return_minutes']>current_t))
+              survive_no_direct=sum(1 for x in rows if x['price_gbp']<=800 and x['outbound_minutes']<=current_t and x['return_minutes']<=current_t)
+              print(f'INTERACTION band={b} price_only={price_only} duration_only={duration_only} both={both} survive_without_directness_at_240={survive_no_direct}')
+
+          with open('network_calibration_summary.json','w') as f:
+              json.dump({'dates':{'outbound':str(OUTBOUND),'return':str(RETURN)},'sample':sample,'band_summaries':report,'route_summaries':route_rows},f,indent=2)
+
+          print('\nDIAGNOSTIC COMPLETE. No Supabase calls were made. No production files were modified by this run.')
+          PY
+
+      - name: Upload calibration artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mizar-network-calibration
+          path: |
+            network_calibration_offers.csv
+            network_calibration_routes.csv
+            network_calibration_summary.json
+          retention-days: 7

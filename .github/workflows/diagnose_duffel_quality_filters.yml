@@ -1,6 +1,10 @@
 name: Diagnose Duffel Quality Filters
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose_duffel_quality_filters.yml'
   workflow_dispatch:
 
 jobs:
@@ -25,7 +29,6 @@ jobs:
           python - << 'PY'
           import os
           import re
-          import json
           import math
           import datetime as dt
           from typing import Any, Dict, Optional
@@ -88,7 +91,6 @@ jobs:
 
           def diagnose_offer(offer: Dict[str, Any], distance_km: Optional[int]) -> Dict[str, Any]:
               reasons = []
-
               currency = offer.get("total_currency", "GBP")
               if currency != "GBP":
                   reasons.append("currency_not_gbp")
@@ -133,12 +135,7 @@ jobs:
                               f"slice_{detail['slice']}_duration_over_240:{detail['duration_minutes']}"
                           )
 
-              if (
-                  distance_km is not None
-                  and distance_km < 3000
-                  and price_gbp is not None
-                  and price_gbp > 800
-              ):
+              if distance_km is not None and distance_km < 3000 and price_gbp is not None and price_gbp > 800:
                   reasons.append(f"price_over_800:{price_gbp:.2f}")
 
               return {
@@ -161,20 +158,11 @@ jobs:
                       "cabin_class": "economy",
                       "passengers": [{"type": "adult"}],
                       "slices": [
-                          {
-                              "origin": origin,
-                              "destination": destination,
-                              "departure_date": str(outbound),
-                          },
-                          {
-                              "origin": destination,
-                              "destination": origin,
-                              "departure_date": str(return_date),
-                          },
+                          {"origin": origin, "destination": destination, "departure_date": str(outbound)},
+                          {"origin": destination, "destination": origin, "departure_date": str(return_date)},
                       ],
                   }
               }
-
               response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
               print(f"HTTP status: {response.status_code}")
               if response.status_code >= 400:
@@ -210,7 +198,6 @@ jobs:
                       gbp_count += 1
                   if result["passes"]:
                       pass_count += 1
-
                   for reason in result["reasons"]:
                       key = reason.split(":")[0]
                       rejection_counts[key] = rejection_counts.get(key, 0) + 1
@@ -223,10 +210,8 @@ jobs:
                   print(f"  slice_count: {result['slice_count']}")
                   for detail in result["slice_details"]:
                       print(
-                          f"  slice {detail['slice']}: "
-                          f"segments={detail['segment_count']} "
-                          f"duration_raw={detail['duration_raw']} "
-                          f"duration_minutes={detail['duration_minutes']}"
+                          f"  slice {detail['slice']}: segments={detail['segment_count']} "
+                          f"duration_raw={detail['duration_raw']} duration_minutes={detail['duration_minutes']}"
                       )
                   print(f"  PASSES QUALITY FILTER: {result['passes']}")
                   if result["reasons"]:

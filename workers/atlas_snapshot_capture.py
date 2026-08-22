@@ -363,32 +363,92 @@ def parse_iso8601_duration_minutes(value: Any) -> Optional[int]:
     return days * 1440 + hours * 60 + minutes
 
 
-def offer_passes_quality_filters(offer: Dict[str, Any], distance_km: Optional[int]) -> bool:
-    """Apply independent offer-quality controls before price selection."""
+# TEMPORARY GOVERNANCE BOUNDARY:
+# 500 minutes is an interim safety ceiling for connecting-market fallback.
+# It is NOT a calibrated or validated model parameter. Review after 7 days
+# of production instrumentation before retaining or changing it.
+CONNECTING_MAX_SLICE_MINUTES = 500
+EUROPEAN_PRICE_CEILING_GBP = 800
+
+
+def _offer_metrics(
+    offer: Dict[str, Any],
+    distance_km: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    """
+    Return comparable metrics for a plausible GBP return offer.
+
+    This deliberately does NOT impose the legacy directness or 240-minute
+    duration rules. It establishes the calibration population from which
+    direct or connecting reference fares are selected.
+    """
     try:
         if offer.get("total_currency", "GBP") != "GBP":
-            return False
+            return None
 
         price_gbp = float(offer["total_amount"])
         slices = offer.get("slices") or []
         if len(slices) != 2:
-            return False
+            return None
 
-        if distance_km is not None and distance_km < 2500:
-            if not all(len(slice_.get("segments") or []) == 1 for slice_ in slices):
-                return False
+        slice_durations = []
+        for slice_ in slices:
+            duration_minutes = parse_iso8601_duration_minutes(slice_.get("duration"))
+            if duration_minutes is None:
+                return None
+            slice_durations.append(duration_minutes)
 
-            for slice_ in slices:
-                duration_minutes = parse_iso8601_duration_minutes(slice_.get("duration"))
-                if duration_minutes is None or duration_minutes > 240:
-                    return False
+        if distance_km is not None and distance_km < 3000:
+            if price_gbp > EUROPEAN_PRICE_CEILING_GBP:
+                return None
 
-        if distance_km is not None and distance_km < 3000 and price_gbp > 800:
-            return False
+        direct = all(len(slice_.get("segments") or []) == 1 for slice_ in slices)
 
-        return True
+        return {
+            "offer": offer,
+            "price_gbp": price_gbp,
+            "direct": direct,
+            "max_slice_duration": max(slice_durations),
+        }
     except Exception:
-        return False
+        return None
+
+
+def _pareto_frontier(
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Return non-dominated connecting offers on price and max-slice duration.
+
+    Offer A dominates B when A is no more expensive and no slower than B,
+    with at least one strict improvement.
+    """
+    frontier = []
+
+    for candidate in candidates:
+        dominated = False
+
+        for other in candidates:
+            if other is candidate:
+                continue
+
+            no_worse_price = other["price_gbp"] <= candidate["price_gbp"]
+            no_worse_duration = (
+                other["max_slice_duration"] <= candidate["max_slice_duration"]
+            )
+            strictly_better = (
+                other["price_gbp"] < candidate["price_gbp"]
+                or other["max_slice_duration"] < candidate["max_slice_duration"]
+            )
+
+            if no_worse_price and no_worse_duration and strictly_better:
+                dominated = True
+                break
+
+        if not dominated:
+            frontier.append(candidate)
+
+    return frontier
 
 
 def search_duffel(
@@ -401,11 +461,29 @@ def search_duffel(
     max_attempts: int = 3,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     """
-    Search Duffel API and return the cheapest offer that passes quality filters.
+    Search Duffel and select a route-representative reference fare.
+
+    Policy:
+    - If plausible direct inventory exists, select the cheapest direct fare.
+    - Otherwise construct the connecting-offer Pareto frontier using price
+      and max per-slice duration.
+    - Select the fastest Pareto-efficient connecting offer, with price as
+      the tie-breaker.
+    - Reject the connecting reference when its max slice exceeds the
+      temporary 500-minute safety boundary.
 
     Returns:
         (result, status)
-        status in {"success", "quality_filtered", "no_offers", "rate_limited", "failed"}
+
+        status in {
+            "success",
+            "no_calibration_population",
+            "no_pareto_frontier",
+            "no_credible_connecting_fare",
+            "no_offers",
+            "rate_limited",
+            "failed",
+        }
     """
     url = "https://api.duffel.com/air/offer_requests"
     headers = {
@@ -440,72 +518,141 @@ def search_duffel(
                 return None, "no_offers"
 
             offer_prices = []
-            gbp_offers = []
             for offer in offers:
                 total = offer.get("total_amount")
                 currency = offer.get("total_currency", "GBP")
                 if total and currency == "GBP":
                     try:
-                        price = float(total)
-                        offer_prices.append(price)
-                        gbp_offers.append(offer)
+                        offer_prices.append(float(total))
                     except Exception:
                         pass
 
             cheapest_offer_gbp = min(offer_prices) if offer_prices else None
             most_expensive_offer_gbp = max(offer_prices) if offer_prices else None
 
-            valid_offers = [
-                offer for offer in gbp_offers
-                if offer_passes_quality_filters(offer, distance_km)
-            ]
+            calibration_population = []
+            for offer in offers:
+                metrics = _offer_metrics(offer, distance_km)
+                if metrics is not None:
+                    calibration_population.append(metrics)
 
-            if not valid_offers:
+            base_null_result = {
+                "price_gbp": None,
+                "currency": "GBP",
+                "offer_count": len(offers),
+                "cheapest_offer_gbp": cheapest_offer_gbp,
+                "most_expensive_offer_gbp": most_expensive_offer_gbp,
+                "carrier_count": None,
+                "lcc_present": None,
+                "direct": None,
+                "stops": None,
+                "cabin_class": cabin_class,
+                "carrier_primary_iata": None,
+                "reference_fare_type": None,
+                "connecting_pareto_frontier_size": 0,
+                "connecting_max_slice_minutes": None,
+            }
+
+            if not calibration_population:
                 print(
-                    f"Warning: no valid offer after quality filters for {origin}->{dest} "
+                    f"Warning: no calibration population for {origin}->{dest} "
                     f"{outbound}; raw_offers={len(offers)} distance_km={distance_km}"
                 )
-                return {
-                    "price_gbp": None,
-                    "currency": "GBP",
-                    "offer_count": len(offers),
-                    "cheapest_offer_gbp": cheapest_offer_gbp,
-                    "most_expensive_offer_gbp": most_expensive_offer_gbp,
-                    "carrier_count": None,
-                    "lcc_present": None,
-                    "direct": None,
-                    "stops": None,
-                    "cabin_class": cabin_class,
-                    "carrier_primary_iata": None,
-                    "quality_filter_failed": True,
-                }, "quality_filtered"
+                return base_null_result, "no_calibration_population"
 
-            cheapest = min(valid_offers, key=lambda o: float(o["total_amount"]))
+            direct_candidates = [
+                candidate
+                for candidate in calibration_population
+                if candidate["direct"]
+            ]
+
+            if direct_candidates:
+                selected_metrics = min(
+                    direct_candidates,
+                    key=lambda candidate: candidate["price_gbp"],
+                )
+                reference_fare_type = "direct"
+                frontier_size = None
+                connecting_max_slice_minutes = None
+            else:
+                connecting_candidates = [
+                    candidate
+                    for candidate in calibration_population
+                    if not candidate["direct"]
+                ]
+
+                frontier = _pareto_frontier(connecting_candidates)
+
+                if not frontier:
+                    print(
+                        f"Warning: no Pareto frontier for {origin}->{dest} "
+                        f"{outbound}; calibration_offers={len(calibration_population)}"
+                    )
+                    return base_null_result, "no_pareto_frontier"
+
+                selected_metrics = min(
+                    frontier,
+                    key=lambda candidate: (
+                        candidate["max_slice_duration"],
+                        candidate["price_gbp"],
+                    ),
+                )
+
+                fastest_minutes = selected_metrics["max_slice_duration"]
+
+                if fastest_minutes > CONNECTING_MAX_SLICE_MINUTES:
+                    print(
+                        f"Warning: no credible connecting fare for {origin}->{dest} "
+                        f"{outbound}; fastest_pareto_max_slice={fastest_minutes} "
+                        f"temporary_ceiling={CONNECTING_MAX_SLICE_MINUTES} "
+                        f"frontier_size={len(frontier)}"
+                    )
+
+                    result = dict(base_null_result)
+                    result["connecting_pareto_frontier_size"] = len(frontier)
+                    result["connecting_max_slice_minutes"] = fastest_minutes
+                    return result, "no_credible_connecting_fare"
+
+                reference_fare_type = "connecting_pareto"
+                frontier_size = len(frontier)
+                connecting_max_slice_minutes = fastest_minutes
+
+            selected = selected_metrics["offer"]
 
             return {
-                "price_gbp": float(cheapest["total_amount"]),
-                "currency": cheapest["total_currency"],
+                "price_gbp": float(selected["total_amount"]),
+                "currency": selected["total_currency"],
                 "offer_count": len(offers),
                 "cheapest_offer_gbp": cheapest_offer_gbp,
                 "most_expensive_offer_gbp": most_expensive_offer_gbp,
                 "carrier_count": len(
                     set(
                         seg["marketing_carrier"]["iata_code"]
-                        for slice_ in cheapest["slices"]
+                        for slice_ in selected["slices"]
                         for seg in slice_["segments"]
                     )
                 ),
                 "lcc_present": any(
                     seg["marketing_carrier"].get("name", "").lower()
                     in ["ryanair", "easyjet", "wizz air", "norwegian"]
-                    for slice_ in cheapest["slices"]
+                    for slice_ in selected["slices"]
                     for seg in slice_["segments"]
                 ),
-                "direct": all(len(slice_["segments"]) == 1 for slice_ in cheapest["slices"]),
-                "stops": max(len(slice_["segments"]) - 1 for slice_ in cheapest["slices"]),
+                "direct": all(
+                    len(slice_.get("segments") or []) == 1
+                    for slice_ in selected["slices"]
+                ),
+                "stops": max(
+                    len(slice_.get("segments") or []) - 1
+                    for slice_ in selected["slices"]
+                ),
                 "cabin_class": cabin_class,
-                "carrier_primary_iata": cheapest["slices"][0]["segments"][0]["marketing_carrier"]["iata_code"],
-                "quality_filter_failed": False,
+                "carrier_primary_iata": (
+                    selected["slices"][0]["segments"][0]["marketing_carrier"]["iata_code"]
+                ),
+                "reference_fare_type": reference_fare_type,
+                "connecting_pareto_frontier_size": frontier_size,
+                "connecting_max_slice_minutes": connecting_max_slice_minutes,
             }, "success"
 
         except Exception as ex:
@@ -521,7 +668,10 @@ def search_duffel(
                 continue
 
             if is_429:
-                print(f"Warning: Duffel search rate-limited ({origin}->{dest} {outbound}): {ex}")
+                print(
+                    f"Warning: Duffel search rate-limited "
+                    f"({origin}->{dest} {outbound}): {ex}"
+                )
                 return None, "rate_limited"
 
             print(f"Warning: Duffel search failed ({origin}->{dest} {outbound}): {ex}")
@@ -582,7 +732,9 @@ def main():
 
     status_counts = {
         "success": 0,
-        "quality_filtered": 0,
+        "no_calibration_population": 0,
+        "no_pareto_frontier": 0,
+        "no_credible_connecting_fare": 0,
         "no_offers": 0,
         "rate_limited": 0,
         "failed": 0,
@@ -608,11 +760,15 @@ def main():
         )
         crisis_flags = check_crisis_flags(snapshot_date, dest, crisis_events)
 
-        quality_filter_failed = bool(result and result.get("quality_filter_failed"))
+        excluded_capture_status = status in {
+            "no_calibration_population",
+            "no_pareto_frontier",
+            "no_credible_connecting_fare",
+        }
 
         shi_flag = "INSUFFICIENT_DATA"
         shi_score = None
-        if quality_filter_failed:
+        if excluded_capture_status:
             shi_flag = "FLAG"
         elif result and result.get("price_gbp"):
             shi_flag, shi_score = shi_variance_calculation(
@@ -648,7 +804,14 @@ def main():
             "rose_10pct": None,
             "fell_10pct": None,
             "snapshot_key": snapshot_key,
-            "notes": "no_valid_offer_after_quality_filters" if quality_filter_failed else None,
+            "notes": {
+                "no_calibration_population": "no_calibration_population",
+                "no_pareto_frontier": "no_pareto_frontier",
+                "no_credible_connecting_fare": "no_credible_connecting_fare",
+                "no_offers": "no_duffel_offers",
+                "rate_limited": "rate_limited",
+                "failed": "duffel_search_failed",
+            }.get(status),
             "origin_type": "Tier1",
             "shi_variance_flag": shi_flag,
             **crisis_flags,
@@ -658,9 +821,18 @@ def main():
             "route_type": route_type,
             "shi_score": shi_score,
             "model_version": "v1_0_0",
+            "reference_fare_type": (
+                result.get("reference_fare_type") if result else None
+            ),
+            "connecting_pareto_frontier_size": (
+                result.get("connecting_pareto_frontier_size") if result else None
+            ),
+            "connecting_max_slice_minutes": (
+                result.get("connecting_max_slice_minutes") if result else None
+            ),
         }
 
-        if quality_filter_failed:
+        if excluded_capture_status:
             row["training_action"] = "exclude"
 
         snapshots.append(row)
@@ -684,7 +856,15 @@ def main():
         print(f"  {origin}: {searches_per_origin[origin]}")
 
     print("\nDuffel status summary:")
-    for key in ["success", "quality_filtered", "no_offers", "rate_limited", "failed"]:
+    for key in [
+        "success",
+        "no_calibration_population",
+        "no_pareto_frontier",
+        "no_credible_connecting_fare",
+        "no_offers",
+        "rate_limited",
+        "failed",
+    ]:
         print(f"  {key}: {status_counts[key]}")
 
     print("\nSnapshot fill summary:")

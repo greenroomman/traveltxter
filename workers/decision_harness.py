@@ -40,7 +40,6 @@ SUPABASE = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 REQUEST_SLEEP_SECONDS = float(os.environ.get("HARNESS_SLEEP_SECONDS", "0.3"))
 MAX_ROWS = int(os.environ.get("HARNESS_MAX_ROWS", "500"))
-HARNESS_LOOKBACK_DAYS = int(os.environ.get("HARNESS_LOOKBACK_DAYS", "10"))
 BUCKET_TARGET = int(os.environ.get("HARNESS_BUCKET_TARGET", "125"))
 
 
@@ -83,29 +82,21 @@ def dtd_bucket(outbound_date):
     return None
 
 
-def get_latest_snapshot_date():
-    result = (
-        SUPABASE.table("snapshots")
-        .select("snapshot_date")
-        .not_.is_("price_gbp", "null")
-        .order("snapshot_date", desc=True)
-        .limit(1)
-        .execute()
-    )
+def get_scoring_snapshot_date():
+    """
+    Harness scoring is same-day only.
 
-    rows = result.data or []
-    if not rows:
-        return None
-
-    return clean_date(rows[0].get("snapshot_date"))
+    Historical snapshots must never be substituted for today's missing
+    fare. If today's capture has no valid fare for a route, that route
+    does not enter the scoring cohort.
+    """
+    return utc_now().date().isoformat()
 
 
 def fetch_snapshot_rows(snapshot_date):
-    latest = parse_date(snapshot_date)
-    if not latest:
+    scoring_date = parse_date(snapshot_date)
+    if not scoring_date:
         return []
-
-    since = latest - timedelta(days=HARNESS_LOOKBACK_DAYS)
 
     query = (
         SUPABASE.table("snapshots")
@@ -123,11 +114,9 @@ def fetch_snapshot_rows(snapshot_date):
             "carrier_count,"
             "lcc_present"
         )
-        .gte("snapshot_date", since.isoformat())
-        .lte("snapshot_date", latest.isoformat())
+        .eq("snapshot_date", scoring_date.isoformat())
         .not_.is_("price_gbp", "null")
         .not_.is_("outbound_date", "null")
-        .order("snapshot_date", desc=True)
         .limit(max(MAX_ROWS * 4, 1000))
     )
 
@@ -179,6 +168,7 @@ def fetch_snapshot_rows(snapshot_date):
 
 def is_valid_snapshot_row(row):
     required = [
+        "snapshot_date",
         "origin_iata",
         "destination_iata",
         "outbound_date",
@@ -196,6 +186,12 @@ def is_valid_snapshot_row(row):
 
     if price <= 0:
         return False, "non-positive price_gbp"
+
+    source_snapshot_date = clean_date(row.get("snapshot_date"))
+    scoring_date = utc_now().date().isoformat()
+
+    if source_snapshot_date != scoring_date:
+        return False, "stale_snapshot"
 
     if not dtd_bucket(row.get("outbound_date")):
         return False, "outside_dtd_window"
@@ -266,28 +262,27 @@ def main():
     started_at = utc_now()
     print(f"MIZAR Decision Harness starting - {started_at.isoformat()}")
     print(f"API base: {API_BASE}")
-    print("Mode: snapshot-matched, diversified DTD buckets")
-    print(f"Lookback days: {HARNESS_LOOKBACK_DAYS}")
+    print("Mode: same-day snapshot-matched, diversified DTD buckets")
+    print("Snapshot freshness invariant: SAME-DAY ONLY")
     print(f"Max rows: {MAX_ROWS}")
     print(f"Bucket target: {BUCKET_TARGET}")
 
-    snapshot_date = get_latest_snapshot_date()
-
-    if not snapshot_date:
-        print("No usable snapshots found. Exiting.")
-        sys.exit(1)
+    snapshot_date = get_scoring_snapshot_date()
 
     rows = fetch_snapshot_rows(snapshot_date)
 
     if not rows:
-        print(f"No usable diversified snapshot rows found up to {snapshot_date}. Exiting.")
-        sys.exit(1)
+        print(
+            f"No same-day non-NULL snapshot rows found for {snapshot_date}. "
+            "No scoring requests will be sent."
+        )
+        sys.exit(0)
 
     outbound_counts = Counter(clean_date(r.get("outbound_date")) for r in rows if r.get("outbound_date"))
     bucket_counts = Counter(dtd_bucket(r.get("outbound_date")) for r in rows if r.get("outbound_date"))
     route_counts = Counter(f"{r.get('origin_iata')}->{r.get('destination_iata')}" for r in rows)
 
-    print(f"Latest snapshot date: {snapshot_date}")
+    print(f"Scoring snapshot date: {snapshot_date}")
     print(f"Snapshot rows selected: {len(rows)}")
     print(f"Distinct routes: {len(route_counts)}")
     print(f"Distinct outbound dates: {len(outbound_counts)}")
@@ -311,6 +306,8 @@ def main():
 
     for i, row in enumerate(rows, start=1):
         valid, reason = is_valid_snapshot_row(row)
+        snapshot_id = row.get("snapshot_id")
+        source_snapshot_date = clean_date(row.get("snapshot_date"))
         origin = row.get("origin_iata")
         dest = row.get("destination_iata")
         outbound = clean_date(row.get("outbound_date"))
@@ -339,8 +336,10 @@ def main():
 
             print(
                 f"  [{i}/{len(rows)}] {origin}->{dest} "
+                f"snapshot={source_snapshot_date} "
+                f"snapshot_id={str(snapshot_id)[:8]}... "
                 f"out={outbound} bucket={bucket} return={ret or 'oneway'} £{price} | "
-                f"score={score:.3f} | id={str(decision_id)[:8]}..."
+                f"score={score:.3f} | decision_id={str(decision_id)[:8]}..."
             )
         else:
             failed += 1
@@ -355,7 +354,7 @@ def main():
     print()
     print("=" * 60)
     print(f"Harness complete - {utc_now().isoformat()}")
-    print(f"  Latest snapshot date   : {snapshot_date}")
+    print(f"  Scoring snapshot date  : {snapshot_date}")
     print(f"  Snapshot rows selected : {len(rows)}")
     print(f"  Distinct routes        : {len(route_counts)}")
     print(f"  Distinct outbound dates: {len(outbound_counts)}")

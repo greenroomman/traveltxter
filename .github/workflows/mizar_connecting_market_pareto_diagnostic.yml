@@ -1,0 +1,375 @@
+name: MIZAR Connecting Market Pareto Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    name: Read-only multi-DTD Pareto diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Safety gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${DUFFEL_ACCESS_TOKEN:-}"
+          echo "Duffel credential present: YES"
+          if env | grep -Eq '^SUPABASE_(URL|KEY|SERVICE_KEY|SERVICE_ROLE_KEY)='; then
+            echo "Supabase URL/service credential unexpectedly present: YES"
+            echo "Database writes possible: YES"
+            echo "ABORT"
+            exit 1
+          fi
+          echo "Supabase URL present: NO"
+          echo "Supabase service key present: NO"
+          echo "Database writes possible: NO"
+
+      - name: Run read-only Pareto diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          import datetime as dt
+          import json
+          import math
+          import os
+          import random
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+          from collections import defaultdict
+
+          TOKEN = os.environ['DUFFEL_ACCESS_TOKEN']
+          BASE_DATE = dt.date(2026, 8, 22)
+          DTDS = [21, 45, 84]
+          CONNECTING_ROUTES = [
+              ('GLA','VCE'), ('NCL','LIS'), ('LPL','MAD'),
+              ('LPL','FCO'), ('NCL','ATH'), ('GLA','ATH'),
+          ]
+          CONTROL_ROUTES = [('LHR','MAD'), ('MAN','CPH')]
+          INTER_REQUEST_SECONDS = 2.0
+          RETRY_DELAYS = [5, 10, 20]
+          RANDOM_SEED = 22082026
+
+          def parse_duration(value):
+              if not isinstance(value, str):
+                  return None
+              m = re.fullmatch(r'P(?:(?P<days>\d+)D)?T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?', value)
+              if not m:
+                  return None
+              return int(m.group('days') or 0)*1440 + int(m.group('hours') or 0)*60 + int(m.group('minutes') or 0)
+
+          def percentile(vals, p):
+              vals = sorted(vals)
+              if not vals:
+                  return None
+              if len(vals) == 1:
+                  return float(vals[0])
+              k = (len(vals)-1)*(p/100.0)
+              f, c = math.floor(k), math.ceil(k)
+              if f == c:
+                  return float(vals[int(k)])
+              return vals[f]*(c-k) + vals[c]*(k-f)
+
+          headers = {
+              'Duffel-Version': 'v2',
+              'Authorization': f'Bearer {TOKEN}',
+              'Content-Type': 'application/json',
+          }
+
+          def fetch_offers(origin, dest, outbound, return_date):
+              payload = {
+                  'data': {
+                      'cabin_class': 'economy',
+                      'passengers': [{'type':'adult'}],
+                      'slices': [
+                          {'origin':origin,'destination':dest,'departure_date':str(outbound)},
+                          {'origin':dest,'destination':origin,'departure_date':str(return_date)},
+                      ],
+                  }
+              }
+              req = urllib.request.Request(
+                  'https://api.duffel.com/air/offer_requests',
+                  data=json.dumps(payload).encode(),
+                  headers=headers,
+                  method='POST',
+              )
+              last_status = None
+              attempts = 0
+              for attempt in range(1, 5):
+                  attempts = attempt
+                  try:
+                      with urllib.request.urlopen(req, timeout=40) as resp:
+                          body = json.loads(resp.read().decode())
+                          return body.get('data',{}).get('offers',[]) or [], str(resp.status), attempts, attempt > 1
+                  except urllib.error.HTTPError as e:
+                      last_status = f'HTTP {e.code}'
+                      if e.code == 429 and attempt <= 3:
+                          delay = RETRY_DELAYS[attempt-1]
+                          print(f'RETRY {origin}->{dest} {outbound} attempt={attempt} status=429 wait={delay}s')
+                          time.sleep(delay)
+                          continue
+                      return [], f'ERROR:HTTPError:{e.code}', attempts, attempt > 1
+                  except Exception as e:
+                      last_status = f'ERROR:{type(e).__name__}:{e}'
+                      return [], last_status, attempts, attempt > 1
+              return [], last_status or 'ERROR:unknown', attempts, attempts > 1
+
+          def pareto_frontier(rows):
+              frontier = []
+              for a in rows:
+                  dominated = False
+                  for b in rows:
+                      if a is b:
+                          continue
+                      if (b['price_gbp'] <= a['price_gbp'] and
+                          b['max_slice_duration'] <= a['max_slice_duration'] and
+                          (b['price_gbp'] < a['price_gbp'] or b['max_slice_duration'] < a['max_slice_duration'])):
+                          dominated = True
+                          break
+                  if not dominated:
+                      frontier.append(a)
+              return sorted(frontier, key=lambda x: (x['price_gbp'], x['max_slice_duration'], x['offer_id']))
+
+          searches = []
+          for kind, routes in [('connecting', CONNECTING_ROUTES), ('control', CONTROL_ROUTES)]:
+              for origin, dest in routes:
+                  for dtd in DTDS:
+                      outbound = BASE_DATE + dt.timedelta(days=dtd)
+                      return_date = outbound + dt.timedelta(days=7)
+                      searches.append({
+                          'kind': kind, 'origin': origin, 'dest': dest, 'dtd': dtd,
+                          'outbound': outbound, 'return_date': return_date,
+                      })
+
+          random.Random(RANDOM_SEED).shuffle(searches)
+
+          print('READ-ONLY MULTI-DTD CONNECTING-MARKET PARETO DIAGNOSTIC')
+          print(f'Base diagnostic date: {BASE_DATE}')
+          print(f'DTD dates: ' + ', '.join(f'{dtd}={BASE_DATE + dt.timedelta(days=dtd)}' for dtd in DTDS))
+          print(f'Total planned searches: {len(searches)}')
+          print(f'Inter-request pacing: {INTER_REQUEST_SECONDS:.1f}s')
+          print(f'Retry delays for 429: {RETRY_DELAYS}')
+          print(f'Deterministic shuffle seed: {RANDOM_SEED}')
+          for i,s in enumerate(searches,1):
+              print(f'ORDER {i:02d} {s["kind"]} {s["origin"]}->{s["dest"]} DTD={s["dtd"]}')
+
+          offer_rows = []
+          frontier_rows = []
+          summary_rows = []
+          request_rows = []
+
+          for idx, s in enumerate(searches, 1):
+              origin, dest = s['origin'], s['dest']
+              outbound, return_date = s['outbound'], s['return_date']
+              offers, status, attempts, retried = fetch_offers(origin, dest, outbound, return_date)
+              request_rows.append({
+                  'kind':s['kind'],'route':f'{origin}->{dest}','dtd':s['dtd'],
+                  'outbound_date':str(outbound),'return_date':str(return_date),
+                  'status':status,'attempt_count':attempts,'retry_required':retried,
+              })
+
+              rows = []
+              direct_rows = []
+              connecting_rows = []
+              raw_gbp = 0
+
+              for off in offers:
+                  if off.get('total_currency') != 'GBP':
+                      continue
+                  try:
+                      price = float(off['total_amount'])
+                  except Exception:
+                      continue
+                  raw_gbp += 1
+                  slices = off.get('slices') or []
+                  seg_counts = [len((sl or {}).get('segments') or []) for sl in slices]
+                  durations = [parse_duration((sl or {}).get('duration')) for sl in slices]
+                  parse_ok = len(slices)==2 and len(durations)==2 and all(v is not None for v in durations)
+                  direct = len(slices)==2 and len(seg_counts)==2 and all(n==1 for n in seg_counts)
+                  usable = parse_ok and price <= 800
+                  row = {
+                      'kind':s['kind'],'route':f'{origin}->{dest}','origin':origin,'destination':dest,
+                      'dtd':s['dtd'],'outbound_date':str(outbound),'return_date':str(return_date),
+                      'offer_id':off.get('id',''),'currency':'GBP','price_gbp':price,
+                      'slice_count':len(slices),
+                      'outbound_segment_count':seg_counts[0] if len(seg_counts)>0 else '',
+                      'return_segment_count':seg_counts[1] if len(seg_counts)>1 else '',
+                      'outbound_duration_minutes':durations[0] if len(durations)>0 else '',
+                      'return_duration_minutes':durations[1] if len(durations)>1 else '',
+                      'max_slice_duration':max(durations) if parse_ok else '',
+                      'duration_parse_ok':parse_ok,'direct':direct,'price_le_800':price <= 800,
+                      'calibration_population':usable,
+                  }
+                  offer_rows.append(row)
+                  if usable:
+                      rows.append(row)
+                      (direct_rows if direct else connecting_rows).append(row)
+
+              frontier = pareto_frontier(rows)
+              for fr in frontier:
+                  out = dict(fr)
+                  out['pareto'] = True
+                  frontier_rows.append(out)
+
+              search_failed = status.startswith('ERROR:')
+              persistent_429 = status == 'ERROR:HTTPError:429'
+              if search_failed:
+                  factual_class = 'D_SEARCH_UNAVAILABLE'
+              elif not rows:
+                  factual_class = 'C_NO_USABLE_INVENTORY'
+              elif s['kind'] == 'connecting':
+                  factual_class = 'A_CONNECTING_FALLBACK_CANDIDATE'
+              else:
+                  factual_class = 'CONTROL_MARKET'
+
+              cheapest = min(rows, key=lambda x:(x['price_gbp'],x['max_slice_duration'])) if rows else None
+              fastest = min(rows, key=lambda x:(x['max_slice_duration'],x['price_gbp'])) if rows else None
+              cheapest_frontier = min(frontier, key=lambda x:(x['price_gbp'],x['max_slice_duration'])) if frontier else None
+              fastest_frontier = min(frontier, key=lambda x:(x['max_slice_duration'],x['price_gbp'])) if frontier else None
+              minimum_required = min((r['max_slice_duration'] for r in rows), default=None)
+
+              def med(vals):
+                  return percentile(vals, 50) if vals else None
+
+              summary = {
+                  'kind':s['kind'],'route':f'{origin}->{dest}','dtd':s['dtd'],
+                  'outbound_date':str(outbound),'return_date':str(return_date),'http_status':status,
+                  'attempt_count':attempts,'retry_required':retried,'raw_offers':len(offers),'gbp_offers':raw_gbp,
+                  'calibration_offers':len(rows),'direct_offers':len(direct_rows),'connecting_offers':len(connecting_rows),
+                  'pareto_frontier_size':len(frontier),'minimum_required_max_slice_minutes':minimum_required,
+                  'cheapest_calibration_price':cheapest['price_gbp'] if cheapest else None,
+                  'cheapest_calibration_max_slice':cheapest['max_slice_duration'] if cheapest else None,
+                  'fastest_calibration_price':fastest['price_gbp'] if fastest else None,
+                  'fastest_calibration_max_slice':fastest['max_slice_duration'] if fastest else None,
+                  'cheapest_frontier_price':cheapest_frontier['price_gbp'] if cheapest_frontier else None,
+                  'cheapest_frontier_max_slice':cheapest_frontier['max_slice_duration'] if cheapest_frontier else None,
+                  'fastest_frontier_price':fastest_frontier['price_gbp'] if fastest_frontier else None,
+                  'fastest_frontier_max_slice':fastest_frontier['max_slice_duration'] if fastest_frontier else None,
+                  'direct_cheapest_price':min((r['price_gbp'] for r in direct_rows), default=None),
+                  'direct_median_price':med([r['price_gbp'] for r in direct_rows]),
+                  'direct_fastest_max_slice':min((r['max_slice_duration'] for r in direct_rows), default=None),
+                  'direct_median_max_slice':med([r['max_slice_duration'] for r in direct_rows]),
+                  'connecting_cheapest_price':min((r['price_gbp'] for r in connecting_rows), default=None),
+                  'connecting_median_price':med([r['price_gbp'] for r in connecting_rows]),
+                  'connecting_fastest_max_slice':min((r['max_slice_duration'] for r in connecting_rows), default=None),
+                  'connecting_median_max_slice':med([r['max_slice_duration'] for r in connecting_rows]),
+                  'factual_classification':factual_class,
+                  'persistent_429':persistent_429,
+              }
+              summary_rows.append(summary)
+
+              print(f'RESULT {origin}->{dest} DTD={s["dtd"]} kind={s["kind"]} status={status} attempts={attempts} raw={len(offers)} GBP={raw_gbp} calibration={len(rows)} direct={len(direct_rows)} connecting={len(connecting_rows)} frontier={len(frontier)} min_required_max_slice={minimum_required} class={factual_class}')
+              if cheapest_frontier:
+                  print(f'  CHEAPEST_FRONTIER price={cheapest_frontier["price_gbp"]:.2f} out={cheapest_frontier["outbound_duration_minutes"]} ret={cheapest_frontier["return_duration_minutes"]} max={cheapest_frontier["max_slice_duration"]} segs={cheapest_frontier["outbound_segment_count"]}/{cheapest_frontier["return_segment_count"]}')
+              if fastest_frontier:
+                  print(f'  FASTEST_FRONTIER price={fastest_frontier["price_gbp"]:.2f} out={fastest_frontier["outbound_duration_minutes"]} ret={fastest_frontier["return_duration_minutes"]} max={fastest_frontier["max_slice_duration"]} segs={fastest_frontier["outbound_segment_count"]}/{fastest_frontier["return_segment_count"]}')
+              for fr in frontier:
+                  print(f'  PARETO price={fr["price_gbp"]:.2f} max={fr["max_slice_duration"]} out={fr["outbound_duration_minutes"]} ret={fr["return_duration_minutes"]} segs={fr["outbound_segment_count"]}/{fr["return_segment_count"]} id={fr["offer_id"]}')
+
+              if idx < len(searches):
+                  time.sleep(INTER_REQUEST_SECONDS)
+
+          # Comparative thin-market evidence without imposing a production ceiling.
+          # For each DTD, rank successful connecting searches by minimum required max-slice burden.
+          by_dtd = defaultdict(list)
+          for r in summary_rows:
+              if r['kind']=='connecting' and r['minimum_required_max_slice_minutes'] is not None:
+                  by_dtd[r['dtd']].append(r)
+          for dtd, rs in by_dtd.items():
+              ordered = sorted(rs, key=lambda x:x['minimum_required_max_slice_minutes'])
+              for rank, r in enumerate(ordered,1):
+                  r['thin_market_rank_within_dtd'] = rank
+                  r['thin_market_routes_with_data_in_dtd'] = len(ordered)
+                  r['thin_market_relative_percentile'] = round(100*(rank-1)/(len(ordered)-1),1) if len(ordered)>1 else 0.0
+
+          def write_csv(path, rows):
+              if not rows:
+                  with open(path,'w',newline='') as f:
+                      f.write('')
+                  return
+              keys=[]
+              for row in rows:
+                  for k in row.keys():
+                      if k not in keys: keys.append(k)
+              with open(path,'w',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=keys)
+                  w.writeheader(); w.writerows(rows)
+
+          write_csv('mizar_connecting_market_offers.csv', offer_rows)
+          write_csv('mizar_connecting_pareto_frontiers.csv', frontier_rows)
+          write_csv('mizar_connecting_market_summary.csv', summary_rows)
+          write_csv('mizar_duffel_request_status.csv', request_rows)
+
+          report = {
+              'base_date':str(BASE_DATE),
+              'dtds':DTDS,
+              'inter_request_seconds':INTER_REQUEST_SECONDS,
+              'retry_delays_seconds':RETRY_DELAYS,
+              'connecting_routes':[f'{a}->{b}' for a,b in CONNECTING_ROUTES],
+              'control_routes':[f'{a}->{b}' for a,b in CONTROL_ROUTES],
+              'searches':request_rows,
+              'summaries':summary_rows,
+              'pareto_frontiers':frontier_rows,
+          }
+          with open('mizar_connecting_calibration_report.json','w') as f:
+              json.dump(report,f,indent=2)
+
+          total=len(request_rows)
+          successful=sum(1 for r in request_rows if not r['status'].startswith('ERROR:'))
+          first_attempt=sum(1 for r in request_rows if not r['status'].startswith('ERROR:') and r['attempt_count']==1)
+          retried_success=sum(1 for r in request_rows if not r['status'].startswith('ERROR:') and r['attempt_count']>1)
+          persistent429=sum(1 for r in request_rows if r['status']=='ERROR:HTTPError:429')
+          other_fail=sum(1 for r in request_rows if r['status'].startswith('ERROR:') and r['status']!='ERROR:HTTPError:429')
+
+          print('\n=== FINAL SEARCH INTEGRITY ===')
+          print(f'Total searches: {total}')
+          print(f'Successful: {successful}')
+          print(f'Succeeded first attempt: {first_attempt}')
+          print(f'Retried successfully: {retried_success}')
+          print(f'Persistent 429: {persistent429}')
+          print(f'Other failures: {other_fail}')
+
+          print('\n=== CONNECTING MARKET SUMMARY ===')
+          for r in sorted([x for x in summary_rows if x['kind']=='connecting'], key=lambda x:(x['route'],x['dtd'])):
+              print('CONNECTING_SUMMARY', json.dumps(r, sort_keys=True))
+
+          print('\n=== DIRECT MARKET CONTROLS ===')
+          for r in sorted([x for x in summary_rows if x['kind']=='control'], key=lambda x:(x['route'],x['dtd'])):
+              print('CONTROL_SUMMARY', json.dumps(r, sort_keys=True))
+
+          print('\n=== VERIFIED / INFERENCE / UNKNOWN PLACEHOLDERS ===')
+          print('VERIFIED: Search results, offer attributes, Pareto frontiers, minimum_required_max_slice_minutes, retry outcomes.')
+          print('INFERENCE: Whether any frontier offer is commercially credible; whether a route should be treated as thin-market in production.')
+          print('UNKNOWN: Production credibility policy, final duration policy, stale-price remediation design.')
+          print('\nDIAGNOSTIC COMPLETE. No Supabase calls were made. No production files were modified by this run.')
+          PY
+
+      - name: Upload diagnostic artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mizar-connecting-market-pareto-diagnostic
+          path: |
+            mizar_connecting_market_offers.csv
+            mizar_connecting_pareto_frontiers.csv
+            mizar_connecting_market_summary.csv
+            mizar_duffel_request_status.csv
+            mizar_connecting_calibration_report.json
+          retention-days: 7

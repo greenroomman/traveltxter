@@ -1,0 +1,250 @@
+name: Diagnose Duffel Quality Filters
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    name: Read-only Duffel offer diagnostics
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependency
+        run: pip install requests
+
+      - name: Run read-only diagnostic
+        env:
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
+        run: |
+          python - << 'PY'
+          import os
+          import re
+          import json
+          import math
+          import datetime as dt
+          from typing import Any, Dict, Optional
+
+          import requests
+
+          token = os.environ.get("DUFFEL_ACCESS_TOKEN")
+          if not token:
+              raise SystemExit("Missing DUFFEL_ACCESS_TOKEN")
+
+          API_URL = "https://api.duffel.com/air/offer_requests"
+
+          AIRPORT_COORDS = {
+              "GLA": (55.8719, -4.4333),
+              "VCE": (45.5053, 12.3519),
+              "LPL": (53.3337, -2.8497),
+              "MAD": (40.4983, -3.5676),
+              "NCL": (55.0375, -1.6917),
+              "LIS": (38.7742, -9.1342),
+          }
+
+          ROUTES = [
+              ("GLA", "VCE"),
+              ("LPL", "MAD"),
+              ("NCL", "LIS"),
+          ]
+
+          today = dt.date.today()
+          outbound = today + dt.timedelta(days=45)
+          return_date = outbound + dt.timedelta(days=7)
+
+          def haversine_distance_km(lat1, lon1, lat2, lon2):
+              r = 6371.0
+              phi1 = math.radians(lat1)
+              phi2 = math.radians(lat2)
+              dphi = math.radians(lat2 - lat1)
+              dlambda = math.radians(lon2 - lon1)
+              a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+              c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+              return round(r * c)
+
+          def route_distance_km(origin, dest):
+              lat1, lon1 = AIRPORT_COORDS[origin]
+              lat2, lon2 = AIRPORT_COORDS[dest]
+              return haversine_distance_km(lat1, lon1, lat2, lon2)
+
+          def parse_iso8601_duration_minutes(value: Any) -> Optional[int]:
+              if not value or not isinstance(value, str):
+                  return None
+              match = re.fullmatch(
+                  r"P(?:(?P<days>\d+)D)?T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?",
+                  value,
+              )
+              if not match:
+                  return None
+              days = int(match.group("days") or 0)
+              hours = int(match.group("hours") or 0)
+              minutes = int(match.group("minutes") or 0)
+              return days * 1440 + hours * 60 + minutes
+
+          def diagnose_offer(offer: Dict[str, Any], distance_km: Optional[int]) -> Dict[str, Any]:
+              reasons = []
+
+              currency = offer.get("total_currency", "GBP")
+              if currency != "GBP":
+                  reasons.append("currency_not_gbp")
+
+              try:
+                  price_gbp = float(offer["total_amount"])
+              except Exception as exc:
+                  price_gbp = None
+                  reasons.append(f"price_parse_exception:{type(exc).__name__}")
+
+              slices = offer.get("slices") or []
+              if len(slices) != 2:
+                  reasons.append(f"slice_count_not_2:{len(slices)}")
+
+              slice_details = []
+              for idx, slice_ in enumerate(slices, start=1):
+                  segments = slice_.get("segments") or []
+                  raw_duration = slice_.get("duration")
+                  try:
+                      duration_minutes = parse_iso8601_duration_minutes(raw_duration)
+                  except Exception as exc:
+                      duration_minutes = None
+                      reasons.append(f"slice_{idx}_duration_parse_exception:{type(exc).__name__}")
+
+                  slice_details.append({
+                      "slice": idx,
+                      "segment_count": len(segments),
+                      "duration_raw": raw_duration,
+                      "duration_minutes": duration_minutes,
+                  })
+
+              if distance_km is not None and distance_km < 2500:
+                  for detail in slice_details:
+                      if detail["segment_count"] != 1:
+                          reasons.append(
+                              f"slice_{detail['slice']}_not_direct:{detail['segment_count']}_segments"
+                          )
+                      if detail["duration_minutes"] is None:
+                          reasons.append(f"slice_{detail['slice']}_duration_unparseable")
+                      elif detail["duration_minutes"] > 240:
+                          reasons.append(
+                              f"slice_{detail['slice']}_duration_over_240:{detail['duration_minutes']}"
+                          )
+
+              if (
+                  distance_km is not None
+                  and distance_km < 3000
+                  and price_gbp is not None
+                  and price_gbp > 800
+              ):
+                  reasons.append(f"price_over_800:{price_gbp:.2f}")
+
+              return {
+                  "passes": len(reasons) == 0,
+                  "reasons": reasons,
+                  "price_gbp": price_gbp,
+                  "currency": currency,
+                  "slice_count": len(slices),
+                  "slice_details": slice_details,
+              }
+
+          def fetch_offers(origin: str, destination: str):
+              headers = {
+                  "Duffel-Version": "v2",
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json",
+              }
+              payload = {
+                  "data": {
+                      "cabin_class": "economy",
+                      "passengers": [{"type": "adult"}],
+                      "slices": [
+                          {
+                              "origin": origin,
+                              "destination": destination,
+                              "departure_date": str(outbound),
+                          },
+                          {
+                              "origin": destination,
+                              "destination": origin,
+                              "departure_date": str(return_date),
+                          },
+                      ],
+                  }
+              }
+
+              response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+              print(f"HTTP status: {response.status_code}")
+              if response.status_code >= 400:
+                  print(response.text[:2000])
+                  return []
+              return response.json().get("data", {}).get("offers", []) or []
+
+          print("MIZAR DUFFEL OFFER QUALITY DIAGNOSTIC")
+          print("READ-ONLY")
+          print("NO SUPABASE CREDENTIALS PRESENT")
+          print("NO DATABASE WRITES POSSIBLE")
+          print(f"Outbound: {outbound}")
+          print(f"Return:   {return_date}")
+
+          for origin, destination in ROUTES:
+              distance_km = route_distance_km(origin, destination)
+              print()
+              print("=" * 88)
+              print(f"{origin} -> {destination}")
+              print(f"Route distance: {distance_km} km")
+              print("=" * 88)
+
+              offers = fetch_offers(origin, destination)
+              print(f"Raw Duffel offers returned: {len(offers)}")
+
+              gbp_count = 0
+              pass_count = 0
+              rejection_counts = {}
+
+              for idx, offer in enumerate(offers, start=1):
+                  result = diagnose_offer(offer, distance_km)
+                  if result["currency"] == "GBP":
+                      gbp_count += 1
+                  if result["passes"]:
+                      pass_count += 1
+
+                  for reason in result["reasons"]:
+                      key = reason.split(":")[0]
+                      rejection_counts[key] = rejection_counts.get(key, 0) + 1
+
+                  print()
+                  print(f"Offer #{idx}")
+                  print(f"  id: {offer.get('id')}")
+                  print(f"  currency: {result['currency']}")
+                  print(f"  price_gbp: {result['price_gbp']}")
+                  print(f"  slice_count: {result['slice_count']}")
+                  for detail in result["slice_details"]:
+                      print(
+                          f"  slice {detail['slice']}: "
+                          f"segments={detail['segment_count']} "
+                          f"duration_raw={detail['duration_raw']} "
+                          f"duration_minutes={detail['duration_minutes']}"
+                      )
+                  print(f"  PASSES QUALITY FILTER: {result['passes']}")
+                  if result["reasons"]:
+                      print("  rejection reasons:")
+                      for reason in result["reasons"]:
+                          print(f"    - {reason}")
+                  else:
+                      print("  rejection reasons: none")
+
+              print()
+              print("SUMMARY")
+              print(f"  total offers: {len(offers)}")
+              print(f"  GBP offers: {gbp_count}")
+              print(f"  offers passing current filter: {pass_count}")
+              if rejection_counts:
+                  print("  rejection reason counts:")
+                  for key, value in sorted(rejection_counts.items()):
+                      print(f"    {key}: {value}")
+              else:
+                  print("  rejection reason counts: none")
+          PY

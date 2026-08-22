@@ -1,10 +1,6 @@
 name: Diagnose Duffel Quality Filters
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/diagnose_duffel_quality_filters.yml'
   workflow_dispatch:
 
 jobs:

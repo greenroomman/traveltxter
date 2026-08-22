@@ -1,0 +1,181 @@
+name: Validate Connecting Fallback Candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Read-only live Duffel validation
+    runs-on: ubuntu-latest
+    env:
+      DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests supabase
+
+      - name: Safety gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Duffel credential present: $([ -n "${DUFFEL_ACCESS_TOKEN:-}" ] && echo YES || echo NO)"
+          echo "Supabase URL present: $([ -n "${SUPABASE_URL:-}${MIZAR_SUPABASE_URL:-}" ] && echo YES || echo NO)"
+          echo "Supabase service key present: $([ -n "${SUPABASE_SERVICE_ROLE_KEY:-}${SUPABASE_SERVICE_KEY:-}${SUPABASE_KEY:-}${MIZAR_SUPABASE_SERVICE_ROLE_KEY:-}" ] && echo YES || echo NO)"
+
+          if [ -z "${DUFFEL_ACCESS_TOKEN:-}" ]; then
+            echo "ABORT: Duffel credential missing"
+            exit 1
+          fi
+
+          if [ -n "${SUPABASE_URL:-}${MIZAR_SUPABASE_URL:-}" ]; then
+            echo "ABORT: Supabase URL unexpectedly present"
+            exit 1
+          fi
+
+          if [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}${SUPABASE_SERVICE_KEY:-}${SUPABASE_KEY:-}${MIZAR_SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
+            echo "ABORT: Supabase credential unexpectedly present"
+            exit 1
+          fi
+
+          echo "Database writes possible: NO"
+
+      - name: Confirm candidate exists
+        run: |
+          set -euo pipefail
+          test -f tmp/atlas_snapshot_capture_candidate.py
+          python -m py_compile tmp/atlas_snapshot_capture_candidate.py
+          echo "Candidate file present and compiles"
+
+      - name: Run live read-only validation
+        env:
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import datetime as dt
+          import importlib.util
+          import os
+          import sys
+          import time
+
+          path = "tmp/atlas_snapshot_capture_candidate.py"
+          spec = importlib.util.spec_from_file_location("candidate_capture", path)
+          candidate = importlib.util.module_from_spec(spec)
+          sys.modules["candidate_capture"] = candidate
+          spec.loader.exec_module(candidate)
+
+          if not hasattr(candidate, "search_duffel"):
+              raise SystemExit("ABORT: candidate has no search_duffel()")
+
+          token = os.environ["DUFFEL_ACCESS_TOKEN"]
+
+          # Fixed DTD45 validation window from 22 Aug 2026.
+          outbound = dt.date(2026, 10, 6)
+          return_date = dt.date(2026, 10, 13)
+
+          routes = [
+              ("GLA", "VCE"),
+              ("NCL", "LIS"),
+              ("LPL", "MAD"),
+          ]
+
+          note_for_status = {
+              "no_calibration_population": "no_calibration_population",
+              "no_pareto_frontier": "no_pareto_frontier",
+              "no_credible_connecting_fare": "no_credible_connecting_fare",
+              "no_offers": "no_duffel_offers",
+              "rate_limited": "rate_limited",
+              "failed": "duffel_search_failed",
+          }
+
+          observed = {}
+
+          for index, (origin, dest) in enumerate(routes):
+              if index:
+                  time.sleep(2.0)
+
+              result, status = candidate.search_duffel(
+                  origin,
+                  dest,
+                  outbound,
+                  return_date,
+                  "economy",
+                  token,
+              )
+
+              row = {
+                  "status": status,
+                  "reference_fare_type": result.get("reference_fare_type") if result else None,
+                  "price_gbp": result.get("price_gbp") if result else None,
+                  "connecting_pareto_frontier_size": result.get("connecting_pareto_frontier_size") if result else None,
+                  "connecting_max_slice_minutes": result.get("connecting_max_slice_minutes") if result else None,
+                  "notes": note_for_status.get(status),
+              }
+              observed[(origin, dest)] = row
+
+              print()
+              print(f"ROUTE {origin}->{dest}")
+              print(f"status: {row['status']}")
+              print(f"reference_fare_type: {row['reference_fare_type']}")
+              print(f"price_gbp: {row['price_gbp']}")
+              print(f"connecting_pareto_frontier_size: {row['connecting_pareto_frontier_size']}")
+              print(f"connecting_max_slice_minutes: {row['connecting_max_slice_minutes']}")
+              print(f"notes: {row['notes']}")
+
+          failures = []
+
+          gla = observed[("GLA", "VCE")]
+          if not (
+              gla["status"] == "success"
+              and gla["reference_fare_type"] == "connecting_pareto"
+              and gla["price_gbp"] is not None
+              and gla["connecting_max_slice_minutes"] is not None
+              and gla["connecting_max_slice_minutes"] <= 500
+          ):
+              failures.append(f"GLA->VCE unexpected: {gla}")
+
+          ncl = observed[("NCL", "LIS")]
+          if not (
+              ncl["status"] == "success"
+              and ncl["reference_fare_type"] == "connecting_pareto"
+              and ncl["price_gbp"] is not None
+              and ncl["connecting_max_slice_minutes"] is not None
+              and ncl["connecting_max_slice_minutes"] <= 500
+          ):
+              failures.append(f"NCL->LIS unexpected: {ncl}")
+
+          lpl = observed[("LPL", "MAD")]
+          if not (
+              lpl["status"] == "no_credible_connecting_fare"
+              and lpl["reference_fare_type"] is None
+              and lpl["price_gbp"] is None
+              and lpl["connecting_pareto_frontier_size"] is not None
+              and lpl["connecting_pareto_frontier_size"] > 0
+              and lpl["connecting_max_slice_minutes"] is not None
+              and lpl["connecting_max_slice_minutes"] > 500
+              and lpl["notes"] == "no_credible_connecting_fare"
+          ):
+              failures.append(f"LPL->MAD unexpected: {lpl}")
+
+          print()
+          if failures:
+              print("VALIDATION FAILED — DO NOT COMMIT PRODUCTION WORKER")
+              for failure in failures:
+                  print(f"- {failure}")
+              raise SystemExit(1)
+
+          print("VALIDATION PASSED — all three live Duffel outcomes matched expectations")
+          print("No Supabase client initialised.")
+          print("No database writes performed.")
+          PY

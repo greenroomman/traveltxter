@@ -89,11 +89,11 @@ def _duffel_post(path: str, payload: dict[str, Any], retries: int = 3) -> dict[s
                 continue
 
             log.warning("Duffel HTTP %d: %s", exc.code, body[:500])
-            return None, duffel_search_id
+            return None
 
         except Exception as exc:
             log.warning("Duffel request error: %s", exc)
-            return None, duffel_search_id
+            return None
 
     log.error("Duffel exhausted retries for %s", path)
     return None

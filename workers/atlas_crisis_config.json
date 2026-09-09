@@ -1,21 +1,36 @@
 {
-  "crisis_name": "Iran-Israel-US Conflict (Feb 2026)",
-  "crisis_start_date": "2026-02-28",
-  "crisis_end_date": null,
-  "crisis_severity": "high",
-  "affected_regions": [
-    "Middle East",
-    "Eastern Mediterranean"
-  ],
-  "affected_airports": [
-    "TLV",
-    "CAI",
-    "AMM",
-    "BEY",
-    "DXB",
-    "DOH",
-    "AUH",
-    "KWI"
-  ],
-  "notes": "Iran-Israel-US military tensions. Affects routes to/from Middle East and Eastern Mediterranean. All t+14 labels from 2026-02-28 onwards are contaminated. Use t+7 labels only for training until crisis ends + 28 days of clean data accumulates."
+  "crisis_events": [
+    {
+      "crisis_id": "iran_conflict_2026",
+      "crisis_name": "Iran-Israel-US Conflict",
+      "start_date": "2026-03-01",
+      "end_date": null,
+      "severity": "extreme",
+      "global_impact": true,
+      "affected_regions": [
+        "middle_east",
+        "gulf",
+        "east_med"
+      ],
+      "affected_destinations": [
+        "DXB",
+        "AUH",
+        "DOH",
+        "IST",
+        "AYT",
+        "DLM",
+        "PFO",
+        "LCA",
+        "TBS",
+        "AMM",
+        "KWI",
+        "BAH",
+        "MCT",
+        "RUH",
+        "JED"
+      ],
+      "label_contamination_window_days": 14,
+      "training_action": "exclude_all"
+    }
+  ]
 }

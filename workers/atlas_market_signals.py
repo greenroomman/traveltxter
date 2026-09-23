@@ -2,6 +2,7 @@
 import os
 import sys
 import requests
+import time
 from datetime import date, timedelta
 from supabase import create_client
 
@@ -17,21 +18,28 @@ def fetch_jet_fuel_price():
     if not api_key:
         print("WARNING: EIA_API_KEY not set, skipping jet fuel price")
         return None
-    try:
-        url = "https://api.eia.gov/v2/petroleum/pri/spt/data/"
-        params = {
-            "api_key": api_key, "frequency": "weekly", "data[0]": "value",
-            "facets[product][]": "EPD2F", "sort[0][column]": "period",
-            "sort[0][direction]": "desc", "offset": 0, "length": 1
-        }
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        value = r.json()["response"]["data"][0]["value"]
-        print(f"Jet fuel price: ${value}/gal")
-        return float(value)
-    except Exception as ex:
-        print(f"WARNING: Failed to fetch jet fuel price: {ex}")
-        return None
+    url = "https://api.eia.gov/v2/petroleum/pri/spt/data/"
+    params = {
+        "api_key": api_key, "frequency": "weekly", "data[0]": "value",
+        "facets[product][]": "EPD2F", "sort[0][column]": "period",
+        "sort[0][direction]": "desc", "offset": 0, "length": 1
+    }
+    last_error = None
+    for attempt, delay in enumerate((0, 3, 8), start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            value = r.json()["response"]["data"][0]["value"]
+            print(f"Jet fuel price: ${value}/gal")
+            return float(value)
+        except Exception as ex:
+            last_error = ex
+            print(f"WARNING: EIA fetch attempt {attempt}/3 failed: {ex}")
+
+    print(f"::warning title=EIA jet fuel unavailable::All 3 fetch attempts failed: {last_error}")
+    return None
 
 def fetch_gbp_fx_rates():
     try:

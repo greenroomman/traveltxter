@@ -201,7 +201,7 @@ def backfill_t7(supabase: Client):
 
     if not snapshots:
         print("✅ Nothing to backfill")
-        return
+        return {"candidates": 0, "matched": 0, "no_match": 0, "no_price": 0, "written": 0, "failed": 0}
 
     target_dates = sorted(set(
         snap.snapshot_date + dt.timedelta(days=7)
@@ -215,7 +215,8 @@ def backfill_t7(supabase: Client):
 
     if len(price_index) == 0:
         print("❌ Price index is empty — no t+7 snapshots exist yet for these dates. Try again tomorrow.")
-        return
+        print("::warning title=Atlas backfill produced no labels::Price index empty for eligible t+7 cohort")
+        return {"candidates": len(snapshots), "matched": 0, "no_match": len(snapshots), "no_price": 0, "written": 0, "failed": 0}
 
     updates = []
     no_match = 0
@@ -252,11 +253,12 @@ def backfill_t7(supabase: Client):
         missing = needed - covered
         if missing:
             print(f"   Missing t+7 coverage for dates: {sorted(missing)}")
-        return
+        print("::warning title=Atlas backfill produced no labels::Eligible rows were found but none had a usable t+7 match")
+        return {"candidates": len(snapshots), "matched": 0, "no_match": no_match, "no_price": no_price, "written": 0, "failed": 0}
 
     if not updates:
         print("✅ No updates to write")
-        return
+        return {"candidates": len(snapshots), "matched": 0, "no_match": no_match, "no_price": no_price, "written": 0, "failed": 0}
 
     print(f"Writing {len(updates)} labels...")
     written = 0
@@ -278,6 +280,11 @@ def backfill_t7(supabase: Client):
     print(f"   rose_10pct=True:  {sum(1 for u in updates if u['rose_10pct'])}")
     print(f"   fell_10pct=True:  {sum(1 for u in updates if u['fell_10pct'])}")
 
+    if failed:
+        print(f"::warning title=Atlas backfill write failures::{failed} label updates failed")
+
+    return {"candidates": len(snapshots), "matched": len(updates), "no_match": no_match, "no_price": no_price, "written": written, "failed": failed}
+
 
 def main():
     print("=" * 70)
@@ -289,7 +296,15 @@ def main():
     print(f"   Today: {dt.date.today()}")
     print(f"   Backfill cutoff: rows with snapshot_date <= {dt.date.today() - dt.timedelta(days=7)}")
 
-    backfill_t7(supabase)
+    metrics = backfill_t7(supabase)
+
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_path and metrics:
+        with open(summary_path, "a", encoding="utf-8") as summary:
+            summary.write("\n### Atlas t+7 backfill\n\n")
+            summary.write("| Metric | Count |\n|---|---:|\n")
+            for key in ("candidates", "matched", "no_match", "no_price", "written", "failed"):
+                summary.write(f"| {key} | {metrics.get(key, 0)} |\n")
 
     print("\n" + "=" * 70)
     print("✅ Backfill complete")

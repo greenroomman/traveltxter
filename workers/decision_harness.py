@@ -112,7 +112,8 @@ def fetch_snapshot_rows(snapshot_date):
             "direct,"
             "stops,"
             "carrier_count,"
-            "lcc_present"
+            "lcc_present,"
+            "carrier_primary_iata"
         )
         .eq("snapshot_date", scoring_date.isoformat())
         .not_.is_("price_gbp", "null")
@@ -207,6 +208,8 @@ def build_payload(row, session_id):
         "destination": row["destination_iata"],
         "outbound_date": clean_date(row["outbound_date"]),
         "price_gbp": float(row["price_gbp"]),
+        "source_snapshot_id": row.get("snapshot_id"),
+        "decision_carrier_iata": row.get("carrier_primary_iata"),
         "session_id": session_id,
         "client_platform": "api",
         "decision_source_type": "harness",

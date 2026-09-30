@@ -1,0 +1,89 @@
+name: Duffel Offer Request Recovery Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect_offer_request:
+    name: Inspect historical Duffel offer request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Query and summarise historical offer request
+        shell: bash
+        env:
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
+          OFFER_REQUEST_ID: orq_0000BAsWVWbz88yJftye1p
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DUFFEL_ACCESS_TOKEN:-}" ]; then
+            echo "DUFFEL_ACCESS_TOKEN is unavailable"
+            exit 1
+          fi
+
+          status="$(
+            curl --silent --show-error --compressed               --output /tmp/duffel_offer_request.json               --write-out '%{http_code}'               "https://api.duffel.com/air/offer_requests/${OFFER_REQUEST_ID}"               -H "Accept: application/json"               -H "Duffel-Version: v2"               -H "Authorization: Bearer ${DUFFEL_ACCESS_TOKEN}"
+          )"
+
+          echo "http_status=${status}"
+
+          if [ "${status}" != "200" ]; then
+            echo "Offer Request was not retrievable; response body intentionally suppressed."
+            exit 0
+          fi
+
+          python - <<'PY'
+          import json
+
+          path = "/tmp/duffel_offer_request.json"
+          with open(path, "r", encoding="utf-8") as f:
+              payload = json.load(f)
+
+          data = payload.get("data") or {}
+          offers = data.get("offers") or []
+
+          print(f"offer_request_id={data.get('id')}")
+          print(f"offers_present={bool(offers)}")
+          print(f"offer_count={len(offers)}")
+
+          def carrier_summary(offer):
+              owner = offer.get("owner") or {}
+              owner_iata = owner.get("iata_code")
+              owner_name = owner.get("name")
+
+              marketing = set()
+              operating = set()
+              segments = []
+
+              for slc in offer.get("slices") or []:
+                  for seg in slc.get("segments") or []:
+                      mc = seg.get("marketing_carrier") or {}
+                      oc = seg.get("operating_carrier") or {}
+                      if mc.get("iata_code"):
+                          marketing.add(mc["iata_code"])
+                      if oc.get("iata_code"):
+                          operating.add(oc["iata_code"])
+                      segments.append({
+                          "marketing": mc.get("iata_code"),
+                          "operating": oc.get("iata_code"),
+                      })
+
+              return {
+                  "offer_id": offer.get("id"),
+                  "total_amount": offer.get("total_amount"),
+                  "total_currency": offer.get("total_currency"),
+                  "owner_iata": owner_iata,
+                  "owner_name": owner_name,
+                  "marketing_carriers": sorted(marketing),
+                  "operating_carriers": sorted(operating),
+                  "segments": segments,
+              }
+
+          for i, offer in enumerate(offers, start=1):
+              summary = carrier_summary(offer)
+              print(f"offer_{i}=" + json.dumps(summary, separators=(",", ":"), sort_keys=True))
+          PY

@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
+    inputs:
+      api_base:
+        description: "MIZAR API base URL (manual scoped runs only)"
+        required: false
+        type: string
+        default: "https://mizar-api.vercel.app"
 
 jobs:
   daily-report:
@@ -58,4 +64,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.MIZAR_SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.MIZAR_SUPABASE_SERVICE_ROLE_KEY }}
           MIZAR_API_KEY: ${{ secrets.MIZAR_API_KEY }}
-          MIZAR_API_BASE: https://mizar-api.vercel.app
+          MIZAR_API_BASE: ${{ github.event.inputs.api_base || 'https://mizar-api.vercel.app' }}

@@ -106,8 +106,8 @@ def cheapest_gbp_price(
     cabin_class: str = "economy",
     trip_type: str = "return",
     return_date: date | None = None,
-) -> tuple[float | None, str | None]:
-    """Search Duffel for the cheapest GBP offer on the given route/date."""
+) -> tuple[float | None, str | None, list[dict[str, Any]] | None]:
+    """Search Duffel once and return market-cheapest GBP price plus raw offers."""
 
     cabin_map = {
         "economy": "economy",
@@ -151,12 +151,12 @@ def cheapest_gbp_price(
         duffel_search_id = response.get("data", {}).get("id")
 
     if response is None:
-        return None, duffel_search_id
+        return None, duffel_search_id, None
 
     offers = response.get("data", {}).get("offers", [])
 
     if not offers:
-        return None, duffel_search_id
+        return None, duffel_search_id, offers
 
     gbp_prices: list[float] = []
 
@@ -170,9 +170,72 @@ def cheapest_gbp_price(
             continue
 
     if not gbp_prices:
-        return None, duffel_search_id
+        return None, duffel_search_id, offers
 
-    return min(gbp_prices), duffel_search_id
+    return min(gbp_prices), duffel_search_id, offers
+
+
+def offer_primary_carrier_iata(offer: dict[str, Any]) -> str | None:
+    """Mirror snapshots.carrier_primary_iata exactly: first segment marketing carrier."""
+    try:
+        value = offer["slices"][0]["segments"][0]["marketing_carrier"]["iata_code"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip().upper()
+    return value or None
+
+
+def same_carrier_measurement(
+    offers: list[dict[str, Any]] | None,
+    decision_carrier_iata: str | None,
+    price_shown: float | None,
+) -> tuple[str | None, float | None, bool | None, str | None]:
+    """Compute the additive same-carrier outcome without changing market-cheapest semantics."""
+    if not decision_carrier_iata:
+        return None, None, None, "decision_carrier_unknown"
+
+    if offers is None:
+        # Duffel search itself failed, so absence cannot be established.
+        return None, None, None, None
+
+    decision_carrier = decision_carrier_iata.strip().upper()
+    readable_carriers = 0
+    matching_prices: list[float] = []
+
+    for offer in offers:
+        carrier = offer_primary_carrier_iata(offer)
+        if carrier is None:
+            continue
+
+        readable_carriers += 1
+        if carrier != decision_carrier or offer.get("total_currency") != "GBP":
+            continue
+
+        try:
+            matching_prices.append(float(offer["total_amount"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if offers and readable_carriers == 0:
+        return None, None, None, "carrier_extraction_failed"
+
+    if not matching_prices:
+        return None, None, None, "not_present_at_t7"
+
+    same_carrier_price = min(matching_prices)
+    if price_shown is None or price_shown <= 0:
+        same_carrier_rose = None
+    else:
+        same_carrier_change_pct = (
+            (same_carrier_price - float(price_shown)) / float(price_shown)
+        ) * 100
+        same_carrier_rose = same_carrier_change_pct >= RISE_THRESHOLD_PCT
+
+    return decision_carrier, same_carrier_price, same_carrier_rose, "matched"
 
 
 # ------------------------------------------------------------
@@ -228,7 +291,7 @@ def fetch_pending_decisions() -> list[dict[str, Any]]:
             .select(
                 "decision_id, decision_timestamp, origin_iata, destination_iata, "
                 "outbound_date, return_date, price_shown_gbp, regret_risk_score, "
-                "trip_type, cabin_class"
+                "trip_type, cabin_class, decision_carrier_iata"
             )
             .eq("verification_status", "pending")
             .eq("validation_eligible", True)
@@ -308,6 +371,10 @@ def write_verification(
     regret_risk_score: float | None,
     failure_reason: str | None,
     duffel_search_id: str | None = None,
+    t7_carrier_iata: str | None = None,
+    t7_same_carrier_price_gbp: float | None = None,
+    same_carrier_rose: bool | None = None,
+    same_carrier_match_status: str | None = None,
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     status = "failed"
@@ -323,6 +390,10 @@ def write_verification(
             "verification_method": "duffel_api",
             "failure_reason": failure_reason or "invalid_original_price",
             "duffel_search_id": duffel_search_id,
+            "t7_carrier_iata": t7_carrier_iata,
+            "t7_same_carrier_price_gbp": round(float(t7_same_carrier_price_gbp), 2) if t7_same_carrier_price_gbp is not None else None,
+            "same_carrier_rose": same_carrier_rose,
+            "same_carrier_match_status": same_carrier_match_status,
         }
 
     elif price_t7 is None:
@@ -339,6 +410,10 @@ def write_verification(
             "verification_method": "duffel_api",
             "failure_reason": failure_reason or "no_price_returned",
             "duffel_search_id": duffel_search_id,
+            "t7_carrier_iata": t7_carrier_iata,
+            "t7_same_carrier_price_gbp": round(float(t7_same_carrier_price_gbp), 2) if t7_same_carrier_price_gbp is not None else None,
+            "same_carrier_rose": same_carrier_rose,
+            "same_carrier_match_status": same_carrier_match_status,
         }
 
     else:
@@ -356,6 +431,10 @@ def write_verification(
             "verification_method": "duffel_api",
             "failure_reason": None,
             "duffel_search_id": duffel_search_id,
+            "t7_carrier_iata": t7_carrier_iata,
+            "t7_same_carrier_price_gbp": round(float(t7_same_carrier_price_gbp), 2) if t7_same_carrier_price_gbp is not None else None,
+            "same_carrier_rose": same_carrier_rose,
+            "same_carrier_match_status": same_carrier_match_status,
         }
 
         status = "verified"
@@ -469,13 +548,19 @@ def run() -> None:
             f"£{price_shown:.2f}" if price_shown is not None else "NULL",
         )
 
-        price_t7, duffel_search_id = cheapest_gbp_price(
+        price_t7, duffel_search_id, offers = cheapest_gbp_price(
             origin=origin,
             destination=destination,
             outbound_date=outbound_dt,
             cabin_class=cabin_class,
             trip_type=trip_type,
             return_date=return_dt,
+        )
+
+        t7_carrier_iata, t7_same_carrier_price_gbp, same_carrier_rose, same_carrier_match_status = same_carrier_measurement(
+            offers=offers,
+            decision_carrier_iata=decision.get("decision_carrier_iata"),
+            price_shown=price_shown,
         )
 
         if price_t7 is not None and price_shown is not None and price_shown > 0:
@@ -491,12 +576,12 @@ def run() -> None:
             )
 
             success += 1
-            write_verification(decision_id, price_t7, price_shown, score, None, duffel_search_id)
+            write_verification(decision_id, price_t7, price_shown, score, None, duffel_search_id, t7_carrier_iata, t7_same_carrier_price_gbp, same_carrier_rose, same_carrier_match_status)
 
         else:
             log.warning("No valid GBP price returned for %s.", decision_id)
             unavailable += 1
-            write_verification(decision_id, None, price_shown, score, "duffel_no_gbp_offer", duffel_search_id)
+            write_verification(decision_id, None, price_shown, score, "duffel_no_gbp_offer", duffel_search_id, t7_carrier_iata, t7_same_carrier_price_gbp, same_carrier_rose, same_carrier_match_status)
 
         time.sleep(REQUEST_DELAY_S)
 

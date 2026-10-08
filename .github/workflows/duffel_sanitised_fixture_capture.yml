@@ -7,69 +7,72 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Capture four cohort-shaped Duffel return searches
+      - name: Capture cohort-shaped Duffel return offers (allowlist only)
         env:
           DUFFEL_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
         run: |
           python3 - <<'PY'
           import json, os, urllib.request
-          from datetime import date, timedelta
           searches=[
-            ("edi_vce_lh_candidate", [{"origin":"EDI","destination":"VCE","departure_date":"2026-10-20"},{"origin":"VCE","destination":"EDI","departure_date":"2026-10-27"}]),
-            ("bhx_mad_lh_candidate", [{"origin":"BHX","destination":"MAD","departure_date":"2026-11-05"},{"origin":"MAD","destination":"BHX","departure_date":"2026-11-12"}]),
-            ("man_vce_lx_candidate", [{"origin":"MAN","destination":"VCE","departure_date":"2026-11-20"},{"origin":"VCE","destination":"MAN","departure_date":"2026-11-27"}]),
-            ("lhr_mad_codeshare_candidate", [{"origin":"LHR","destination":"MAD","departure_date":"2026-11-05"},{"origin":"MAD","destination":"LHR","departure_date":"2026-11-12"}]),
+            ("edi_vce_lh_candidate", "EDI", "VCE", "2026-10-20", "2026-10-27"),
+            ("bhx_mad_lh_candidate", "BHX", "MAD", "2026-11-05", "2026-11-12"),
+            ("man_vce_lx_candidate", "MAN", "VCE", "2026-11-20", "2026-11-27"),
+            ("lhr_mad_codeshare_candidate", "LHR", "MAD", "2026-11-05", "2026-11-12"),
           ]
           output={"searches":[]}
-          for label,slices in searches:
-              payload={"data":{"slices":slices,"passengers":[{"type":"adult"}],"cabin_class":"economy"}}
+          categories=("connecting","marketing_vs_operating","owner_vs_marketing","return_vs_outbound","outbound_mixed_marketing","non_gbp")
+          for label,origin,destination,outbound,return_date in searches:
+              payload={"data":{"slices":[{"origin":origin,"destination":destination,"departure_date":outbound},{"origin":destination,"destination":origin,"departure_date":return_date}],"passengers":[{"type":"adult"}],"cabin_class":"economy"}}
               req=urllib.request.Request("https://api.duffel.com/air/offer_requests?return_offers=true",data=json.dumps(payload).encode(),headers={"Authorization":"Bearer "+os.environ["DUFFEL_TOKEN"],"Duffel-Version":"v2","Content-Type":"application/json"},method="POST")
               with urllib.request.urlopen(req,timeout=30) as response:
-                  data=json.load(response)["data"]
-              cleaned=[]
-              for offer in data.get("offers",[])[:100]:
-                  safe_slices=[]
-                  for sl in offer.get("slices") or []:
-                      safe_segments=[]
-                      for segment in sl.get("segments") or []:
-                          safe_segments.append({
-                              "marketing_carrier":{"iata_code":(segment.get("marketing_carrier") or {}).get("iata_code")},
-                              "operating_carrier":{"iata_code":(segment.get("operating_carrier") or {}).get("iata_code")},
-                          })
-                      safe_slices.append({"segments":safe_segments})
-                  cleaned.append({
+                  raw=json.load(response)
+              offers=(raw.get("data") or {}).get("offers") or []
+              def clean(offer):
+                  return {
                       "total_amount":offer.get("total_amount"),
                       "total_currency":offer.get("total_currency"),
                       "owner":{"iata_code":(offer.get("owner") or {}).get("iata_code")},
-                      "slices":safe_slices,
-                  })
-              output["searches"].append({"label":label,"offers":cleaned})
-          assert any(x["offers"] for x in output["searches"]), "No offers returned"
-          for result in output["searches"]:
-              offers=result["offers"]
-              def first(o):
-                  try: return o["slices"][0]["segments"][0]
-                  except (KeyError,IndexError,TypeError): return {}
-              differing_marketing_operating=sum(
-                  (first(o).get("marketing_carrier") or {}).get("iata_code") !=
-                  (first(o).get("operating_carrier") or {}).get("iata_code")
-                  for o in offers if (first(o).get("marketing_carrier") or {}).get("iata_code")
-                  and (first(o).get("operating_carrier") or {}).get("iata_code")
+                      "slices":[{"segments":[{
+                          "marketing_carrier":{"iata_code":(seg.get("marketing_carrier") or {}).get("iata_code")},
+                          "operating_carrier":{"iata_code":(seg.get("operating_carrier") or {}).get("iata_code")}
+                      } for seg in (sl.get("segments") or [])]} for sl in (offer.get("slices") or [])],
+                  }
+              def code(offer,slice_index,segment_index,field="marketing_carrier"):
+                  try: return offer["slices"][slice_index]["segments"][segment_index][field]["iata_code"]
+                  except (KeyError,IndexError,TypeError): return None
+              def flags(offer):
+                  outbound=code(offer,0,0)
+                  operating=code(offer,0,0,"operating_carrier")
+                  owner=(offer.get("owner") or {}).get("iata_code")
+                  returning=code(offer,1,0)
+                  outbound_segments=(offer.get("slices") or [{}])[0].get("segments") or []
+                  outbound_codes=[(s.get("marketing_carrier") or {}).get("iata_code") for s in outbound_segments]
+                  return {
+                      "connecting":len(outbound_segments)>1,
+                      "marketing_vs_operating":bool(outbound and operating and outbound!=operating),
+                      "owner_vs_marketing":bool(outbound and owner and owner!=outbound),
+                      "return_vs_outbound":bool(outbound and returning and outbound!=returning),
+                      "outbound_mixed_marketing":len(set(x for x in outbound_codes if x))>1,
+                      "non_gbp":offer.get("total_currency")!="GBP",
+                  }
+              # Counts cover every offer in the offer-request response; never cap counting.
+              sanitized=[clean(o) for o in offers]
+              indices=set()
+              for category in categories:
+                  indices.update(i for i,o in enumerate(sanitized) if flags(o)[category])[:3])
+              gbp_prices=sorted(
+                  ((float(o["total_amount"]),i) for i,o in enumerate(sanitized)
+                   if o.get("total_currency")=="GBP" and o.get("total_amount") is not None),
+                  key=lambda x:(x[0],x[1])
               )
-              multi_segment=sum(len(o["slices"][0]["segments"])>1 for o in offers if o.get("slices"))
-              owner_differs=sum(
-                  (o.get("owner") or {}).get("iata_code") !=
-                  (first(o).get("marketing_carrier") or {}).get("iata_code")
-                  for o in offers if (o.get("owner") or {}).get("iata_code")
-                  and (first(o).get("marketing_carrier") or {}).get("iata_code")
-              )
-              non_gbp=sum(o.get("total_currency")!="GBP" for o in offers)
-              two_slices=sum(len(o.get("slices") or [])>=2 for o in offers)
-              print("COVERAGE",json.dumps({"label":result["label"],"offers":len(offers),
-                  "marketing_vs_operating":differing_marketing_operating,
-                  "outbound_multisegment":multi_segment,"owner_vs_marketing":owner_differs,
-                  "non_gbp":non_gbp,"two_slices":two_slices}))
-
+              indices.update(i for _,i in gbp_prices[:8])
+              selected=[sanitized[i] for i in sorted(indices)]
+              counts={category:sum(bool(flags(o)[category]) for o in sanitized) for category in categories}
+              counts["two_slices"]=sum(len(o["slices"])>=2 for o in sanitized)
+              summary={"label":label,"total_offers":len(offers),"counts":counts,"sampled_offers":len(selected)}
+              print("COVERAGE",json.dumps(summary,sort_keys=True))
+              output["searches"].append({"label":label,"total_offers":len(offers),"counts":counts,"offers":selected})
+          assert any(s["total_offers"] for s in output["searches"]), "No offers returned"
           with open("duffel-sanitised-fixture.json","w") as f:
               json.dump(output,f,indent=2)
           print("BEGIN_SANITISED_DUFFEL_FIXTURE")

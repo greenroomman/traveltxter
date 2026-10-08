@@ -59,12 +59,13 @@ jobs:
               sanitized=[clean(o) for o in offers]
               indices=set()
               for category in categories:
-                  indices.update(i for i,o in enumerate(sanitized) if flags(o)[category])[:3])
-              gbp_prices=sorted(
-                  ((float(o["total_amount"]),i) for i,o in enumerate(sanitized)
-                   if o.get("total_currency")=="GBP" and o.get("total_amount") is not None),
-                  key=lambda x:(x[0],x[1])
-              )
+                  indices.update([i for i,o in enumerate(sanitized) if flags(o)[category]][:3])
+              gbp_prices=[]
+              for i,o in enumerate(sanitized):
+                  if o.get("total_currency")=="GBP":
+                      try: gbp_prices.append((float(o["total_amount"]),i))
+                      except (ValueError,TypeError): pass
+              gbp_prices.sort(key=lambda x:(x[0],x[1]))
               indices.update(i for _,i in gbp_prices[:8])
               selected=[sanitized[i] for i in sorted(indices)]
               counts={category:sum(bool(flags(o)[category]) for o in sanitized) for category in categories}

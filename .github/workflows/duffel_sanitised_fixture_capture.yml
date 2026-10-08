@@ -7,18 +7,18 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Capture three allowlisted Duffel offer searches
+      - name: Capture four cohort-shaped Duffel return searches
         env:
           DUFFEL_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
         run: |
           python3 - <<'PY'
           import json, os, urllib.request
           from datetime import date, timedelta
-          departure=(date.today()+timedelta(days=45)).isoformat()
           searches=[
-            ("ba_ib_candidate", [{"origin":"LHR","destination":"MAD","departure_date":departure}]),
-            ("ib_ba_candidate", [{"origin":"MAD","destination":"LHR","departure_date":departure}]),
-            ("connecting_candidate", [{"origin":"LHR","destination":"AGP","departure_date":departure}]),
+            ("edi_vce_lh_candidate", [{"origin":"EDI","destination":"VCE","departure_date":"2026-10-20"},{"origin":"VCE","destination":"EDI","departure_date":"2026-10-27"}]),
+            ("bhx_mad_lh_candidate", [{"origin":"BHX","destination":"MAD","departure_date":"2026-11-05"},{"origin":"MAD","destination":"BHX","departure_date":"2026-11-12"}]),
+            ("man_vce_lx_candidate", [{"origin":"MAN","destination":"VCE","departure_date":"2026-11-20"},{"origin":"VCE","destination":"MAN","departure_date":"2026-11-27"}]),
+            ("lhr_mad_codeshare_candidate", [{"origin":"LHR","destination":"MAD","departure_date":"2026-11-05"},{"origin":"MAD","destination":"LHR","departure_date":"2026-11-12"}]),
           ]
           output={"searches":[]}
           for label,slices in searches:
@@ -45,6 +45,31 @@ jobs:
                   })
               output["searches"].append({"label":label,"offers":cleaned})
           assert any(x["offers"] for x in output["searches"]), "No offers returned"
+          for result in output["searches"]:
+              offers=result["offers"]
+              def first(o):
+                  try: return o["slices"][0]["segments"][0]
+                  except (KeyError,IndexError,TypeError): return {}
+              differing_marketing_operating=sum(
+                  (first(o).get("marketing_carrier") or {}).get("iata_code") !=
+                  (first(o).get("operating_carrier") or {}).get("iata_code")
+                  for o in offers if (first(o).get("marketing_carrier") or {}).get("iata_code")
+                  and (first(o).get("operating_carrier") or {}).get("iata_code")
+              )
+              multi_segment=sum(len(o["slices"][0]["segments"])>1 for o in offers if o.get("slices"))
+              owner_differs=sum(
+                  (o.get("owner") or {}).get("iata_code") !=
+                  (first(o).get("marketing_carrier") or {}).get("iata_code")
+                  for o in offers if (o.get("owner") or {}).get("iata_code")
+                  and (first(o).get("marketing_carrier") or {}).get("iata_code")
+              )
+              non_gbp=sum(o.get("total_currency")!="GBP" for o in offers)
+              two_slices=sum(len(o.get("slices") or [])>=2 for o in offers)
+              print("COVERAGE",json.dumps({"label":result["label"],"offers":len(offers),
+                  "marketing_vs_operating":differing_marketing_operating,
+                  "outbound_multisegment":multi_segment,"owner_vs_marketing":owner_differs,
+                  "non_gbp":non_gbp,"two_slices":two_slices}))
+
           with open("duffel-sanitised-fixture.json","w") as f:
               json.dump(output,f,indent=2)
           print("BEGIN_SANITISED_DUFFEL_FIXTURE")

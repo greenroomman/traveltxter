@@ -239,14 +239,9 @@ def carrier_fields(measurement):
 
 
 def _confirmed_enhanced_rejection(exc):
-    """Never retry ambiguous network failures or timeouts."""
-    status = getattr(exc, "code", None)
-    if status is None:
-        status = getattr(exc, "status_code", None)
-    try:
-        return 400 <= int(status) < 500 and int(status) not in (408, 409, 429)
-    except (ValueError, TypeError):
-        return False
+    """Retry only known carrier-column rejection codes; never ambiguous writes."""
+    code = getattr(exc, "code", None)
+    return str(code) in {"23514", "PGRST204"}
 
 
 # ------------------------------------------------------------

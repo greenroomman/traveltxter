@@ -5,7 +5,7 @@ atlas_outcome_verify.py
 
 MIZAR Atlas — Outcome Verification Worker
 
-Runs daily at 10:00 UTC via atlas_outcome_verify.yml.
+Scheduled daily at 13:11 UTC via atlas_outcome_verify.yml.
 """
 
 import json
@@ -48,6 +48,11 @@ DUFFEL_HEADERS = {
 RISE_THRESHOLD_PCT = 10.0
 HIGH_RISK_THRESHOLD = 0.70
 REQUEST_DELAY_S = 1.2
+CARRIER_MATCH_STATUSES = frozenset({"matched", "not_present_at_t7", "decision_carrier_unknown", "carrier_extraction_failed"})
+SAME_CARRIER_METHOD = "carrier_consistent_v1"
+
+# Set only while processing one decision; the market calculation remains unchanged.
+_last_offers = None
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -143,7 +148,13 @@ def cheapest_gbp_price(
         }
     }
 
+    global _last_offers
+    _last_offers = None
     response = _duffel_post("/air/offer_requests?return_offers=true", payload)
+    if isinstance(response, dict):
+        data = response.get("data") or {}
+        if isinstance(data, dict):
+            _last_offers = data.get("offers")
 
     duffel_search_id = None
 
@@ -173,6 +184,69 @@ def cheapest_gbp_price(
         return None, duffel_search_id
 
     return min(gbp_prices), duffel_search_id
+
+
+def measure_same_carrier(offers, decision_carrier, price_shown):
+    """Return (carrier, cheapest GBP, rose, status); first marketing segment only."""
+    if not decision_carrier:
+        return None, None, None, "decision_carrier_unknown"
+    if not isinstance(offers, list):
+        return None, None, None, "carrier_extraction_failed"
+    matches = []
+    for offer in offers:
+        if offer.get("total_currency") != "GBP":
+            continue
+        try:
+            carrier = offer["slices"][0]["segments"][0]["marketing_carrier"]["iata_code"]
+            if not isinstance(carrier, str) or not carrier:
+                raise ValueError("invalid carrier")
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None, None, None, "carrier_extraction_failed"
+        if carrier == decision_carrier:
+            try:
+                matches.append(float(offer["total_amount"]))
+            except (KeyError, TypeError, ValueError):
+                # Price parsing is independent of carrier extraction.
+                continue
+    if not matches:
+        return None, None, None, "not_present_at_t7"
+    cheapest = min(matches)
+    rose = None
+    if price_shown is not None and price_shown > 0:
+        change_pct = ((float(cheapest) - float(price_shown)) / float(price_shown)) * 100
+        rose = change_pct >= RISE_THRESHOLD_PCT
+    return decision_carrier, cheapest, rose, "matched"
+
+
+def safe_measure_same_carrier(offers, decision_carrier, price_shown, measurement_fn=None):
+    try:
+        return (measurement_fn or measure_same_carrier)(offers, decision_carrier, price_shown)
+    except Exception:
+        log.exception("Carrier computation failed; market result retained")
+        return None, None, None, "carrier_extraction_failed"
+
+
+def carrier_fields(measurement):
+    carrier, price, rose, status = measurement
+    assert status in CARRIER_MATCH_STATUSES
+    return {
+        "t7_carrier_iata": carrier,
+        "t7_same_carrier_price_gbp": price,
+        "same_carrier_rose": rose,
+        "same_carrier_match_status": status,
+        "same_carrier_verification_method": SAME_CARRIER_METHOD,
+    }
+
+
+def _confirmed_enhanced_rejection(exc):
+    """Never retry ambiguous network failures or timeouts."""
+    status = getattr(exc, "code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    try:
+        return 400 <= int(status) < 500 and int(status) not in (408, 409, 429)
+    except (ValueError, TypeError):
+        return False
 
 
 # ------------------------------------------------------------
@@ -228,7 +302,7 @@ def fetch_pending_decisions() -> list[dict[str, Any]]:
             .select(
                 "decision_id, decision_timestamp, origin_iata, destination_iata, "
                 "outbound_date, return_date, price_shown_gbp, regret_risk_score, "
-                "trip_type, cabin_class"
+                "trip_type, cabin_class, decision_carrier_iata"
             )
             .eq("verification_status", "pending")
             .eq("validation_eligible", True)
@@ -308,6 +382,7 @@ def write_verification(
     regret_risk_score: float | None,
     failure_reason: str | None,
     duffel_search_id: str | None = None,
+    same_carrier: tuple | None = None,
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     status = "failed"
@@ -360,18 +435,26 @@ def write_verification(
 
         status = "verified"
 
+    market_row = dict(row)
+    row.update(carrier_fields(same_carrier or (None, None, None, "decision_carrier_unknown")))
+    # Insert, never overwrite: already_verified() is a guard, not an upsert guarantee.
     try:
-        (
-            supabase.table("outcome_verification")
-            .upsert(row, on_conflict="decision_id")
-            .execute()
-        )
-
-        mark_decision_status(decision_id, status)
-
+        supabase.table("outcome_verification").insert(row).execute()
     except Exception as exc:
-        log.error("Failed to write verification for %s: %s", decision_id, exc)
-        mark_decision_status(decision_id, "failed")
+        if _confirmed_enhanced_rejection(exc):
+            log.warning("Enhanced write rejected for %s: %s; retrying market-only once", decision_id, exc)
+            try:
+                supabase.table("outcome_verification").insert(market_row).execute()
+                log.warning("MARKET_ONLY_FALLBACK persisted for %s", decision_id)
+            except Exception as fallback_exc:
+                log.error("Market-only fallback failed for %s: %s", decision_id, fallback_exc)
+                mark_decision_status(decision_id, "failed")
+                return
+        else:
+            log.error("Ambiguous/non-retryable enhanced write failure for %s: %s", decision_id, exc)
+            mark_decision_status(decision_id, "failed")
+            return
+    mark_decision_status(decision_id, status)
 
 
 # ------------------------------------------------------------
@@ -478,6 +561,9 @@ def run() -> None:
             return_date=return_dt,
         )
 
+        same_carrier = safe_measure_same_carrier(
+            _last_offers, decision.get("decision_carrier_iata"), price_shown
+        )
         if price_t7 is not None and price_shown is not None and price_shown > 0:
             change_pct = ((price_t7 - price_shown) / price_shown) * 100
             outcome = classify_outcome(score, change_pct >= RISE_THRESHOLD_PCT)
@@ -491,12 +577,12 @@ def run() -> None:
             )
 
             success += 1
-            write_verification(decision_id, price_t7, price_shown, score, None, duffel_search_id)
+            write_verification(decision_id, price_t7, price_shown, score, None, duffel_search_id, same_carrier)
 
         else:
             log.warning("No valid GBP price returned for %s.", decision_id)
             unavailable += 1
-            write_verification(decision_id, None, price_shown, score, "duffel_no_gbp_offer", duffel_search_id)
+            write_verification(decision_id, None, price_shown, score, "duffel_no_gbp_offer", duffel_search_id, same_carrier)
 
         time.sleep(REQUEST_DELAY_S)
 

@@ -1,0 +1,19 @@
+name: Step 2 Offline Tests
+on:
+  pull_request:
+    paths:
+      - 'workers/atlas_outcome_verify.py'
+      - 'tests/test_atlas_outcome_verify*.py'
+      - '.github/workflows/step2_offline_tests.yml'
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run offline unit tests without credentials
+        run: python -m unittest discover -s tests -p 'test_atlas_outcome_verify*.py' -v

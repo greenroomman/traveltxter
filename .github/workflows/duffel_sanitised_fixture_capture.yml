@@ -30,4 +30,4 @@ jobs:
         with:
           name: duffel-sanitised-fixture
           path: duffel-sanitised-fixture.json
-          retention-days: 2
+          retention-days: 1

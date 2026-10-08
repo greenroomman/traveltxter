@@ -4,8 +4,10 @@ on:
 jobs:
   capture:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: Capture one sanitised offer search
+      - name: Capture three allowlisted Duffel offer searches
         env:
           DUFFEL_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
         run: |
@@ -13,18 +15,41 @@ jobs:
           import json, os, urllib.request
           from datetime import date, timedelta
           departure=(date.today()+timedelta(days=45)).isoformat()
-          payload={"data":{"slices":[{"origin":"LHR","destination":"MAD","departure_date":departure}],"passengers":[{"type":"adult"}],"cabin_class":"economy"}}
-          req=urllib.request.Request("https://api.duffel.com/air/offer_requests?return_offers=true",data=json.dumps(payload).encode(),headers={"Authorization":"Bearer "+os.environ["DUFFEL_TOKEN"],"Duffel-Version":"v2","Content-Type":"application/json"},method="POST")
-          with urllib.request.urlopen(req,timeout=30) as response:
-              data=json.load(response)["data"]
-          sanitized=[]
-          for offer in data.get("offers",[])[:20]:
-              segments=(offer.get("slices") or [{}])[0].get("segments") or [{}]
-              segment=segments[0]
-              sanitized.append({"total_amount":offer.get("total_amount"),"total_currency":offer.get("total_currency"),"owner":{"iata_code":(offer.get("owner") or {}).get("iata_code")},"slices":[{"segments":[{"marketing_carrier":{"iata_code":(segment.get("marketing_carrier") or {}).get("iata_code")},"operating_carrier":{"iata_code":(segment.get("operating_carrier") or {}).get("iata_code")}}]}]})
-          assert sanitized, "No offers returned"
-          with open("duffel-sanitised-fixture.json","w") as f: json.dump({"offers":sanitized},f,indent=2)
-          print("Sanitised offers:",len(sanitized),"— no IDs or credentials emitted")
+          searches=[
+            ("ba_ib_candidate", [{"origin":"LHR","destination":"MAD","departure_date":departure}]),
+            ("ib_ba_candidate", [{"origin":"MAD","destination":"LHR","departure_date":departure}]),
+            ("connecting_candidate", [{"origin":"LHR","destination":"AGP","departure_date":departure}]),
+          ]
+          output={"searches":[]}
+          for label,slices in searches:
+              payload={"data":{"slices":slices,"passengers":[{"type":"adult"}],"cabin_class":"economy"}}
+              req=urllib.request.Request("https://api.duffel.com/air/offer_requests?return_offers=true",data=json.dumps(payload).encode(),headers={"Authorization":"Bearer "+os.environ["DUFFEL_TOKEN"],"Duffel-Version":"v2","Content-Type":"application/json"},method="POST")
+              with urllib.request.urlopen(req,timeout=30) as response:
+                  data=json.load(response)["data"]
+              cleaned=[]
+              for offer in data.get("offers",[])[:100]:
+                  safe_slices=[]
+                  for sl in offer.get("slices") or []:
+                      safe_segments=[]
+                      for segment in sl.get("segments") or []:
+                          safe_segments.append({
+                              "marketing_carrier":{"iata_code":(segment.get("marketing_carrier") or {}).get("iata_code")},
+                              "operating_carrier":{"iata_code":(segment.get("operating_carrier") or {}).get("iata_code")},
+                          })
+                      safe_slices.append({"segments":safe_segments})
+                  cleaned.append({
+                      "total_amount":offer.get("total_amount"),
+                      "total_currency":offer.get("total_currency"),
+                      "owner":{"iata_code":(offer.get("owner") or {}).get("iata_code")},
+                      "slices":safe_slices,
+                  })
+              output["searches"].append({"label":label,"offers":cleaned})
+          assert any(x["offers"] for x in output["searches"]), "No offers returned"
+          with open("duffel-sanitised-fixture.json","w") as f:
+              json.dump(output,f,indent=2)
+          print("BEGIN_SANITISED_DUFFEL_FIXTURE")
+          print(json.dumps(output,indent=2))
+          print("END_SANITISED_DUFFEL_FIXTURE")
           PY
       - uses: actions/upload-artifact@v4
         with:

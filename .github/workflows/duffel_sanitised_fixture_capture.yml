@@ -56,6 +56,20 @@ jobs:
                       "non_gbp":offer.get("total_currency")!="GBP",
                   }
               # Counts cover every offer in the offer-request response; never cap counting.
+              # Full-population strict verifier extraction check on raw Duffel offers.
+              gbp_offers=[o for o in offers if o.get("total_currency")=="GBP"]
+              def extraction_invalid(o):
+                  try:
+                      value=o["slices"][0]["segments"][0]["marketing_carrier"]["iata_code"]
+                      return not isinstance(value,str) or not value
+                  except (KeyError,IndexError,TypeError,ValueError):
+                      return True
+              invalid_gbp=sum(extraction_invalid(o) for o in gbp_offers)
+              print("EXTRACTION_AUDIT",json.dumps({
+                  "label":label,"total_offers":len(offers),
+                  "gbp_offers":len(gbp_offers),"invalid_gbp_first_marketing_carrier":invalid_gbp,
+                  "strict_search_would_fail":invalid_gbp>0
+              },sort_keys=True))
               sanitized=[clean(o) for o in offers]
               indices=set()
               for category in categories:

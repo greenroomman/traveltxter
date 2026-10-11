@@ -1,0 +1,2317 @@
+{
+  "searches": [
+    {
+      "label": "edi_vce_lh_candidate",
+      "total_offers": 648,
+      "counts": {
+        "connecting": 648,
+        "marketing_vs_operating": 148,
+        "owner_vs_marketing": 40,
+        "return_vs_outbound": 66,
+        "outbound_mixed_marketing": 10,
+        "non_gbp": 0,
+        "two_slices": 648
+      },
+      "offers": [
+        {
+          "total_amount": "226.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "242.55",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "249.45",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "278.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "EN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "278.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "278.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "OS"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "OS"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "OS"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "OS"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "OS"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "278.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "OS"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "OS"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "OS"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "OS"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "OS"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "294.55",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "330.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "EN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "330.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "OS"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "OS"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "OS"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "OS"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "OS"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "475.75",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "EN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "bhx_mad_lh_candidate",
+      "total_offers": 1065,
+      "counts": {
+        "connecting": 1065,
+        "marketing_vs_operating": 62,
+        "owner_vs_marketing": 62,
+        "return_vs_outbound": 62,
+        "outbound_mixed_marketing": 0,
+        "non_gbp": 0,
+        "two_slices": 1065
+      },
+      "offers": [
+        {
+          "total_amount": "197.98",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "200.38",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "207.20",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "209.60",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "210.48",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "212.97",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "214.98",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "217.38",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "219.70",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "227.48",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "323.03",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "332.25",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "340.03",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "man_vce_lx_candidate",
+      "total_offers": 934,
+      "counts": {
+        "connecting": 934,
+        "marketing_vs_operating": 246,
+        "owner_vs_marketing": 126,
+        "return_vs_outbound": 202,
+        "outbound_mixed_marketing": 36,
+        "non_gbp": 0,
+        "two_slices": 934
+      },
+      "offers": [
+        {
+          "total_amount": "158.63",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "VY"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "VY"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VY"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "VY"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VY"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "VY"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VY"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "VY"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VY"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "193.33",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "193.33",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "194.93",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "194.93",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "195.13",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "195.13",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "195.83",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "195.83",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "197.63",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "245.83",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "EN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "245.83",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "EN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "247.63",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "EN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "EN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "EN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "VL"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "lhr_mad_codeshare_candidate",
+      "total_offers": 3314,
+      "counts": {
+        "connecting": 1626,
+        "marketing_vs_operating": 1248,
+        "owner_vs_marketing": 594,
+        "return_vs_outbound": 944,
+        "outbound_mixed_marketing": 0,
+        "non_gbp": 0,
+        "two_slices": 3314
+      },
+      "offers": [
+        {
+          "total_amount": "118.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "IB"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "118.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "IB"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "118.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "BA"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "BA"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "BA"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "118.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "BA"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "BA"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "BA"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "126.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "IB"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "126.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "IB"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "126.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "IB"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "IB"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "126.65",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "BA"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "BA"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "BA"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "IB"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "202.25",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "212.29",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LX"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LX"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "total_amount": "213.10",
+          "total_currency": "GBP",
+          "owner": {
+            "iata_code": "LH"
+          },
+          "slices": [
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "SN"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "SN"
+                  }
+                }
+              ]
+            },
+            {
+              "segments": [
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                },
+                {
+                  "marketing_carrier": {
+                    "iata_code": "LH"
+                  },
+                  "operating_carrier": {
+                    "iata_code": "LH"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "provenance": {
+    "source": "GitHub Actions job 113218996680, 2026-10-08, BEGIN_SANITISED_DUFFEL_FIXTURE to END_SANITISED_DUFFEL_FIXTURE",
+    "sanitisation": "diagnostic workflow allowlist; no identifiers or secrets",
+    "non_gbp_case": "not captured; any non-GBP test must be labelled modified real structure, not captured"
+  }
+}

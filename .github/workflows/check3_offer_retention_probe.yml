@@ -1,0 +1,21 @@
+name: Check 3 Duffel Offer Retention Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 135
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: One search and timed GET probes
+        env:
+          DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
+        run: python -u scripts/check3_offer_retention_probe.py

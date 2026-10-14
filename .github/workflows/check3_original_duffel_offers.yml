@@ -2,6 +2,11 @@ name: Check 3 Original Duffel Offers
 
 on:
   workflow_dispatch:
+    inputs:
+      samples_json:
+        description: 'Optional JSON array of sample objects; blank uses nine 13 Oct samples'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -18,4 +23,5 @@ jobs:
       - name: Compare original offers (read-only)
         env:
           DUFFEL_ACCESS_TOKEN: ${{ secrets.DUFFEL_API_KEY }}
+          CHECK3_SAMPLES_JSON: ${{ inputs.samples_json }}
         run: python scripts/check3_original_duffel_offers.py

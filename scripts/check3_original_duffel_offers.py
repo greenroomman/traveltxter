@@ -82,11 +82,43 @@ def inspect(sample, token):
                          and result["carrier_min"] == expected_carrier else "FAIL")
     return result
 
+def load_samples():
+    supplied = os.environ.get("CHECK3_SAMPLES_JSON", "").strip()
+    if not supplied:
+        return SAMPLES
+    try:
+        items = json.loads(supplied)
+        if not isinstance(items, list) or not (1 <= len(items) <= 30):
+            raise ValueError("Expected 1 to 30 sample objects")
+        samples = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("Each sample must be an object")
+            request_id = item["id"]
+            route = item["route"]
+            carrier = item["carrier"]
+            market = item["market"]
+            carrier_min = item.get("carrier_min")
+            if not isinstance(request_id, str) or not request_id.startswith("orq_") or not request_id[4:].isalnum() or len(request_id) > 80:
+                raise ValueError("Invalid offer request ID")
+            if not isinstance(route, str) or len(route) != 7 or route[3] != "-" or not route.replace("-", "").isalpha():
+                raise ValueError("Invalid route")
+            if not isinstance(carrier, str) or not (2 <= len(carrier) <= 3) or not carrier.isalnum():
+                raise ValueError("Invalid carrier")
+            if not isinstance(market, str) or amount(market) is None:
+                raise ValueError("Invalid market amount")
+            if carrier_min is not None and (not isinstance(carrier_min, str) or amount(carrier_min) is None):
+                raise ValueError("Invalid carrier amount")
+            samples.append((request_id, route, carrier, market, carrier_min))
+        return samples
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        raise SystemExit("Invalid CHECK3_SAMPLES_JSON; expected sample objects with id, route, carrier, market, carrier_min") from None
+
 def main():
     token = os.environ.get("DUFFEL_ACCESS_TOKEN")
     if not token:
         raise SystemExit("Missing Duffel credential")
-    rows = [inspect(sample, token) for sample in SAMPLES]
+    rows = [inspect(sample, token) for sample in load_samples()]
     print(json.dumps({"check": "original_offer_request_check3", "results": rows}, indent=2))
     if any(row["verdict"] == "FAIL" for row in rows):
         raise SystemExit(1)
